@@ -10,6 +10,45 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# Source trust tiers used to weight the consensus fair value. Sharp books and
+# exchanges anchor the fair price; soft books contribute little. Keys are matched
+# as case-insensitive substrings of the quote source name.
+SOURCE_TIERS: dict[str, tuple[float, bool]] = {
+    # name fragment -> (weight, is_exchange)
+    "pinnacle": (1.0, False),
+    "circa": (1.0, False),
+    "bookmaker": (0.9, False),
+    "betonline": (0.7, False),
+    # exchanges: quotes already trade near a de-vigged mid
+    "polymarket": (0.9, True),
+    "betfair": (0.9, True),
+    "smarkets": (0.8, True),
+    "matchbook": (0.8, True),
+    "prophetx": (0.8, True),
+    "kalshi": (0.8, True),
+    # soft retail books (contribute little to fair value)
+    "draftkings": (0.2, False),
+    "fanduel": (0.2, False),
+    "betmgm": (0.2, False),
+    "caesars": (0.2, False),
+    "espn bet": (0.2, False),
+    "bet365": (0.25, False),
+    "pointsbet": (0.2, False),
+    # demo feed used offline
+    "demo exchange": (0.9, True),
+    "demobook": (0.3, False),
+}
+
+
+def classify_source(name: str) -> tuple[float, bool]:
+    """Return (fair-value weight, is_exchange) for a quote source name."""
+    lowered = (name or "").casefold()
+    for fragment, tier in SOURCE_TIERS.items():
+        if fragment in lowered:
+            return tier
+    return (0.35, False)  # unknown book: modest default weight
+
+
 @dataclass(slots=True)
 class Event:
     name: str
@@ -68,6 +107,11 @@ class Signal:
     reasons: list[str]
     observed_at: datetime = field(default_factory=now_utc)
     quote_source: str = ""
+    # Phase 0 auditable fields from the Rust engine.
+    market_fair_prob: float = 0.0
+    devig_method: str = ""
+    overround: float = 1.0
+    n_reference_sources: int = 0
 
 
 def as_json(value: Any) -> Any:

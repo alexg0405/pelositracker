@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from .models import GameState, Quote, Signal
+from .models import GameState, Quote, Signal, classify_source
 
 try:
     from ._native_engine import evaluate_json
@@ -33,15 +33,7 @@ class SignalEngine:
             "max_age_seconds": self.max_age_seconds,
             "away_outcome": away_outcome,
             "quotes": [
-                {
-                    "market": q.market,
-                    "outcome": q.outcome,
-                    "probability": q.probability,
-                    "source": q.source,
-                    "observed_at": q.observed_at.timestamp(),
-                    "bid": q.bid,
-                    "ask": q.ask,
-                }
+                self._quote_payload(q)
                 for q in quotes
             ],
             "states": [
@@ -55,4 +47,21 @@ class SignalEngine:
         }
         results = json.loads(evaluate_json(json.dumps(request, separators=(",", ":"))))
         return [Signal(**result) for result in results]
+
+    @staticmethod
+    def _quote_payload(q: Quote) -> dict:
+        weight, is_exchange = classify_source(q.source)
+        return {
+            "market": q.market,
+            "outcome": q.outcome,
+            "probability": q.probability,
+            "source": q.source,
+            "observed_at": q.observed_at.timestamp(),
+            "bid": q.bid,
+            "ask": q.ask,
+            "source_weight": weight,
+            "is_exchange": is_exchange,
+            "decimal_odds": q.decimal_odds,
+            "liquidity": q.liquidity,
+        }
 

@@ -26,6 +26,38 @@ def parse_jsonish(value):
     return value or []
 
 
+def _to_float(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _book_depth(levels: list, best_price: float | None) -> float:
+    """Total resting size at the best price level of one side of the book."""
+    if best_price is None or not levels:
+        return 0.0
+    total = 0.0
+    for level in levels:
+        price = _to_float(level.get("price"))
+        size = _to_float(level.get("size"))
+        if price is not None and size is not None and abs(price - best_price) < 1e-9:
+            total += size
+    return total
+
+
+def _best_level_size(change: dict) -> float | None:
+    """Best-of-book size from a price_change / best_bid_ask message, if present."""
+    total = 0.0
+    seen = False
+    for key in ("best_bid_size", "best_ask_size"):
+        size = _to_float(change.get(key))
+        if size is not None:
+            total += size
+            seen = True
+    return total if seen else None
+
+
 async def polymarket_event(slug: str) -> dict:
     async with httpx.AsyncClient(timeout=15) as client:
         response = await client.get(f"https://gamma-api.polymarket.com/events/slug/{slug}")
@@ -70,15 +102,18 @@ async def polymarket_market_stream(event: Event, emit: Callable[[list[Quote]], A
                             market, outcome = token_meta[token]
                             bid = float(change["best_bid"]) if change.get("best_bid") else None
                             ask = float(change["best_ask"]) if change.get("best_ask") else None
+                            liquidity = _best_level_size(change)
                             if message.get("event_type") == "book":
                                 bids, asks = message.get("bids", []), message.get("asks", [])
                                 bid = max((float(x["price"]) for x in bids), default=None)
                                 ask = min((float(x["price"]) for x in asks), default=None)
+                                liquidity = _book_depth(bids, bid) + _book_depth(asks, ask)
                             probability = ((bid + ask) / 2 if bid is not None and ask is not None
                                            else ask if ask is not None else bid)
                             if probability is not None:
                                 quotes.append(Quote(event.id, market, outcome, probability,
-                                                    "Polymarket", bid=bid, ask=ask))
+                                                    "Polymarket", bid=bid, ask=ask,
+                                                    liquidity=liquidity))
                     if quotes:
                         await emit(quotes)
         except asyncio.CancelledError:
