@@ -1,13 +1,196 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Live Edge Monitor</title>
 <style>
-:root{color-scheme:dark;--bg:#07100e;--panel:#101b18;--line:#24332e;--muted:#91a19b;--lime:#b8ff48;--amber:#ffcb6b;--red:#ff6b6b}*{box-sizing:border-box}body{margin:0;font-family:Inter,ui-sans-serif,system-ui;background:radial-gradient(circle at 80% 0,#17382c 0,transparent 30%),var(--bg);color:#eef5f1}.wrap{max-width:1180px;margin:auto;padding:34px 20px}header{display:flex;justify-content:space-between;align-items:end;margin-bottom:28px}h1{font-size:clamp(28px,5vw,54px);letter-spacing:-.05em;margin:0}.eyebrow{color:var(--lime);text-transform:uppercase;letter-spacing:.18em;font-size:11px;font-weight:800}.sub{color:var(--muted);max-width:650px}.badge{border:1px solid var(--line);padding:8px 12px;border-radius:99px;color:var(--muted);font-size:12px}.grid{display:grid;grid-template-columns:320px 1fr;gap:18px}.panel{background:rgba(16,27,24,.92);border:1px solid var(--line);border-radius:18px;padding:18px}h2{font-size:14px;text-transform:uppercase;letter-spacing:.12em;margin:0 0 16px;color:#b7c5c0}label{display:block;color:var(--muted);font-size:12px;margin:12px 0 5px}input{width:100%;border:1px solid var(--line);background:#091310;color:#fff;padding:11px;border-radius:9px}button{border:0;background:var(--lime);color:#14200f;font-weight:800;padding:11px 14px;border-radius:9px;cursor:pointer;margin-top:14px;width:100%}button.secondary{background:transparent;color:var(--lime);border:1px solid #4d6c43}.event{border:1px solid var(--line);border-radius:14px;padding:17px;margin-bottom:12px}.event-top{display:flex;justify-content:space-between;gap:12px}.score{font-size:28px;font-weight:800;letter-spacing:-.05em}.muted{color:var(--muted);font-size:12px}.signal{display:grid;grid-template-columns:minmax(160px,1.4fr) repeat(3,1fr);gap:10px;margin-top:15px}.metric{background:#0a1411;border-radius:10px;padding:12px}.metric b{display:block;font-size:19px;margin-top:4px}.paper{color:var(--lime)}.watch{color:var(--amber)}.meter{height:6px;background:#25312d;border-radius:8px;overflow:hidden;margin-top:8px}.meter i{height:100%;display:block;background:var(--lime)}details{margin-top:12px;color:var(--muted);font-size:12px}li{margin:4px 0}.empty{text-align:center;padding:60px 20px;color:var(--muted)}.warning{border-left:3px solid var(--amber);padding-left:12px;margin-top:18px;color:var(--muted);font-size:12px}@media(max-width:780px){.grid{grid-template-columns:1fr}.signal{grid-template-columns:1fr 1fr}header{align-items:start;gap:16px;flex-direction:column}}</style>
-</head><body><main class="wrap"><header><div><div class="eyebrow">Paper signals only</div><h1>Live Edge Monitor</h1><p class="sub">Score momentum, market movement, source agreement, freshness, and executable price—gated into an explainable signal.</p></div><div class="badge" id="config">Loading thresholds…</div></header><div class="grid"><aside class="panel"><h2>Register event</h2><form id="form"><label>Event name</label><input name="name" required placeholder="Knicks vs Celtics"><label>Sport</label><input name="sport" required placeholder="basketball"><label>Home team</label><input name="home" required><label>Away team</label><input name="away" required><label>Polymarket event slug (optional)</label><input name="polymarket_slug" placeholder="nba-nyk-bos-2026-..."><label>TheOddsAPI sport key (optional)</label><input name="odds_api_sport" placeholder="basketball_nba"><label>TheOddsAPI event ID (optional)</label><input name="odds_api_event_id"><button>Start monitoring</button></form><button class="secondary" id="demo">Launch live demo</button><p class="warning">This is research software, not financial advice. “Confidence” is signal quality, not a guaranteed win rate. No wager is placed.</p></aside><section class="panel"><h2>Monitored events</h2><div id="events" class="empty">No events registered. Launch the demo to see the engine work.</div></section></div></main>
+:root{
+  color-scheme:dark;
+  --bg:#0d1117;--panel:#161b22;--panel-2:#1c222b;--line:#2a313c;
+  --text:#e6edf3;--muted:#8b949e;--faint:#6e7681;
+  --accent:#2f81f7;--yes:#3fb950;--no:#f85149;--warn:#d29922;
+  --radius:12px;
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.45}
+.wrap{max-width:1080px;margin:0 auto;padding:24px 20px 64px}
+a{color:inherit}
+
+/* header */
+header{display:flex;justify-content:space-between;align-items:center;gap:16px;padding-bottom:20px;margin-bottom:24px;border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:10px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--yes);box-shadow:0 0 0 4px rgba(63,185,80,.15)}
+h1{font-size:17px;font-weight:600;letter-spacing:-.01em;margin:0}
+.brand small{display:block;color:var(--muted);font-size:12px;font-weight:400}
+.config{color:var(--muted);font-size:12px;border:1px solid var(--line);padding:6px 12px;border-radius:99px;white-space:nowrap}
+
+/* layout */
+.grid{display:grid;grid-template-columns:300px 1fr;gap:20px;align-items:start}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius)}
+.panel-pad{padding:18px}
+.section-title{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 14px}
+
+/* form */
+label{display:block;color:var(--muted);font-size:12px;margin:12px 0 5px}
+label:first-of-type{margin-top:0}
+input{width:100%;border:1px solid var(--line);background:var(--bg);color:var(--text);padding:9px 11px;border-radius:8px;font-size:13px;transition:border-color .15s}
+input::placeholder{color:var(--faint)}
+input:focus{outline:none;border-color:var(--accent)}
+button{border:0;border-radius:8px;font-weight:600;font-size:13px;padding:10px 14px;cursor:pointer;width:100%;transition:opacity .15s}
+button:hover{opacity:.9}
+.btn-primary{background:var(--accent);color:#fff;margin-top:16px}
+.btn-ghost{background:transparent;color:var(--text);border:1px solid var(--line);margin-top:10px}
+.note{color:var(--faint);font-size:11px;line-height:1.5;margin:16px 0 0;padding-top:14px;border-top:1px solid var(--line)}
+
+/* events */
+.stack{display:flex;flex-direction:column;gap:14px}
+.event{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+.event-head{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line)}
+.event-head .name{font-weight:600;font-size:15px}
+.event-head .meta{color:var(--muted);font-size:12px;margin-top:2px}
+.score{font-size:22px;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.score .sep{color:var(--faint);margin:0 4px}
+
+.markets{display:flex;flex-direction:column}
+.market{padding:14px 18px;border-bottom:1px solid var(--line)}
+.market:last-child{border-bottom:0}
+.market-top{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.outcome{font-weight:600}
+.outcome small{display:block;color:var(--muted);font-weight:400;font-size:12px;margin-top:1px}
+.tag{font-size:11px;font-weight:600;padding:3px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.04em}
+.tag.bet{background:rgba(63,185,80,.15);color:var(--yes)}
+.tag.watch{background:rgba(210,153,34,.15);color:var(--warn)}
+
+.figs{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:12px}
+.fig .k{color:var(--muted);font-size:11px}
+.fig .v{font-size:16px;font-weight:600;font-variant-numeric:tabular-nums;margin-top:2px}
+.v.pos{color:var(--yes)}.v.neg{color:var(--no)}
+
+.bar{height:5px;background:var(--panel-2);border-radius:99px;overflow:hidden;margin-top:12px}
+.bar i{display:block;height:100%;background:var(--accent);border-radius:99px;transition:width .4s ease}
+.why{margin-top:12px}
+.why summary{color:var(--muted);font-size:12px;cursor:pointer;list-style:none}
+.why summary::-webkit-details-marker{display:none}
+.why summary::before{content:"▸ ";color:var(--faint)}
+.why[open] summary::before{content:"▾ "}
+.why ul{margin:8px 0 0;padding-left:16px;color:var(--muted);font-size:12px}
+.why li{margin:3px 0}
+.pending{color:var(--muted);font-size:13px;padding:14px 18px}
+
+.empty{text-align:center;padding:72px 20px;color:var(--muted)}
+.empty b{display:block;color:var(--text);margin-bottom:6px;font-size:15px}
+
+@media(max-width:820px){.grid{grid-template-columns:1fr}.figs{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+<main class="wrap">
+  <header>
+    <div class="brand">
+      <span class="dot"></span>
+      <div>
+        <h1>Live Edge Monitor</h1>
+        <small>Paper signals only · never places a wager</small>
+      </div>
+    </div>
+    <div class="config" id="config">Loading…</div>
+  </header>
+
+  <div class="grid">
+    <aside class="panel panel-pad">
+      <h2 class="section-title">Register event</h2>
+      <form id="form">
+        <label>Event name</label>
+        <input name="name" required placeholder="Knicks vs Celtics">
+        <label>Sport</label>
+        <input name="sport" required placeholder="basketball">
+        <label>Home team</label>
+        <input name="home" required>
+        <label>Away team</label>
+        <input name="away" required>
+        <label>Polymarket slug <span style="color:var(--faint)">(optional)</span></label>
+        <input name="polymarket_slug" placeholder="nba-nyk-bos-2026-…">
+        <label>TheOddsAPI sport key <span style="color:var(--faint)">(optional)</span></label>
+        <input name="odds_api_sport" placeholder="basketball_nba">
+        <label>TheOddsAPI event ID <span style="color:var(--faint)">(optional)</span></label>
+        <input name="odds_api_event_id">
+        <button class="btn-primary">Start monitoring</button>
+      </form>
+      <button class="btn-ghost" id="demo">Launch live demo</button>
+      <p class="note">Research software, not financial advice. “Confidence” is signal quality, not a win rate.</p>
+    </aside>
+
+    <section>
+      <h2 class="section-title">Monitored events</h2>
+      <div id="events"></div>
+    </section>
+  </div>
+</main>
+
 <script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function refresh(){const data=await fetch('/api/events').then(r=>r.json());const root=document.querySelector('#events');if(!data.length){root.className='empty';root.textContent='No events registered. Launch the demo to see the engine work.';return}root.className='';root.innerHTML=data.map(({event,latest_state:s,signals})=>`<article class="event"><div class="event-top"><div><b>${esc(event.name)}</b><div class="muted">${esc(event.sport)} · ${esc(s?.period||'waiting')} ${esc(s?.clock||'')}</div></div><div class="score">${s?`${s.home_score}–${s.away_score}`:'—'}</div></div>${signals.slice(0,3).map(x=>`<div class="signal"><div class="metric"><span class="${x.action==='PAPER_BET'?'paper':'watch'}">${esc(x.action.replace('_',' '))}</span><b>${esc(x.outcome)}</b><small>${esc(x.market)}</small></div><div class="metric"><span class="muted">Model</span><b>${(x.model_probability*100).toFixed(1)}%</b></div><div class="metric"><span class="muted">Edge</span><b>${x.edge>=0?'+':''}${(x.edge*100).toFixed(1)}%</b></div><div class="metric"><span class="muted">Signal quality</span><b>${x.confidence.toFixed(0)}/100</b><div class="meter"><i style="width:${x.confidence}%"></i></div></div></div><details><summary>Why this signal?</summary><ul>${x.reasons.map(r=>`<li>${esc(r)}</li>`).join('')}</ul></details>`).join('')||'<p class="muted">Waiting for enough market data…</p>'}</article>`).join('')}
-document.querySelector('#form').onsubmit=async e=>{e.preventDefault();const o=Object.fromEntries(new FormData(e.target));Object.keys(o).forEach(k=>{if(!o[k])delete o[k]});const r=await fetch('/api/events',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(o)});if(!r.ok)alert((await r.json()).detail);else{e.target.reset();refresh()}};
-document.querySelector('#demo').onclick=async()=>{await fetch('/api/demo',{method:'POST'});refresh()};fetch('/api/config').then(r=>r.json()).then(c=>document.querySelector('#config').textContent=`Quality ≥ ${c.confidence_threshold} · Edge ≥ ${(c.edge_threshold*100).toFixed(1)}%`);refresh();setInterval(refresh,1000);
-</script></body></html>
+const pct=n=>`${(n*100).toFixed(1)}%`;
+const signed=n=>`${n>=0?'+':''}${(n*100).toFixed(1)}%`;
 
+function marketRow(x){
+  const bet=x.action==='PAPER_BET';
+  return `<div class="market">
+    <div class="market-top">
+      <div class="outcome">${esc(x.outcome)}<small>${esc(x.market)}</small></div>
+      <span class="tag ${bet?'bet':'watch'}">${esc(x.action.replace('_',' '))}</span>
+    </div>
+    <div class="figs">
+      <div class="fig"><div class="k">Model</div><div class="v">${pct(x.model_probability)}</div></div>
+      <div class="fig"><div class="k">Edge</div><div class="v ${x.edge>=0?'pos':'neg'}">${signed(x.edge)}</div></div>
+      <div class="fig"><div class="k">Signal quality</div><div class="v">${x.confidence.toFixed(0)}<span style="color:var(--faint);font-size:12px">/100</span></div></div>
+    </div>
+    <div class="bar"><i style="width:${Math.max(0,Math.min(100,x.confidence))}%"></i></div>
+    <details class="why"><summary>Why this signal?</summary><ul>${x.reasons.map(r=>`<li>${esc(r)}</li>`).join('')}</ul></details>
+  </div>`;
+}
+
+function eventCard({event,latest_state:s,signals}){
+  const score=s?`${s.home_score}<span class="sep">–</span>${s.away_score}`:'—';
+  const rows=signals.slice(0,3).map(marketRow).join('');
+  return `<article class="event">
+    <div class="event-head">
+      <div>
+        <div class="name">${esc(event.name)}</div>
+        <div class="meta">${esc(event.sport)} · ${esc(s?.period||'waiting')} ${esc(s?.clock||'')}</div>
+      </div>
+      <div class="score">${score}</div>
+    </div>
+    <div class="markets">${rows||'<div class="pending">Waiting for enough market data…</div>'}</div>
+  </article>`;
+}
+
+async function refresh(){
+  let data;
+  try{ data=await fetch('/api/events').then(r=>r.json()); }catch{ return; }
+  const root=document.querySelector('#events');
+  if(!data.length){
+    root.innerHTML='<div class="panel empty"><b>No events yet</b>Launch the demo to watch the engine work.</div>';
+    return;
+  }
+  root.innerHTML=`<div class="stack">${data.map(eventCard).join('')}</div>`;
+}
+
+document.querySelector('#form').onsubmit=async e=>{
+  e.preventDefault();
+  const o=Object.fromEntries(new FormData(e.target));
+  Object.keys(o).forEach(k=>{if(!o[k])delete o[k]});
+  const r=await fetch('/api/events',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(o)});
+  if(!r.ok){ alert((await r.json()).detail); }
+  else{ e.target.reset(); refresh(); }
+};
+document.querySelector('#demo').onclick=async()=>{ await fetch('/api/demo',{method:'POST'}); refresh(); };
+
+fetch('/api/config').then(r=>r.json()).then(c=>{
+  document.querySelector('#config').textContent=`Quality ≥ ${c.confidence_threshold} · Edge ≥ ${(c.edge_threshold*100).toFixed(1)}%`;
+});
+refresh();
+setInterval(refresh,1000);
+</script>
+</body>
+</html>
