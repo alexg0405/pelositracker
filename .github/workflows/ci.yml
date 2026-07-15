@@ -6,10 +6,11 @@ on:
 
 jobs:
   test:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.12", "3.14"]
+        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,11 +18,23 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install Python dependencies
-        run: python -m pip install -r requirements.txt
-      - name: Build Rust extension
-        run: python -m maturin develop --release
+
+      # maturin develop needs an active virtualenv; it also drops the compiled
+      # app._native_engine into the source tree so pytest imports it in place.
+      - name: Install deps and build the native engine
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          maturin develop --release
+
       - name: Python tests
-        run: python -m pytest -q
+        run: |
+          . .venv/bin/activate
+          pytest -q
+
+      # extension-module is off by default (Cargo.toml), so cargo can link
+      # libpython and run the pure-Rust unit tests.
       - name: Rust tests
         run: cargo test --manifest-path native_engine/Cargo.toml
