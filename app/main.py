@@ -10,6 +10,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
@@ -146,6 +147,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Live Sports Signal Monitor", version=__version__, lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
 
 class EventIn(BaseModel):
