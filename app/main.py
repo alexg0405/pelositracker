@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -20,7 +21,8 @@ from .lines import pregame_priors
 from .models import Event, GameState, Quote, as_json
 from .sources import (demo_stream, extract_polymarket_slug, infer_polymarket_event,
                       match_odds_api_event, odds_api_poll, polymarket_event,
-                      polymarket_market_stream, polymarket_sports_stream)
+                      polymarket_market_stream, polymarket_sports_events,
+                      polymarket_sports_stream)
 from .store import Store
 
 load_dotenv()
@@ -176,6 +178,23 @@ async def index():
 async def config():
     return {"confidence_threshold": engine.confidence_threshold, "edge_threshold": engine.edge_threshold,
             "max_age_seconds": engine.max_age_seconds, "auto_betting": False}
+
+
+_discover_cache: dict = {"at": 0.0, "data": []}
+
+
+@app.get("/api/discover")
+async def discover():
+    """Browse live/upcoming Polymarket sports games to add without a link."""
+    now = time.monotonic()
+    if _discover_cache["data"] and now - _discover_cache["at"] < 45:
+        return _discover_cache["data"]  # cache so browsing doesn't hammer Gamma
+    try:
+        games = await polymarket_sports_events()
+    except Exception as exc:
+        raise HTTPException(502, f"Could not reach Polymarket: {exc}") from exc
+    _discover_cache.update(at=now, data=games)
+    return games
 
 
 @app.get("/api/events")

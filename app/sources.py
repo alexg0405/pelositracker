@@ -133,6 +133,68 @@ async def polymarket_event(slug: str) -> dict:
         return response.json()
 
 
+_SPORTS_TAGS = (
+    "nba", "nfl", "nhl", "mlb", "mls", "epl", "premier league", "la liga", "serie a",
+    "bundesliga", "ligue 1", "champions league", "europa league", "soccer", "football",
+    "tennis", "ufc", "mma", "boxing", "f1", "formula 1", "golf", "ncaa", "ncaab", "ncaaf",
+    "cricket", "world cup", "sports", "cfb", "cbb", "wnba",
+)
+
+
+def _tag_labels(event: dict) -> list[str]:
+    return [str(t.get("label", "")).casefold() for t in (event.get("tags") or [])]
+
+
+def _is_sports_event(event: dict) -> bool:
+    labels = _tag_labels(event)
+    return any(any(kw in label for kw in _SPORTS_TAGS) for label in labels)
+
+
+def _league_label(event: dict) -> str:
+    for t in (event.get("tags") or []):
+        label = str(t.get("label", ""))
+        if label.casefold() in _SPORTS_TAGS or any(kw in label.casefold() for kw in _SPORTS_TAGS):
+            if label.casefold() not in ("sports", "games", "football"):
+                return label
+    return "Sports"
+
+
+def filter_sports_games(events: list[dict]) -> list[dict]:
+    """Keep tradeable sports GAMES (team-vs-team matchups); drop futures and
+    per-market sub-events. Pure so it can be unit-tested without the network."""
+    games = []
+    for event in events:
+        title = str(event.get("title", ""))
+        if "vs" not in title.casefold() or " - " in title:  # matchups, not sub-markets
+            continue
+        if not event.get("enableOrderBook", False) or not _is_sports_event(event):
+            continue
+        slug = event.get("slug")
+        if not slug:
+            continue
+        games.append({
+            "slug": slug,
+            "title": title,
+            "league": _league_label(event),
+            "start_date": event.get("startDate"),
+            "volume24hr": event.get("volume24hr"),
+            "restricted": bool(event.get("restricted", False)),
+        })
+    return games
+
+
+async def polymarket_sports_events(limit: int = 200) -> list[dict]:
+    """List currently-tradeable Polymarket sports games for in-site discovery."""
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.get(
+            "https://gamma-api.polymarket.com/events",
+            params={"closed": "false", "active": "true", "limit": str(limit),
+                    "order": "volume24hr", "ascending": "false"},
+        )
+        response.raise_for_status()
+        return filter_sports_games(response.json())
+
+
 async def match_odds_api_event(sport_key: str | None, title: str) -> dict | None:
     """Match a Polymarket sports title to The Odds API's quota-free events list."""
     key = os.getenv("THE_ODDS_API_KEY")

@@ -49,6 +49,19 @@
     @media(max-width:960px){.grid{grid-template-columns:1fr}.figs{grid-template-columns:1fr 1fr}.panel{position:static}}
     @media(max-width:560px){.wrap{padding:14px 10px 50px}header,.event-head{align-items:flex-start;flex-direction:column}.event-actions{width:100%;justify-content:space-between}.figs{grid-template-columns:1fr 1fr}.position-form{grid-template-columns:1fr}.market-top,.position-top{align-items:flex-start}.config{white-space:normal}}
     @media(prefers-reduced-motion:reduce){.dot{animation:none}}
+    .browse{margin-top:18px;padding-top:16px;border-top:1px dashed var(--line)}
+    .browse-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+    .browse-head .title{margin:0}
+    #discover-refresh{width:auto;padding:4px 8px;font-size:10px;background:transparent;color:var(--cyan);border:1px solid var(--bright)}
+    #discover-search{margin-top:10px}
+    .discover-list{margin-top:8px;max-height:320px;overflow-y:auto;display:flex;flex-direction:column;gap:6px}
+    .game{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--line);background:var(--panel2);cursor:pointer;transition:border-color .12s,background .12s}
+    .game:hover{border-color:var(--coral);background:rgba(255,77,46,.07)}
+    .game[aria-disabled=true]{opacity:.5;cursor:wait}
+    .game .g-title{font-size:12px;line-height:1.3}
+    .game .g-league{margin-top:2px;color:var(--muted);font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase}
+    .game .g-add{color:var(--cyan);font-family:var(--mono);font-size:10px;white-space:nowrap}
+    .discover-empty{color:var(--faint);font-size:12px;font-family:var(--mono)}
   </style>
 </head>
 <body>
@@ -79,6 +92,14 @@
       </form>
       <button class="ghost" id="demo" type="button">Launch paper demo</button>
       <p class="note">Only markets accepting orders with an executable ask are shown. Availability and legality vary by location. Entry, hold, and cash guidance is heuristic research output—not a guarantee or instruction to wager.</p>
+      <div class="browse">
+        <div class="browse-head">
+          <h2 class="title">Live Polymarket games</h2>
+          <button id="discover-refresh" type="button">Refresh</button>
+        </div>
+        <input id="discover-search" placeholder="Filter games…" autocomplete="off">
+        <div id="discover-list" class="discover-list" aria-live="polite"></div>
+      </div>
     </aside>
     <section aria-labelledby="events-heading">
       <h2 class="title" id="events-heading">Monitored events</h2>
@@ -205,8 +226,33 @@
   document.querySelector("#events").addEventListener("click",async event=>{const removeEvent=event.target.closest("[data-remove-event]"),removePosition=event.target.closest("[data-remove-position]");
     if(removeEvent){removeEvent.disabled=true;try{const response=await fetch(`/api/events/${encodeURIComponent(removeEvent.dataset.removeEvent)}`,{method:"DELETE"});if(response.ok){await refresh();await refreshMetrics()}}catch{}finally{removeEvent.disabled=false}}
     if(removePosition){removePosition.disabled=true;try{const response=await fetch(`/api/events/${encodeURIComponent(removePosition.dataset.eventId)}/positions/${encodeURIComponent(removePosition.dataset.tokenId)}`,{method:"DELETE"});if(response.ok)await refresh()}catch{}finally{removePosition.disabled=false}}});
+  let discoverGames = [];
+  function renderDiscover() {
+    const list=document.querySelector("#discover-list");
+    if(!discoverGames.length){list.innerHTML='<div class="discover-empty">No live games found right now.</div>';return}
+    const q=(document.querySelector("#discover-search").value||"").toLowerCase();
+    const shown=discoverGames.filter(g=>!q||`${g.title} ${g.league||""}`.toLowerCase().includes(q));
+    list.innerHTML=shown.length?shown.map(g=>`<div class="game" data-slug="${esc(g.slug)}" role="button" tabindex="0" title="${esc(g.title)}"><div><div class="g-title">${esc(g.title)}</div><div class="g-league">${esc(g.league||"sports")}</div></div><span class="g-add">+ Monitor</span></div>`).join(""):'<div class="discover-empty">No games match.</div>';
+  }
+  async function loadDiscover() {
+    const list=document.querySelector("#discover-list");
+    try{const r=await fetch("/api/discover");if(!r.ok)throw new Error();discoverGames=await r.json();renderDiscover()}
+    catch{if(!discoverGames.length)list.innerHTML='<div class="discover-empty">Could not load games.</div>'}
+  }
+  async function monitorGame(slug,row) {
+    const box=document.querySelector("#form-error");
+    if(row)row.setAttribute("aria-disabled","true");box.hidden=true;
+    try{const r=await fetch("/api/events",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({polymarket_url:`https://polymarket.com/event/${slug}`})});
+      const body=await r.json().catch(()=>({}));if(!r.ok)throw new Error(body.detail||`Could not monitor (${r.status})`);await refresh();await refreshMetrics()}
+    catch(error){box.textContent=error.message;box.hidden=false}
+    finally{if(row)row.removeAttribute("aria-disabled")}
+  }
+  document.querySelector("#discover-list").addEventListener("click",e=>{const row=e.target.closest("[data-slug]");if(row&&row.getAttribute("aria-disabled")!=="true")monitorGame(row.dataset.slug,row)});
+  document.querySelector("#discover-search").addEventListener("input",renderDiscover);
+  document.querySelector("#discover-refresh").addEventListener("click",loadDiscover);
+
   fetch("/api/config").then(r=>r.json()).then(c=>document.querySelector("#config").textContent=`Quality ≥ ${c.confidence_threshold} · Required edge ≥ ${(c.edge_threshold*100).toFixed(1)}%`).catch(()=>document.querySelector("#config").textContent="Thresholds unavailable");
-  refresh();refreshMetrics();startStream();setInterval(refresh,10000);setInterval(refreshMetrics,5000);
+  refresh();refreshMetrics();startStream();loadDiscover();setInterval(refresh,10000);setInterval(refreshMetrics,5000);setInterval(loadDiscover,60000);
 </script>
 </body>
 </html>
