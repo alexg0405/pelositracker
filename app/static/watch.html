@@ -46,6 +46,12 @@
   .watch-links a:hover{border-color:var(--cyan)}
   .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}
   .muted{color:var(--muted);font-size:12px}
+  .carousel{display:flex;gap:8px;overflow-x:auto;padding:2px 2px 10px;margin:8px 0 2px}
+  .carousel .pill{flex:0 0 auto;padding:6px 12px;border:1px solid var(--bright);background:var(--panel2);color:var(--muted);font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;cursor:pointer;white-space:nowrap}
+  .carousel .pill:hover{border-color:var(--cyan);color:var(--text)}
+  .carousel .pill.active{background:var(--cyan);color:#04110f;border-color:var(--cyan)}
+  .carousel .pill.live-pill{color:var(--red);border-color:var(--red)}
+  .carousel .pill.live-pill.active{background:var(--red);color:#170604;border-color:var(--red)}
   @media(max-width:820px){.grid{grid-template-columns:1fr}}
 </style>
 </head>
@@ -59,6 +65,7 @@
     <aside class="panel">
       <h2 class="title">Games</h2>
       <input id="search" placeholder="Filter games…" autocomplete="off">
+      <div id="league-filter" class="carousel" role="tablist" aria-label="Filter by league"></div>
       <div id="games" class="games"><div class="muted">Loading games…</div></div>
     </aside>
     <main class="panel">
@@ -92,7 +99,7 @@
     golf:[["ESPN+ / Golf Channel","https://www.espn.com/watch/"]],
     nascar:[["How to watch (official)","https://www.nascar.com/how-to-watch/"]],
   };
-  let games = [], selected = null, hls = null;
+  let games = [], selected = null, hls = null, activeLeague = "all";
 
   function whereToWatch(league, title){
     const lk = (league||"").toLowerCase();
@@ -102,11 +109,32 @@
     return list;
   }
 
+  function renderLeagues(leagues, hasLive){
+    const el = document.getElementById("league-filter");
+    if (leagues.length <= 1 && !hasLive){ el.innerHTML = ""; return; }  // nothing to filter
+    const pill = (k, label, cls="") => `<button class="pill${cls}${activeLeague===k?" active":""}" data-league="${esc(k)}">${esc(label)}</button>`;
+    let html = pill("all", "All");
+    if (hasLive) html += pill("__live__", "● Live", " live-pill");
+    html += leagues.map(lg => pill(lg, lg)).join("");
+    el.innerHTML = html;
+  }
+
   function render(){
     const q = (document.getElementById("search").value||"").toLowerCase();
     const el = document.getElementById("games");
-    if (!games.length){ el.innerHTML = '<div class="muted">No games right now.</div>'; return; }
-    const shown = games.filter(g => !q || `${g.title} ${g.league||""}`.toLowerCase().includes(q));
+    if (!games.length){ el.innerHTML = '<div class="muted">No games right now.</div>'; document.getElementById("league-filter").innerHTML = ""; return; }
+    const leagues = [...new Set(games.map(g => g.league || "Sports"))].sort();
+    const hasLive = games.some(g => g.status === "live");
+    if (activeLeague === "__live__" && !hasLive) activeLeague = "all";
+    if (activeLeague !== "all" && activeLeague !== "__live__" && !leagues.includes(activeLeague)) activeLeague = "all";
+    renderLeagues(leagues, hasLive);
+    const shown = games.filter(g => {
+      const inFilter = activeLeague === "all" ? true
+        : activeLeague === "__live__" ? g.status === "live"
+        : (g.league || "Sports") === activeLeague;
+      const inSearch = !q || `${g.title} ${g.league||""}`.toLowerCase().includes(q);
+      return inFilter && inSearch;
+    });
     el.innerHTML = shown.map(g => `<div class="game${selected&&selected.slug===g.slug?" active":""}" data-slug="${esc(g.slug)}" title="${esc(g.title)}">
       <div><div class="g-title">${esc(g.title)}</div><div class="g-league">${g.status==="live"?'<span class="g-live">● LIVE</span> ':""}${esc(g.league||"sports")}</div></div></div>`).join("")
       || '<div class="muted">No games match.</div>';
@@ -163,6 +191,10 @@
     const g = games.find(x => x.slug === row.dataset.slug); if (g) select(g);
   });
   document.getElementById("search").addEventListener("input", render);
+  document.getElementById("league-filter").addEventListener("click", e => {
+    const p = e.target.closest("[data-league]"); if (!p) return;
+    activeLeague = p.dataset.league; render();
+  });
   document.getElementById("play").addEventListener("click", play);
   document.getElementById("stream-url").addEventListener("keydown", e => { if (e.key === "Enter") play(); });
   load();
