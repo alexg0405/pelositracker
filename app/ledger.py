@@ -142,6 +142,8 @@ class Ledger:
 
     def settle_moneyline(self, event_id: str, winner_labels: set[str]) -> None:
         """Settle moneyline-style bets from the final result (win=1, loss=0)."""
+        if not winner_labels:  # never settle every bet to a loss on unknown result
+            return
         now = _now()
         with self._lock:
             cur = self._conn.execute(

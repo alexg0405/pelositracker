@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -27,33 +28,63 @@ engine = SignalEngine(float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", "72")),
                       float(os.getenv("SIGNAL_EDGE_THRESHOLD", "0.035")),
                       float(os.getenv("MAX_DATA_AGE_SECONDS", "20")))
 tasks: dict[str, list[asyncio.Task]] = {}
+_finalized: set[str] = set()
 _FINAL_STATUSES = {"final", "ended", "closed", "complete", "finished"}
+_SAFE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _require_safe_id(value: str | None, field: str) -> None:
+    # These are interpolated into outbound API paths; reject path/query injection.
+    if value is not None and not _SAFE_ID.match(value):
+        raise HTTPException(400, f"invalid {field}")
 
 
 async def on_state(state: GameState):
     store.add_state(state)
-    recompute(state.event_id)
+    await record(state.event_id)
     if str(state.status).lower() in _FINAL_STATUSES:
-        finalize_event(state.event_id)
+        await finalize_event(state.event_id)
 
 
 async def on_quotes(quotes: list[Quote]):
     store.add_quotes(quotes)
     if quotes:
-        recompute(quotes[0].event_id)
+        await record(quotes[0].event_id)
 
 
-def recompute(event_id: str):
-    event = store.events[event_id]
+def recompute(event_id: str) -> list:
+    event = store.events.get(event_id)
+    if event is None:  # event removed between emit and callback
+        return []
     signals = engine.evaluate(event_id, store.quotes[event_id],
                               store.states[event_id], event.away, sport=event.sport)
     store.set_signals(event_id, signals)
-    if ledger is not None:
-        ledger.record_signals(event, signals)
+    return signals
 
 
-def finalize_event(event_id: str) -> None:
-    """Snapshot the closing consensus (for CLV) and settle moneylines."""
+async def record(event_id: str) -> None:
+    signals = recompute(event_id)
+    event = store.events.get(event_id)
+    # Ledger commits fsync to disk; keep that off the event loop.
+    if ledger is not None and event is not None and signals:
+        await asyncio.to_thread(ledger.record_signals, event, signals)
+
+
+def _winner_labels(event: Event, home_score: float, away_score: float) -> set[str]:
+    if home_score > away_score:
+        return {"home", event.home}
+    if away_score > home_score:
+        return {"away", event.away}
+    return {"draw", "Draw"}  # a tie settles the Draw outcome, not nothing
+
+
+async def finalize_event(event_id: str) -> None:
+    """Cancel the event's feeds, snapshot the closing consensus (CLV), settle."""
+    if event_id in _finalized:
+        return
+    _finalized.add(event_id)
+    for task in tasks.pop(event_id, []):  # stop paid pollers / streams for a dead game
+        task.cancel()
     if ledger is None:
         return
     event = store.events.get(event_id)
@@ -63,17 +94,16 @@ def finalize_event(event_id: str) -> None:
         for s in signals
         if (s.market_fair_prob or s.model_probability)
     }
-    ledger.snapshot_closing(event_id, fair_by_selection)
     states = store.states.get(event_id) or []
-    if event and states:
-        last = states[-1]
-        winners: set[str] = set()
-        if last.home_score > last.away_score:
-            winners = {"home", event.home}
-        elif last.away_score > last.home_score:
-            winners = {"away", event.away}
+    winners = _winner_labels(event, states[-1].home_score, states[-1].away_score) \
+        if (event and states) else set()
+
+    def _writes():
+        ledger.snapshot_closing(event_id, fair_by_selection)
         if winners:
             ledger.settle_moneyline(event_id, winners)
+
+    await asyncio.to_thread(_writes)
 
 
 @asynccontextmanager
@@ -157,6 +187,10 @@ async def add_event(payload: EventIn):
     if link_or_slug:
         try:
             slug = extract_polymarket_slug(link_or_slug)
+        except Exception as exc:
+            raise HTTPException(400, f"Could not parse Polymarket link: {exc}") from exc
+        _require_safe_id(slug, "polymarket slug")
+        try:
             poly = await polymarket_event(slug)
         except Exception as exc:
             raise HTTPException(400, f"Could not resolve Polymarket link: {exc}") from exc
@@ -192,6 +226,8 @@ async def add_event(payload: EventIn):
     missing = [field for field in required if not values.get(field)]
     if missing:
         raise HTTPException(400, f"Missing required fields: {', '.join(missing)}")
+    _require_safe_id(values.get("odds_api_sport"), "odds_api_sport")
+    _require_safe_id(values.get("odds_api_event_id"), "odds_api_event_id")
     event = store.add_event(Event(**values))
     group = []
     if payload.demo:
@@ -243,11 +279,12 @@ async def bets(event_id: str | None = None):
 async def delete_event(event_id: str):
     if event_id not in store.events:
         raise HTTPException(404, "event not found")
-    finalize_event(event_id)
+    await finalize_event(event_id)
     if ledger is not None:
         ledger.delete_event_positions(event_id)
     for task in tasks.pop(event_id, []):
         task.cancel()
+    _finalized.discard(event_id)
     del store.events[event_id]
     store.states.pop(event_id, None)
     store.quotes.pop(event_id, None)

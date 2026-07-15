@@ -303,7 +303,10 @@ async def polymarket_sports_stream(events: Callable[[], list[Event]],
                     score = str(data.get("score", "0-0")).split("-")
                     if len(score) != 2:
                         continue
-                    await emit(GameState(matched.id, float(score[0]), float(score[1]),
+                    home_score, away_score = _to_float(score[0]), _to_float(score[1])
+                    if home_score is None or away_score is None:
+                        continue  # skip one bad message, don't drop the shared socket
+                    await emit(GameState(matched.id, home_score, away_score,
                                          str(data.get("period", "")), str(data.get("elapsed", "")),
                                          "Polymarket sports", possession=data.get("turn"),
                                          status=str(data.get("status", "in_progress"))))
@@ -415,21 +418,26 @@ async def demo_stream(event: Event, emit_state, emit_quotes):
     probability = 0.52
     tick = 0
     while True:
-        tick += 1
-        if tick % 3 == 0:
-            if random.random() < probability:
-                home += random.choice([1, 2, 3])
-                probability = min(0.88, probability + random.uniform(0.015, 0.04))
-            else:
-                away += random.choice([1, 2, 3])
-                probability = max(0.12, probability - random.uniform(0.015, 0.04))
-        await emit_state(GameState(event.id, home, away, f"Q{min(4, 1 + tick // 20)}",
-                                   f"{max(0, 12 - tick % 12):02d}:00", "Demo feed"))
-        quotes = []
-        for source, noise in (("DemoBook A", -0.025), ("DemoBook B", 0.005), ("Demo exchange", 0.02)):
-            p = max(0.02, min(0.98, probability + noise + random.uniform(-0.008, 0.008)))
-            quotes.extend([Quote(event.id, "moneyline", "home", p, source, ask=p + 0.01, bid=p - 0.01),
-                           Quote(event.id, "moneyline", "away", 1 - p, source,
-                                 ask=1 - p + 0.01, bid=1 - p - 0.01)])
-        await emit_quotes(quotes)
+        try:
+            tick += 1
+            if tick % 3 == 0:
+                if random.random() < probability:
+                    home += random.choice([1, 2, 3])
+                    probability = min(0.88, probability + random.uniform(0.015, 0.04))
+                else:
+                    away += random.choice([1, 2, 3])
+                    probability = max(0.12, probability - random.uniform(0.015, 0.04))
+            await emit_state(GameState(event.id, home, away, f"Q{min(4, 1 + tick // 20)}",
+                                       f"{max(0, 12 - tick % 12):02d}:00", "Demo feed"))
+            quotes = []
+            for source, noise in (("DemoBook A", -0.025), ("DemoBook B", 0.005), ("Demo exchange", 0.02)):
+                p = max(0.02, min(0.98, probability + noise + random.uniform(-0.008, 0.008)))
+                quotes.extend([Quote(event.id, "moneyline", "home", p, source, ask=p + 0.01, bid=p - 0.01),
+                               Quote(event.id, "moneyline", "away", 1 - p, source,
+                                     ask=1 - p + 0.01, bid=1 - p - 0.01)])
+            await emit_quotes(quotes)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("demo stream tick failed for %s", event.name, exc_info=False)
         await asyncio.sleep(1)
