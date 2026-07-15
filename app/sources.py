@@ -148,6 +148,10 @@ _SPORTS_TAGS = (
     "tennis", "ufc", "mma", "boxing", "f1", "formula 1", "golf", "ncaa", "ncaab", "ncaaf",
     "cricket", "world cup", "sports", "cfb", "cbb", "wnba",
 )
+_MATCHUP_RE = re.compile(r"\b(?:vs\.?|at)\b", re.IGNORECASE)
+_LIVE_GAME_STATUSES = {"live", "in progress", "inprogress", "playing", "halftime", "intermission"}
+_FINAL_GAME_STATUSES = {"final", "ended", "closed", "complete", "completed", "finished", "cancelled", "canceled"}
+_UPCOMING_GAME_STATUSES = {"scheduled", "upcoming", "not started", "pregame", "pre game", "delayed", "postponed"}
 
 
 def _tag_labels(event: dict) -> list[str]:
@@ -168,6 +172,29 @@ def _league_label(event: dict) -> str:
     return "Sports"
 
 
+def sports_game_status(payload) -> str | None:
+    """Normalize explicit provider state without guessing from the start time."""
+    if isinstance(payload, str):
+        raw = payload
+        live_value = None
+    elif isinstance(payload, dict):
+        raw = next((payload.get(key) for key in
+                    ("status", "gameStatus", "game_status", "state") if payload.get(key)), "")
+        live_value = payload.get("live")
+    else:
+        return None
+    if live_value is True or str(live_value).strip().casefold() == "true":
+        return "live"
+    normalized = re.sub(r"[_-]+", " ", str(raw).strip().casefold())
+    if normalized in _FINAL_GAME_STATUSES:
+        return "final"
+    if normalized in _LIVE_GAME_STATUSES:
+        return "live"
+    if normalized in _UPCOMING_GAME_STATUSES:
+        return "upcoming"
+    return None
+
+
 def filter_sports_games(events: list[dict]) -> list[dict]:
     """Keep tradeable sports GAMES (team-vs-team matchups) that are accepting
     orders right now; drop futures, sub-events, and finished/idle markets. Pure
@@ -175,7 +202,7 @@ def filter_sports_games(events: list[dict]) -> list[dict]:
     games = []
     for event in events:
         title = str(event.get("title", ""))
-        if "vs" not in title.casefold() or " - " in title:  # matchups, not sub-markets
+        if not _MATCHUP_RE.search(title) or " - " in title:  # matchups, not names containing "vs"
             continue
         if not event.get("enableOrderBook", False) or not _is_sports_event(event):
             continue
@@ -188,11 +215,14 @@ def filter_sports_games(events: list[dict]) -> list[dict]:
         # Real first-pitch/tip time lives on the market (top-level startDate is
         # just when the market was created).
         game_start = next((m.get("gameStartTime") for m in markets if m.get("gameStartTime")), None)
+        provider_status = next((sports_game_status(m) for m in markets if sports_game_status(m)),
+                               sports_game_status(event))
         games.append({
             "slug": slug,
             "title": title,
             "league": _league_label(event),
             "game_start": game_start,
+            "provider_status": provider_status,
             "restricted": bool(event.get("restricted", False)),
         })
     return games
@@ -214,29 +244,53 @@ def _parse_iso(value) -> datetime | None:
         return None
 
 
-def _game_window(games: list[dict], now: datetime) -> list[dict]:
-    """Tag live/upcoming by real game time; keep in-progress + upcoming, drop
-    games that finished hours ago. Live sorted first, then soonest."""
+def _game_window(games: list[dict], now: datetime,
+                 live_statuses: dict[str, dict] | None = None) -> list[dict]:
+    """Use explicit provider state for LIVE; time alone can only mean STARTED.
+
+    A recently passed start time is not proof that a game is still in progress.
+    This avoids labeling finals, postponements, and stale tennis markets live.
+    """
+    live_statuses = live_statuses or {}
     out = []
-    for game in games:
+    for original in games:
+        game = dict(original)
         start = _parse_iso(game.get("game_start"))
+        status_payload = live_statuses.get(str(game.get("slug"))) or game.get("provider_status")
+        explicit = sports_game_status(status_payload)
+        if explicit == "live" and isinstance(status_payload, dict) and status_payload.get("_received_at"):
+            received_at = _parse_iso(status_payload.get("_received_at"))
+            if received_at and (now - received_at).total_seconds() > 180:
+                explicit = None  # a stale LIVE packet must not keep a game live forever
+        if explicit == "final":
+            continue
+        if explicit == "live":
+            game["status"] = "live"
+            game["status_source"] = "polymarket-live-feed"
+            out.append(game)
+            continue
         if start is None:
-            game["status"] = "upcoming"     # unknown time: show, don't guess live
+            game["status"] = "upcoming"
+            game["status_source"] = "schedule-missing"
             out.append(game)
             continue
         hours = (now - start).total_seconds() / 3600.0
-        if 0 <= hours <= 5:                 # in progress (typical game length)
-            game["status"] = "live"
-        elif -168 <= hours < 0:             # starts within the next 7 days
+        if explicit == "upcoming" or -168 <= hours < 0:
             game["status"] = "upcoming"
+            game["status_source"] = "provider" if explicit else "schedule"
+        elif 0 <= hours <= 6:
+            game["status"] = "started"
+            game["status_source"] = "schedule-only"
         else:
-            continue                         # finished >5h ago, or >7d out
+            continue
         out.append(game)
-    out.sort(key=lambda g: (g["status"] != "live", _parse_iso(g.get("game_start")) or now))
+    rank = {"live": 0, "started": 1, "upcoming": 2}
+    out.sort(key=lambda g: (rank.get(g["status"], 9), _parse_iso(g.get("game_start")) or now))
     return out
 
 
-async def polymarket_sports_events(limit_per_league: int = 100) -> list[dict]:
+async def polymarket_sports_events(limit_per_league: int = 100,
+                                   live_statuses: dict[str, dict] | None = None) -> list[dict]:
     """List live/upcoming Polymarket sports games across leagues for discovery.
 
     Gamma can't order by real game time, so per league we pull both creation
@@ -267,7 +321,7 @@ async def polymarket_sports_events(limit_per_league: int = 100) -> list[dict]:
         if key not in seen_events:
             seen_events.add(key)
             events.append(event)
-    ranked = _game_window(filter_sports_games(events), datetime.now(timezone.utc))
+    ranked = _game_window(filter_sports_games(events), datetime.now(timezone.utc), live_statuses)
     return ranked[:80]  # live first, then soonest — keep the picker manageable
 
 
@@ -425,7 +479,8 @@ async def polymarket_market_stream(event: Event, emit: Callable[[list[Quote]], A
 
 
 async def polymarket_sports_stream(events: Callable[[], list[Event]],
-                                    emit: Callable[[GameState], Awaitable[None]]):
+                                    emit: Callable[[GameState], Awaitable[None]],
+                                    status_emit: Callable[[str, dict], Awaitable[None]] | None = None):
     while True:
         try:
             async with websockets.connect("wss://sports-api.polymarket.com/ws") as ws:
@@ -435,6 +490,8 @@ async def polymarket_sports_stream(events: Callable[[], list[Event]],
                         continue
                     data = json.loads(raw)
                     slug = data.get("slug")
+                    if slug and status_emit is not None:
+                        await status_emit(str(slug), data)
                     matched = next((e for e in events() if e.polymarket_slug == slug), None)
                     if not matched:
                         continue
@@ -605,12 +662,34 @@ async def demo_stream(event: Event, emit_state, emit_quotes):
                     probability = max(0.12, probability - random.uniform(0.015, 0.04))
             await emit_state(GameState(event.id, home, away, f"Q{min(4, 1 + tick // 20)}",
                                        f"{max(0, 12 - tick % 12):02d}:00", "Demo feed"))
+            spread_home = max(0.08, min(0.92, probability - 0.04))
+            total_over = max(0.30, min(0.70, 0.51 + (home + away - 20) * 0.002))
+            markets = [
+                ("moneyline", "home", "away", probability, "Winner"),
+                ("spread", "home -3.5", "away +3.5", spread_home, "Spread: home -3.5"),
+                ("total", "Over 214.5", "Under 214.5", total_over, "Total: 214.5"),
+            ]
             quotes = []
-            for source, noise in (("DemoBook A", -0.025), ("DemoBook B", 0.005), ("Demo exchange", 0.02)):
-                p = max(0.02, min(0.98, probability + noise + random.uniform(-0.008, 0.008)))
-                quotes.extend([Quote(event.id, "moneyline", "home", p, source, ask=p + 0.01, bid=p - 0.01),
-                               Quote(event.id, "moneyline", "away", 1 - p, source,
-                                     ask=1 - p + 0.01, bid=1 - p - 0.01)])
+            for market, first, second, base, _question in markets:
+                for source, noise in (("DemoBook A", -0.025), ("DemoBook B", 0.005),
+                                      ("Demo exchange", 0.02)):
+                    p = max(0.02, min(0.98, base + noise + random.uniform(-0.008, 0.008)))
+                    quotes.extend([
+                        Quote(event.id, market, first, p, source, ask=min(.99, p + .01),
+                              bid=max(.01, p - .01)),
+                        Quote(event.id, market, second, 1 - p, source, ask=min(.99, 1 - p + .01),
+                              bid=max(.01, 1 - p - .01)),
+                    ])
+            for market, first, second, base, question in markets:
+                first_ask = max(.02, min(.98, base - .045))
+                second_ask = max(.02, min(.98, 1 - base + .025))
+                for suffix, outcome, ask in (("a", first, first_ask), ("b", second, second_ask)):
+                    quotes.append(Quote(
+                        event.id, market, outcome, ask - .01, "Polymarket",
+                        bid=max(.01, ask - .02), ask=ask, token_id=f"demo-{market}-{suffix}",
+                        market_slug=f"demo-{market}", question=question, bid_size=250,
+                        ask_size=200, market_liquidity=10_000, min_order_size=5, tick_size=.01,
+                    ))
             await emit_quotes(quotes)
         except asyncio.CancelledError:
             raise

@@ -110,6 +110,12 @@ struct SignalOutput {
     required_edge: f64,      // base + z*consensus_stderr + market premium
     fair_stderr: f64,        // standard error of the consensus fair
     fillable_size: Option<f64>,
+    // Auditable data-quality components (0-100). Edge is deliberately absent:
+    // opportunity size must not make the underlying data look more reliable.
+    quality_freshness: f64,
+    quality_agreement: f64,
+    quality_sources: f64,
+    quality_execution: f64,
 }
 
 fn clamp(value: f64, low: f64, high: f64) -> f64 {
@@ -520,9 +526,15 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
             continue;
         }
 
-        // The quote we would actually take: the best (lowest) executable ask.
+        // This app displays Polymarket execution. If a Polymarket quote exists,
+        // evaluate that exact ask rather than silently borrowing a cheaper
+        // sportsbook ask and showing its edge beside the Polymarket card.
+        let has_polymarket = target_quotes
+            .iter()
+            .any(|quote| quote.source.eq_ignore_ascii_case("polymarket"));
         let best = target_quotes
             .iter()
+            .filter(|quote| !has_polymarket || quote.source.eq_ignore_ascii_case("polymarket"))
             .min_by(|a, b| {
                 a.executable_probability()
                     .total_cmp(&b.executable_probability())
@@ -609,6 +621,10 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
                 required_edge: 0.0,
                 fair_stderr: 0.0,
                 fillable_size: best.liquidity,
+                quality_freshness: (freshness_score * 1000.0).round() / 10.0,
+                quality_agreement: 0.0,
+                quality_sources: 0.0,
+                quality_execution: (spread_score * 1000.0).round() / 10.0,
             });
             continue;
         }
@@ -662,17 +678,16 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
 
         let agreement_score = (1.0 - dispersion / 0.12).max(0.0);
         let source_score = (source_count as f64 / 3.0).min(1.0);
-        let edge_stability = clamp(
-            edge.max(0.0) / (request.edge_threshold * 2.0).max(0.001),
-            0.0,
-            1.0,
-        );
+        let reference_freshness = reference
+            .iter()
+            .map(|f| (-(now_seconds - f.observed_at).max(0.0) / max_age).exp())
+            .sum::<f64>() / source_count as f64;
+        let quality_freshness = 0.5 * freshness_score + 0.5 * reference_freshness;
         let confidence = 100.0
-            * (0.28 * freshness_score
-                + 0.24 * agreement_score
-                + 0.18 * source_score
-                + 0.15 * spread_score
-                + 0.15 * edge_stability);
+            * (0.30 * quality_freshness
+                + 0.30 * agreement_score
+                + 0.25 * source_score
+                + 0.15 * spread_score);
 
         let target_method = fairs
             .iter()
@@ -770,6 +785,10 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
             required_edge,
             fair_stderr,
             fillable_size,
+            quality_freshness: (quality_freshness * 1000.0).round() / 10.0,
+            quality_agreement: (agreement_score * 1000.0).round() / 10.0,
+            quality_sources: (source_score * 1000.0).round() / 10.0,
+            quality_execution: (spread_score * 1000.0).round() / 10.0,
         });
     }
 
@@ -886,6 +905,63 @@ mod tests {
         assert!(home.edge > 0.02, "edge was {}", home.edge);
         assert_eq!(home.action, "PAPER_BET");
         assert_eq!(home.n_reference_sources, 2);
+    }
+
+    #[test]
+    fn polymarket_card_uses_the_polymarket_ask_even_when_a_book_is_cheaper() {
+        let now = 1_000.0;
+        let mut quotes = Vec::new();
+        for source in ["A", "B"] {
+            quotes.push(quote(source, "home", 0.64, now));
+            quotes.push(quote(source, "away", 0.36, now));
+        }
+        let mut cheaper_book = quote("C", "home", 0.54, now);
+        cheaper_book.bid = Some(0.53);
+        cheaper_book.ask = Some(0.55);
+        quotes.push(cheaper_book);
+        quotes.push(quote("C", "away", 0.46, now));
+        let mut poly_home = quote("Polymarket", "home", 0.59, now);
+        poly_home.bid = Some(0.58);
+        poly_home.ask = Some(0.60);
+        quotes.push(poly_home);
+        quotes.push(quote("Polymarket", "away", 0.41, now));
+
+        let home = evaluate(request(quotes), now)
+            .into_iter()
+            .find(|signal| signal.outcome == "home")
+            .unwrap();
+        assert_eq!(home.quote_source, "Polymarket");
+        assert!((home.market_probability - 0.60).abs() < 1e-9);
+        assert!((home.edge - (home.market_fair_prob - 0.60)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn data_quality_does_not_increase_just_because_edge_is_larger() {
+        let now = 1_000.0;
+        let result_for_ask = |ask: f64| {
+            let mut quotes = Vec::new();
+            for source in ["A", "B"] {
+                quotes.push(quote(source, "home", 0.60, now));
+                quotes.push(quote(source, "away", 0.40, now));
+            }
+            let mut poly_home = quote("Polymarket", "home", ask - 0.01, now);
+            poly_home.bid = Some(ask - 0.02);
+            poly_home.ask = Some(ask);
+            quotes.push(poly_home);
+            quotes.push(quote("Polymarket", "away", 1.0 - ask + 0.01, now));
+            evaluate(request(quotes), now)
+                .into_iter()
+                .find(|signal| signal.outcome == "home")
+                .unwrap()
+        };
+        let expensive = result_for_ask(0.58);
+        let cheap = result_for_ask(0.54);
+        assert!(cheap.edge > expensive.edge);
+        assert_eq!(cheap.confidence, expensive.confidence);
+        assert_eq!(cheap.quality_freshness, expensive.quality_freshness);
+        assert_eq!(cheap.quality_agreement, expensive.quality_agreement);
+        assert_eq!(cheap.quality_sources, expensive.quality_sources);
+        assert_eq!(cheap.quality_execution, expensive.quality_execution);
     }
 
     #[test]

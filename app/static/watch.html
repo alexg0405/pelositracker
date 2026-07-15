@@ -35,7 +35,7 @@
   .game:hover,.game.active{border-color:var(--coral);background:rgba(255,77,46,.07)}
   .g-title{font-size:12px}
   .g-league{margin-top:2px;color:var(--muted);font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase}
-  .g-live{color:var(--red);font-weight:700}
+  .g-live{color:var(--red);font-weight:700}.g-started{color:var(--yellow);font-weight:700}
   .now{font-family:var(--mono);font-size:16px;font-weight:700;letter-spacing:.03em}
   .player{margin-top:12px;aspect-ratio:16/9;background:#000;border:1px solid var(--line);display:flex;align-items:center;justify-content:center}
   .player video{width:100%;height:100%;background:#000}
@@ -121,6 +121,18 @@
     el.innerHTML = html;
   }
 
+  function statusBadge(game){
+    if (game.status === "live") return '<span class="g-live">● LIVE</span> ';
+    if (game.status === "started") return '<span class="g-started">◌ STARTED · VERIFYING</span> ';
+    return "";
+  }
+
+  function statusLabel(game){
+    if (game.status === "live") return "● Live now";
+    if (game.status === "started") return "Started · awaiting live-feed confirmation";
+    return "Upcoming";
+  }
+
   function render(){
     const q = (document.getElementById("search").value||"").toLowerCase();
     const el = document.getElementById("games");
@@ -138,7 +150,7 @@
       return inFilter && inSearch;
     });
     el.innerHTML = shown.map(g => `<div class="game${selected&&selected.slug===g.slug?" active":""}" data-slug="${esc(g.slug)}" title="${esc(g.title)}">
-      <div><div class="g-title">${esc(g.title)}</div><div class="g-league">${g.status==="live"?'<span class="g-live">● LIVE</span> ':""}${esc(g.league||"sports")}</div></div></div>`).join("")
+      <div><div class="g-title">${esc(g.title)}</div><div class="g-league">${statusBadge(g)}${esc(g.league||"sports")}</div></div></div>`).join("")
       || '<div class="muted">No games match.</div>';
   }
 
@@ -149,7 +161,7 @@
       .map(([name,url]) => `<a href="${esc(url)}" target="_blank" rel="noopener">${esc(name)} ↗</a>`).join("");
     document.getElementById("where").innerHTML = `<h2 class="title" style="margin-top:20px">Where to watch (official)</h2><div class="watch-links">${links}</div>`;
     document.getElementById("actions").innerHTML =
-      `<button id="track" class="nav" style="cursor:pointer">Track edges on dashboard</button><span class="muted">${g.status==="live"?"● Live now":"Upcoming"}</span>`;
+      `<button id="track" class="nav" style="cursor:pointer">Track edges on dashboard</button><span class="muted">${statusLabel(g)}</span>`;
     document.getElementById("track").onclick = trackGame;
   }
 

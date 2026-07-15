@@ -131,6 +131,10 @@ class Signal:
     required_edge: float = 0.0
     fair_stderr: float = 0.0
     fillable_size: float | None = None
+    quality_freshness: float = 0.0
+    quality_agreement: float = 0.0
+    quality_sources: float = 0.0
+    quality_execution: float = 0.0
 
 
 def as_json(value: Any) -> Any:

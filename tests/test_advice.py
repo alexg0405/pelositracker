@@ -14,11 +14,13 @@ def poly_quote():
                  min_order_size=5, tick_size=.01)
 
 
-def signal(model=.62, action="PAPER_BET", confidence=82):
+def signal(model=.62, action="PAPER_BET", confidence=82, required_edge=0.0):
     return Signal("event", "moneyline", "Knicks", model, .56, model - .56,
                   confidence, action, ["two sharp references agree"], NOW,
                   quote_source="Polymarket", market_fair_prob=model,
-                  devig_method="exchange", n_reference_sources=2)
+                  devig_method="exchange", n_reference_sources=2,
+                  required_edge=required_edge, quality_freshness=90,
+                  quality_agreement=80, quality_sources=67, quality_execution=95)
 
 
 def test_actionable_market_has_executable_prices_and_entry_ceiling():
@@ -28,6 +30,15 @@ def test_actionable_market_has_executable_prices_and_entry_ceiling():
     assert views[0]["buy_price"] == .56
     assert views[0]["sell_price"] == .54
     assert abs(views[0]["price_ceiling"] - .585) < 1e-9
+    assert views[0]["edge"] == views[0]["entry_margin"]
+    assert views[0]["quality_components"]["freshness"] == 90
+
+
+def test_entry_ceiling_uses_risk_adjusted_required_edge():
+    views = market_views([poly_quote()], [signal(required_edge=.06)], edge_threshold=.035)
+    assert abs(views[0]["price_ceiling"] - .56) < 1e-9
+    assert views[0]["required_edge"] == .06
+    assert abs(views[0]["edge_buffer"] - 0.0) < 1e-9
 
 
 def test_market_without_an_ask_is_not_shown_as_placeable():

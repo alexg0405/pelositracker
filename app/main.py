@@ -6,6 +6,7 @@ import os
 import re
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -23,7 +24,7 @@ from .models import Event, GameState, Quote, as_json
 from .sources import (demo_stream, extract_polymarket_slug, infer_polymarket_event,
                       match_odds_api_event, odds_api_poll, polymarket_event,
                       polymarket_market_stream, polymarket_sports_events,
-                      polymarket_sports_stream)
+                      polymarket_sports_stream, sports_game_status)
 from .store import Store
 
 load_dotenv()
@@ -38,6 +39,7 @@ tasks: dict[str, list[asyncio.Task]] = {}
 _finalized: set[str] = set()
 _pregame: dict[str, dict] = {}  # event_id -> {"spread": home point, "total": line}, captured near tip
 _subscribers: set[asyncio.Queue] = set()  # SSE clients for real-time dashboard pushes
+_sports_status: dict[str, dict] = {}  # latest public Polymarket sport_result by event slug
 
 
 def _notify_subscribers() -> None:
@@ -63,6 +65,24 @@ async def on_state(state: GameState):
     await record(state.event_id)
     if str(state.status).lower() in _FINAL_STATUSES:
         await finalize_event(state.event_id)
+
+
+async def on_sports_status(slug: str, payload: dict) -> None:
+    """Cache authoritative live/final state for discovery without paid polling."""
+    snapshot = dict(payload)
+    snapshot["_received_at"] = datetime.now(timezone.utc).isoformat()
+    _sports_status[slug] = snapshot
+    normalized = sports_game_status(snapshot)
+    if not _discover_cache.get("data") or normalized is None:
+        return
+    if normalized == "final":
+        _discover_cache["data"] = [game for game in _discover_cache["data"]
+                                   if game.get("slug") != slug]
+        return
+    for game in _discover_cache["data"]:
+        if game.get("slug") == slug:
+            game["status"] = normalized
+            game["status_source"] = "polymarket-live-feed"
 
 
 async def on_quotes(quotes: list[Quote]):
@@ -137,7 +157,8 @@ async def finalize_event(event_id: str) -> None:
 async def lifespan(_: FastAPI):
     global ledger
     ledger = Ledger()
-    sports_task = asyncio.create_task(polymarket_sports_stream(lambda: list(store.events.values()), on_state))
+    sports_task = asyncio.create_task(polymarket_sports_stream(
+        lambda: list(store.events.values()), on_state, on_sports_status))
     yield
     sports_task.cancel()
     for group in tasks.values():
@@ -197,7 +218,7 @@ async def discover():
     if _discover_cache["data"] and now - _discover_cache["at"] < 45:
         return _discover_cache["data"]  # cache so browsing doesn't hammer Gamma
     try:
-        games = await polymarket_sports_events()
+        games = await polymarket_sports_events(live_statuses=_sports_status)
     except Exception as exc:
         raise HTTPException(502, f"Could not reach Polymarket: {exc}") from exc
     _discover_cache.update(at=now, data=games)

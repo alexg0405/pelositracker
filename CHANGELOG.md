@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — Live-status and signal audit
+
+- Replaced the five-hour schedule guess with fresh Polymarket `sport_result` status for `LIVE`; schedule-only games now show `STARTED · VERIFYING`.
+- Removed false matchup discovery caused by matching the letters `vs` inside participant names.
+- Forced Polymarket cards to calculate edge against the exact executable Polymarket ask displayed on the website.
+- Separated data quality from edge size and exposed freshness, agreement, source-coverage, and execution components.
+- Changed entry ceilings to use the full risk-adjusted required edge and added raw edge / required edge / edge-buffer display.
+- Expanded the offline paper demo to exercise executable moneyline, spread, and total cards without consuming provider credits.
+
 ## 0.4.0 — URL-first markets and paper positions
 
 - Added full Polymarket event-link registration, including mobile share links.

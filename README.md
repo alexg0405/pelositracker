@@ -7,6 +7,7 @@ A paper-only live sports market monitor with a Rust scoring engine and a FastAPI
 ## Features
 
 - Public Polymarket market and sports WebSocket streams.
+- Provider-confirmed live-game filtering; schedule-only starts are labeled `STARTED · VERIFYING` instead of guessed live.
 - Paste a complete Polymarket event or mobile share link; no manual slug is required.
 - Actionable-only selection view based on accepting-orders status and executable asks.
 - Optional multi-sportsbook polling through TheOddsAPI.
@@ -91,10 +92,12 @@ For The Odds API, get valid sport keys from `GET /v4/sports` and event IDs from 
 
 - **WATCH**: one or more safety gates failed.
 - **PAPER BET**: every configured gate passed; no wager is placed.
-- **Model probability**: consensus probability plus a deliberately capped recent-scoring adjustment.
-- **Estimated edge**: model probability minus the best executable market probability.
-- **Signal quality**: a 0–100 quality score based on freshness, source agreement/count, spread, and edge strength—not a win probability.
-- **Entry ceiling**: model fair probability minus the configured minimum edge. An ask below the ceiling has enough modeled margin to pass that gate.
+- **Model probability**: the leave-one-out consensus fair value; the independent live model is shown separately as a cross-check.
+- **Edge**: consensus fair probability minus the executable Polymarket ask shown on that card.
+- **Required edge**: the configured base edge plus consensus uncertainty and the market-type risk premium.
+- **Edge buffer**: raw edge minus required edge. It must be non-negative before an entry can qualify.
+- **Signal quality**: a 0–100 data-reliability score based only on quote/reference freshness, agreement, independent-source coverage, and execution spread—not edge size or win probability.
+- **Entry ceiling**: model fair probability minus the risk-adjusted required edge, not merely the base threshold.
 - **HOLD / CONSIDER CASH / EXIT WATCH**: paper-position heuristics using the executable bid, spread, P/L, model fair value, remaining edge, and data quality. They are not personalized financial advice or guaranteed outcomes.
 - **Cash value**: shares multiplied by the current best bid, before fees, slippage, or failed fills.
 

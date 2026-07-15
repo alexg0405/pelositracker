@@ -62,7 +62,7 @@
     .game[aria-disabled=true]{opacity:.5;cursor:wait}
     .game .g-title{font-size:12px;line-height:1.3}
     .game .g-league{margin-top:2px;color:var(--muted);font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase}
-    .game .g-live{color:var(--red);font-weight:700}
+    .game .g-live{color:var(--red);font-weight:700}.game .g-started{color:var(--yellow);font-weight:700}
     .carousel{display:flex;gap:8px;overflow-x:auto;padding:2px 2px 12px;margin-bottom:6px}
     .carousel .pill{flex:0 0 auto;padding:6px 14px;border:1px solid var(--bright);background:var(--panel2);color:var(--muted);font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;cursor:pointer;white-space:nowrap}
     .carousel .pill:hover{border-color:var(--cyan);color:var(--text)}
@@ -165,20 +165,22 @@
     const guide = market.price_ceiling == null
       ? "Add a matching sportsbook event to calculate a validated entry ceiling."
       : market.room_to_ceiling >= 0
-        ? `<strong>Entry ceiling ${cents(market.price_ceiling)}</strong> · current ask is ${signedCents(-market.room_to_ceiling)} from the ceiling.`
-        : `<strong>Wait for ${cents(market.price_ceiling)} or lower</strong> · current ask is ${signedCents(-market.room_to_ceiling)} too expensive.`;
+        ? `<strong>Entry ceiling ${cents(market.price_ceiling)}</strong> · current ask is ${cents(market.room_to_ceiling)} below the ceiling.`
+        : `<strong>Wait for ${cents(market.price_ceiling)} or lower</strong> · current ask is ${cents(-market.room_to_ceiling)} above the ceiling.`;
     const risks = market.risk_flags.length ? market.risk_flags : ["No elevated execution flags detected; continue watching price and news latency."];
+    const quality = market.quality_components;
+    const qualityReason = quality ? `<li>Quality breakdown: freshness ${quality.freshness.toFixed(0)}, agreement ${quality.agreement.toFixed(0)}, source coverage ${quality.sources.toFixed(0)}, execution ${quality.execution.toFixed(0)}.</li>` : "";
     return `<div class="market" data-line="${lineType(market.market,market.outcome)}" data-token-id="${esc(market.token_id)}">
       <div class="market-top"><div class="outcome">${lineBadge(market.market,market.outcome)}${esc(market.outcome)}<small>${esc(market.question)}</small></div><span class="tag ${tagClass(market.entry_action)}">${esc(market.entry_action)}</span></div>
       <div class="figs">
         <div class="fig"><div class="key">Buy now</div><div class="value">${cents(market.buy_price)}</div><div class="hint">Executable ask</div></div>
         <div class="fig"><div class="key">Sell now</div><div class="value">${cents(market.sell_price)}</div><div class="hint">Executable bid</div></div>
-        <div class="fig"><div class="key">Entry margin</div><div class="value ${modelClass}">${signedCents(market.entry_margin)}</div><div class="hint">Model fair minus ask</div></div>
-        <div class="fig"><div class="key">Signal quality</div><div class="value">${market.confidence == null ? "—" : market.confidence.toFixed(0)+"/100"}</div><div class="hint">${market.reference_sources} reference source(s)</div></div>
+        <div class="fig"><div class="key">Edge</div><div class="value ${modelClass}">${signedCents(market.edge)}</div><div class="hint">Need ${cents(market.required_edge)} · buffer ${signedCents(market.edge_buffer)}</div></div>
+        <div class="fig"><div class="key">Signal quality</div><div class="value">${market.confidence == null ? "—" : market.confidence.toFixed(0)+"/100"}</div><div class="hint">Data reliability · ${market.reference_sources} reference source(s)</div></div>
       </div>
       <div class="guide">${guide}${market.model_live_prob == null ? "" : ` Independent live win model ${pct(market.model_live_prob)}.`} Spread ${cents(market.spread)} · ask depth ${market.ask_size == null ? "—" : market.ask_size.toFixed(1)+" shares"} · market liquidity ${market.market_liquidity == null ? "—" : "$"+Number(market.market_liquidity).toLocaleString(undefined,{maximumFractionDigits:0})}.</div>
       <details class="why" data-detail-key="${detailKey}"${openDetails.has(detailKey) ? " open" : ""}><summary>What to look out for</summary>
-        <ul>${market.reasons.map(reason => `<li>${esc(reason)}</li>`).join("")}${risks.map(risk => `<li class="risk">${esc(risk)}</li>`).join("")}</ul></details>
+        <ul>${qualityReason}${market.reasons.map(reason => `<li>${esc(reason)}</li>`).join("")}${risks.map(risk => `<li class="risk">${esc(risk)}</li>`).join("")}</ul></details>
       <details class="why"><summary>Add or update my position</summary>
         <form class="position-form" data-save-position data-event-id="${esc(eventId)}" data-token-id="${esc(market.token_id)}" data-market="${esc(market.market)}" data-outcome="${esc(market.outcome)}">
           <div><label>Shares</label><input name="shares" type="number" min="0.01" max="1000000" step="0.01" required placeholder="25"></div>
@@ -288,12 +290,17 @@
     if(removeEvent){removeEvent.disabled=true;try{const response=await fetch(`/api/events/${encodeURIComponent(removeEvent.dataset.removeEvent)}`,{method:"DELETE"});if(response.ok){await refresh();await refreshMetrics()}}catch{}finally{removeEvent.disabled=false}}
     if(removePosition){removePosition.disabled=true;try{const response=await fetch(`/api/events/${encodeURIComponent(removePosition.dataset.eventId)}/positions/${encodeURIComponent(removePosition.dataset.tokenId)}`,{method:"DELETE"});if(response.ok)await refresh()}catch{}finally{removePosition.disabled=false}}});
   let discoverGames = [];
+  function discoverStatus(game){
+    if(game.status==="live")return '<span class="g-live">● LIVE</span> ';
+    if(game.status==="started")return '<span class="g-started">◌ STARTED · VERIFYING</span> ';
+    return "";
+  }
   function renderDiscover() {
     const list=document.querySelector("#discover-list");
-    if(!discoverGames.length){list.innerHTML='<div class="discover-empty">No live games found right now.</div>';return}
+    if(!discoverGames.length){list.innerHTML='<div class="discover-empty">No live or upcoming games found right now.</div>';return}
     const q=(document.querySelector("#discover-search").value||"").toLowerCase();
     const shown=discoverGames.filter(g=>!q||`${g.title} ${g.league||""}`.toLowerCase().includes(q));
-    list.innerHTML=shown.length?shown.map(g=>`<div class="game" data-slug="${esc(g.slug)}" role="button" tabindex="0" title="${esc(g.title)}"><div><div class="g-title">${esc(g.title)}</div><div class="g-league">${g.status==="live"?'<span class="g-live">● LIVE</span> ':""}${esc(g.league||"sports")}</div></div><span class="g-add">+ Monitor</span></div>`).join(""):'<div class="discover-empty">No games match.</div>';
+    list.innerHTML=shown.length?shown.map(g=>`<div class="game" data-slug="${esc(g.slug)}" role="button" tabindex="0" title="${esc(g.title)}"><div><div class="g-title">${esc(g.title)}</div><div class="g-league">${discoverStatus(g)}${esc(g.league||"sports")}</div></div><span class="g-add">+ Monitor</span></div>`).join(""):'<div class="discover-empty">No games match.</div>';
   }
   async function loadDiscover() {
     const list=document.querySelector("#discover-list");
@@ -313,7 +320,7 @@
   document.querySelector("#discover-refresh").addEventListener("click",loadDiscover);
   document.querySelector("#line-filter").addEventListener("click",e=>{const p=e.target.closest("[data-line]");if(!p)return;activeLine=p.dataset.line;renderEvents(lastEvents);});
 
-  fetch("/api/config").then(r=>r.json()).then(c=>document.querySelector("#config").textContent=`Quality ≥ ${c.confidence_threshold} · Required edge ≥ ${(c.edge_threshold*100).toFixed(1)}%`).catch(()=>document.querySelector("#config").textContent="Thresholds unavailable");
+  fetch("/api/config").then(r=>r.json()).then(c=>document.querySelector("#config").textContent=`Quality ≥ ${c.confidence_threshold} · Base edge ≥ ${(c.edge_threshold*100).toFixed(1)}%`).catch(()=>document.querySelector("#config").textContent="Thresholds unavailable");
   refresh();refreshMetrics();startStream();loadDiscover();setInterval(refresh,10000);setInterval(refreshMetrics,5000);setInterval(loadDiscover,60000);
 </script>
 </body>

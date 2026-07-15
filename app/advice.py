@@ -69,9 +69,11 @@ def market_views(quotes: list[Quote], signals: list[Signal], edge_threshold: flo
         spread = quote.ask - quote.bid if quote.bid is not None else None
         model_probability = signal.model_probability if signal else None
         entry_margin = model_probability - quote.ask if model_probability is not None else None
-        price_ceiling = max(0.0, model_probability - edge_threshold) if signal else None
+        required_edge = max(edge_threshold, signal.required_edge) if signal else None
+        price_ceiling = max(0.0, model_probability - required_edge) if signal else None
         room_to_ceiling = price_ceiling - quote.ask if price_ceiling is not None else None
-        if signal and signal.action == "PAPER_BET" and room_to_ceiling is not None and room_to_ceiling >= 0:
+        edge_buffer = entry_margin - required_edge if entry_margin is not None and required_edge is not None else None
+        if signal and signal.action == "PAPER_BET" and edge_buffer is not None and edge_buffer >= 0:
             entry_action = "ENTRY WINDOW"
         elif signal:
             entry_action = "WAIT"
@@ -98,10 +100,19 @@ def market_views(quotes: list[Quote], signals: list[Signal], edge_threshold: flo
             "model_probability": model_probability,
             "model_live_prob": signal.model_live_prob if signal else None,
             "entry_margin": entry_margin,
+            "edge": entry_margin,
+            "required_edge": required_edge,
+            "edge_buffer": edge_buffer,
             "price_ceiling": price_ceiling,
             "room_to_ceiling": room_to_ceiling,
             "confidence": signal.confidence if signal else None,
             "reference_sources": signal.n_reference_sources if signal else 0,
+            "quality_components": ({
+                "freshness": signal.quality_freshness,
+                "agreement": signal.quality_agreement,
+                "sources": signal.quality_sources,
+                "execution": signal.quality_execution,
+            } if signal else None),
             "reasons": signal.reasons if signal else ["Waiting for an independent sportsbook reference."],
             "risk_flags": risks,
         })

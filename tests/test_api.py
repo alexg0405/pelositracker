@@ -25,7 +25,8 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "details[open][data-detail-key]" in html
         assert "Paste Polymarket link" in html
         assert "data-save-position" in html
-        assert "Entry margin" in html
+        assert "Signal quality" in html
+        assert "Edge buffer" in html or "edge_buffer" in html
 
 
 def test_position_can_be_saved_and_removed_for_a_visible_selection():
