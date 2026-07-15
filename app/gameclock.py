@@ -35,12 +35,17 @@ def _regulation_for(sport: str) -> tuple[int, int] | None:
     return None
 
 
+_OVERTIME = re.compile(r"^(\d*ot\d*|overtime|shootout|so)$")
+
+
 def _period_index(period: str) -> int:
     """Extract the current period number from labels like 'Q4', '2H', '3', 'OT'."""
     text = (period or "").strip().casefold()
     if not text:
         return 1
-    if "ot" in text or "overtime" in text:
+    # Match overtime on whole tokens, so 'Not started' is not read as OT.
+    tokens = [t for t in re.split(r"[^a-z0-9]+", text) if t]
+    if any(_OVERTIME.fullmatch(t) for t in tokens):
         return 99  # overtime: treat as past regulation (near-zero time)
     match = re.search(r"\d+", text)
     return int(match.group()) if match else 1
@@ -78,7 +83,8 @@ def game_progress(sport: str, period: str, clock: str) -> tuple[float, float] | 
     index = _period_index(period)
     within = _clock_seconds(clock)
     if within is None:
-        within = float(period_len)  # assume the period just started
+        # Regulation: assume the period just started. Overtime: essentially over.
+        within = 0.0 if index >= n_periods else float(period_len)
     within = max(0.0, min(within, float(period_len)))
     periods_after = max(0, n_periods - index)
     seconds_remaining = periods_after * period_len + within

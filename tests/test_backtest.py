@@ -70,6 +70,42 @@ def test_ledger_roundtrip_clv_and_settlement(tmp_path):
         ledger.close()
 
 
+def test_draw_settles_the_draw_outcome_not_nothing(tmp_path):
+    ledger = Ledger(str(tmp_path / "d.db"))
+    try:
+        event = Event(name="A vs B", sport="soccer", home="A", away="B")
+        for outcome in ("A", "B", "Draw"):
+            ledger.record_signals(event, [
+                Signal(event.id, "h2h", outcome, model_probability=0.33,
+                       market_probability=0.33, edge=0.03, confidence=80.0,
+                       action="PAPER_BET", reasons=[], quote_source="Book",
+                       market_fair_prob=0.33, devig_method="shin", overround=1.06,
+                       n_reference_sources=2),
+            ])
+        # 1-1 final -> Draw wins.
+        ledger.settle_moneyline(event.id, {"draw", "Draw"})
+        settled = {b["outcome"]: b["settled_result"] for b in ledger.all_bets()}
+        assert settled == {"A": 0.0, "B": 0.0, "Draw": 1.0}
+    finally:
+        ledger.close()
+
+
+def test_empty_winner_set_settles_nothing(tmp_path):
+    ledger = Ledger(str(tmp_path / "e.db"))
+    try:
+        event = Event(name="A vs B", sport="soccer", home="A", away="B")
+        ledger.record_signals(event, [
+            Signal(event.id, "h2h", "A", model_probability=0.5, market_probability=0.5,
+                   edge=0.03, confidence=80.0, action="PAPER_BET", reasons=[],
+                   quote_source="Book", market_fair_prob=0.5, devig_method="shin",
+                   overround=1.05, n_reference_sources=2),
+        ])
+        ledger.settle_moneyline(event.id, set())  # unknown result must not mis-settle
+        assert ledger.all_bets()[0]["settled_result"] is None
+    finally:
+        ledger.close()
+
+
 def test_metrics_endpoint_is_available():
     with TestClient(app) as client:
         response = client.get("/api/metrics")

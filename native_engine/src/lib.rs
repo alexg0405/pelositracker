@@ -258,26 +258,23 @@ fn source_fair(outcome: &str, source_quotes: &[&QuoteInput]) -> Option<Fair> {
     let booksum: f64 = implied.iter().sum();
     let is_exchange = source_quotes.iter().any(|q| q.exchange());
 
-    let (fair, method) = if is_exchange || booksum <= 1.01 || implied.len() < 2 {
-        // Exchange mid / already-fair single-sided quote: no multiplicative devig.
-        (target.probability.min(0.999).max(0.001), "exchange-mid")
+    let (fair, method) = if is_exchange {
+        // Exchange mid is already ~de-vigged; no multiplicative normalization.
+        (clamp(target.probability, 0.001, 0.999), "exchange-mid")
+    } else if implied.len() < 2 {
+        // A single side from a traditional book cannot be de-vigged, so its
+        // vig-laden price must not enter the consensus. Exclude the source.
+        return None;
     } else {
+        let idx = source_quotes
+            .iter()
+            .position(|q| q.outcome == outcome)
+            .unwrap();
+        // Shin handles the vig; for a ~zero-hold 2-way book (booksum <= 1) it
+        // returns None and we fall back to proportional (which is ~identity).
         match devig_shin(&implied) {
-            Some(fairs) => {
-                let idx = source_quotes
-                    .iter()
-                    .position(|q| q.outcome == outcome)
-                    .unwrap();
-                (fairs[idx], "shin")
-            }
-            None => {
-                let fairs = devig_proportional(&implied);
-                let idx = source_quotes
-                    .iter()
-                    .position(|q| q.outcome == outcome)
-                    .unwrap();
-                (fairs[idx], "proportional")
-            }
+            Some(fairs) => (fairs[idx], "shin"),
+            None => (devig_proportional(&implied)[idx], "proportional"),
         }
     };
 
@@ -399,20 +396,26 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
             .map(|f| f.booksum)
             .unwrap_or(1.0);
 
-        // LEAVE-ONE-OUT: the consensus fair excludes the book we would bet, so
-        // it is a genuinely independent reference rather than a self-comparison.
+        // LEAVE-ONE-OUT: the consensus fair excludes the book we would bet
+        // (genuinely independent), and drops references older than max_age so a
+        // dead source cannot linger in the consensus.
         let reference: Vec<&Fair> = fairs
             .iter()
-            .filter(|f| f.source != target_source)
+            .filter(|f| f.source != target_source && (now_seconds - f.observed_at) <= max_age)
             .collect();
 
         let age = (now_seconds - best.observed_at).max(0.0);
-        let spread = match (best.ask, best.bid) {
-            (Some(ask), Some(bid)) => (ask - bid).max(0.0),
-            _ => 0.04,
+        // Spread is only defined when we have both sides of the book. For
+        // fixed-odds quotes without bid/ask it is unknown, not zero.
+        let spread: Option<f64> = match (best.ask, best.bid) {
+            (Some(ask), Some(bid)) => Some((ask - bid).max(0.0)),
+            _ => None,
         };
         let freshness_score = (1.0 - age / max_age).max(0.0);
-        let spread_score = (1.0 - spread / 0.12).max(0.0);
+        let spread_score = match spread {
+            Some(s) => (1.0 - s / 0.12).max(0.0),
+            None => 0.5, // unknown: neutral, neither rewarded nor blocked
+        };
 
         let mut reasons = Vec::new();
 
@@ -473,7 +476,9 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         let ref_probs: Vec<f64> = reference.iter().map(|f| f.prob).collect();
         for f in &reference {
             let ref_age = (now_seconds - f.observed_at).max(0.0);
-            let recency = (-ref_age / max_age).exp().max(0.05);
+            // No floor: references are already age-gated to <= max_age, and a
+            // floor would keep a near-dead quote at fixed weight forever.
+            let recency = (-ref_age / max_age).exp();
             let w = f.weight_base.max(0.0) * recency / f.booksum.max(1.0);
             if w > 0.0 {
                 wsum += w;
@@ -544,8 +549,10 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         if source_count < 2 {
             blockers.push("fewer than 2 independent reference sources".to_string());
         }
-        if spread > 0.08 {
-            blockers.push(format!("wide executable spread ({:.1}%)", spread * 100.0));
+        if let Some(s) = spread {
+            if s > 0.08 {
+                blockers.push(format!("wide executable spread ({:.1}%)", s * 100.0));
+            }
         }
         if edge < request.edge_threshold {
             blockers.push(format!(
