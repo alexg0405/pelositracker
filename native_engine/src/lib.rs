@@ -23,6 +23,12 @@ struct QuoteInput {
     decimal_odds: Option<f64>,
     #[allow(dead_code)]
     liquidity: Option<f64>,
+    // Phase 2b: parsed spread/total line and normalized side
+    // (home | away | over | under), resolved in Python.
+    #[serde(default)]
+    point: Option<f64>,
+    #[serde(default)]
+    side: Option<String>,
 }
 
 impl QuoteInput {
@@ -173,6 +179,108 @@ fn live_winprob(lead: f64, pregame_margin: f64, fraction_remaining: f64, sigma: 
     }
     let expected_margin = lead + pregame_margin * f;
     normal_cdf(expected_margin / (sigma * f.sqrt())).clamp(0.001, 0.999)
+}
+
+fn is_spread(market: &str) -> bool {
+    matches!(
+        market.to_lowercase().as_str(),
+        "spread" | "spreads" | "handicap" | "point_spread"
+    )
+}
+
+fn is_total(market: &str) -> bool {
+    matches!(
+        market.to_lowercase().as_str(),
+        "total" | "totals" | "over_under" | "ou" | "game_total"
+    )
+}
+
+/// SD of the FINAL combined score (points/goals) per sport.
+fn sport_total_sigma(sport: &str) -> f64 {
+    match sport.trim().to_lowercase().as_str() {
+        "basketball" | "nba" => 16.0,
+        "wnba" | "ncaab" => 14.0,
+        "football" | "nfl" => 10.0,
+        "ncaaf" => 11.0,
+        "hockey" | "nhl" => 2.0,
+        "baseball" | "mlb" => 3.0,
+        _ => 16.0,
+    }
+}
+
+/// Probability the given spread side covers. `point` is the side's line
+/// (e.g. home -6.5 -> point=-6.5); it covers if side_margin + point > 0.
+/// Gaussian approximation — NFL key-number masses at 3/7 are a known
+/// limitation and are not modeled here (this is a cross-check, not the price).
+fn spread_cover_prob(
+    lead: f64,
+    pregame_margin: f64,
+    fraction_remaining: f64,
+    sigma: f64,
+    point: f64,
+    side: &str,
+) -> Option<f64> {
+    let f = fraction_remaining.clamp(0.0, 1.0);
+    let side_lead = match side {
+        "home" => lead,
+        "away" => -lead,
+        _ => return None,
+    };
+    if f <= 1e-4 {
+        let margin = side_lead + point;
+        return Some(if margin > 0.0 {
+            0.999
+        } else if margin < 0.0 {
+            0.001
+        } else {
+            0.5
+        });
+    }
+    let side_margin = match side {
+        "home" => lead + pregame_margin * f,
+        "away" => -(lead + pregame_margin * f),
+        _ => return None,
+    };
+    Some(normal_cdf((side_margin + point) / (sigma * f.sqrt())).clamp(0.001, 0.999))
+}
+
+/// Probability the total goes over/under `line`. E[final] blends a pregame
+/// total prior (weighted by fraction remaining) with the observed pace.
+fn total_prob(
+    current_total: f64,
+    pregame_total: Option<f64>,
+    fraction_remaining: f64,
+    sigma_total: f64,
+    line: f64,
+    side: &str,
+) -> f64 {
+    let f = fraction_remaining.clamp(0.0, 1.0);
+    let over = if f <= 1e-4 {
+        if current_total > line {
+            0.999
+        } else if current_total < line {
+            0.001
+        } else {
+            0.5
+        }
+    } else {
+        let pace_final = if (1.0 - f) > 1e-3 {
+            current_total / (1.0 - f)
+        } else {
+            current_total
+        };
+        let expected_final = match pregame_total {
+            // w = f: trust the prior early, the observed pace late.
+            Some(prior) => f * (current_total + prior * f) + (1.0 - f) * pace_final,
+            None => pace_final,
+        };
+        (1.0 - normal_cdf((line - expected_final) / (sigma_total * f.sqrt()))).clamp(0.001, 0.999)
+    };
+    if side == "under" {
+        1.0 - over
+    } else {
+        over
+    }
 }
 
 /// Shin (1992/1993) de-vig: recovers "fair" probabilities from a booksum-laden
@@ -341,24 +449,31 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
             continue;
         }
 
-        // Independent live win-probability for this outcome (moneyline only).
-        let model_live: Option<f64> = if is_moneyline(&market) {
-            latest_state.and_then(|st| {
-                st.fraction_remaining.map(|f| {
-                    let lead = st.home_score - st.away_score;
-                    let p_home = live_winprob(lead, pregame_margin, f, sport_margin_sigma(&sport));
-                    let is_away = outcome.eq_ignore_ascii_case("away")
-                        || outcome.eq_ignore_ascii_case(&request.away_outcome);
-                    if is_away {
-                        1.0 - p_home
-                    } else {
-                        p_home
-                    }
-                })
-            })
-        } else {
-            None
-        };
+        // Independent live model for this outcome (cross-check, not the edge).
+        let model_live: Option<f64> = latest_state.and_then(|st| {
+            let f = st.fraction_remaining?;
+            let lead = st.home_score - st.away_score;
+            if is_moneyline(&market) {
+                let p_home = live_winprob(lead, pregame_margin, f, sport_margin_sigma(&sport));
+                let is_away = outcome.eq_ignore_ascii_case("away")
+                    || outcome.eq_ignore_ascii_case(&request.away_outcome);
+                Some(if is_away { 1.0 - p_home } else { p_home })
+            } else if is_spread(&market) {
+                let sample = target_quotes.first()?;
+                spread_cover_prob(
+                    lead, pregame_margin, f, sport_margin_sigma(&sport),
+                    sample.point?, sample.side.as_deref()?,
+                )
+            } else if is_total(&market) {
+                let sample = target_quotes.first()?;
+                Some(total_prob(
+                    st.home_score + st.away_score, request.pregame_total, f,
+                    sport_total_sigma(&sport), sample.point?, sample.side.as_deref()?,
+                ))
+            } else {
+                None
+            }
+        });
 
         // Per-source de-vigged fair for this outcome.
         let sources: BTreeSet<&str> = same_market
@@ -443,9 +558,8 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
             ));
             if let (Some(p), Some(st)) = (model_live, latest_state) {
                 reasons.push(format!(
-                    "live model {:.1}% (home lead {:+.0}, {:.0}% game left)",
+                    "live model {:.1}% ({:.0}% game left)",
                     p * 100.0,
-                    st.home_score - st.away_score,
                     st.fraction_remaining.unwrap_or(0.0) * 100.0
                 ));
             }
@@ -534,10 +648,9 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         ));
         if let (Some(p), Some(st)) = (model_live, latest_state) {
             reasons.push(format!(
-                "live model {:.1}% ({:+.1}pp vs market fair), home lead {:+.0}, {:.0}% game left",
+                "live model {:.1}% ({:+.1}pp vs market fair, {:.0}% game left)",
                 p * 100.0,
                 (p - fair) * 100.0,
-                st.home_score - st.away_score,
                 st.fraction_remaining.unwrap_or(0.0) * 100.0
             ));
         }
@@ -641,6 +754,8 @@ mod tests {
             is_exchange: Some(true), // exchange-mid: no multiplicative devig in tests
             decimal_odds: None,
             liquidity: None,
+            point: None,
+            side: None,
         }
     }
 
@@ -747,6 +862,34 @@ mod tests {
         assert!(live_winprob(1.0, 0.0, 0.0, sigma) > 0.99);
         // Pregame favorite prior lifts an early tie above 0.5.
         assert!(live_winprob(0.0, 6.0, 0.9, sigma) > 0.5);
+    }
+
+    #[test]
+    fn spread_cover_prob_behaves() {
+        let sigma = 11.5;
+        // Home -6.5 (point=-6.5), home up 10 with a quarter left -> likely covers.
+        let p = spread_cover_prob(10.0, 0.0, 0.25, sigma, -6.5, "home").unwrap();
+        assert!(p > 0.7, "cover prob was {p}");
+        // The away +6.5 side is the complement of home -6.5 (continuous, no push).
+        let q = spread_cover_prob(10.0, 0.0, 0.25, sigma, 6.5, "away").unwrap();
+        assert!((p + q - 1.0).abs() < 1e-6);
+        // At the buzzer a covered number is decisive.
+        assert!(spread_cover_prob(10.0, 0.0, 0.0, sigma, -6.5, "home").unwrap() > 0.99);
+        // Unknown side -> no model.
+        assert!(spread_cover_prob(0.0, 0.0, 0.5, sigma, -3.0, "draw").is_none());
+    }
+
+    #[test]
+    fn total_prob_behaves() {
+        let sigma = 16.0;
+        // Way over the line already with little time left -> over is near-certain.
+        assert!(total_prob(230.0, Some(220.0), 0.05, sigma, 210.5, "over") > 0.9);
+        // Over and under are complementary.
+        let over = total_prob(100.0, Some(220.0), 0.5, sigma, 220.5, "over");
+        let under = total_prob(100.0, Some(220.0), 0.5, sigma, 220.5, "under");
+        assert!((over + under - 1.0).abs() < 1e-6);
+        // Blistering first-half pace pushes the projection over a pregame-average line.
+        assert!(total_prob(130.0, Some(220.0), 0.5, sigma, 220.5, "over") > 0.5);
     }
 
     #[test]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from .gameclock import game_progress
+from .lines import quote_line_side
 from .models import GameState, Quote, Signal, classify_source
 
 try:
@@ -26,7 +27,9 @@ class SignalEngine:
         self.max_age_seconds = max_age_seconds
 
     def evaluate(self, event_id: str, quotes: list[Quote], states: list[GameState],
-                 away_outcome: str = "away", sport: str = "") -> list[Signal]:
+                 away_outcome: str = "away", sport: str = "", home_outcome: str = "",
+                 pregame_spread: float | None = None,
+                 pregame_total: float | None = None) -> list[Signal]:
         request = {
             "event_id": event_id,
             "confidence_threshold": self.confidence_threshold,
@@ -34,10 +37,10 @@ class SignalEngine:
             "max_age_seconds": self.max_age_seconds,
             "away_outcome": away_outcome,
             "sport": sport or None,
-            "pregame_spread": None,
-            "pregame_total": None,
+            "pregame_spread": pregame_spread,
+            "pregame_total": pregame_total,
             "quotes": [
-                self._quote_payload(q)
+                self._quote_payload(q, home_outcome, away_outcome)
                 for q in quotes
             ],
             "states": [
@@ -59,8 +62,9 @@ class SignalEngine:
         }
 
     @staticmethod
-    def _quote_payload(q: Quote) -> dict:
+    def _quote_payload(q: Quote, home_outcome: str = "", away_outcome: str = "") -> dict:
         weight, is_exchange = classify_source(q.source)
+        point, side = quote_line_side(q.market, q.outcome, home_outcome, away_outcome)
         return {
             "market": q.market,
             "outcome": q.outcome,
@@ -73,5 +77,7 @@ class SignalEngine:
             "is_exchange": is_exchange,
             "decimal_odds": q.decimal_odds,
             "liquidity": q.liquidity,
+            "point": point,
+            "side": side,
         }
 

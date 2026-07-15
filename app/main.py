@@ -15,6 +15,7 @@ from .engine import SignalEngine
 from . import __version__, backtest
 from .advice import market_views, position_views
 from .ledger import Ledger
+from .lines import pregame_priors
 from .models import Event, GameState, Quote, as_json
 from .sources import (demo_stream, extract_polymarket_slug, infer_polymarket_event,
                       match_odds_api_event, odds_api_poll, polymarket_event,
@@ -29,6 +30,7 @@ engine = SignalEngine(float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", "72")),
                       float(os.getenv("MAX_DATA_AGE_SECONDS", "20")))
 tasks: dict[str, list[asyncio.Task]] = {}
 _finalized: set[str] = set()
+_pregame: dict[str, dict] = {}  # event_id -> {"spread": home point, "total": line}, captured near tip
 _FINAL_STATUSES = {"final", "ended", "closed", "complete", "finished"}
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -56,8 +58,15 @@ def recompute(event_id: str) -> list:
     event = store.events.get(event_id)
     if event is None:  # event removed between emit and callback
         return []
-    signals = engine.evaluate(event_id, store.quotes[event_id],
-                              store.states[event_id], event.away, sport=event.sport)
+    quotes = store.quotes[event_id]
+    prior = _pregame.setdefault(event_id, {"spread": None, "total": None})
+    if prior["spread"] is None or prior["total"] is None:
+        spread, total = pregame_priors(quotes, event.home, event.away)
+        prior["spread"] = prior["spread"] if prior["spread"] is not None else spread
+        prior["total"] = prior["total"] if prior["total"] is not None else total
+    signals = engine.evaluate(event_id, quotes, store.states[event_id], event.away,
+                              sport=event.sport, home_outcome=event.home,
+                              pregame_spread=prior["spread"], pregame_total=prior["total"])
     store.set_signals(event_id, signals)
     return signals
 
@@ -285,6 +294,7 @@ async def delete_event(event_id: str):
     for task in tasks.pop(event_id, []):
         task.cancel()
     _finalized.discard(event_id)
+    _pregame.pop(event_id, None)
     del store.events[event_id]
     store.states.pop(event_id, None)
     store.quotes.pop(event_id, None)
