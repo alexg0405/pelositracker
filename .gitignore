@@ -19,6 +19,11 @@ target/
 # Environment / secrets
 .env
 
+# Ledger / paper-bet database
+*.db
+*.sqlite
+*.sqlite3
+
 # Local work and deliverables
 work/
 outputs/
