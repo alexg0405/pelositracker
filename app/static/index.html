@@ -61,6 +61,12 @@
     .game .g-title{font-size:12px;line-height:1.3}
     .game .g-league{margin-top:2px;color:var(--muted);font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase}
     .game .g-live{color:var(--red);font-weight:700}
+    .carousel{display:flex;gap:8px;overflow-x:auto;padding:2px 2px 12px;margin-bottom:6px}
+    .carousel .pill{flex:0 0 auto;padding:6px 14px;border:1px solid var(--bright);background:var(--panel2);color:var(--muted);font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;cursor:pointer;white-space:nowrap}
+    .carousel .pill:hover{border-color:var(--cyan);color:var(--text)}
+    .carousel .pill.active{background:var(--cyan);color:#04110f;border-color:var(--cyan)}
+    .line-badge{display:inline-block;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:2px 7px;margin-bottom:5px;border:1px solid currentColor}
+    .lt-ml{color:var(--cyan)} .lt-sp{color:var(--yellow)} .lt-ou{color:var(--coral)}
     .game .g-add{color:var(--cyan);font-family:var(--mono);font-size:10px;white-space:nowrap}
     .discover-empty{color:var(--faint);font-size:12px;font-family:var(--mono)}
   </style>
@@ -108,6 +114,7 @@
     <section aria-labelledby="events-heading">
       <h2 class="title" id="events-heading">Monitored events</h2>
       <div class="error" id="action-error" role="alert" hidden></div>
+      <div id="line-filter" class="carousel" role="tablist" aria-label="Filter by line type"></div>
       <div id="events" aria-live="polite"></div>
     </section>
   </div>
@@ -130,6 +137,24 @@
     return "wait";
   }
 
+  let activeLine = "all", lastEvents = [];
+  const LINE_META = { moneyline:{label:"Moneyline",cls:"lt-ml"}, spread:{label:"Spread",cls:"lt-sp"}, total:{label:"Over / Under",cls:"lt-ou"} };
+  const LINE_ORDER = ["moneyline","spread","total"];
+  function lineType(market, outcome){
+    const m=(market||"").toLowerCase(), o=String(outcome||"").trim().toLowerCase();
+    if(o.startsWith("over")||o.startsWith("under")||/total|over.?under|o\/u/.test(m)) return "total";
+    if(/spread|handicap|run.?line|puck.?line|\bline\b/.test(m) || /[+-]\d/.test(String(outcome||""))) return "spread";
+    return "moneyline";
+  }
+  function lineBadge(market, outcome){ const meta=LINE_META[lineType(market,outcome)]; return `<span class="line-badge ${meta.cls}">${meta.label}</span>`; }
+  function renderCarousel(present){
+    const el=document.querySelector("#line-filter");
+    const types=LINE_ORDER.filter(t=>present.has(t));
+    if(types.length<=1){ el.innerHTML=""; return; }   // nothing to filter
+    const pill=(k,l)=>`<button class="pill${activeLine===k?" active":""}" data-line="${k}">${l}</button>`;
+    el.innerHTML=pill("all","All")+types.map(t=>pill(t,LINE_META[t].label)).join("");
+  }
+
   function marketRow(eventId, market, openDetails) {
     const detailKey = keyFor("market", eventId, market.token_id);
     const modelClass = market.entry_margin == null ? "" : market.entry_margin >= 0 ? "positive" : "negative";
@@ -139,8 +164,8 @@
         ? `<strong>Entry ceiling ${cents(market.price_ceiling)}</strong> · current ask is ${signedCents(-market.room_to_ceiling)} from the ceiling.`
         : `<strong>Wait for ${cents(market.price_ceiling)} or lower</strong> · current ask is ${signedCents(-market.room_to_ceiling)} too expensive.`;
     const risks = market.risk_flags.length ? market.risk_flags : ["No elevated execution flags detected; continue watching price and news latency."];
-    return `<div class="market" data-token-id="${esc(market.token_id)}">
-      <div class="market-top"><div class="outcome">${esc(market.outcome)}<small>${esc(market.question)}</small></div><span class="tag ${tagClass(market.entry_action)}">${esc(market.entry_action)}</span></div>
+    return `<div class="market" data-line="${lineType(market.market,market.outcome)}" data-token-id="${esc(market.token_id)}">
+      <div class="market-top"><div class="outcome">${lineBadge(market.market,market.outcome)}${esc(market.outcome)}<small>${esc(market.question)}</small></div><span class="tag ${tagClass(market.entry_action)}">${esc(market.entry_action)}</span></div>
       <div class="figs">
         <div class="fig"><div class="key">Buy now</div><div class="value">${cents(market.buy_price)}</div><div class="hint">Executable ask</div></div>
         <div class="fig"><div class="key">Sell now</div><div class="value">${cents(market.sell_price)}</div><div class="hint">Executable bid</div></div>
@@ -177,15 +202,26 @@
   }
 
   function fallbackSignal(signal) {
-    return `<div class="market"><div class="market-top"><div class="outcome">${esc(signal.outcome)}<small>${esc(signal.market)} demo signal</small></div><span class="tag ${signal.action === "PAPER_BET" ? "entry" : "wait"}">${esc(signal.action.replace("_"," "))}</span></div>
+    return `<div class="market" data-line="${lineType(signal.market,signal.outcome)}"><div class="market-top"><div class="outcome">${lineBadge(signal.market,signal.outcome)}${esc(signal.outcome)}<small>${esc(signal.market)} demo signal</small></div><span class="tag ${signal.action === "PAPER_BET" ? "entry" : "wait"}">${esc(signal.action.replace("_"," "))}</span></div>
       <div class="figs"><div class="fig"><div class="key">Model probability</div><div class="value">${pct(signal.model_probability)}</div><div class="hint">${signal.model_live_prob == null ? "Market consensus" : `Live model ${pct(signal.model_live_prob)}`}</div></div><div class="fig"><div class="key">Estimated edge</div><div class="value">${signedCents(signal.edge)}</div></div><div class="fig"><div class="key">Quality</div><div class="value">${signal.confidence.toFixed(0)}/100</div></div></div></div>`;
   }
 
   function eventCard(view, openDetails) {
     const {event,state_points,quote_points,latest_state:state,actionable_markets:markets,positions,signals} = view;
+    const usingFallback = !markets.length && !event.polymarket_slug;
+    let mkts = markets, sigs = signals.slice(0,3);
+    if (activeLine !== "all") {
+      mkts = markets.filter(m => lineType(m.market,m.outcome) === activeLine);
+      sigs = sigs.filter(s => lineType(s.market,s.outcome) === activeLine);
+    }
+    // Under an active filter, hide events that have nothing matching.
+    if (activeLine !== "all" && !mkts.length && !(usingFallback && sigs.length) && !positions.length) return "";
     const score = state ? `${state.home_score}<span class="sep">–</span>${state.away_score}` : "—";
     const portfolio = positions.length ? `<div class="section-strip"><span>My positions</span> · paper hold/cash monitor</div><div class="portfolio">${positions.map(p => positionRow(event.id,p,openDetails)).join("")}</div>` : "";
-    const marketBody = markets.length ? markets.map(m => marketRow(event.id,m,openDetails)).join("") : signals.length && !event.polymarket_slug ? signals.slice(0,3).map(fallbackSignal).join("") : '<div class="pending">Waiting for a fresh executable ask and reference prices…</div>';
+    const marketBody = mkts.length ? mkts.map(m => marketRow(event.id,m,openDetails)).join("")
+      : (usingFallback && sigs.length) ? sigs.map(fallbackSignal).join("")
+      : activeLine !== "all" ? '<div class="pending">No matching lines for this filter.</div>'
+      : '<div class="pending">Waiting for a fresh executable ask and reference prices…</div>';
     const link = event.polymarket_url ? `<a href="${esc(event.polymarket_url)}" target="_blank" rel="noopener">Open event ↗</a>` : "demo";
     const restriction = event.polymarket_restricted ? '<strong>Region notice:</strong> Polymarket marks this event restricted. The monitor shows public data only and does not bypass availability rules.' : 'Only selections accepting orders with a visible ask are listed.';
     return `<article class="event" data-event-id="${esc(event.id)}"><div class="event-head"><div><div class="name">${esc(event.name)}</div><div class="meta">${esc(event.sport)} · ${link} · ${state_points} state / ${quote_points} quote updates</div></div><div class="event-actions"><div class="score">${score}</div><button class="remove" data-remove-event="${esc(event.id)}">Remove</button></div></div>
@@ -199,9 +235,22 @@
   function renderEvents(events) {
     // Don't stomp a position form the user is actively editing.
     if (document.activeElement?.closest("[data-save-position]")) return;
+    lastEvents = events;
     const root=document.querySelector("#events");
     const openDetails=new Set([...root.querySelectorAll("details[open][data-detail-key]")].map(d=>d.dataset.detailKey));
-    root.innerHTML=events.length?`<div class="stack">${events.map(e=>eventCard(e,openDetails)).join("")}</div>`:'<div class="panel empty"><b>No events yet</b>Paste a Polymarket event link to begin.</div>';
+    // Which line types are actually available right now?
+    const present=new Set();
+    for (const v of events) {
+      if ((v.actionable_markets||[]).length) v.actionable_markets.forEach(m=>present.add(lineType(m.market,m.outcome)));
+      else if (!v.event.polymarket_slug) (v.signals||[]).slice(0,3).forEach(s=>present.add(lineType(s.market,s.outcome)));
+    }
+    if (activeLine !== "all" && !present.has(activeLine)) activeLine = "all";  // filter no longer available
+    renderCarousel(present);
+    const cards = events.map(e=>eventCard(e,openDetails)).filter(Boolean).join("");
+    root.innerHTML = cards ? `<div class="stack">${cards}</div>`
+      : (events.length && activeLine !== "all"
+          ? `<div class="panel empty"><b>No ${LINE_META[activeLine].label} lines</b>Nothing matches this filter right now.</div>`
+          : '<div class="panel empty"><b>No events yet</b>Paste a Polymarket event link to begin.</div>');
   }
   async function refresh() {
     if (refreshInFlight || document.activeElement?.closest("[data-save-position]")) return;
@@ -254,6 +303,7 @@
   document.querySelector("#discover-list").addEventListener("click",e=>{const row=e.target.closest("[data-slug]");if(row&&row.getAttribute("aria-disabled")!=="true")monitorGame(row.dataset.slug,row)});
   document.querySelector("#discover-search").addEventListener("input",renderDiscover);
   document.querySelector("#discover-refresh").addEventListener("click",loadDiscover);
+  document.querySelector("#line-filter").addEventListener("click",e=>{const p=e.target.closest("[data-line]");if(!p)return;activeLine=p.dataset.line;renderEvents(lastEvents);});
 
   fetch("/api/config").then(r=>r.json()).then(c=>document.querySelector("#config").textContent=`Quality ≥ ${c.confidence_threshold} · Required edge ≥ ${(c.edge_threshold*100).toFixed(1)}%`).catch(()=>document.querySelector("#config").textContent="Thresholds unavailable");
   refresh();refreshMetrics();startStream();loadDiscover();setInterval(refresh,10000);setInterval(refreshMetrics,5000);setInterval(loadDiscover,60000);
