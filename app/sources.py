@@ -19,15 +19,24 @@ from .models import Event, GameState, Quote
 logger = logging.getLogger(__name__)
 
 _SPORT_KEYS = {
-    "nba": ("basketball", "basketball_nba"),
     "wnba": ("basketball", "basketball_wnba"),
+    "nba": ("basketball", "basketball_nba"),
     "ncaab": ("basketball", "basketball_ncaab"),
     "nfl": ("football", "americanfootball_nfl"),
     "ncaaf": ("football", "americanfootball_ncaaf"),
     "mlb": ("baseball", "baseball_mlb"),
     "nhl": ("hockey", "icehockey_nhl"),
-    "epl": ("soccer", "soccer_epl"),
+    "ufc": ("mma", "mma_mixed_martial_arts"),
+    "mma": ("mma", "mma_mixed_martial_arts"),
+    "boxing": ("boxing", "boxing_boxing"),
     "premier league": ("soccer", "soccer_epl"),
+    "epl": ("soccer", "soccer_epl"),
+    "la liga": ("soccer", "soccer_spain_la_liga"),
+    "serie a": ("soccer", "soccer_italy_serie_a"),
+    "bundesliga": ("soccer", "soccer_germany_bundesliga"),
+    "ligue 1": ("soccer", "soccer_france_ligue_one"),
+    "champions league": ("soccer", "soccer_uefa_champs_league"),
+    "world cup": ("soccer", "soccer_fifa_world_cup"),
     "mls": ("soccer", "soccer_usa_mls"),
 }
 

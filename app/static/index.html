@@ -67,6 +67,8 @@
     .carousel .pill.active{background:var(--cyan);color:#04110f;border-color:var(--cyan)}
     .line-badge{display:inline-block;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:2px 7px;margin-bottom:5px;border:1px solid currentColor}
     .lt-ml{color:var(--cyan)} .lt-sp{color:var(--yellow)} .lt-ou{color:var(--coral)}
+    .notice.price-only{margin-top:8px;padding:8px 12px;border:1px solid var(--yellow);border-left-width:3px;background:rgba(255,207,63,.06);color:var(--text);font-size:12px;line-height:1.5}
+    .notice.price-only strong{color:var(--yellow);font-family:var(--mono);letter-spacing:.04em;text-transform:uppercase}
     .game .g-add{color:var(--cyan);font-family:var(--mono);font-size:10px;white-space:nowrap}
     .discover-empty{color:var(--faint);font-size:12px;font-family:var(--mono)}
   </style>
@@ -209,6 +211,10 @@
   function eventCard(view, openDetails) {
     const {event,state_points,quote_points,latest_state:state,actionable_markets:markets,positions,signals} = view;
     const usingFallback = !markets.length && !event.polymarket_slug;
+    const anyReference = markets.some(m => (m.reference_sources||0) >= 1);
+    const priceOnly = markets.length && !anyReference
+      ? '<div class="notice price-only"><strong>Price only</strong> · no sportsbook reference matched yet, so there\'s no validated edge here. Edges need 2+ independent price sources — this appears for games books haven\'t posted lines for (too far out) or leagues The Odds API doesn\'t cover.</div>'
+      : "";
     let mkts = markets, sigs = signals.slice(0,3);
     if (activeLine !== "all") {
       mkts = markets.filter(m => lineType(m.market,m.outcome) === activeLine);
@@ -225,7 +231,7 @@
     const link = event.polymarket_url ? `<a href="${esc(event.polymarket_url)}" target="_blank" rel="noopener">Open event ↗</a>` : "demo";
     const restriction = event.polymarket_restricted ? '<strong>Region notice:</strong> Polymarket marks this event restricted. The monitor shows public data only and does not bypass availability rules.' : 'Only selections accepting orders with a visible ask are listed.';
     return `<article class="event" data-event-id="${esc(event.id)}"><div class="event-head"><div><div class="name">${esc(event.name)}</div><div class="meta">${esc(event.sport)} · ${link} · ${state_points} state / ${quote_points} quote updates</div></div><div class="event-actions"><div class="score">${score}</div><button class="remove" data-remove-event="${esc(event.id)}">Remove</button></div></div>
-      <div class="notice">${restriction}</div>${portfolio}<div class="section-strip"><span>Actionable selections</span> · buy, sell, margin, and risk</div><div>${marketBody}</div></article>`;
+      <div class="notice">${restriction}</div>${priceOnly}${portfolio}<div class="section-strip"><span>Actionable selections</span> · buy, sell, margin, and risk</div><div>${marketBody}</div></article>`;
   }
 
   function showActionError(message) { const box=document.querySelector("#action-error"); box.textContent=message; box.hidden=false; }
