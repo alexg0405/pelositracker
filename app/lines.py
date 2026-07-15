@@ -27,13 +27,15 @@ def is_total_market(market: str) -> bool:
 
 
 def quote_line_side(market: str, outcome: str, home: str, away: str) -> tuple[float | None, str | None]:
-    """Return (point, side) for a spread/total outcome, else (None, None)."""
+    """Return (point, side) for a spread/total/prop outcome, else (None, None).
+
+    An "Over N" / "Under N" label is unambiguous and covers both game totals and
+    player props; spreads carry the point on the team label.
+    """
     label = (outcome or "").strip()
-    if is_total_market(market):
-        match = _TOTAL_LABEL.match(label)
-        if match:
-            return float(match.group(2)), match.group(1).casefold()
-        return None, None
+    total = _TOTAL_LABEL.match(label)
+    if total:
+        return float(total.group(2)), total.group(1).casefold()
     if is_spread_market(market):
         match = _TRAILING_SIGNED.match(label)
         if not match:
@@ -48,21 +50,24 @@ def quote_line_side(market: str, outcome: str, home: str, away: str) -> tuple[fl
 
 
 def pregame_priors(quotes, home: str, away: str) -> tuple[float | None, float | None]:
-    """Best-effort pregame spread (home point) and total line from current quotes.
+    """Best-effort pregame spread (home point) and game total line from quotes.
 
     Captured near tip and held as a prior; the home spread point becomes the
-    expected home margin (mu = -point) for the live win-probability model.
+    expected home margin (mu = -point) for the live win-probability model. Gated
+    to real spread/total markets so a player-prop "Over 24.5" is never mistaken
+    for the game total.
     """
     spread_home = None
     total_line = None
     for quote in quotes:
-        point, side = quote_line_side(quote.market, quote.outcome, home, away)
-        if point is None:
-            continue
-        if spread_home is None and side == "home":
-            spread_home = point
-        elif total_line is None and side in ("over", "under"):
-            total_line = point
+        if spread_home is None and is_spread_market(quote.market):
+            point, side = quote_line_side(quote.market, quote.outcome, home, away)
+            if point is not None and side == "home":
+                spread_home = point
+        elif total_line is None and is_total_market(quote.market):
+            point, side = quote_line_side(quote.market, quote.outcome, home, away)
+            if point is not None and side in ("over", "under"):
+                total_line = point
         if spread_home is not None and total_line is not None:
             break
     return spread_home, total_line

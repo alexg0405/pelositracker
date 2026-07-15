@@ -323,14 +323,21 @@ def american_probability(price: float) -> float:
 def odds_api_request(event: Event, key: str) -> tuple[str, dict[str, str]]:
     """Build an authenticated The Odds API V4 request without exposing the key in logs."""
     root = f"https://api.the-odds-api.com/v4/sports/{event.odds_api_sport}"
+    markets = os.getenv("ODDS_MARKETS", "h2h,spreads,totals")
     if event.odds_api_event_id:
         url = f"{root}/events/{event.odds_api_event_id}/odds"
+        # Player props are only served by the per-event endpoint. Opt-in and
+        # sport-specific (an unsupported market key makes The Odds API 422), so
+        # off by default; set ODDS_PLAYER_MARKETS per sport to enable.
+        props = os.getenv("ODDS_PLAYER_MARKETS", "").strip()
+        if props:
+            markets = f"{markets},{props}"
     else:
         url = f"{root}/odds"
     params = {
         "apiKey": key,
         "regions": os.getenv("ODDS_REGIONS", "us"),
-        "markets": os.getenv("ODDS_MARKETS", "h2h,spreads,totals"),
+        "markets": markets,
         "oddsFormat": "american",
         "dateFormat": "iso",
     }
@@ -359,6 +366,27 @@ def _outcome_label(market: str, outcome: dict) -> str:
     return name
 
 
+def is_player_prop(provider_key: str) -> bool:
+    key = (provider_key or "").casefold()
+    return key.startswith(("player_", "batter_", "pitcher_")) and not key.endswith("_alternate")
+
+
+def _prop_market_outcome(provider_key: str, outcome: dict) -> tuple[str, str] | None:
+    """(market, outcome) for a player prop, keyed per (player, stat, line) so the
+    engine de-vigs each player's Over/Under and never mixes players or lines."""
+    player = str(outcome.get("description", "")).strip()
+    point = outcome.get("point")
+    side = str(outcome.get("name", "")).strip()  # Over / Under
+    if not player or point is None or not side:
+        return None
+    stat = provider_key.casefold()
+    for prefix in ("player_", "batter_", "pitcher_"):
+        if stat.startswith(prefix):
+            stat = stat[len(prefix):]
+            break
+    return f"{player} — {stat.replace('_', ' ')}", f"{side} {float(point):g}"
+
+
 def odds_api_quotes(event: Event, payload: dict | list[dict]) -> list[Quote]:
     games = [payload] if isinstance(payload, dict) else payload
     quotes = []
@@ -372,15 +400,23 @@ def odds_api_quotes(event: Event, payload: dict | list[dict]) -> list[Quote]:
             source = bookmaker.get("title") or bookmaker.get("key", "sportsbook")
             for market in bookmaker.get("markets", []):
                 provider_key = market.get("key", "h2h")
-                market_key = canonical_market(provider_key)
+                prop = is_player_prop(provider_key)
                 for outcome in market.get("outcomes", []):
                     price = float(outcome["price"])
                     if price == 0:
                         continue
+                    if prop:
+                        resolved = _prop_market_outcome(provider_key, outcome)
+                        if resolved is None:
+                            continue
+                        market_key, outcome_label = resolved
+                    else:
+                        market_key = canonical_market(provider_key)
+                        outcome_label = _outcome_label(provider_key, outcome)
                     quotes.append(Quote(
                         event.id,
                         market_key,
-                        _outcome_label(provider_key, outcome),
+                        outcome_label,
                         american_probability(price),
                         source,
                         decimal_odds=(price / 100 + 1 if price > 0 else 100 / -price + 1),
