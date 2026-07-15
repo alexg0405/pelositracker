@@ -27,7 +27,9 @@ store = Store()
 ledger: Ledger | None = None
 engine = SignalEngine(float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", "72")),
                       float(os.getenv("SIGNAL_EDGE_THRESHOLD", "0.035")),
-                      float(os.getenv("MAX_DATA_AGE_SECONDS", "20")))
+                      float(os.getenv("MAX_DATA_AGE_SECONDS", "20")),
+                      kelly_fraction=float(os.getenv("SIGNAL_KELLY_FRACTION", "0.25")),
+                      edge_z=float(os.getenv("SIGNAL_EDGE_Z", "1.0")))
 tasks: dict[str, list[asyncio.Task]] = {}
 _finalized: set[str] = set()
 _pregame: dict[str, dict] = {}  # event_id -> {"spread": home point, "total": line}, captured near tip

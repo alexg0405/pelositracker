@@ -21,10 +21,13 @@ class SignalEngine:
     """Python-facing configuration wrapper for the Rust recommendation engine."""
 
     def __init__(self, confidence_threshold: float = 72, edge_threshold: float = 0.035,
-                 max_age_seconds: float = 20):
+                 max_age_seconds: float = 20, kelly_fraction: float = 0.25,
+                 edge_z: float = 1.0):
         self.confidence_threshold = confidence_threshold
         self.edge_threshold = edge_threshold
         self.max_age_seconds = max_age_seconds
+        self.kelly_fraction = kelly_fraction
+        self.edge_z = edge_z
 
     def evaluate(self, event_id: str, quotes: list[Quote], states: list[GameState],
                  away_outcome: str = "away", sport: str = "", home_outcome: str = "",
@@ -39,6 +42,8 @@ class SignalEngine:
             "sport": sport or None,
             "pregame_spread": pregame_spread,
             "pregame_total": pregame_total,
+            "edge_z": self.edge_z,
+            "kelly_fraction": self.kelly_fraction,
             "quotes": [
                 self._quote_payload(q, home_outcome, away_outcome)
                 for q in quotes

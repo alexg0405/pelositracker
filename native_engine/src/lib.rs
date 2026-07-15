@@ -76,6 +76,12 @@ struct EvaluateRequest {
     #[allow(dead_code)]
     #[serde(default)]
     pregame_total: Option<f64>,
+    // Phase 4: required-edge z-multiplier on consensus uncertainty, and the
+    // fractional-Kelly lambda applied to the shrunk edge.
+    #[serde(default)]
+    edge_z: Option<f64>,
+    #[serde(default)]
+    kelly_fraction: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +104,12 @@ struct SignalOutput {
     // Phase 2a: independent live win-probability (moneyline only, when game
     // state is available). null otherwise. A cross-check, not the edge basis.
     model_live_prob: Option<f64>,
+    // Phase 4: sizing & risk-normalized gating.
+    ev_per_stake: f64,       // fair/executable - 1
+    kelly_fraction: f64,     // fractional Kelly on the uncertainty-shrunk edge
+    required_edge: f64,      // base + z*consensus_stderr + market premium
+    fair_stderr: f64,        // standard error of the consensus fair
+    fillable_size: Option<f64>,
 }
 
 fn clamp(value: f64, low: f64, high: f64) -> f64 {
@@ -193,6 +205,19 @@ fn is_total(market: &str) -> bool {
         market.to_lowercase().as_str(),
         "total" | "totals" | "over_under" | "ou" | "game_total"
     )
+}
+
+/// Extra required edge by market efficiency/limits. Player props (anything not
+/// a mainline market) have high vig and low limits, so demand more; totals a
+/// little; moneyline/spread none.
+fn market_premium(market: &str) -> f64 {
+    if is_moneyline(market) || is_spread(market) {
+        0.0
+    } else if is_total(market) {
+        0.01
+    } else {
+        0.02 // player props and other thin markets
+    }
 }
 
 /// SD of the FINAL combined score (points/goals) per sport.
@@ -579,6 +604,11 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
                 overround: target_booksum,
                 n_reference_sources: 0,
                 model_live_prob: model_live,
+                ev_per_stake: 0.0,
+                kelly_fraction: 0.0,
+                required_edge: 0.0,
+                fair_stderr: 0.0,
+                fillable_size: best.liquidity,
             });
             continue;
         }
@@ -612,6 +642,23 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
             0.08
         };
         let source_count = reference.len();
+
+        // Phase 4: sizing & risk-normalized required edge.
+        let z = request.edge_z.unwrap_or(1.0);
+        let lambda = request.kelly_fraction.unwrap_or(0.25);
+        // Standard error of the consensus mean; more disagreement / fewer books
+        // -> less certain fair -> higher bar and smaller stake.
+        let fair_stderr = dispersion / (source_count as f64).max(1.0).sqrt();
+        let required_edge = request.edge_threshold + z * fair_stderr + market_premium(&market);
+        let ev_per_stake = if executable > 1e-6 { fair / executable - 1.0 } else { 0.0 };
+        // Shrink the edge by its uncertainty before sizing (optimizer's curse).
+        let edge_shrunk = (edge - z * fair_stderr).max(0.0);
+        let kelly_fraction = if executable < 0.999 {
+            (lambda * edge_shrunk / (1.0 - executable)).max(0.0)
+        } else {
+            0.0
+        };
+        let fillable_size = best.liquidity;
 
         let agreement_score = (1.0 - dispersion / 0.12).max(0.0);
         let source_score = (source_count as f64 / 3.0).min(1.0);
@@ -654,6 +701,16 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
                 st.fraction_remaining.unwrap_or(0.0) * 100.0
             ));
         }
+        reasons.push(format!(
+            "EV {:+.1}%/stake · Kelly {:.1}% bankroll · required edge {:.1}%{}",
+            ev_per_stake * 100.0,
+            kelly_fraction * 100.0,
+            required_edge * 100.0,
+            match fillable_size {
+                Some(size) => format!(" · fillable {size:.0}"),
+                None => String::new(),
+            }
+        ));
 
         let mut blockers = Vec::new();
         if age > max_age {
@@ -667,11 +724,13 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
                 blockers.push(format!("wide executable spread ({:.1}%)", s * 100.0));
             }
         }
-        if edge < request.edge_threshold {
+        if edge < required_edge {
             blockers.push(format!(
-                "edge {:.1}% below {:.1}% threshold",
+                "edge {:.1}% below required {:.1}% (base {:.1}% + risk {:.1}%)",
                 edge * 100.0,
-                request.edge_threshold * 100.0
+                required_edge * 100.0,
+                request.edge_threshold * 100.0,
+                (required_edge - request.edge_threshold) * 100.0
             ));
         }
         if confidence < request.confidence_threshold {
@@ -706,6 +765,11 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
             overround: target_booksum,
             n_reference_sources: source_count as i64,
             model_live_prob: model_live,
+            ev_per_stake,
+            kelly_fraction,
+            required_edge,
+            fair_stderr,
+            fillable_size,
         });
     }
 
@@ -779,6 +843,8 @@ mod tests {
             sport,
             pregame_spread: None,
             pregame_total: None,
+            edge_z: None,
+            kelly_fraction: None,
         }
     }
 
@@ -877,6 +943,35 @@ mod tests {
         assert!(spread_cover_prob(10.0, 0.0, 0.0, sigma, -6.5, "home").unwrap() > 0.99);
         // Unknown side -> no model.
         assert!(spread_cover_prob(0.0, 0.0, 0.5, sigma, -3.0, "draw").is_none());
+    }
+
+    #[test]
+    fn sizing_fields_and_risk_normalized_gate() {
+        let now = 1_000.0;
+        // Three exchange books agree home ~0.60; a cheap book offers home at 0.55.
+        let mut quotes = Vec::new();
+        for source in ["A", "B"] {
+            quotes.push(quote(source, "home", 0.60, now));
+            quotes.push(quote(source, "away", 0.40, now));
+        }
+        let mut cheap = quote("C", "home", 0.545, now);
+        cheap.ask = Some(0.55);
+        cheap.bid = Some(0.54);
+        cheap.liquidity = Some(1234.0);
+        quotes.push(cheap);
+        quotes.push(quote("C", "away", 0.455, now));
+
+        let home = evaluate(request(quotes), now)
+            .into_iter()
+            .find(|s| s.outcome == "home")
+            .unwrap();
+        // EV per stake = fair/executable - 1 = 0.60/0.55 - 1 ~ 0.0909.
+        assert!((home.ev_per_stake - (0.60 / 0.55 - 1.0)).abs() < 0.02);
+        // Consensus is unanimous (dispersion 0) so required edge == base 0.02.
+        assert!((home.required_edge - 0.02).abs() < 1e-6);
+        assert!(home.kelly_fraction > 0.0 && home.kelly_fraction < 0.25);
+        assert_eq!(home.fillable_size, Some(1234.0));
+        assert_eq!(home.action, "PAPER_BET");
     }
 
     #[test]

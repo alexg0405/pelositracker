@@ -125,6 +125,12 @@ class Signal:
     n_reference_sources: int = 0
     # Phase 2a: independent live win-probability (moneyline only), or None.
     model_live_prob: float | None = None
+    # Phase 4: sizing & risk-normalized gating.
+    ev_per_stake: float = 0.0
+    kelly_fraction: float = 0.0
+    required_edge: float = 0.0
+    fair_stderr: float = 0.0
+    fillable_size: float | None = None
 
 
 def as_json(value: Any) -> Any:
