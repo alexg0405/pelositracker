@@ -1,0 +1,25 @@
+# Render blueprint. Deploys the Docker image (builds the Rust engine, runs uvicorn).
+# Free plan works out of the box but sleeps after ~15 min idle (streams pause
+# until the next request) and has no persistent disk (the CLV ledger resets on
+# redeploy). For an always-on monitor with a durable ledger, switch plan to
+# "starter" and uncomment the disk block + LEDGER_DB below.
+services:
+  - type: web
+    name: live-edge-monitor
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/config
+    autoDeploy: true
+    envVars:
+      - key: THE_ODDS_API_KEY   # optional; Polymarket + demo work without it
+        sync: false
+      - key: ODDS_POLL_SECONDS
+        value: "20"
+      - key: ODDS_PLAYER_MARKETS  # e.g. player_points,player_rebounds (per sport)
+        sync: false
+      # - key: LEDGER_DB
+      #   value: /var/data/ledger.db
+    # disk:                       # requires a paid plan
+    #   name: ledger
+    #   mountPath: /var/data
+    #   sizeGB: 1
