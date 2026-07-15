@@ -122,7 +122,7 @@
         <div class="fig"><div class="key">Entry margin</div><div class="value ${modelClass}">${signedCents(market.entry_margin)}</div><div class="hint">Model fair minus ask</div></div>
         <div class="fig"><div class="key">Signal quality</div><div class="value">${market.confidence == null ? "—" : market.confidence.toFixed(0)+"/100"}</div><div class="hint">${market.reference_sources} reference source(s)</div></div>
       </div>
-      <div class="guide">${guide} Spread ${cents(market.spread)} · ask depth ${market.ask_size == null ? "—" : market.ask_size.toFixed(1)+" shares"} · market liquidity ${market.market_liquidity == null ? "—" : "$"+Number(market.market_liquidity).toLocaleString(undefined,{maximumFractionDigits:0})}.</div>
+      <div class="guide">${guide}${market.model_live_prob == null ? "" : ` Independent live win model ${pct(market.model_live_prob)}.`} Spread ${cents(market.spread)} · ask depth ${market.ask_size == null ? "—" : market.ask_size.toFixed(1)+" shares"} · market liquidity ${market.market_liquidity == null ? "—" : "$"+Number(market.market_liquidity).toLocaleString(undefined,{maximumFractionDigits:0})}.</div>
       <details class="why" data-detail-key="${detailKey}"${openDetails.has(detailKey) ? " open" : ""}><summary>What to look out for</summary>
         <ul>${market.reasons.map(reason => `<li>${esc(reason)}</li>`).join("")}${risks.map(risk => `<li class="risk">${esc(risk)}</li>`).join("")}</ul></details>
       <details class="why"><summary>Add or update my position</summary>
@@ -153,7 +153,7 @@
 
   function fallbackSignal(signal) {
     return `<div class="market"><div class="market-top"><div class="outcome">${esc(signal.outcome)}<small>${esc(signal.market)} demo signal</small></div><span class="tag ${signal.action === "PAPER_BET" ? "entry" : "wait"}">${esc(signal.action.replace("_"," "))}</span></div>
-      <div class="figs"><div class="fig"><div class="key">Model probability</div><div class="value">${pct(signal.model_probability)}</div></div><div class="fig"><div class="key">Estimated edge</div><div class="value">${signedCents(signal.edge)}</div></div><div class="fig"><div class="key">Quality</div><div class="value">${signal.confidence.toFixed(0)}/100</div></div></div></div>`;
+      <div class="figs"><div class="fig"><div class="key">Model probability</div><div class="value">${pct(signal.model_probability)}</div><div class="hint">${signal.model_live_prob == null ? "Market consensus" : `Live model ${pct(signal.model_live_prob)}`}</div></div><div class="fig"><div class="key">Estimated edge</div><div class="value">${signedCents(signal.edge)}</div></div><div class="fig"><div class="key">Quality</div><div class="value">${signal.confidence.toFixed(0)}/100</div></div></div></div>`;
   }
 
   function eventCard(view, openDetails) {

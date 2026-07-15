@@ -96,6 +96,7 @@ def market_views(quotes: list[Quote], signals: list[Signal], edge_threshold: flo
             "age_seconds": age_seconds,
             "entry_action": entry_action,
             "model_probability": model_probability,
+            "model_live_prob": signal.model_live_prob if signal else None,
             "entry_margin": entry_margin,
             "price_ceiling": price_ceiling,
             "room_to_ceiling": room_to_ceiling,
