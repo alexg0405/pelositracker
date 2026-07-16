@@ -54,22 +54,22 @@
       text-align: center;
       margin-bottom: 4px;
       text-shadow: 0 0 20px rgba(41,231,214,0.5);
-      position: relative;
     }
-    .login-box h1::before, .login-box h1::after {
+    .glitch { position: relative; display: inline-block; }
+    .glitch::before, .glitch::after {
       content: attr(data-text);
       position: absolute;
       top: 0; left: 0; width: 100%; height: 100%;
       background: transparent;
-      color: #fff;
+      color: currentColor;
     }
-    .login-box h1::before {
+    .glitch::before {
       left: 2px;
       text-shadow: -1px 0 var(--red);
       clip-path: inset(10% 0 60% 0);
       animation: glitch-anim-1 2s infinite linear alternate-reverse;
     }
-    .login-box h1::after {
+    .glitch::after {
       left: -2px;
       text-shadow: -1px 0 var(--cyan);
       clip-path: inset(80% 0 5% 0);
@@ -195,7 +195,7 @@
 <body>
 <div id="login-overlay">
   <div class="login-box">
-    <h1 data-text="PelosiAlpha">Pelosi<span>Alpha</span></h1>
+    <h1 class="glitch" data-text="PelosiAlpha">Pelosi<span>Alpha</span></h1>
     <p>SECURE TERMINAL ACCESS</p>
     <div id="login-error" class="error" hidden></div>
     <form id="login-form">
@@ -210,7 +210,7 @@
 
 <main class="wrap">
   <header>
-    <div class="brand"><span class="dot" aria-hidden="true"></span><div><h1>PelosiTracker</h1><small>Paper-only entry and position guidance</small></div></div>
+    <div class="brand"><span class="dot" aria-hidden="true"></span><div><h1 class="glitch" data-text="PelosiTracker">PelosiTracker</h1><small>Paper-only entry and position guidance</small></div></div>
     <div style="display:flex;align-items:center;gap:10px">
       <div class="config" id="config">Loading thresholds…</div>
     </div>
@@ -224,7 +224,7 @@
 
   <!-- TAB 1: LIVE RADAR -->
   <div id="tab-live" class="tab-content">
-    <h2 class="title">Monitored events</h2>
+    <h2 class="title glitch" data-text="Monitored events">Monitored events</h2>
     <div class="error" id="action-error" role="alert" hidden></div>
     <div id="line-filter" class="carousel" role="tablist" aria-label="Filter by line type"></div>
     <div id="events" aria-live="polite"></div>
@@ -299,12 +299,12 @@
     </div>
 
     <section class="panel metrics-panel" aria-labelledby="leaderboard-heading" style="border-color: var(--cyan); background: linear-gradient(180deg, rgba(41,231,214,.05), transparent), var(--panel);">
-      <div class="metrics-head"><h2 class="title" id="leaderboard-heading" style="color: var(--cyan)">Strategy Calibration · Dummy Accounts</h2></div>
+      <div class="metrics-head"><h2 class="title glitch" data-text="Strategy Calibration · Dummy Accounts" id="leaderboard-heading" style="color: var(--cyan)">Strategy Calibration · Dummy Accounts</h2></div>
       <div id="leaderboard-body" aria-live="polite"></div>
     </section>
     
     <section class="panel metrics-panel" aria-labelledby="metrics-heading">
-      <div class="metrics-head"><h2 class="title" id="metrics-heading">Truth loop · CLV &amp; calibration</h2><span class="metrics-sub" id="metrics-sub"></span></div>
+      <div class="metrics-head"><h2 class="title glitch" data-text="Truth loop · CLV & calibration" id="metrics-heading">Truth loop · CLV &amp; calibration</h2><span class="metrics-sub" id="metrics-sub"></span></div>
       <div id="metrics-body" aria-live="polite"></div>
     </section>
   </div>
