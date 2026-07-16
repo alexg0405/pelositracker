@@ -19,6 +19,7 @@ from .engine import SignalEngine
 from . import __version__, backtest
 from .accounts import AccountBook, DEFAULT_STRATEGIES
 from .advice import market_views, position_views
+from .history import HistoryDB
 from .ledger import Ledger
 from .lines import pregame_priors
 from .models import Event, GameState, Quote, as_json
@@ -32,6 +33,7 @@ load_dotenv()
 store = Store()
 ledger: Ledger | None = None
 account_book: AccountBook | None = None
+history_db: HistoryDB | None = None
 engine = SignalEngine(float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", "72")),
                       float(os.getenv("SIGNAL_EDGE_THRESHOLD", "0.035")),
                       float(os.getenv("MAX_DATA_AGE_SECONDS", "20")),
@@ -65,6 +67,8 @@ def _require_safe_id(value: str | None, field: str) -> None:
 
 async def on_state(state: GameState):
     store.add_state(state)
+    if history_db is not None:
+        await asyncio.to_thread(history_db.log_state, state)
     await record(state.event_id)
     if str(state.status).lower() in _FINAL_STATUSES:
         await finalize_event(state.event_id)
@@ -90,6 +94,8 @@ async def on_sports_status(slug: str, payload: dict) -> None:
 
 async def on_quotes(quotes: list[Quote]):
     store.add_quotes(quotes)
+    if history_db is not None and quotes:
+        await asyncio.to_thread(history_db.log_quotes, quotes)
     if quotes:
         await record(quotes[0].event_id)
 
@@ -156,6 +162,10 @@ async def finalize_event(event_id: str) -> None:
             ledger.settle_moneyline(event_id, winners)
         if account_book is not None and event is not None and states:
             account_book.settle(event, states[-1].home_score, states[-1].away_score)
+        if history_db is not None and event is not None:
+            prior = _pregame.get(event_id, {})
+            final_state = states[-1] if states else None
+            history_db.log_outcome(event, prior.get("spread"), prior.get("total"), final_state)
 
     await asyncio.to_thread(_writes)
 
@@ -182,9 +192,10 @@ async def auto_monitor_loop():
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global ledger, account_book
+    global ledger, account_book, history_db
     ledger = Ledger()
     account_book = AccountBook()
+    history_db = HistoryDB()
     account_book.seed(DEFAULT_STRATEGIES)
     sports_task = asyncio.create_task(polymarket_sports_stream(
         lambda: list(store.events.values()), on_state, on_sports_status))
@@ -197,6 +208,7 @@ async def lifespan(_: FastAPI):
             task.cancel()
     ledger.close()
     account_book.close()
+    history_db.close()
 
 
 app = FastAPI(title="Live Sports Signal Monitor", version=__version__, lifespan=lifespan)
