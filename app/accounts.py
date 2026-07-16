@@ -61,7 +61,7 @@ class Strategy:
     blurb: str = ""
     edge_threshold: float = 0.03
     confidence_threshold: float = 0.0
-    min_sources: int = 2
+    min_sources: int = 1
     markets: tuple = ("all",)
     sizing: str = "kelly"            # kelly | flat | flat_pct
     kelly_multiplier: float = 1.0
