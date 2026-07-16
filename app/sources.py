@@ -532,7 +532,7 @@ def odds_api_request(event: Event, key: str) -> tuple[str, dict[str, str]]:
         url = f"{root}/odds"
     params = {
         "apiKey": key,
-        "regions": os.getenv("ODDS_REGIONS", "us"),
+        "regions": os.getenv("ODDS_REGIONS", "us,eu,uk"),
         "markets": markets,
         "oddsFormat": "american",
         "dateFormat": "iso",
@@ -609,6 +609,13 @@ def odds_api_quotes(event: Event, payload: dict | list[dict]) -> list[Quote]:
                     else:
                         market_key = canonical_market(provider_key)
                         outcome_label = _outcome_label(provider_key, outcome)
+                        
+                        odds_home = str(game.get("home_team", ""))
+                        odds_away = str(game.get("away_team", ""))
+                        if odds_home and outcome_label.startswith(odds_home):
+                            outcome_label = outcome_label.replace(odds_home, event.home, 1)
+                        elif odds_away and outcome_label.startswith(odds_away):
+                            outcome_label = outcome_label.replace(odds_away, event.away, 1)
                     quotes.append(Quote(
                         event.id,
                         market_key,
@@ -630,8 +637,6 @@ async def odds_api_poll(event: Event, emit: Callable[[list[Quote]], Awaitable[No
             matched = await match_odds_api_event(event.odds_api_sport, event.name)
             if matched:
                 event.odds_api_event_id = str(matched["id"])
-                event.home = str(matched["home_team"])
-                event.away = str(matched["away_team"])
         except Exception as exc:
             logger.warning("Failed to match Odds API event: %s", exc)
             
