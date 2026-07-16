@@ -35,8 +35,8 @@ store = Store()
 ledger: Ledger | None = None
 account_book: AccountBook | None = None
 history_db: HistoryDB | None = None
-engine = SignalEngine(float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", "72")),
-                      float(os.getenv("SIGNAL_EDGE_THRESHOLD", "0.035")),
+engine = SignalEngine(float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", "0.0")),
+                      float(os.getenv("SIGNAL_EDGE_THRESHOLD", "0.0")),
                       float(os.getenv("MAX_DATA_AGE_SECONDS", "20")),
                       kelly_fraction=float(os.getenv("SIGNAL_KELLY_FRACTION", "0.25")),
                       edge_z=float(os.getenv("SIGNAL_EDGE_Z", "1.0")))
