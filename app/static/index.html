@@ -6,6 +6,7 @@
   <meta name="description" content="Paper-only Polymarket entry and position monitor">
   <title>PelosiTracker Dashboard</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
     :root {
       color-scheme: dark;
@@ -212,6 +213,16 @@
   </div>
   <div id="bot-modal-content" style="display:flex; flex-direction:column; gap:8px">Loading...</div>
 </dialog>
+
+<dialog id="chart-modal" class="panel pad" style="max-width:800px; width:95%; border:1px solid var(--cyan); background:var(--panel); color:var(--text); margin:auto; position:fixed; top:50%; left:50%; transform:translate(-50%, -50%); z-index:99;">
+  <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:12px; border-bottom:1px solid var(--line); padding-bottom:8px">
+    <h2 class="title" id="chart-modal-title" style="margin:0; color:var(--cyan)">Historical Odds</h2>
+    <button class="ghost" style="padding:4px 8px; font-size:10px; width:auto; margin:0;" onclick="document.querySelector('#chart-modal').close()">Close</button>
+  </div>
+  <div style="position:relative; height:400px; width:100%">
+    <canvas id="historyChart"></canvas>
+  </div>
+</dialog>
 <style>dialog::backdrop { background: rgba(0,0,0,0.7); }</style>
 
 <script>
@@ -361,7 +372,7 @@
       : '<div class="pending">Waiting for a fresh executable ask and reference prices…</div>';
     const link = event.polymarket_url ? `<a href="${esc(event.polymarket_url)}" target="_blank" rel="noopener">Open event ↗</a>` : "demo";
     const restriction = event.polymarket_restricted ? '<strong>Region notice:</strong> Polymarket marks this event restricted. The monitor shows public data only and does not bypass availability rules.' : 'Only selections accepting orders with a visible ask are listed.';
-    return `<article class="event" data-event-id="${esc(event.id)}"><div class="event-head"><div><div class="name">${esc(event.name)}</div><div class="meta">${esc(event.sport)} · ${link} · ${state_points} state / ${quote_points} updates</div></div><div class="event-actions"><div class="score">${score}</div><button class="remove" data-remove-event="${esc(event.id)}">Remove</button></div></div>
+    return `<article class="event" data-event-id="${esc(event.id)}"><div class="event-head"><div><div class="name">${esc(event.name)}</div><div class="meta">${esc(event.sport)} · ${link} · ${state_points} state / ${quote_points} updates</div></div><div class="event-actions"><button class="ghost" style="padding:6px 9px; margin:0; width:auto; font-size:10px; border-color:var(--cyan)" data-chart-event="${esc(event.id)}" data-chart-title="${esc(event.name)}">View Chart</button><div class="score">${score}</div><button class="remove" data-remove-event="${esc(event.id)}">Remove</button></div></div>
       <div class="notice">${restriction}</div>${priceOnly}${portfolio}<div class="section-strip"><span>Actionable selections</span> · buy, sell, margin, and risk</div><div>${marketBody}</div></article>`;
   }
 
@@ -463,9 +474,49 @@
     const payload={token_id:form.dataset.tokenId,market:form.dataset.market,outcome:form.dataset.outcome,shares:Number(data.get("shares")),avg_entry_price:Number(data.get("entry_cents"))/100};
     try{const response=await fetch(`/api/events/${encodeURIComponent(form.dataset.eventId)}/positions`,{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify(payload)});const body=await response.json().catch(()=>({}));if(!response.ok)throw new Error(body.detail||"Could not save position");document.activeElement.blur();await refresh()}
     catch(error){showActionError(error.message)}finally{button.disabled=false}});
-  document.querySelector("#events").addEventListener("click",async event=>{const removeEvent=event.target.closest("[data-remove-event]"),removePosition=event.target.closest("[data-remove-position]");
+  let currentChart = null;
+  async function viewChart(eventId, eventName) {
+    const dialog = document.querySelector("#chart-modal");
+    document.querySelector("#chart-modal-title").textContent = eventName + " History";
+    dialog.showModal();
+    try {
+      const r = await fetch(`/api/events/${encodeURIComponent(eventId)}/history`);
+      if (!r.ok) throw new Error();
+      const data = await r.json();
+      
+      const ctx = document.getElementById('historyChart').getContext('2d');
+      if (currentChart) currentChart.destroy();
+      
+      const datasets = [];
+      const colors = ['#29e7d6', '#ffcf3f', '#ff4d2e', '#a020f0', '#00ff00', '#ff00ff'];
+      let cIdx = 0;
+      
+      const byOutcome = {};
+      for (const q of data.quotes) {
+        if (!byOutcome[q.outcome]) byOutcome[q.outcome] = [];
+        byOutcome[q.outcome].push({x: q.observed_at * 1000, y: q.probability * 100});
+      }
+      for (const [outcome, pts] of Object.entries(byOutcome)) {
+        datasets.push({ label: outcome + ' Prob (%)', data: pts, borderColor: colors[cIdx % colors.length], fill: false, stepped: true });
+        cIdx++;
+      }
+      
+      const homeScores = data.states.filter(s => s.home_score != null).map(s => ({x: s.observed_at * 1000, y: s.home_score}));
+      if (homeScores.length > 0) datasets.push({ label: 'Home Score', data: homeScores, borderColor: '#ffffff', borderDash: [5, 5], stepped: true });
+      
+      currentChart = new Chart(ctx, {
+        type: 'line', data: { datasets },
+        options: { responsive: true, maintainAspectRatio: false, scales: { x: { type: 'linear', ticks: { callback: v => new Date(v).toLocaleTimeString() } }, y: { min: 0 } }, animation: false }
+      });
+    } catch {
+      console.error("Failed to load chart");
+    }
+  }
+
+  document.querySelector("#events").addEventListener("click",async event=>{const removeEvent=event.target.closest("[data-remove-event]"),removePosition=event.target.closest("[data-remove-position]"),chartBtn=event.target.closest("[data-chart-event]");
     if(removeEvent){removeEvent.disabled=true;try{const response=await fetch(`/api/events/${encodeURIComponent(removeEvent.dataset.removeEvent)}`,{method:"DELETE"});if(response.ok){await refresh();await refreshMetrics()}}catch{}finally{removeEvent.disabled=false}}
-    if(removePosition){removePosition.disabled=true;try{const response=await fetch(`/api/events/${encodeURIComponent(removePosition.dataset.eventId)}/positions/${encodeURIComponent(removePosition.dataset.tokenId)}`,{method:"DELETE"});if(response.ok)await refresh()}catch{}finally{removePosition.disabled=false}}});
+    if(removePosition){removePosition.disabled=true;try{const response=await fetch(`/api/events/${encodeURIComponent(removePosition.dataset.eventId)}/positions/${encodeURIComponent(removePosition.dataset.tokenId)}`,{method:"DELETE"});if(response.ok)await refresh()}catch{}finally{removePosition.disabled=false}}
+    if(chartBtn){viewChart(chartBtn.dataset.chartEvent, chartBtn.dataset.chartTitle)}});
   let discoverGames = [];
   function discoverStatus(game){
     if(game.status==="live")return '<span class="g-live">● LIVE</span> ';

@@ -356,6 +356,13 @@ def event_view(event_id: str):
             "quote_points": len(store.quotes[event_id])}
 
 
+@app.get("/api/events/{event_id}/history", dependencies=[Depends(verify_auth)])
+async def get_event_history_api(event_id: str):
+    if history_db is None:
+        raise HTTPException(503, "History database not available")
+    return history_db.get_event_history(event_id)
+
+
 @app.get("/api/events/{event_id}", dependencies=[Depends(verify_auth)])
 async def get_event(event_id: str):
     return event_view(event_id)

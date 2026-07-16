@@ -127,3 +127,19 @@ class HistoryDB:
                  pregame_spread, pregame_total, home_score, away_score, status, now)
             )
             self._conn.commit()
+
+    def get_event_history(self, event_id: str) -> dict:
+        """Fetch chronological quotes and states for an event for charting."""
+        with self._lock:
+            quotes_cur = self._conn.execute(
+                "SELECT market, outcome, probability, observed_at FROM quotes_history WHERE event_id=? ORDER BY observed_at ASC", 
+                (event_id,)
+            )
+            states_cur = self._conn.execute(
+                "SELECT home_score, away_score, status, observed_at FROM states_history WHERE event_id=? ORDER BY observed_at ASC", 
+                (event_id,)
+            )
+            return {
+                "quotes": [dict(r) for r in quotes_cur.fetchall()],
+                "states": [dict(r) for r in states_cur.fetchall()]
+            }
