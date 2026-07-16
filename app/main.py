@@ -42,6 +42,7 @@ _finalized: set[str] = set()
 _pregame: dict[str, dict] = {}  # event_id -> {"spread": home point, "total": line}, captured near tip
 _subscribers: set[asyncio.Queue] = set()  # SSE clients for real-time dashboard pushes
 _sports_status: dict[str, dict] = {}  # latest public Polymarket sport_result by event slug
+_config_state = {"auto_monitor": False}
 
 
 def _notify_subscribers() -> None:
@@ -159,6 +160,26 @@ async def finalize_event(event_id: str) -> None:
     await asyncio.to_thread(_writes)
 
 
+async def auto_monitor_loop():
+    while True:
+        try:
+            if _config_state["auto_monitor"]:
+                games = await polymarket_sports_events(live_statuses=_sports_status)
+                for game in games:
+                    if game.get("status") == "live":
+                        slug = game.get("slug")
+                        if slug and not any(e.polymarket_slug == slug for e in store.events.values()):
+                            try:
+                                await add_event(EventIn(polymarket_url=f"https://polymarket.com/event/{slug}"))
+                            except Exception:
+                                pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global ledger, account_book
@@ -167,8 +188,10 @@ async def lifespan(_: FastAPI):
     account_book.seed(DEFAULT_STRATEGIES)
     sports_task = asyncio.create_task(polymarket_sports_stream(
         lambda: list(store.events.values()), on_state, on_sports_status))
+    auto_task = asyncio.create_task(auto_monitor_loop())
     yield
     sports_task.cancel()
+    auto_task.cancel()
     for group in tasks.values():
         for task in group:
             task.cancel()
@@ -210,6 +233,10 @@ class StrategyIn(BaseModel):
     start_bankroll: float = 10000.0
 
 
+class ConfigIn(BaseModel):
+    auto_monitor: bool
+
+
 @app.get("/")
 async def index():
     return FileResponse(Path(__file__).parent / "static" / "index.html")
@@ -223,7 +250,13 @@ async def watch():
 @app.get("/api/config")
 async def config():
     return {"confidence_threshold": engine.confidence_threshold, "edge_threshold": engine.edge_threshold,
-            "max_age_seconds": engine.max_age_seconds, "auto_betting": False}
+            "max_age_seconds": engine.max_age_seconds, "auto_monitor": _config_state["auto_monitor"]}
+
+
+@app.post("/api/config")
+async def update_config(payload: ConfigIn):
+    _config_state["auto_monitor"] = payload.auto_monitor
+    return await config()
 
 
 _discover_cache: dict = {"at": 0.0, "data": []}

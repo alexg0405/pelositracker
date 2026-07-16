@@ -232,7 +232,8 @@ def filter_sports_games(events: list[dict]) -> list[dict]:
 # tennis has hundreds of daily matches) can't crowd others out of a single
 # volume/date-ordered page. Override with DISCOVER_LEAGUES (comma-separated).
 _DEFAULT_LEAGUES = ("mlb", "nba", "wnba", "nfl", "nhl", "mls", "epl",
-                    "ufc", "tennis", "golf", "boxing", "nascar")
+                    "ufc", "tennis", "golf", "boxing", "nascar",
+                    "basketball", "football", "soccer", "esports")
 
 
 def _parse_iso(value) -> datetime | None:
