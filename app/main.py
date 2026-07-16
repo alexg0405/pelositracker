@@ -282,6 +282,11 @@ async def watch():
     return FileResponse(Path(__file__).parent / "static" / "watch.html")
 
 
+@app.get("/api/health")
+async def health():
+    return {"status": "ok"}
+
+
 @app.post("/api/login")
 async def login(response: Response, username: str = Form(...), password: str = Form(...)):
     for auth_u, auth_p in AUTHORIZED_USERS.items():
