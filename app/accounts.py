@@ -62,7 +62,7 @@ class Strategy:
     edge_threshold: float = 0.03
     confidence_threshold: float = 0.0
     min_sources: int = 2
-    markets: tuple = ("moneyline", "spread", "total")
+    markets: tuple = ("all",)
     sizing: str = "kelly"            # kelly | flat | flat_pct
     kelly_multiplier: float = 1.0
     flat_stake: float = 100.0
