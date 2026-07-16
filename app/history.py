@@ -1,6 +1,7 @@
 import asyncio
 import os
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import threading
 import time
 from typing import Iterable
@@ -16,37 +17,37 @@ CREATE TABLE IF NOT EXISTS event_outcomes (
     away TEXT,
     league TEXT,
     polymarket_slug TEXT,
-    pregame_spread REAL,
-    pregame_total REAL,
-    final_home_score REAL,
-    final_away_score REAL,
+    pregame_spread DOUBLE PRECISION,
+    pregame_total DOUBLE PRECISION,
+    final_home_score DOUBLE PRECISION,
+    final_away_score DOUBLE PRECISION,
     final_status TEXT,
-    settled_ts REAL
+    settled_ts DOUBLE PRECISION
 );
 
 CREATE TABLE IF NOT EXISTS quotes_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     event_id TEXT NOT NULL,
     market TEXT NOT NULL,
     outcome TEXT NOT NULL,
     source TEXT,
-    probability REAL NOT NULL,
-    ask REAL,
-    bid REAL,
-    liquidity REAL,
-    observed_at REAL NOT NULL
+    probability DOUBLE PRECISION NOT NULL,
+    ask DOUBLE PRECISION,
+    bid DOUBLE PRECISION,
+    liquidity DOUBLE PRECISION,
+    observed_at DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_quotes_event ON quotes_history(event_id, observed_at);
 
 CREATE TABLE IF NOT EXISTS states_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     event_id TEXT NOT NULL,
-    home_score REAL NOT NULL,
-    away_score REAL NOT NULL,
+    home_score DOUBLE PRECISION NOT NULL,
+    away_score DOUBLE PRECISION NOT NULL,
     period TEXT,
     clock TEXT,
     status TEXT,
-    observed_at REAL NOT NULL
+    observed_at DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_states_event ON states_history(event_id, observed_at);
 """
@@ -56,12 +57,15 @@ def _now() -> float:
 
 class HistoryDB:
     def __init__(self, path: str | None = None):
-        self.path = path or os.getenv("HISTORY_DB", "history.db")
-        self._conn = sqlite3.connect(self.path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+        self.path = path or os.getenv("DATABASE_URL")
+        if not self.path:
+            raise ValueError("DATABASE_URL environment variable is required for Supabase")
+        self._conn = psycopg2.connect(self.path)
+        self._conn.autocommit = False
         self._lock = threading.Lock()
         with self._lock:
-            self._conn.executescript(_SCHEMA)
+            with self._conn.cursor() as cur:
+                cur.execute(_SCHEMA)
             self._conn.commit()
             
         self._last_quote_time = {}
@@ -93,22 +97,25 @@ class HistoryDB:
             return
             
         with self._lock:
-            self._conn.executemany(
-                """INSERT INTO quotes_history 
-                   (event_id, market, outcome, source, probability, ask, bid, liquidity, observed_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)""", rows
-            )
+            with self._conn.cursor() as cur:
+                from psycopg2.extras import execute_batch
+                execute_batch(cur,
+                    """INSERT INTO quotes_history 
+                       (event_id, market, outcome, source, probability, ask, bid, liquidity, observed_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""", rows
+                )
             self._conn.commit()
 
     def log_state(self, state: GameState) -> None:
         with self._lock:
-            self._conn.execute(
-                """INSERT INTO states_history 
-                   (event_id, home_score, away_score, period, clock, status, observed_at)
-                   VALUES (?,?,?,?,?,?,?)""",
-                (state.event_id, state.home_score, state.away_score, 
-                 state.period, state.clock, state.status, state.observed_at.timestamp())
-            )
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO states_history 
+                       (event_id, home_score, away_score, period, clock, status, observed_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                    (state.event_id, state.home_score, state.away_score, 
+                     state.period, state.clock, state.status, state.observed_at.timestamp())
+                )
             self._conn.commit()
 
     def log_outcome(self, event: Event, pregame_spread: float | None, pregame_total: float | None, final_state: GameState | None) -> None:
@@ -118,28 +125,38 @@ class HistoryDB:
         status = final_state.status if final_state else None
         
         with self._lock:
-            self._conn.execute(
-                """INSERT OR REPLACE INTO event_outcomes 
-                   (event_id, name, sport, home, away, league, polymarket_slug, 
-                    pregame_spread, pregame_total, final_home_score, final_away_score, final_status, settled_ts)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (event.id, event.name, event.sport, event.home, event.away, event.league, event.polymarket_slug,
-                 pregame_spread, pregame_total, home_score, away_score, status, now)
-            )
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO event_outcomes 
+                       (event_id, name, sport, home, away, league, polymarket_slug, 
+                        pregame_spread, pregame_total, final_home_score, final_away_score, final_status, settled_ts)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT(event_id) DO UPDATE SET
+                         name=EXCLUDED.name, sport=EXCLUDED.sport, home=EXCLUDED.home, away=EXCLUDED.away,
+                         league=EXCLUDED.league, polymarket_slug=EXCLUDED.polymarket_slug,
+                         pregame_spread=EXCLUDED.pregame_spread, pregame_total=EXCLUDED.pregame_total,
+                         final_home_score=EXCLUDED.final_home_score, final_away_score=EXCLUDED.final_away_score,
+                         final_status=EXCLUDED.final_status, settled_ts=EXCLUDED.settled_ts""",
+                    (event.id, event.name, event.sport, event.home, event.away, event.league, event.polymarket_slug,
+                     pregame_spread, pregame_total, home_score, away_score, status, now)
+                )
             self._conn.commit()
 
     def get_event_history(self, event_id: str) -> dict:
         """Fetch chronological quotes and states for an event for charting."""
         with self._lock:
-            quotes_cur = self._conn.execute(
-                "SELECT market, outcome, probability, observed_at FROM quotes_history WHERE event_id=? ORDER BY observed_at ASC", 
-                (event_id,)
-            )
-            states_cur = self._conn.execute(
-                "SELECT home_score, away_score, status, observed_at FROM states_history WHERE event_id=? ORDER BY observed_at ASC", 
-                (event_id,)
-            )
-            return {
-                "quotes": [dict(r) for r in quotes_cur.fetchall()],
-                "states": [dict(r) for r in states_cur.fetchall()]
-            }
+            with self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute(
+                    "SELECT market, outcome, probability, observed_at FROM quotes_history WHERE event_id=%s ORDER BY observed_at ASC", 
+                    (event_id,)
+                )
+                quotes_rows = cur.fetchall()
+                cur.execute(
+                    "SELECT home_score, away_score, status, observed_at FROM states_history WHERE event_id=%s ORDER BY observed_at ASC", 
+                    (event_id,)
+                )
+                states_rows = cur.fetchall()
+                return {
+                    "quotes": [dict(r) for r in quotes_rows],
+                    "states": [dict(r) for r in states_rows]
+                }

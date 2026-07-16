@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import threading
 import time
 from dataclasses import asdict, dataclass, field, fields
@@ -29,27 +30,27 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
     name           TEXT PRIMARY KEY,
     strategy       TEXT NOT NULL,
-    start_bankroll REAL NOT NULL,
-    bankroll       REAL NOT NULL,
-    created_ts     REAL NOT NULL
+    start_bankroll DOUBLE PRECISION NOT NULL,
+    bankroll       DOUBLE PRECISION NOT NULL,
+    created_ts     DOUBLE PRECISION NOT NULL
 );
 CREATE TABLE IF NOT EXISTS account_bets (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    id          SERIAL PRIMARY KEY,
     account     TEXT NOT NULL,
     event_id    TEXT NOT NULL,
     event_name  TEXT,
     market      TEXT NOT NULL,
     outcome     TEXT NOT NULL,
-    entry_price REAL NOT NULL,
-    stake       REAL NOT NULL,
-    shares      REAL NOT NULL,
-    model_prob  REAL,
-    edge        REAL,
-    placed_ts   REAL NOT NULL,
+    entry_price DOUBLE PRECISION NOT NULL,
+    stake       DOUBLE PRECISION NOT NULL,
+    shares      DOUBLE PRECISION NOT NULL,
+    model_prob  DOUBLE PRECISION,
+    edge        DOUBLE PRECISION,
+    placed_ts   DOUBLE PRECISION NOT NULL,
     status      TEXT NOT NULL DEFAULT 'open',   -- open|win|loss|push|void
-    result      REAL,                            -- 1 win, 0 loss, NULL otherwise
-    pnl         REAL,
-    settled_ts  REAL,
+    result      DOUBLE PRECISION,                            -- 1 win, 0 loss, NULL otherwise
+    pnl         DOUBLE PRECISION,
+    settled_ts  DOUBLE PRECISION,
     UNIQUE(account, event_id, market, outcome)
 );
 """
@@ -171,15 +172,18 @@ def _now() -> float:
 
 
 class AccountBook:
-    """Thread-safe SQLite store of paper accounts and their bets."""
+    """Thread-safe PostgreSQL store of paper accounts and their bets."""
 
     def __init__(self, path: str | None = None):
-        self.path = path or os.getenv("ACCOUNTS_DB", os.getenv("LEDGER_DB", "ledger.db"))
-        self._conn = sqlite3.connect(self.path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+        self.path = path or os.getenv("DATABASE_URL")
+        if not self.path:
+            raise ValueError("DATABASE_URL environment variable is required for Supabase")
+        self._conn = psycopg2.connect(self.path)
+        self._conn.autocommit = False
         self._lock = threading.Lock()
         with self._lock:
-            self._conn.executescript(_SCHEMA)
+            with self._conn.cursor() as cur:
+                cur.execute(_SCHEMA)
             self._conn.commit()
 
     def close(self) -> None:
@@ -190,12 +194,13 @@ class AccountBook:
         """Create any missing preset accounts (idempotent)."""
         now = _now()
         with self._lock:
-            for strat in strategies:
-                self._conn.execute(
-                    """INSERT OR IGNORE INTO accounts (name, strategy, start_bankroll, bankroll, created_ts)
-                       VALUES (?,?,?,?,?)""",
-                    (strat.name, strat.to_json(), strat.start_bankroll, strat.start_bankroll, now),
-                )
+            with self._conn.cursor() as cur:
+                for strat in strategies:
+                    cur.execute(
+                        """INSERT INTO accounts (name, strategy, start_bankroll, bankroll, created_ts)
+                           VALUES (%s,%s,%s,%s,%s) ON CONFLICT (name) DO NOTHING""",
+                        (strat.name, strat.to_json(), strat.start_bankroll, strat.start_bankroll, now),
+                    )
             self._conn.commit()
 
     def place(self, event: Event, signals: list[Signal]) -> list[dict]:
@@ -203,25 +208,28 @@ class AccountBook:
         now = _now()
         placed_bets = []
         with self._lock:
-            accounts = self._conn.execute("SELECT name, strategy, bankroll FROM accounts").fetchall()
-            for account in accounts:
-                strategy = Strategy.from_json(account["strategy"])
-                bankroll = account["bankroll"]
-                for signal in signals:
-                    if signal.market_probability <= 0 or not qualifies(strategy, signal):
-                        continue
-                    stake = stake_for(strategy, signal, bankroll)
-                    if stake < 1.0:  # dust or out of funds
-                        continue
-                    cur = self._conn.execute(
-                        """INSERT OR IGNORE INTO account_bets
-                           (account, event_id, event_name, market, outcome, entry_price, stake,
-                            shares, model_prob, edge, placed_ts, status)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?, 'open')""",
-                        (account["name"], event.id, event.name, signal.market, signal.outcome,
-                         signal.market_probability, stake, stake / signal.market_probability,
-                         signal.model_probability, signal.edge, now),
-                    )
+            with self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute("SELECT name, strategy, bankroll FROM accounts")
+                accounts = cur.fetchall()
+                for account in accounts:
+                    strategy = Strategy.from_json(account["strategy"])
+                    bankroll = account["bankroll"]
+                    for signal in signals:
+                        if signal.market_probability <= 0 or not qualifies(strategy, signal):
+                            continue
+                        stake = stake_for(strategy, signal, bankroll)
+                        if stake < 1.0:  # dust or out of funds
+                            continue
+                        cur.execute(
+                            """INSERT INTO account_bets
+                               (account, event_id, event_name, market, outcome, entry_price, stake,
+                                shares, model_prob, edge, placed_ts, status)
+                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, 'open')
+                               ON CONFLICT (account, event_id, market, outcome) DO NOTHING""",
+                            (account["name"], event.id, event.name, signal.market, signal.outcome,
+                             signal.market_probability, stake, stake / signal.market_probability,
+                             signal.model_probability, signal.edge, now),
+                        )
                     if cur.rowcount:
                         bankroll -= stake
                         placed_bets.append({
@@ -235,7 +243,7 @@ class AccountBook:
                             "entry_price": signal.market_probability,
                             "edge": signal.edge,
                         })
-                        self._conn.execute("UPDATE accounts SET bankroll=? WHERE name=?",
+                        cur.execute("UPDATE accounts SET bankroll=%s WHERE name=%s",
                                            (bankroll, account["name"]))
             if placed_bets:
                 self._conn.commit()
@@ -246,9 +254,11 @@ class AccountBook:
         now = _now()
         settled = 0
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM account_bets WHERE event_id=? AND status='open'", (event.id,)
-            ).fetchall()
+            with self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM account_bets WHERE event_id=%s AND status='open'", (event.id,)
+                )
+                rows = cur.fetchall()
             credits: dict[str, float] = {}
             updates = []
             for row in rows:
@@ -264,32 +274,36 @@ class AccountBook:
                 updates.append((verdict, result, pnl, now, row["id"]))
                 settled += 1
             if updates:
-                self._conn.executemany(
-                    "UPDATE account_bets SET status=?, result=?, pnl=?, settled_ts=? WHERE id=?", updates
+                from psycopg2.extras import execute_batch
+                execute_batch(cur,
+                    "UPDATE account_bets SET status=%s, result=%s, pnl=%s, settled_ts=%s WHERE id=%s", updates
                 )
                 for name, credit in credits.items():
-                    self._conn.execute("UPDATE accounts SET bankroll=bankroll+? WHERE name=?",
+                    cur.execute("UPDATE accounts SET bankroll=bankroll+%s WHERE name=%s",
                                        (credit, name))
-                self._conn.commit()
+            self._conn.commit()
         return settled
 
     def leaderboard(self) -> list[dict]:
         with self._lock:
-            accounts = self._conn.execute("SELECT * FROM accounts").fetchall()
-            board = []
-            for account in accounts:
-                agg = self._conn.execute(
-                    """SELECT
-                         COUNT(*) AS n_bets,
-                         SUM(status='open') AS n_open,
-                         SUM(status IN ('win','loss','push','void')) AS n_settled,
-                         SUM(status='win') AS wins,
-                         SUM(status='loss') AS losses,
-                         COALESCE(SUM(CASE WHEN status='open' THEN stake ELSE 0 END), 0) AS open_stake,
-                         COALESCE(SUM(pnl), 0) AS realized_pnl
-                       FROM account_bets WHERE account=?""",
-                    (account["name"],),
-                ).fetchone()
+            with self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute("SELECT * FROM accounts")
+                accounts = cur.fetchall()
+                board = []
+                for account in accounts:
+                    cur.execute(
+                        """SELECT
+                             COUNT(*) AS n_bets,
+                             COALESCE(SUM(CASE WHEN status='open' THEN 1 ELSE 0 END), 0) AS n_open,
+                             COALESCE(SUM(CASE WHEN status IN ('win','loss','push','void') THEN 1 ELSE 0 END), 0) AS n_settled,
+                             COALESCE(SUM(CASE WHEN status='win' THEN 1 ELSE 0 END), 0) AS wins,
+                             COALESCE(SUM(CASE WHEN status='loss' THEN 1 ELSE 0 END), 0) AS losses,
+                             COALESCE(SUM(CASE WHEN status='open' THEN stake ELSE 0 END), 0) AS open_stake,
+                             COALESCE(SUM(pnl), 0) AS realized_pnl
+                           FROM account_bets WHERE account=%s""",
+                        (account["name"],),
+                    )
+                    agg = cur.fetchone()
                 start = account["start_bankroll"]
                 equity = account["bankroll"] + agg["open_stake"]
                 decided = (agg["wins"] or 0) + (agg["losses"] or 0)
@@ -314,14 +328,17 @@ class AccountBook:
 
     def account_bets(self, name: str, limit: int = 100) -> list[dict]:
         with self._lock:
-            return [dict(r) for r in self._conn.execute(
-                "SELECT * FROM account_bets WHERE account=? ORDER BY placed_ts DESC LIMIT ?",
-                (name, limit))]
+            with self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM account_bets WHERE account=%s ORDER BY placed_ts DESC LIMIT %s",
+                    (name, limit))
+                return [dict(r) for r in cur.fetchall()]
 
     def reset(self, strategies: list[Strategy]) -> None:
         """Wipe all bets and restore every account to its starting bankroll."""
         with self._lock:
-            self._conn.execute("DELETE FROM account_bets")
-            self._conn.execute("DELETE FROM accounts")
+            with self._conn.cursor() as cur:
+                cur.execute("DELETE FROM account_bets")
+                cur.execute("DELETE FROM accounts")
             self._conn.commit()
         self.seed(strategies)
