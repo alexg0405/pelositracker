@@ -560,10 +560,10 @@
   });
 
   // Only start the app data fetching after successful login or if already authenticated.
-  // We check if the config endpoint succeeds. If so, we are logged in, hide overlay immediately.
+  // We check if the events endpoint succeeds. If so, we are logged in, hide overlay immediately.
   async function checkAuthAndStart() {
     try {
-      const r = await fetch("/api/config");
+      const r = await fetch("/api/events");
       if (r.ok) {
         document.querySelector("#login-overlay").style.display = "none";
         startApp();
