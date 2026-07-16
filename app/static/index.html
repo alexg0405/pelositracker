@@ -84,6 +84,10 @@
       <div class="config" id="config">Loading thresholds…</div>
     </div>
   </header>
+  <section class="panel metrics-panel" aria-labelledby="leaderboard-heading" style="border-color: var(--cyan); background: linear-gradient(180deg, rgba(41,231,214,.05), transparent), var(--panel);">
+    <div class="metrics-head"><h2 class="title" id="leaderboard-heading" style="color: var(--cyan)">Strategy Calibration · Dummy Accounts</h2></div>
+    <div id="leaderboard-body" aria-live="polite"></div>
+  </section>
   <section class="panel metrics-panel" aria-labelledby="metrics-heading">
     <div class="metrics-head"><h2 class="title" id="metrics-heading">Truth loop · CLV &amp; calibration</h2><span class="metrics-sub" id="metrics-sub"></span></div>
     <div id="metrics-body" aria-live="polite"></div>
@@ -242,6 +246,7 @@
   function metricTile(key,value,cls="",sub="") { return `<div class="mtile"><div class="k">${key}</div><div class="v ${cls}">${value}</div>${sub?`<div class="sub2">${sub}</div>`:""}</div>`; }
   function reliabilityView(bins) { if(!bins?.length)return "";const columns=bins.map(bin=>`<div class="rbin" title="predicted ${pct(bin.mean_predicted)} · actual ${pct(bin.empirical_rate)} · n=${bin.count}"><div class="rtrack"><div class="remp" style="height:${(bin.empirical_rate*100).toFixed(1)}%"></div><div class="rpred" style="bottom:${(bin.mean_predicted*100).toFixed(1)}%"></div></div><div class="rlabel">${Math.round(bin.lo*100)}</div></div>`).join("");return `<div class="reliability">${columns}</div><div class="metrics-sub">Bar = actual win rate · line = predicted probability</div>`; }
   async function refreshMetrics() { const body=document.querySelector("#metrics-body"),sub=document.querySelector("#metrics-sub");try{const response=await fetch("/api/metrics");if(!response.ok)return;const m=await response.json();if(!m?.n_bets){sub.textContent="";body.innerHTML='<div class="metrics-empty">No paper bets logged yet. CLV and calibration appear after qualified signals and event closes.</div>';return}const clv=m.clv||{},model=m.model||{},base=m.market_baseline||{};sub.textContent=`${m.n_bets} paper bet(s) · ${m.n_settled} settled`;const tiles=[metricTile("Beat close",clv.beat_close_rate==null?"—":pct(clv.beat_close_rate),clv.beat_close_rate>=.5?"good":"bad",clv.n?`n=${clv.n}`:"awaiting closes"),metricTile("Mean CLV",clv.mean_clv==null?"—":signedCents(clv.mean_clv),clv.mean_clv>=0?"good":"bad","vs closing fair"),metricTile("Settled",String(m.n_settled),"","moneyline"),metricTile("Model Brier",model.brier==null?"—":model.brier.toFixed(3),model.brier!=null&&base.brier!=null&&model.brier<base.brier?"good":"",base.brier==null?"awaiting settle":`market ${base.brier.toFixed(3)}`)];if(model.log_loss!=null)tiles.push(metricTile("Log loss",model.log_loss.toFixed(3)));if(model.ece!=null)tiles.push(metricTile("ECE",model.ece.toFixed(3),"","calibration gap"));body.innerHTML=`<div class="metric-tiles">${tiles.join("")}</div>`+reliabilityView(m.reliability)}catch{}}
+  async function refreshLeaderboard() { const body=document.querySelector("#leaderboard-body");try{const r=await fetch("/api/leaderboard");if(!r.ok)return;const lb=await r.json();if(!lb.length){body.innerHTML='<div class="metrics-empty">No dummy accounts seeded.</div>';return}const cols=lb.map(a=>`<div class="mtile" title="${esc(a.strategy)}"><div class="k" style="color:var(--cyan)">${esc(a.name)}</div><div class="v ${a.roi>=0?"good":"bad"}">${pct(a.roi)}</div><div class="sub2">$${a.equity.toFixed(2)} eq · ${a.win_rate==null?"—":pct(a.win_rate)} WR</div><div class="sub2" style="margin-top:2px">${a.n_bets} bets (${a.wins}W-${a.losses}L)</div></div>`).join("");body.innerHTML=`<div class="metric-tiles">${cols}</div>`;}catch{} }
   function renderEvents(events) {
     // Don't stomp a position form the user is actively editing.
     if (document.activeElement?.closest("[data-save-position]")) return;
@@ -321,7 +326,7 @@
   document.querySelector("#line-filter").addEventListener("click",e=>{const p=e.target.closest("[data-line]");if(!p)return;activeLine=p.dataset.line;renderEvents(lastEvents);});
 
   fetch("/api/config").then(r=>r.json()).then(c=>document.querySelector("#config").textContent=`Quality ≥ ${c.confidence_threshold} · Base edge ≥ ${(c.edge_threshold*100).toFixed(1)}%`).catch(()=>document.querySelector("#config").textContent="Thresholds unavailable");
-  refresh();refreshMetrics();startStream();loadDiscover();setInterval(refresh,10000);setInterval(refreshMetrics,5000);setInterval(loadDiscover,60000);
+  refresh();refreshMetrics();refreshLeaderboard();startStream();loadDiscover();setInterval(refresh,10000);setInterval(refreshMetrics,5000);setInterval(refreshLeaderboard,5000);setInterval(loadDiscover,60000);
 </script>
 </body>
 </html>
