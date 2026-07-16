@@ -108,7 +108,7 @@
         </details>
         <button class="primary" id="submit-event" type="submit">Monitor actionable markets</button>
       </form>
-      <button class="ghost" id="demo" type="button">Launch paper demo</button>
+
       <p class="note">Only markets accepting orders with an executable ask are shown. Availability and legality vary by location. Entry, hold, and cash guidance is heuristic research output—not a guarantee or instruction to wager.</p>
       <div class="browse" style="margin-top: 24px; padding-top: 16px; border-top: 1px dashed var(--line);">
         <h2 class="title">Create Custom Bot</h2>
@@ -368,7 +368,7 @@
     finally { btn.disabled = false; }
   });
 
-  document.querySelector("#demo").addEventListener("click",async event=>{const box=document.querySelector("#form-error");event.currentTarget.disabled=true;box.hidden=true;try{const r=await fetch("/api/demo",{method:"POST"});if(!r.ok)throw new Error("Could not launch demo");await refresh();await refreshMetrics()}catch(error){box.textContent=error.message;box.hidden=false}finally{event.currentTarget.disabled=false}});
+
   document.querySelector("#events").addEventListener("submit",async event=>{const form=event.target.closest("[data-save-position]");if(!form)return;event.preventDefault();const button=form.querySelector("button"),data=new FormData(form);button.disabled=true;document.querySelector("#action-error").hidden=true;
     const payload={token_id:form.dataset.tokenId,market:form.dataset.market,outcome:form.dataset.outcome,shares:Number(data.get("shares")),avg_entry_price:Number(data.get("entry_cents"))/100};
     try{const response=await fetch(`/api/events/${encodeURIComponent(form.dataset.eventId)}/positions`,{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify(payload)});const body=await response.json().catch(()=>({}));if(!response.ok)throw new Error(body.detail||"Could not save position");document.activeElement.blur();await refresh()}

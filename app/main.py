@@ -213,7 +213,6 @@ class EventIn(BaseModel):
     polymarket_slug: str | None = None
     odds_api_sport: str | None = None
     odds_api_event_id: str | None = None
-    demo: bool = False
 
 
 class PositionIn(BaseModel):
@@ -330,7 +329,7 @@ async def get_event(event_id: str):
 
 @app.post("/api/events", status_code=201)
 async def add_event(payload: EventIn):
-    values = payload.model_dump(exclude={"demo"})
+    values = payload.model_dump()
     link_or_slug = payload.polymarket_url or payload.polymarket_slug
     if link_or_slug:
         try:
@@ -378,8 +377,6 @@ async def add_event(payload: EventIn):
     _require_safe_id(values.get("odds_api_event_id"), "odds_api_event_id")
     event = store.add_event(Event(**values))
     group = []
-    if payload.demo:
-        group.append(asyncio.create_task(demo_stream(event, on_state, on_quotes)))
     if event.polymarket_slug:
         group.append(asyncio.create_task(polymarket_market_stream(event, on_quotes)))
     if event.odds_api_sport:
@@ -476,7 +473,3 @@ async def delete_event(event_id: str):
     _notify_subscribers()
 
 
-@app.post("/api/demo", status_code=201)
-async def add_demo():
-    return await add_event(EventIn(name="Demo: Harbor Hawks vs Metro Foxes", sport="basketball",
-                                   league="demo", home="Harbor Hawks", away="Metro Foxes", demo=True))
