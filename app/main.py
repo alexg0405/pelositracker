@@ -7,9 +7,10 @@ import re
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import secrets
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response, Depends, Form
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
@@ -46,6 +47,13 @@ _subscribers: set[asyncio.Queue] = set()  # SSE clients for real-time dashboard 
 _sports_status: dict[str, dict] = {}  # latest public Polymarket sport_result by event slug
 _config_state = {"auto_monitor": False}
 
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
+AUTH_TOKEN = secrets.token_urlsafe(32)
+
+async def verify_auth(request: Request):
+    if request.cookies.get("auth_token") != AUTH_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 def _notify_subscribers() -> None:
     """Wake every SSE client that a snapshot changed (coalesced per client)."""
@@ -258,13 +266,27 @@ async def watch():
     return FileResponse(Path(__file__).parent / "static" / "watch.html")
 
 
-@app.get("/api/config")
+@app.post("/api/login")
+async def login(response: Response, username: str = Form(...), password: str = Form(...)):
+    if secrets.compare_digest(username, ADMIN_USERNAME) and secrets.compare_digest(password, ADMIN_PASSWORD):
+        response.set_cookie(key="auth_token", value=AUTH_TOKEN, httponly=True, samesite="strict")
+        return {"status": "ok"}
+    raise HTTPException(status_code=401, detail="Invalid credentials")
+
+
+@app.post("/api/logout")
+async def logout(response: Response):
+    response.delete_cookie("auth_token")
+    return {"status": "ok"}
+
+
+@app.get("/api/config", dependencies=[Depends(verify_auth)])
 async def config():
     return {"confidence_threshold": engine.confidence_threshold, "edge_threshold": engine.edge_threshold,
             "max_age_seconds": engine.max_age_seconds, "auto_monitor": _config_state["auto_monitor"]}
 
 
-@app.post("/api/config")
+@app.post("/api/config", dependencies=[Depends(verify_auth)])
 async def update_config(payload: ConfigIn):
     _config_state["auto_monitor"] = payload.auto_monitor
     return await config()
@@ -273,7 +295,7 @@ async def update_config(payload: ConfigIn):
 _discover_cache: dict = {"at": 0.0, "data": []}
 
 
-@app.get("/api/discover")
+@app.get("/api/discover", dependencies=[Depends(verify_auth)])
 async def discover():
     """Browse live/upcoming Polymarket sports games to add without a link."""
     now = time.monotonic()
@@ -287,7 +309,7 @@ async def discover():
     return games
 
 
-@app.get("/api/events")
+@app.get("/api/events", dependencies=[Depends(verify_auth)])
 async def list_events():
     return [event_view(event.id) for event in store.events.values()]
 
@@ -297,7 +319,7 @@ def _events_snapshot_sse() -> str:
     return f"data: {payload}\n\n"
 
 
-@app.get("/api/stream")
+@app.get("/api/stream", dependencies=[Depends(verify_auth)])
 async def stream():
     """Server-Sent Events: push the events snapshot the instant data changes."""
     async def generator():
@@ -334,12 +356,12 @@ def event_view(event_id: str):
             "quote_points": len(store.quotes[event_id])}
 
 
-@app.get("/api/events/{event_id}")
+@app.get("/api/events/{event_id}", dependencies=[Depends(verify_auth)])
 async def get_event(event_id: str):
     return event_view(event_id)
 
 
-@app.post("/api/events", status_code=201)
+@app.post("/api/events", status_code=201, dependencies=[Depends(verify_auth)])
 async def add_event(payload: EventIn):
     values = payload.model_dump()
     link_or_slug = payload.polymarket_url or payload.polymarket_slug
@@ -398,7 +420,7 @@ async def add_event(payload: EventIn):
     return event_view(event.id)
 
 
-@app.put("/api/events/{event_id}/positions")
+@app.put("/api/events/{event_id}/positions", dependencies=[Depends(verify_auth)])
 async def save_position(event_id: str, payload: PositionIn):
     if event_id not in store.events:
         raise HTTPException(404, "event not found")
@@ -414,28 +436,28 @@ async def save_position(event_id: str, payload: PositionIn):
     return event_view(event_id)
 
 
-@app.delete("/api/events/{event_id}/positions/{token_id}", status_code=204)
+@app.delete("/api/events/{event_id}/positions/{token_id}", status_code=204, dependencies=[Depends(verify_auth)])
 async def remove_position(event_id: str, token_id: str):
     if ledger is None or not ledger.delete_position(event_id, token_id):
         raise HTTPException(404, "position not found")
     _notify_subscribers()
 
 
-@app.get("/api/metrics")
+@app.get("/api/metrics", dependencies=[Depends(verify_auth)])
 async def metrics():
     if ledger is None:
         return {"n_bets": 0, "n_settled": 0}
     return backtest.summary(ledger.all_bets())
 
 
-@app.get("/api/leaderboard")
+@app.get("/api/leaderboard", dependencies=[Depends(verify_auth)])
 async def get_leaderboard():
     if account_book is None:
         return []
     return account_book.leaderboard()
 
 
-@app.post("/api/accounts", status_code=201)
+@app.post("/api/accounts", status_code=201, dependencies=[Depends(verify_auth)])
 async def create_account(payload: StrategyIn):
     if account_book is None:
         raise HTTPException(503, "Account book is not initialized")
@@ -453,21 +475,21 @@ async def create_account(payload: StrategyIn):
     return {"status": "ok"}
 
 
-@app.get("/api/accounts/{name}/bets")
+@app.get("/api/accounts/{name}/bets", dependencies=[Depends(verify_auth)])
 async def get_account_bets(name: str):
     if account_book is None:
         return []
     return account_book.account_bets(name)
 
 
-@app.get("/api/bets")
+@app.get("/api/bets", dependencies=[Depends(verify_auth)])
 async def bets(event_id: str | None = None):
     if ledger is None:
         return []
     return ledger.event_bets(event_id) if event_id else ledger.all_bets()
 
 
-@app.delete("/api/events/{event_id}", status_code=204)
+@app.delete("/api/events/{event_id}", status_code=204, dependencies=[Depends(verify_auth)])
 async def delete_event(event_id: str):
     if event_id not in store.events:
         raise HTTPException(404, "event not found")
