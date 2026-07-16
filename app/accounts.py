@@ -230,21 +230,21 @@ class AccountBook:
                              signal.market_probability, stake, stake / signal.market_probability,
                              signal.model_probability, signal.edge, now),
                         )
-                    if cur.rowcount:
-                        bankroll -= stake
-                        placed_bets.append({
-                            "bot_name": account["name"],
-                            "webhook_url": strategy.webhook_url,
-                            "event_name": event.name,
-                            "market": signal.market,
-                            "outcome": signal.outcome,
-                            "action": "PAPER_BET",
-                            "stake": stake,
-                            "entry_price": signal.market_probability,
-                            "edge": signal.edge,
-                        })
-                        cur.execute("UPDATE accounts SET bankroll=%s WHERE name=%s",
-                                           (bankroll, account["name"]))
+                        if cur.rowcount:
+                            bankroll -= stake
+                            placed_bets.append({
+                                "bot_name": account["name"],
+                                "webhook_url": strategy.webhook_url,
+                                "event_name": event.name,
+                                "market": signal.market,
+                                "outcome": signal.outcome,
+                                "action": "PAPER_BET",
+                                "stake": stake,
+                                "entry_price": signal.market_probability,
+                                "edge": signal.edge,
+                            })
+                            cur.execute("UPDATE accounts SET bankroll=%s WHERE name=%s",
+                                               (bankroll, account["name"]))
             if placed_bets:
                 self._conn.commit()
         return placed_bets
