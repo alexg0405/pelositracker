@@ -302,7 +302,7 @@ async def logout(response: Response):
     return {"status": "ok"}
 
 
-@app.get("/api/config", dependencies=[Depends(verify_auth)])
+@app.get("/api/config")
 async def config():
     return {"confidence_threshold": engine.confidence_threshold, "edge_threshold": engine.edge_threshold,
             "max_age_seconds": engine.max_age_seconds, "auto_monitor": _config_state["auto_monitor"]}
