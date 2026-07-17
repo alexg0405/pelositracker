@@ -21,7 +21,7 @@ def implied_probability(american: int | None) -> float:
 async def _ensure_books(client: httpx.AsyncClient):
     if not _book_map:
         try:
-            r = await client.get("https://api.actionnetwork.com/web/v1/books")
+            r = await client.get("https://api.actionnetwork.com/web/v1/books", headers={"User-Agent": "Mozilla/5.0"})
             if r.status_code == 200:
                 for b in r.json().get("books", []):
                     _book_map[b["id"]] = b["display_name"]
@@ -62,10 +62,11 @@ def parse_action_quotes(event: Event, game: dict) -> list[Quote]:
         spread_home = odds.get("spread_home")
         spread_home_line = odds.get("spread_home_line")
         if spread_home is not None and spread_home_line is not None and spread_home_line != 0:
+            outcome_str = f"{event.home} {spread_home:g}" if spread_home < 0 else f"{event.home} +{spread_home:g}"
             quotes.append(Quote(
                 event_id=event.id,
-                market=f"spread_{spread_home:g}",
-                outcome=event.home,
+                market="spread",
+                outcome=outcome_str,
                 probability=implied_probability(spread_home_line),
                 source=source,
             ))
@@ -73,10 +74,11 @@ def parse_action_quotes(event: Event, game: dict) -> list[Quote]:
         spread_away = odds.get("spread_away")
         spread_away_line = odds.get("spread_away_line")
         if spread_away is not None and spread_away_line is not None and spread_away_line != 0:
+            outcome_str = f"{event.away} {spread_away:g}" if spread_away < 0 else f"{event.away} +{spread_away:g}"
             quotes.append(Quote(
                 event_id=event.id,
-                market=f"spread_{spread_away:g}",
-                outcome=event.away,
+                market="spread",
+                outcome=outcome_str,
                 probability=implied_probability(spread_away_line),
                 source=source,
             ))
@@ -88,16 +90,16 @@ def parse_action_quotes(event: Event, game: dict) -> list[Quote]:
             if over_line is not None and over_line != 0:
                 quotes.append(Quote(
                     event_id=event.id,
-                    market=f"total_{total:g}",
-                    outcome="Over",
+                    market="total",
+                    outcome=f"Over {total:g}",
                     probability=implied_probability(over_line),
                     source=source,
                 ))
             if under_line is not None and under_line != 0:
                 quotes.append(Quote(
                     event_id=event.id,
-                    market=f"total_{total:g}",
-                    outcome="Under",
+                    market="total",
+                    outcome=f"Under {total:g}",
                     probability=implied_probability(under_line),
                     source=source,
                 ))
