@@ -332,13 +332,20 @@ async def discover():
     return games
 
 
+def _sort_events_by_edge():
+    events = list(store.events.values())
+    def max_edge(event):
+        signals = store.signals.get(event.id, [])
+        return max((s.edge for s in signals if s.edge is not None), default=0.0)
+    events.sort(key=max_edge, reverse=True)
+    return events
+
 @app.get("/api/events", dependencies=[Depends(verify_auth)])
 async def list_events():
-    return [event_view(event.id) for event in store.events.values()]
-
+    return [event_view(event.id) for event in _sort_events_by_edge()]
 
 def _events_snapshot_sse() -> str:
-    payload = json.dumps([event_view(event.id) for event in store.events.values()], default=str)
+    payload = json.dumps([event_view(event.id) for event in _sort_events_by_edge()], default=str)
     return f"data: {payload}\n\n"
 
 
