@@ -14,6 +14,7 @@ import httpx
 import websockets
 
 from .models import Event, GameState, Quote
+from .matching import closest_start
 
 
 logger = logging.getLogger(__name__)
@@ -79,8 +80,10 @@ def infer_polymarket_event(data: dict) -> dict[str, str | None]:
     matchup = re.split(r"\s+(?:vs\.?|at)\s+", title, maxsplit=1, flags=re.IGNORECASE)
     if len(matchup) == 2:
         away, home = matchup[0].strip(), matchup[1].strip()
+    game_start = next((str(market.get("gameStartTime")) for market in data.get("markets", [])
+                       if market.get("gameStartTime")), None)
     return {"name": title, "sport": sport, "away": away, "home": home,
-            "odds_api_sport": odds_sport}
+            "odds_api_sport": odds_sport, "game_start": game_start}
 
 
 def canonical_market(value: str) -> str:
@@ -92,6 +95,112 @@ def canonical_market(value: str) -> str:
     if lowered in {"totals", "total", "over_under"}:
         return "total"
     return value or "market"
+
+
+def _format_line(value: float) -> str:
+    """Render provider line numbers the same way across every quote adapter."""
+    return f"{value:g}"
+
+
+def _format_signed_line(value: float) -> str:
+    return f"{0.0 if abs(value) < 1e-9 else value:+g}"
+
+
+def _polymarket_outcome_labels(market_type: str, outcomes: list, line: float | None) -> list[str]:
+    """Expand Gamma's line metadata into comparable selection labels.
+
+    Polymarket keeps the handicap/total in ``market.line`` while its token
+    outcomes are just team names or ``Over``/``Under``. Sportsbook adapters put
+    the line in the outcome label. Without this normalization the two feeds can
+    never join, so every Polymarket spread/total reports zero references.
+    """
+    labels = [str(outcome).strip() for outcome in outcomes]
+    if line is None:
+        return labels
+    if market_type == "total":
+        return [f"{label} {_format_line(abs(line))}" for label in labels]
+    if market_type == "spread" and labels:
+        # Gamma's first outcome is the team named by the spread market and
+        # ``line`` is that team's handicap. The opposing outcome gets -line.
+        normalized = [f"{labels[0]} {_format_signed_line(line)}"]
+        normalized.extend(f"{label} {_format_signed_line(-line)}" for label in labels[1:])
+        return normalized
+    return labels
+
+
+_PROP_OU_RE = re.compile(
+    r"^(?P<player>.+?):\s*(?P<stat>.+?)\s+O/U\s+(?P<line>[+-]?\d+(?:\.\d+)?)\s*$",
+    re.IGNORECASE,
+)
+_SCOPED_MAINLINE_RE = re.compile(
+    r"\b(?:(?:1st|first|2nd|second|3rd|third|4th|fourth)\s+"
+    r"(?:half|quarter|period|inning)|(?:first|1st)\s+(?:five|5)\s+innings|[12]h)\b",
+    re.IGNORECASE,
+)
+_PROP_STAT_ALIASES = {
+    "three pointers": "threes",
+    "3 pointers": "threes",
+    "three point field goals": "threes",
+}
+
+
+def _polymarket_selections(market: dict, market_type: str, outcomes: list,
+                           line: float | None) -> list[tuple[str, str]]:
+    """Build comparison-safe display identities for one Gamma market.
+
+    Gamma uses both conventional multi-outcome books and separate Yes/No
+    conditions.  The latter must be translated before joining to sportsbook
+    selections; otherwise unrelated ``Yes`` tokens collapse into one market.
+    """
+    question = str(market.get("question") or market.get("groupItemTitle") or "Market").strip()
+    group = str(market.get("groupItemTitle") or "").strip()
+    labels = [str(outcome).strip() for outcome in outcomes]
+    binary = labels and all(label.casefold() in {"yes", "no"} for label in labels)
+
+    # Soccer 1X2 is represented as three independent binary conditions.  The
+    # affirmative tokens map to the normal home/away/draw market.  A negative
+    # token means "any of the other outcomes", so it intentionally remains a
+    # unique condition and can never be compared to one sportsbook leg.
+    if market_type == "moneyline" and binary and group:
+        affirmative = "Draw" if group.casefold().startswith("draw") else group
+        return [
+            ("moneyline", affirmative)
+            if label.casefold() == "yes"
+            else ("moneyline condition", f"Not {affirmative}")
+            for label in labels
+        ]
+
+    # Real Gamma player props use Yes/No plus a line, while sportsbook feeds
+    # use Over/Under.  Only translate an anchored ``PLAYER: STAT O/U N`` shape
+    # whose printed number agrees with Gamma's numeric line.
+    if binary and line is not None and market_type not in {"moneyline", "spread", "total", "market"}:
+        match = next(
+            (candidate for raw in (group, question) if raw
+             and (candidate := _PROP_OU_RE.match(raw)) is not None),
+            None,
+        )
+        if match and abs(float(match.group("line")) - line) < 1e-9:
+            player = match.group("player").strip()
+            stat = market_type.replace("_", " ").strip().casefold()
+            stat = _PROP_STAT_ALIASES.get(stat, stat)
+            prop_market = f"{player} — {stat}"
+            return [
+                (prop_market,
+                 f"{'Over' if label.casefold() == 'yes' else 'Under'} {_format_line(line)}")
+                for label in labels
+            ]
+
+    expanded = _polymarket_outcome_labels(market_type, labels, line)
+
+    # Do not let first-half/period/inning mainlines borrow full-game prices.
+    if market_type in {"moneyline", "spread", "total"} and _SCOPED_MAINLINE_RE.search(question):
+        return [(question, label) for label in expanded]
+
+    # Every unrecognized binary condition gets its own market identity.  This
+    # is deliberately MARKET ONLY until a verified external mapping exists.
+    if binary:
+        return [(question, label) for label in labels]
+    return [(market_type, label) for label in expanded]
 
 
 def parse_jsonish(value):
@@ -133,6 +242,13 @@ def _best_level_size(change: dict) -> float | None:
             total += size
             seen = True
     return total if seen else None
+
+
+def _visible_liquidity(bid_size: float | None, ask_size: float | None) -> float | None:
+    """Return known top-of-book depth without turning unknown depth into zero."""
+    if bid_size is None and ask_size is None:
+        return None
+    return (bid_size or 0.0) + (ask_size or 0.0)
 
 
 async def polymarket_event(slug: str) -> dict:
@@ -215,6 +331,7 @@ def filter_sports_games(events: list[dict]) -> list[dict]:
         # Real first-pitch/tip time lives on the market (top-level startDate is
         # just when the market was created).
         game_start = next((m.get("gameStartTime") for m in markets if m.get("gameStartTime")), None)
+        inferred = infer_polymarket_event(event)
         provider_status = next((sports_game_status(m) for m in markets if sports_game_status(m)),
                                sports_game_status(event))
         games.append({
@@ -224,6 +341,7 @@ def filter_sports_games(events: list[dict]) -> list[dict]:
             "game_start": game_start,
             "provider_status": provider_status,
             "restricted": bool(event.get("restricted", False)),
+            "reference_adapter": bool(inferred.get("odds_api_sport")),
         })
     return games
 
@@ -326,7 +444,8 @@ async def polymarket_sports_events(limit_per_league: int = 100,
     return ranked[:80]  # live first, then soonest — keep the picker manageable
 
 
-async def match_odds_api_event(sport_key: str | None, title: str) -> dict | None:
+async def match_odds_api_event(sport_key: str | None, title: str,
+                               game_start: str | None = None) -> dict | None:
     """Match a Polymarket sports title to The Odds API's quota-free events list."""
     key = os.getenv("THE_ODDS_API_KEY")
     if not key or not sport_key:
@@ -349,7 +468,11 @@ async def match_odds_api_event(sport_key: str | None, title: str) -> dict | None
     if not ranked:
         return None
     ranked.sort(key=lambda item: item[0], reverse=True)
-    return ranked[0][1] if ranked[0][0] >= 2 else None
+    if ranked[0][0] < 2:
+        return None
+    best_score = ranked[0][0]
+    candidates = [game for score, game in ranked if score == best_score]
+    return closest_start(candidates, game_start, lambda game: game.get("commence_time"))
 
 
 def _polymarket_token_meta(data: dict) -> dict[str, dict]:
@@ -363,9 +486,12 @@ def _polymarket_token_meta(data: dict) -> dict[str, dict]:
         tokens = parse_jsonish(market.get("clobTokenIds"))
         question = str(market.get("question") or market.get("groupItemTitle") or "Market")
         market_type = canonical_market(str(market.get("sportsMarketType") or question))
-        for token, outcome in zip(tokens, outcomes):
+        selections = _polymarket_selections(
+            market, market_type, outcomes, _to_float(market.get("line"))
+        )
+        for token, (selection_market, outcome) in zip(tokens, selections):
             token_meta[str(token)] = {
-                "market": market_type,
+                "market": selection_market,
                 "outcome": str(outcome),
                 "question": question,
                 "market_slug": str(market.get("slug") or ""),
@@ -401,6 +527,64 @@ def _quote_from_book(event: Event, token: str, meta: dict, book: dict) -> Quote 
     )
 
 
+def _quote_from_ws_change(event: Event, token: str, meta: dict, message: dict,
+                          change: dict, previous: Quote | None = None) -> Quote | None:
+    """Merge one incremental CLOB packet with the last known top of book.
+
+    ``price_change`` and ``best_bid_ask`` packets commonly omit depth.  A
+    missing field means unknown/unchanged—not zero shares.  Keeping that
+    distinction prevents paper sizing from being incorrectly capped at $0.
+    """
+    bid = _to_float(change.get("best_bid"))
+    ask = _to_float(change.get("best_ask"))
+    bid_size = _to_float(change.get("best_bid_size"))
+    ask_size = _to_float(change.get("best_ask_size"))
+
+    if message.get("event_type") == "book":
+        bids, asks = message.get("bids", []), message.get("asks", [])
+        bid_prices = [price for level in bids
+                      if (price := _to_float(level.get("price"))) is not None]
+        ask_prices = [price for level in asks
+                      if (price := _to_float(level.get("price"))) is not None]
+        bid = max(bid_prices, default=None)
+        ask = min(ask_prices, default=None)
+        bid_size = _book_depth(bids, bid)
+        ask_size = _book_depth(asks, ask)
+    else:
+        if bid is None and previous is not None:
+            bid = previous.bid
+        if ask is None and previous is not None:
+            ask = previous.ask
+
+        changed_price = _to_float(change.get("price"))
+        changed_size = _to_float(change.get("size"))
+        changed_side = str(change.get("side") or "").strip().casefold()
+        if changed_price is not None and changed_size is not None:
+            if changed_side in {"buy", "bid"} and bid is not None and abs(changed_price - bid) < 1e-9:
+                bid_size = changed_size
+            elif changed_side in {"sell", "ask"} and ask is not None and abs(changed_price - ask) < 1e-9:
+                ask_size = changed_size
+
+        if bid_size is None and previous is not None and bid == previous.bid:
+            bid_size = previous.bid_size
+        if ask_size is None and previous is not None and ask == previous.ask:
+            ask_size = previous.ask_size
+
+    probability = ((bid + ask) / 2 if bid is not None and ask is not None
+                   else ask if ask is not None else bid)
+    if probability is None:
+        return None
+    return Quote(
+        event.id, meta["market"], meta["outcome"], probability, "Polymarket",
+        bid=bid, ask=ask, liquidity=_visible_liquidity(bid_size, ask_size),
+        market_liquidity=meta.get("liquidity"), token_id=token,
+        market_slug=meta.get("market_slug"), question=meta.get("question"),
+        bid_size=bid_size, ask_size=ask_size,
+        min_order_size=meta.get("min_order_size"), tick_size=meta.get("tick_size"),
+        accepting_orders=True,
+    )
+
+
 async def _initial_polymarket_quotes(event: Event, token_meta: dict[str, dict]) -> list[Quote]:
     semaphore = asyncio.Semaphore(10)
     async with httpx.AsyncClient(timeout=15) as client:
@@ -427,6 +611,7 @@ async def polymarket_market_stream(event: Event, emit: Callable[[list[Quote]], A
                 await asyncio.sleep(30)
                 continue
             initial = await _initial_polymarket_quotes(event, token_meta)
+            latest_quotes = {quote.token_id: quote for quote in initial if quote.token_id}
             if initial:
                 await emit(initial)
             async with websockets.connect("wss://ws-subscriptions-clob.polymarket.com/ws/market") as ws:
@@ -448,29 +633,12 @@ async def polymarket_market_stream(event: Event, emit: Callable[[list[Quote]], A
                             if token not in token_meta:
                                 continue
                             meta = token_meta[token]
-                            bid = float(change["best_bid"]) if change.get("best_bid") else None
-                            ask = float(change["best_ask"]) if change.get("best_ask") else None
-                            bid_size = _to_float(change.get("best_bid_size"))
-                            ask_size = _to_float(change.get("best_ask_size"))
-                            if message.get("event_type") == "book":
-                                bids, asks = message.get("bids", []), message.get("asks", [])
-                                bid = max((float(x["price"]) for x in bids), default=None)
-                                ask = min((float(x["price"]) for x in asks), default=None)
-                                bid_size = _book_depth(bids, bid)
-                                ask_size = _book_depth(asks, ask)
-                            probability = ((bid + ask) / 2 if bid is not None and ask is not None
-                                           else ask if ask is not None else bid)
-                            if probability is not None:
-                                quotes.append(Quote(
-                                    event.id, meta["market"], meta["outcome"], probability,
-                                    "Polymarket", bid=bid, ask=ask,
-                                    liquidity=(bid_size or 0.0) + (ask_size or 0.0),
-                                    market_liquidity=meta.get("liquidity"), token_id=token,
-                                    market_slug=meta.get("market_slug"), question=meta.get("question"),
-                                    bid_size=bid_size, ask_size=ask_size,
-                                    min_order_size=meta.get("min_order_size"),
-                                    tick_size=meta.get("tick_size"), accepting_orders=True,
-                                ))
+                            quote = _quote_from_ws_change(
+                                event, token, meta, message, change, latest_quotes.get(token)
+                            )
+                            if quote is not None:
+                                latest_quotes[token] = quote
+                                quotes.append(quote)
                     if quotes:
                         await emit(quotes)
         except asyncio.CancelledError:
@@ -631,26 +799,25 @@ async def odds_api_poll(event: Event, emit: Callable[[list[Quote]], Awaitable[No
     key = os.getenv("THE_ODDS_API_KEY")
     if not key or not event.odds_api_sport:
         return
-        
-    if not event.odds_api_event_id:
-        try:
-            matched = await match_odds_api_event(event.odds_api_sport, event.name)
-            if matched:
-                event.odds_api_event_id = str(matched["id"])
-        except Exception as exc:
-            logger.warning("Failed to match Odds API event: %s", exc)
-            
-    if not event.odds_api_event_id:
-        logger.warning("Could not resolve Odds API event ID for %s", event.name)
-        return
 
     # Lower interval = fresher sportsbook lines but more (paid) API credits.
     # Polymarket streams in real time regardless; this only paces The Odds API.
     interval = max(1.0, float(os.getenv("ODDS_POLL_SECONDS", "20")))
-    url, params = odds_api_request(event, key)
     async with httpx.AsyncClient(timeout=15) as client:
         while True:
             try:
+                if not event.odds_api_event_id:
+                    matched = await match_odds_api_event(
+                        event.odds_api_sport, event.name, event.game_start
+                    )
+                    if matched:
+                        event.odds_api_event_id = str(matched["id"])
+                    else:
+                        logger.warning("Could not resolve Odds API event ID for %s; retrying",
+                                       event.name)
+                        await asyncio.sleep(interval)
+                        continue
+                url, params = odds_api_request(event, key)
                 response = await client.get(url, params=params)
                 response.raise_for_status()
                 quotes = odds_api_quotes(event, response.json())

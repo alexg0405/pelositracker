@@ -14,13 +14,11 @@ props can't be graded from the score so they're voided (refunded) at settle.
 from __future__ import annotations
 
 import json
-import os
-import psycopg2
-import psycopg2.extras
 import threading
 import time
 from dataclasses import asdict, dataclass, field, fields
 
+from .database import Database
 from .lines import is_spread_market, is_total_market, quote_line_side
 from .models import Event, Signal
 
@@ -62,7 +60,7 @@ class Strategy:
     blurb: str = ""
     edge_threshold: float = 0.03
     confidence_threshold: float = 0.0
-    min_sources: int = 1
+    min_sources: int = 2
     markets: tuple = ("all",)
     sizing: str = "kelly"            # kelly | flat | flat_pct
     kelly_multiplier: float = 1.0
@@ -87,8 +85,8 @@ class Strategy:
 
 # A spread of risk profiles for calibration.
 DEFAULT_STRATEGIES = [
-    Strategy("Engine Kelly", "Full fractional Kelly at the engine's edge floor.",
-             edge_threshold=0.03, kelly_multiplier=1.0),
+    Strategy("Engine Kelly", "Full fractional Kelly whenever the engine clears every risk gate.",
+             edge_threshold=0.0, kelly_multiplier=1.0),
     Strategy("Half Kelly", "Half-Kelly stakes — smoother equity curve.",
              edge_threshold=0.03, kelly_multiplier=0.5),
     Strategy("Quarter Kelly (safe)", "Quarter-Kelly and only well-anchored signals.",
@@ -118,11 +116,30 @@ def market_allowed(strategy: Strategy, market: str) -> bool:
     return "all" in strategy.markets or line_type(market) in strategy.markets
 
 
+def qualification_failures(strategy: Strategy, signal: Signal) -> list[str]:
+    """Explain why a strategy must not paper-buy a signal."""
+    failures = []
+    if signal.action != "PAPER_BET":
+        failures.append("engine gates did not clear")
+    if signal.quote_source.casefold() != "polymarket":
+        failures.append("not an executable Polymarket selection")
+    if not 0 < signal.market_probability < 1:
+        failures.append("invalid executable price")
+    if signal.n_reference_sources < strategy.min_sources:
+        failures.append("too few independent references")
+    if signal.edge < signal.required_edge:
+        failures.append("edge is below the engine's risk-adjusted requirement")
+    if signal.edge < strategy.edge_threshold:
+        failures.append("edge is below the strategy threshold")
+    if (signal.confidence or 0) < strategy.confidence_threshold:
+        failures.append("signal quality is below the strategy threshold")
+    if not market_allowed(strategy, signal.market):
+        failures.append("market is disabled for this strategy")
+    return failures
+
+
 def qualifies(strategy: Strategy, signal: Signal) -> bool:
-    return (signal.n_reference_sources >= strategy.min_sources
-            and signal.edge >= strategy.edge_threshold
-            and (signal.confidence or 0) >= strategy.confidence_threshold
-            and market_allowed(strategy, signal.market))
+    return not qualification_failures(strategy, signal)
 
 
 def stake_for(strategy: Strategy, signal: Signal, bankroll: float) -> float:
@@ -133,6 +150,9 @@ def stake_for(strategy: Strategy, signal: Signal, bankroll: float) -> float:
     else:  # kelly
         stake = (signal.kelly_fraction or 0.0) * strategy.kelly_multiplier * bankroll
     stake = min(stake, strategy.max_stake_pct * bankroll, bankroll)
+    if signal.quote_source.casefold() == "polymarket" and signal.fillable_size is not None:
+        # fillable_size is best-ask shares; convert it to dollars at the entry price.
+        stake = min(stake, max(0.0, signal.fillable_size) * signal.market_probability)
     return max(0.0, stake)
 
 
@@ -172,44 +192,46 @@ def _now() -> float:
 
 
 class AccountBook:
-    """Thread-safe PostgreSQL store of paper accounts and their bets."""
+    """Thread-safe PostgreSQL/SQLite store of paper accounts and bets."""
 
     def __init__(self, path: str | None = None):
-        self.path = path or os.getenv("DATABASE_URL")
-        if not self.path:
-            raise ValueError("DATABASE_URL environment variable is required for Supabase")
-        self._conn = psycopg2.connect(self.path)
-        self._conn.autocommit = False
+        self._db = Database.open(
+            path,
+            sqlite_envs=("ACCOUNTS_DB", "LEDGER_DB"),
+            sqlite_default="ledger.db",
+        )
+        self.path = self._db.target
+        self.backend = self._db.backend
+        self._conn = self._db.connection
         self._lock = threading.Lock()
         with self._lock:
-            with self._conn.cursor() as cur:
-                cur.execute(_SCHEMA)
-            self._conn.commit()
+            self._db.initialize(_SCHEMA)
 
     def close(self) -> None:
         with self._lock:
-            self._conn.close()
+            self._db.close()
 
     def seed(self, strategies: list[Strategy]) -> None:
         """Create any missing preset accounts (idempotent)."""
         now = _now()
         with self._lock:
-            with self._conn.cursor() as cur:
+            with self._db.transaction() as cur:
                 for strat in strategies:
-                    cur.execute(
+                    self._db.execute(
+                        cur,
                         """INSERT INTO accounts (name, strategy, start_bankroll, bankroll, created_ts)
-                           VALUES (%s,%s,%s,%s,%s) ON CONFLICT (name) DO NOTHING""",
+                           VALUES (%s,%s,%s,%s,%s) ON CONFLICT (name) DO UPDATE SET
+                           strategy=EXCLUDED.strategy""",
                         (strat.name, strat.to_json(), strat.start_bankroll, strat.start_bankroll, now),
                     )
-            self._conn.commit()
 
     def place(self, event: Event, signals: list[Signal]) -> list[dict]:
         """Let every account bet the signals that clear its own bar (once each)."""
         now = _now()
         placed_bets = []
         with self._lock:
-            with self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                cur.execute("SELECT name, strategy, bankroll FROM accounts")
+            with self._db.transaction(dict_rows=True) as cur:
+                self._db.execute(cur, "SELECT name, strategy, bankroll FROM accounts")
                 accounts = cur.fetchall()
                 for account in accounts:
                     strategy = Strategy.from_json(account["strategy"])
@@ -220,7 +242,8 @@ class AccountBook:
                         stake = stake_for(strategy, signal, bankroll)
                         if stake < 1.0:  # dust or out of funds
                             continue
-                        cur.execute(
+                        self._db.execute(
+                            cur,
                             """INSERT INTO account_bets
                                (account, event_id, event_name, market, outcome, entry_price, stake,
                                 shares, model_prob, edge, placed_ts, status)
@@ -243,10 +266,11 @@ class AccountBook:
                                 "entry_price": signal.market_probability,
                                 "edge": signal.edge,
                             })
-                            cur.execute("UPDATE accounts SET bankroll=%s WHERE name=%s",
-                                               (bankroll, account["name"]))
-            if placed_bets:
-                self._conn.commit()
+                            self._db.execute(
+                                cur,
+                                "UPDATE accounts SET bankroll=%s WHERE name=%s",
+                                (bankroll, account["name"]),
+                            )
         return placed_bets
 
     def settle(self, event: Event, home_score: float, away_score: float) -> int:
@@ -254,44 +278,87 @@ class AccountBook:
         now = _now()
         settled = 0
         with self._lock:
-            with self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                cur.execute(
+            with self._db.transaction(dict_rows=True) as cur:
+                self._db.execute(
+                    cur,
                     "SELECT * FROM account_bets WHERE event_id=%s AND status='open'", (event.id,)
                 )
                 rows = cur.fetchall()
-            credits: dict[str, float] = {}
-            updates = []
-            for row in rows:
-                verdict = grade(row["market"], row["outcome"], event.home, event.away,
-                                home_score, away_score) or "void"
-                if verdict == "win":
-                    payout, pnl, result = row["shares"], row["shares"] - row["stake"], 1.0
-                elif verdict == "loss":
-                    payout, pnl, result = 0.0, -row["stake"], 0.0
-                else:  # push or void -> refund the stake
-                    payout, pnl, result = row["stake"], 0.0, None
-                credits[row["account"]] = credits.get(row["account"], 0.0) + payout
-                updates.append((verdict, result, pnl, now, row["id"]))
-                settled += 1
-            if updates:
-                from psycopg2.extras import execute_batch
-                execute_batch(cur,
-                    "UPDATE account_bets SET status=%s, result=%s, pnl=%s, settled_ts=%s WHERE id=%s", updates
+                credits: dict[str, float] = {}
+                updates = []
+                for row in rows:
+                    verdict = grade(row["market"], row["outcome"], event.home, event.away,
+                                    home_score, away_score) or "void"
+                    if verdict == "win":
+                        payout, pnl, result = row["shares"], row["shares"] - row["stake"], 1.0
+                    elif verdict == "loss":
+                        payout, pnl, result = 0.0, -row["stake"], 0.0
+                    else:  # push or void -> refund the stake
+                        payout, pnl, result = row["stake"], 0.0, None
+                    credits[row["account"]] = credits.get(row["account"], 0.0) + payout
+                    updates.append((verdict, result, pnl, now, row["id"]))
+                    settled += 1
+                if updates:
+                    self._db.execute_many(
+                        cur,
+                        "UPDATE account_bets SET status=%s, result=%s, pnl=%s, settled_ts=%s WHERE id=%s",
+                        updates,
+                    )
+                    for name, credit in credits.items():
+                        self._db.execute(
+                            cur,
+                            "UPDATE accounts SET bankroll=bankroll+%s WHERE name=%s",
+                            (credit, name),
+                        )
+        return settled
+
+    def void_event(self, event_id: str) -> int:
+        """Void every open bet on an event and refund its stake exactly once.
+
+        This is deliberately separate from score-based settlement. Stopping
+        tracking manually, or receiving a provider cancellation, must never
+        turn the latest in-progress score into a final result.
+        """
+        now = _now()
+        with self._lock:
+            with self._db.transaction(dict_rows=True) as cur:
+                self._db.execute(
+                    cur,
+                    "SELECT id, account, stake FROM account_bets "
+                    "WHERE event_id=%s AND status='open'",
+                    (event_id,),
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    return 0
+                credits: dict[str, float] = {}
+                updates = []
+                for row in rows:
+                    credits[row["account"]] = credits.get(row["account"], 0.0) + row["stake"]
+                    updates.append((now, row["id"]))
+                self._db.execute_many(
+                    cur,
+                    "UPDATE account_bets SET status='void', result=NULL, pnl=0, "
+                    "settled_ts=%s WHERE id=%s",
+                    updates,
                 )
                 for name, credit in credits.items():
-                    cur.execute("UPDATE accounts SET bankroll=bankroll+%s WHERE name=%s",
-                                       (credit, name))
-            self._conn.commit()
-        return settled
+                    self._db.execute(
+                        cur,
+                        "UPDATE accounts SET bankroll=bankroll+%s WHERE name=%s",
+                        (credit, name),
+                    )
+                return len(rows)
 
     def leaderboard(self) -> list[dict]:
         with self._lock:
-            with self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                cur.execute("SELECT * FROM accounts")
+            with self._db.cursor(dict_rows=True) as cur:
+                self._db.execute(cur, "SELECT * FROM accounts")
                 accounts = cur.fetchall()
                 board = []
                 for account in accounts:
-                    cur.execute(
+                    self._db.execute(
+                        cur,
                         """SELECT
                              COUNT(*) AS n_bets,
                              COALESCE(SUM(CASE WHEN status='open' THEN 1 ELSE 0 END), 0) AS n_open,
@@ -304,32 +371,33 @@ class AccountBook:
                         (account["name"],),
                     )
                     agg = cur.fetchone()
-                start = account["start_bankroll"]
-                equity = account["bankroll"] + agg["open_stake"]
-                decided = (agg["wins"] or 0) + (agg["losses"] or 0)
-                board.append({
-                    "name": account["name"],
-                    "strategy": Strategy.from_json(account["strategy"]).blurb,
-                    "bankroll": account["bankroll"],
-                    "start_bankroll": start,
-                    "equity": equity,
-                    "roi": (equity - start) / start if start else 0.0,
-                    "realized_pnl": agg["realized_pnl"] or 0.0,
-                    "n_bets": agg["n_bets"] or 0,
-                    "n_open": agg["n_open"] or 0,
-                    "n_settled": agg["n_settled"] or 0,
-                    "wins": agg["wins"] or 0,
-                    "losses": agg["losses"] or 0,
-                    "win_rate": (agg["wins"] / decided) if decided else None,
-                    "open_stake": agg["open_stake"] or 0.0,
-                })
+                    start = account["start_bankroll"]
+                    equity = account["bankroll"] + agg["open_stake"]
+                    decided = (agg["wins"] or 0) + (agg["losses"] or 0)
+                    board.append({
+                        "name": account["name"],
+                        "strategy": Strategy.from_json(account["strategy"]).blurb,
+                        "bankroll": account["bankroll"],
+                        "start_bankroll": start,
+                        "equity": equity,
+                        "roi": (equity - start) / start if start else 0.0,
+                        "realized_pnl": agg["realized_pnl"] or 0.0,
+                        "n_bets": agg["n_bets"] or 0,
+                        "n_open": agg["n_open"] or 0,
+                        "n_settled": agg["n_settled"] or 0,
+                        "wins": agg["wins"] or 0,
+                        "losses": agg["losses"] or 0,
+                        "win_rate": (agg["wins"] / decided) if decided else None,
+                        "open_stake": agg["open_stake"] or 0.0,
+                    })
             board.sort(key=lambda a: a["equity"], reverse=True)
             return board
 
     def account_bets(self, name: str, limit: int = 100) -> list[dict]:
         with self._lock:
-            with self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                cur.execute(
+            with self._db.cursor(dict_rows=True) as cur:
+                self._db.execute(
+                    cur,
                     "SELECT * FROM account_bets WHERE account=%s ORDER BY placed_ts DESC LIMIT %s",
                     (name, limit))
                 return [dict(r) for r in cur.fetchall()]
@@ -337,8 +405,7 @@ class AccountBook:
     def reset(self, strategies: list[Strategy]) -> None:
         """Wipe all bets and restore every account to its starting bankroll."""
         with self._lock:
-            with self._conn.cursor() as cur:
-                cur.execute("DELETE FROM account_bets")
-                cur.execute("DELETE FROM accounts")
-            self._conn.commit()
+            with self._db.transaction() as cur:
+                self._db.execute(cur, "DELETE FROM account_bets")
+                self._db.execute(cur, "DELETE FROM accounts")
         self.seed(strategies)

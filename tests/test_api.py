@@ -4,11 +4,23 @@ from app.main import app, store
 from app.models import Quote
 
 
+def login(client):
+    response = client.post("/api/login", data={"username": "admin", "password": "admin"})
+    assert response.status_code == 200
+
+
+def create_manual_event(client):
+    login(client)
+    response = client.post("/api/events", json={
+        "name": "Away at Home", "sport": "basketball", "home": "Home", "away": "Away"
+    })
+    assert response.status_code == 201
+    return response.json()
+
+
 def test_registered_event_can_be_removed():
     with TestClient(app) as client:
-        created = client.post("/api/demo")
-        assert created.status_code == 201
-        event_id = created.json()["event"]["id"]
+        event_id = create_manual_event(client)["event"]["id"]
 
         removed = client.delete(f"/api/events/{event_id}")
         assert removed.status_code == 204
@@ -31,7 +43,7 @@ def test_dashboard_contains_merged_ui_behaviors():
 
 def test_position_can_be_saved_and_removed_for_a_visible_selection():
     with TestClient(app) as client:
-        created = client.post("/api/demo").json()
+        created = create_manual_event(client)
         event_id = created["event"]["id"]
         store.add_quotes([Quote(event_id, "moneyline", "home", .52, "Polymarket",
                                 bid=.51, ask=.53, token_id="token-1")])

@@ -8,6 +8,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 struct QuoteInput {
     market: String,
     outcome: String,
+    #[serde(default)]
+    comparison_market: Option<String>,
+    #[serde(default)]
+    comparison_outcome: Option<String>,
+    #[serde(default)]
+    comparison_source: Option<String>,
     probability: f64,
     source: String,
     observed_at: f64,
@@ -23,6 +29,8 @@ struct QuoteInput {
     decimal_odds: Option<f64>,
     #[allow(dead_code)]
     liquidity: Option<f64>,
+    #[serde(default)]
+    ask_size: Option<f64>,
     // Phase 2b: parsed spread/total line and normalized side
     // (home | away | over | under), resolved in Python.
     #[serde(default)]
@@ -40,6 +48,21 @@ impl QuoteInput {
     }
     fn exchange(&self) -> bool {
         self.is_exchange.unwrap_or(false)
+    }
+    fn market_key(&self) -> &str {
+        self.comparison_market.as_deref().unwrap_or(&self.market)
+    }
+    fn outcome_key(&self) -> &str {
+        self.comparison_outcome.as_deref().unwrap_or(&self.outcome)
+    }
+    fn source_key(&self) -> String {
+        self.comparison_source.clone().unwrap_or_else(|| {
+            self.source
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect()
+        })
     }
 }
 
@@ -105,10 +128,10 @@ struct SignalOutput {
     // state is available). null otherwise. A cross-check, not the edge basis.
     model_live_prob: Option<f64>,
     // Phase 4: sizing & risk-normalized gating.
-    ev_per_stake: f64,       // fair/executable - 1
-    kelly_fraction: f64,     // fractional Kelly on the uncertainty-shrunk edge
-    required_edge: f64,      // base + z*consensus_stderr + market premium
-    fair_stderr: f64,        // standard error of the consensus fair
+    ev_per_stake: f64,   // fair/executable - 1
+    kelly_fraction: f64, // fractional Kelly on the uncertainty-shrunk edge
+    required_edge: f64,  // base + z*consensus_stderr + market premium
+    fair_stderr: f64,    // standard error of the consensus fair
     fillable_size: Option<f64>,
     // Auditable data-quality components (0-100). Edge is deliberately absent:
     // opportunity size must not make the underlying data look more reliable.
@@ -163,7 +186,10 @@ fn normal_cdf(x: f64) -> f64 {
 }
 
 fn is_moneyline(market: &str) -> bool {
-    matches!(market.to_lowercase().as_str(), "moneyline" | "h2h" | "winner")
+    matches!(
+        market.to_lowercase().as_str(),
+        "moneyline" | "h2h" | "winner"
+    )
 }
 
 /// Standard deviation of the FINAL score margin per sport (points/goals).
@@ -327,9 +353,7 @@ fn devig_shin(implied: &[f64]) -> Option<Vec<f64>> {
     let sum_at = |z: f64| -> f64 {
         implied
             .iter()
-            .map(|&q| {
-                ((z * z + 4.0 * (1.0 - z) * q * q / booksum).sqrt() - z) / (2.0 * (1.0 - z))
-            })
+            .map(|&q| ((z * z + 4.0 * (1.0 - z) * q * q / booksum).sqrt() - z) / (2.0 * (1.0 - z)))
             .sum::<f64>()
     };
     // f(z) = sum_at(z) - 1. f(0) = sqrt(booksum) - 1 > 0; sum decreases as z grows.
@@ -380,7 +404,7 @@ fn devig_proportional(implied: &[f64]) -> Vec<f64> {
 /// The de-vigged fair probability contributed by one source for one outcome,
 /// with the method used and the source's booksum (overround proxy).
 struct Fair {
-    source: String,
+    source_key: String,
     prob: f64,
     booksum: f64,
     method: &'static str,
@@ -391,8 +415,10 @@ struct Fair {
 /// Compute one source's fair value for `outcome` given all of its quotes in the
 /// market. Exchanges are read at their mid (already ~de-vigged); traditional
 /// books are de-vigged with Shin, falling back to proportional.
-fn source_fair(outcome: &str, source_quotes: &[&QuoteInput]) -> Option<Fair> {
-    let target = source_quotes.iter().find(|q| q.outcome == outcome)?;
+fn source_fair(outcome_key: &str, source_quotes: &[&QuoteInput]) -> Option<Fair> {
+    let target = source_quotes
+        .iter()
+        .find(|q| q.outcome_key() == outcome_key)?;
     let implied: Vec<f64> = source_quotes.iter().map(|q| q.probability).collect();
     let booksum: f64 = implied.iter().sum();
     let is_exchange = source_quotes.iter().any(|q| q.exchange());
@@ -407,7 +433,7 @@ fn source_fair(outcome: &str, source_quotes: &[&QuoteInput]) -> Option<Fair> {
     } else {
         let idx = source_quotes
             .iter()
-            .position(|q| q.outcome == outcome)
+            .position(|q| q.outcome_key() == outcome_key)
             .unwrap();
         // Shin handles the vig; for a ~zero-hold 2-way book (booksum <= 1) it
         // returns None and we fall back to proportional (which is ~identity).
@@ -418,12 +444,18 @@ fn source_fair(outcome: &str, source_quotes: &[&QuoteInput]) -> Option<Fair> {
     };
 
     Some(Fair {
-        source: target.source.clone(),
+        source_key: target.source_key(),
         prob: clamp(fair, 0.001, 0.999),
         booksum: booksum.max(1.0),
         method,
         weight_base: target.weight(),
-        observed_at: target.observed_at,
+        // A fair price depends on every leg used in the de-vig.  Timestamp it
+        // at the oldest component so a fresh favorite cannot revive a stale
+        // opposing side.
+        observed_at: source_quotes
+            .iter()
+            .map(|quote| quote.observed_at)
+            .fold(f64::INFINITY, f64::min),
     })
 }
 
@@ -446,10 +478,22 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
     // Keep the freshest quote per (market, outcome, source).
     let mut freshest: BTreeMap<(String, String, String), QuoteInput> = BTreeMap::new();
     for quote in request.quotes {
+        let valid_probability = |value: f64| value.is_finite() && value > 0.0 && value < 1.0;
+        let valid_size = |value: f64| value.is_finite() && value >= 0.0;
+        if !valid_probability(quote.probability)
+            || quote.ask.is_some_and(|value| !valid_probability(value))
+            || quote
+                .bid
+                .is_some_and(|value| !value.is_finite() || value < 0.0 || value >= 1.0)
+            || quote.ask_size.is_some_and(|value| !valid_size(value))
+            || quote.liquidity.is_some_and(|value| !valid_size(value))
+        {
+            continue;
+        }
         let key = (
-            quote.market.clone(),
-            quote.outcome.clone(),
-            quote.source.clone(),
+            quote.market_key().to_string(),
+            quote.outcome_key().to_string(),
+            quote.source_key().to_string(),
         );
         let replace = freshest
             .get(&key)
@@ -462,44 +506,64 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
     let current: Vec<QuoteInput> = freshest.into_values().collect();
     let pairs: BTreeSet<(String, String)> = current
         .iter()
-        .map(|quote| (quote.market.clone(), quote.outcome.clone()))
+        .map(|quote| {
+            (
+                quote.market_key().to_string(),
+                quote.outcome_key().to_string(),
+            )
+        })
         .collect();
     let mut signals = Vec::new();
 
-    for (market, outcome) in pairs {
+    for (market_key, outcome_key) in pairs {
         let same_market: Vec<&QuoteInput> = current
             .iter()
-            .filter(|quote| quote.market == market)
+            .filter(|quote| quote.market_key() == market_key)
             .collect();
         let target_quotes: Vec<&QuoteInput> = same_market
             .iter()
             .copied()
-            .filter(|quote| quote.outcome == outcome)
+            .filter(|quote| quote.outcome_key() == outcome_key)
             .collect();
         if target_quotes.is_empty() {
             continue;
         }
+        let market_type = target_quotes[0].market.clone();
+        let expected_outcomes: BTreeSet<&str> = same_market
+            .iter()
+            .map(|quote| quote.outcome_key())
+            .collect();
 
         // Independent live model for this outcome (cross-check, not the edge).
         let model_live: Option<f64> = latest_state.and_then(|st| {
             let f = st.fraction_remaining?;
             let lead = st.home_score - st.away_score;
-            if is_moneyline(&market) {
+            if is_moneyline(&market_type) {
                 let p_home = live_winprob(lead, pregame_margin, f, sport_margin_sigma(&sport));
-                let is_away = outcome.eq_ignore_ascii_case("away")
-                    || outcome.eq_ignore_ascii_case(&request.away_outcome);
+                let is_away = outcome_key.eq_ignore_ascii_case("away")
+                    || target_quotes[0]
+                        .outcome
+                        .eq_ignore_ascii_case(&request.away_outcome);
                 Some(if is_away { 1.0 - p_home } else { p_home })
-            } else if is_spread(&market) {
+            } else if is_spread(&market_type) {
                 let sample = target_quotes.first()?;
                 spread_cover_prob(
-                    lead, pregame_margin, f, sport_margin_sigma(&sport),
-                    sample.point?, sample.side.as_deref()?,
+                    lead,
+                    pregame_margin,
+                    f,
+                    sport_margin_sigma(&sport),
+                    sample.point?,
+                    sample.side.as_deref()?,
                 )
-            } else if is_total(&market) {
+            } else if is_total(&market_type) {
                 let sample = target_quotes.first()?;
                 Some(total_prob(
-                    st.home_score + st.away_score, request.pregame_total, f,
-                    sport_total_sigma(&sport), sample.point?, sample.side.as_deref()?,
+                    st.home_score + st.away_score,
+                    request.pregame_total,
+                    f,
+                    sport_total_sigma(&sport),
+                    sample.point?,
+                    sample.side.as_deref()?,
                 ))
             } else {
                 None
@@ -507,18 +571,28 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         });
 
         // Per-source de-vigged fair for this outcome.
-        let sources: BTreeSet<&str> = same_market
-            .iter()
-            .map(|quote| quote.source.as_str())
-            .collect();
+        let sources: BTreeSet<String> =
+            same_market.iter().map(|quote| quote.source_key()).collect();
         let mut fairs: Vec<Fair> = Vec::new();
         for source in sources {
             let source_quotes: Vec<&QuoteInput> = same_market
                 .iter()
                 .copied()
-                .filter(|quote| quote.source == source)
+                .filter(|quote| quote.source_key() == source)
                 .collect();
-            if let Some(fair) = source_fair(&outcome, &source_quotes) {
+            let source_outcomes: BTreeSet<&str> = source_quotes
+                .iter()
+                .map(|quote| quote.outcome_key())
+                .collect();
+            // Traditional books must provide the complete 2-way/3-way market
+            // before de-vigging.  Treating a soccer home/away pair as binary
+            // while omitting Draw materially inflates both fair prices.
+            if !source_quotes.iter().any(|quote| quote.exchange())
+                && source_outcomes != expected_outcomes
+            {
+                continue;
+            }
+            if let Some(fair) = source_fair(&outcome_key, &source_quotes) {
                 fairs.push(fair);
             }
         }
@@ -531,10 +605,24 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         // sportsbook ask and showing its edge beside the Polymarket card.
         let has_polymarket = target_quotes
             .iter()
-            .any(|quote| quote.source.eq_ignore_ascii_case("polymarket"));
-        let best = target_quotes
+            .any(|quote| quote.source_key() == "polymarket");
+        let preferred: Vec<&&QuoteInput> = target_quotes
             .iter()
-            .filter(|quote| !has_polymarket || quote.source.eq_ignore_ascii_case("polymarket"))
+            .filter(|quote| !has_polymarket || quote.source_key() == "polymarket")
+            .collect();
+        let fresh_preferred: Vec<&&QuoteInput> = preferred
+            .iter()
+            .copied()
+            .filter(|quote| (now_seconds - quote.observed_at) <= max_age)
+            .collect();
+        let candidates = if fresh_preferred.is_empty() {
+            &preferred
+        } else {
+            &fresh_preferred
+        };
+        let best = candidates
+            .iter()
+            .copied()
             .min_by(|a, b| {
                 a.executable_probability()
                     .total_cmp(&b.executable_probability())
@@ -542,9 +630,12 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
             .expect("target quotes checked above");
         let executable = best.executable_probability();
         let target_source = best.source.clone();
+        let target_source_key = best.source_key().to_string();
+        let display_market = best.market.clone();
+        let display_outcome = best.outcome.clone();
         let target_booksum = fairs
             .iter()
-            .find(|f| f.source == target_source)
+            .find(|f| f.source_key == target_source_key)
             .map(|f| f.booksum)
             .unwrap_or(1.0);
 
@@ -553,7 +644,9 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         // dead source cannot linger in the consensus.
         let reference: Vec<&Fair> = fairs
             .iter()
-            .filter(|f| f.source != target_source && (now_seconds - f.observed_at) <= max_age)
+            .filter(|f| {
+                f.source_key != target_source_key && (now_seconds - f.observed_at) <= max_age
+            })
             .collect();
 
         let age = (now_seconds - best.observed_at).max(0.0);
@@ -576,12 +669,12 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         if reference.is_empty() {
             let own = fairs
                 .iter()
-                .find(|f| f.source == target_source)
+                .find(|f| f.source_key == target_source_key)
                 .map(|f| f.prob)
                 .unwrap_or(executable);
             let own_method = fairs
                 .iter()
-                .find(|f| f.source == target_source)
+                .find(|f| f.source_key == target_source_key)
                 .map(|f| f.method)
                 .unwrap_or("n/a");
             reasons.push(format!(
@@ -602,8 +695,8 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
             }
             signals.push(SignalOutput {
                 event_id: request.event_id.clone(),
-                market,
-                outcome,
+                market: display_market,
+                outcome: display_outcome,
                 model_probability: own,
                 market_probability: executable,
                 edge: 0.0,
@@ -620,7 +713,11 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
                 kelly_fraction: 0.0,
                 required_edge: 0.0,
                 fair_stderr: 0.0,
-                fillable_size: best.liquidity,
+                fillable_size: if best.exchange() {
+                    best.ask_size
+                } else {
+                    best.liquidity
+                },
                 quality_freshness: (freshness_score * 1000.0).round() / 10.0,
                 quality_agreement: 0.0,
                 quality_sources: 0.0,
@@ -665,8 +762,13 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         // Standard error of the consensus mean; more disagreement / fewer books
         // -> less certain fair -> higher bar and smaller stake.
         let fair_stderr = dispersion / (source_count as f64).max(1.0).sqrt();
-        let required_edge = request.edge_threshold + z * fair_stderr + market_premium(&market);
-        let ev_per_stake = if executable > 1e-6 { fair / executable - 1.0 } else { 0.0 };
+        let required_edge =
+            request.edge_threshold + z * fair_stderr + market_premium(&display_market);
+        let ev_per_stake = if executable > 1e-6 {
+            fair / executable - 1.0
+        } else {
+            0.0
+        };
         // Shrink the edge by its uncertainty before sizing (optimizer's curse).
         let edge_shrunk = (edge - z * fair_stderr).max(0.0);
         let kelly_fraction = if executable < 0.999 {
@@ -674,14 +776,19 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         } else {
             0.0
         };
-        let fillable_size = best.liquidity;
+        let fillable_size = if best.exchange() {
+            best.ask_size
+        } else {
+            best.liquidity
+        };
 
         let agreement_score = (1.0 - dispersion / 0.12).max(0.0);
         let source_score = (source_count as f64 / 3.0).min(1.0);
         let reference_freshness = reference
             .iter()
             .map(|f| (-(now_seconds - f.observed_at).max(0.0) / max_age).exp())
-            .sum::<f64>() / source_count as f64;
+            .sum::<f64>()
+            / source_count as f64;
         let quality_freshness = 0.5 * freshness_score + 0.5 * reference_freshness;
         let confidence = 100.0
             * (0.30 * quality_freshness
@@ -691,7 +798,7 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
 
         let target_method = fairs
             .iter()
-            .find(|f| f.source == target_source)
+            .find(|f| f.source_key == target_source_key)
             .map(|f| f.method)
             .unwrap_or("n/a");
 
@@ -739,6 +846,9 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
                 blockers.push(format!("wide executable spread ({:.1}%)", s * 100.0));
             }
         }
+        if best.exchange() && best.ask.is_none() {
+            blockers.push("no executable ask for exchange quote".to_string());
+        }
         if edge < required_edge {
             blockers.push(format!(
                 "edge {:.1}% below required {:.1}% (base {:.1}% + risk {:.1}%)",
@@ -763,8 +873,8 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
 
         signals.push(SignalOutput {
             event_id: request.event_id.clone(),
-            market,
-            outcome,
+            market: display_market,
+            outcome: display_outcome,
             // Phase 0 has no independent model, so the model probability IS the
             // sharp leave-one-out consensus. These diverge once a projection
             // model is added (Phase 3).
@@ -828,6 +938,9 @@ mod tests {
         QuoteInput {
             market: "moneyline".to_string(),
             outcome: outcome.to_string(),
+            comparison_market: None,
+            comparison_outcome: None,
+            comparison_source: None,
             probability,
             source: source.to_string(),
             observed_at: now,
@@ -837,6 +950,7 @@ mod tests {
             is_exchange: Some(true), // exchange-mid: no multiplicative devig in tests
             decimal_odds: None,
             liquidity: None,
+            ask_size: None,
             point: None,
             side: None,
         }
@@ -1034,6 +1148,7 @@ mod tests {
         cheap.ask = Some(0.55);
         cheap.bid = Some(0.54);
         cheap.liquidity = Some(1234.0);
+        cheap.ask_size = Some(1234.0);
         quotes.push(cheap);
         quotes.push(quote("C", "away", 0.455, now));
 

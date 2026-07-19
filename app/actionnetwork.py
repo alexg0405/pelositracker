@@ -1,14 +1,31 @@
 import asyncio
 import logging
+import re as _re
 from typing import Awaitable, Callable
 
 import httpx
 
 from .models import Event, Quote
+from .matching import best_team_pair_match
 
 logger = logging.getLogger(__name__)
 
 _book_map = {}
+
+_SCOREBOARD_SPORTS = {
+    "americanfootball_nfl": "nfl",
+    "americanfootball_ncaaf": "ncaaf",
+    "baseball_mlb": "mlb",
+    "basketball_nba": "nba",
+    "basketball_wnba": "wnba",
+    "basketball_ncaab": "ncaab",
+    "icehockey_nhl": "nhl",
+    "mma_mixed_martial_arts": "ufc",
+}
+
+
+def scoreboard_sport(provider_sport: str) -> str:
+    return _SCOREBOARD_SPORTS.get(provider_sport, provider_sport.split("_")[-1])
 
 def implied_probability(american: int | None) -> float:
     if american is None:
@@ -28,7 +45,6 @@ async def _ensure_books(client: httpx.AsyncClient):
         except Exception as e:
             logger.error(f"Failed to fetch Action Network books: {e}")
 
-import re as _re
 
 _STATE_SUFFIX = _re.compile(r"\s+[A-Z]{2}$")  # " NJ", " PA", " WY", etc.
 
@@ -76,6 +92,16 @@ def parse_action_quotes(event: Event, game: dict) -> list[Quote]:
                 market="moneyline",
                 outcome=event.away,
                 probability=implied_probability(ml_away),
+                source=source,
+            ))
+
+        ml_draw = odds.get("ml_draw")
+        if ml_draw is not None and ml_draw != 0:
+            quotes.append(Quote(
+                event_id=event.id,
+                market="moneyline",
+                outcome="Draw",
+                probability=implied_probability(ml_draw),
                 source=source,
             ))
             
@@ -126,44 +152,48 @@ def parse_action_quotes(event: Event, game: dict) -> list[Quote]:
     return quotes
 
 def match_game(event: Event, games: list[dict]) -> dict | None:
-    target_home = event.home.lower().replace(" st.", " state").split()[-1]
-    target_away = event.away.lower().replace(" st.", " state").split()[-1]
-    
-    for game in games:
-        teams = game.get("teams", [])
-        if len(teams) < 2: continue
-        
-        t1 = teams[0].get("display_name", "").lower()
-        t2 = teams[1].get("display_name", "").lower()
-        
-        if (target_home in t1 or target_home in t2) and (target_away in t1 or target_away in t2):
-            return game
-            
-    return None
+    return best_team_pair_match(
+        games,
+        event.home,
+        event.away,
+        lambda game: [team.get("display_name", "") for team in game.get("teams", [])],
+        event.game_start,
+        lambda game: game.get("start_time"),
+    )
+
+
+async def _action_network_once(event: Event, client: httpx.AsyncClient,
+                               emit: Callable[[list[Quote]], Awaitable[None]]) -> None:
+    """Fetch one snapshot, retrying book metadata whenever it is still absent."""
+    await _ensure_books(client)
+    if not _book_map:
+        logger.warning("Action Network book metadata is unavailable for %s; retrying", event.name)
+        return
+
+    sport = scoreboard_sport(event.odds_api_sport or "")
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = await client.get(
+        f"https://api.actionnetwork.com/web/v1/scoreboard/{sport}", headers=headers
+    )
+    if response.status_code != 200:
+        logger.warning("Action Network scoreboard status %s for %s", response.status_code, event.name)
+        return
+    matched = match_game(event, response.json().get("games", []))
+    if matched:
+        quotes = parse_action_quotes(event, matched)
+        if quotes:
+            await emit(quotes)
 
 async def action_network_poll(event: Event, emit: Callable[[list[Quote]], Awaitable[None]]):
     if not event.odds_api_sport: return
-    
-    sport = event.odds_api_sport.split("_")[-1]
-    headers = {"User-Agent": "Mozilla/5.0"}
-    
+
     async with httpx.AsyncClient() as client:
-        await _ensure_books(client)
-        
         while True:
             try:
-                r = await client.get(f"https://api.actionnetwork.com/web/v1/scoreboard/{sport}", headers=headers)
-                if r.status_code == 200:
-                    data = r.json()
-                    games = data.get("games", [])
-                    matched = match_game(event, games)
-                    if matched:
-                        quotes = parse_action_quotes(event, matched)
-                        if quotes:
-                            await emit(quotes)
+                await _action_network_once(event, client, emit)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Action Network poll error for {event.name}: {e}")
             
-            await asyncio.sleep(60)
+            await asyncio.sleep(25)

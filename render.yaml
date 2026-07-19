@@ -1,8 +1,6 @@
-# Render blueprint. Deploys the Docker image (builds the Rust engine, runs uvicorn).
-# Free plan works out of the box but sleeps after ~15 min idle (streams pause
-# until the next request) and has no persistent disk (the CLV ledger resets on
-# redeploy). For an always-on monitor with a durable ledger, switch plan to
-# "starter" and uncomment the disk block + LEDGER_DB below.
+# Render blueprint. The Docker image builds the Rust engine and runs uvicorn.
+# Sleeping instances pause live feeds. For durable data, set DATABASE_URL to a
+# PostgreSQL DSN or attach a disk and uncomment the SQLite paths below.
 services:
   - type: web
     name: live-edge-monitor
@@ -11,14 +9,31 @@ services:
     healthCheckPath: /api/config
     autoDeploy: true
     envVars:
-      - key: THE_ODDS_API_KEY   # optional; Polymarket + demo work without it
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: THE_ODDS_API_KEY   # optional; public Polymarket feeds need no key
         sync: false
       - key: ODDS_POLL_SECONDS
         value: "20"
+      - key: MAX_DATA_AGE_SECONDS
+        value: "120"
+      # Keep global floors neutral so custom bots apply their own thresholds.
+      - key: SIGNAL_CONFIDENCE_THRESHOLD
+        value: "0"
+      - key: SIGNAL_EDGE_THRESHOLD
+        value: "0"
       - key: ODDS_PLAYER_MARKETS  # e.g. player_points,player_rebounds (per sport)
+        sync: false
+      - key: DATABASE_URL       # optional PostgreSQL; takes priority over SQLite
         sync: false
       # - key: LEDGER_DB
       #   value: /var/data/ledger.db
+      # - key: HISTORY_DB
+      #   value: /var/data/history.db
+      # - key: STATE_DB          # optional; otherwise monitor state uses LEDGER_DB
+      #   value: /var/data/state.db
     # disk:                       # requires a paid plan
     #   name: ledger
     #   mountPath: /var/data

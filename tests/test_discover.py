@@ -20,6 +20,18 @@ def test_keeps_tradeable_sports_matchups():
     assert all(g["slug"] and g["game_start"] for g in games)
 
 
+def test_discovery_marks_events_without_reference_adapters_price_only():
+    games = filter_sports_games([
+        _ev("Lakers vs. Celtics", ["NBA"]),
+        _ev("Player One vs. Player Two", ["Tennis"]),
+    ])
+    support = {game["title"]: game["reference_adapter"] for game in games}
+    assert support == {
+        "Lakers vs. Celtics": True,
+        "Player One vs. Player Two": False,
+    }
+
+
 def test_drops_futures_submarkets_untradeable_and_nonsports():
     events = [
         _ev("World Cup Winner", ["Soccer"]),                       # future, no "vs"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -19,11 +20,13 @@ from pydantic import BaseModel, Field
 from .engine import SignalEngine
 from . import __version__, backtest
 from .accounts import AccountBook, DEFAULT_STRATEGIES
+from .diagnostics import edge_health
 from .advice import market_views, position_views
 from .history import HistoryDB
 from .ledger import Ledger
 from .lines import pregame_priors
 from .models import Event, GameState, Quote, as_json
+from .monitor_state import MonitorState
 from .sources import (extract_polymarket_slug, infer_polymarket_event,
                       match_odds_api_event, odds_api_poll, polymarket_event,
                       polymarket_market_stream, polymarket_sports_events,
@@ -32,18 +35,24 @@ from .actionnetwork import action_network_poll
 from .pinnacle import pinnacle_poll
 from .store import Store
 
+
+logger = logging.getLogger(__name__)
+
 load_dotenv()
 store = Store()
 ledger: Ledger | None = None
 account_book: AccountBook | None = None
 history_db: HistoryDB | None = None
+monitor_state: MonitorState | None = None
 engine = SignalEngine(float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", "0.0")),
                       float(os.getenv("SIGNAL_EDGE_THRESHOLD", "0.0")),
-                      float(os.getenv("MAX_DATA_AGE_SECONDS", "20")),
+                      float(os.getenv("MAX_DATA_AGE_SECONDS", "120")),
                       kelly_fraction=float(os.getenv("SIGNAL_KELLY_FRACTION", "0.25")),
                       edge_z=float(os.getenv("SIGNAL_EDGE_Z", "1.0")))
 tasks: dict[str, list[asyncio.Task]] = {}
 _finalized: set[str] = set()
+_terminal_events: dict[str, str] = {}  # event_id -> final | canceled | deleted | shutdown
+_event_locks: dict[str, asyncio.Lock] = {}
 _pregame: dict[str, dict] = {}  # event_id -> {"spread": home point, "total": line}, captured near tip
 _subscribers: set[asyncio.Queue] = set()  # SSE clients for real-time dashboard pushes
 _sports_status: dict[str, dict] = {}  # latest public Polymarket sport_result by event slug
@@ -75,8 +84,31 @@ def _notify_subscribers() -> None:
                 queue.put_nowait(1)
             except asyncio.QueueFull:
                 pass
-_FINAL_STATUSES = {"final", "ended", "closed", "complete", "finished"}
+_FINAL_STATUSES = {"final", "ended", "closed", "complete", "completed", "finished"}
+_CANCELED_STATUSES = {"canceled", "cancelled", "abandoned", "void", "voided"}
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _terminal_kind(status: object) -> str | None:
+    normalized = re.sub(r"[_-]+", " ", str(status or "").strip().casefold())
+    if normalized in _CANCELED_STATUSES:
+        return "canceled"
+    if normalized in _FINAL_STATUSES:
+        return "final"
+    return None
+
+
+def _event_lock(event_id: str) -> asyncio.Lock:
+    return _event_locks.setdefault(event_id, asyncio.Lock())
+
+
+async def _cancel_tasks(group: list[asyncio.Task]) -> None:
+    current = asyncio.current_task()
+    pending = [task for task in group if task is not current and not task.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 def _require_safe_id(value: str | None, field: str) -> None:
@@ -86,12 +118,21 @@ def _require_safe_id(value: str | None, field: str) -> None:
 
 
 async def on_state(state: GameState):
+    terminal = _terminal_kind(state.status)
+    if terminal is not None:
+        # Close the entry gate synchronously, before history I/O yields control
+        # to quote callbacks that might otherwise place a known-result bet.
+        _terminal_events.setdefault(state.event_id, terminal)
     store.add_state(state)
     if history_db is not None:
-        await asyncio.to_thread(history_db.log_state, state)
-    await record(state.event_id)
-    if str(state.status).lower() in _FINAL_STATUSES:
-        await finalize_event(state.event_id)
+        try:
+            await asyncio.to_thread(history_db.log_state, state)
+        except Exception as exc:
+            logger.warning("Could not persist state telemetry for %s: %s", state.event_id, exc)
+    if terminal is not None:
+        await finalize_event(state.event_id, canceled=terminal == "canceled")
+    else:
+        await record(state.event_id)
 
 
 async def on_sports_status(slug: str, payload: dict) -> None:
@@ -99,6 +140,19 @@ async def on_sports_status(slug: str, payload: dict) -> None:
     snapshot = dict(payload)
     snapshot["_received_at"] = datetime.now(timezone.utc).isoformat()
     _sports_status[slug] = snapshot
+    raw_status = next((snapshot.get(key) for key in
+                       ("status", "gameStatus", "game_status", "state")
+                       if snapshot.get(key)), None)
+    terminal = _terminal_kind(raw_status)
+    matched = next((event for event in store.events.values()
+                    if event.polymarket_slug == slug), None)
+    if terminal is not None and matched is not None:
+        # The status callback runs before score parsing in the shared sports
+        # stream. Close entry immediately even if a malformed final score keeps
+        # the subsequent GameState callback from being emitted.
+        _terminal_events.setdefault(matched.id, terminal)
+        if terminal == "canceled":
+            await finalize_event(matched.id, canceled=True)
     normalized = sports_game_status(snapshot)
     if not _discover_cache.get("data") or normalized is None:
         return
@@ -115,7 +169,10 @@ async def on_sports_status(slug: str, payload: dict) -> None:
 async def on_quotes(quotes: list[Quote]):
     store.add_quotes(quotes)
     if history_db is not None and quotes:
-        await asyncio.to_thread(history_db.log_quotes, quotes)
+        try:
+            await asyncio.to_thread(history_db.log_quotes, quotes)
+        except Exception as exc:
+            logger.warning("Could not persist quote telemetry for %s: %s", quotes[0].event_id, exc)
     if quotes:
         await record(quotes[0].event_id)
 
@@ -138,19 +195,26 @@ def recompute(event_id: str) -> list:
 
 
 async def record(event_id: str) -> None:
-    signals = recompute(event_id)
-    _notify_subscribers()  # push the fresh snapshot to the dashboard immediately
-    event = store.events.get(event_id)
-    # Ledger commits fsync to disk; keep that off the event loop.
-    if ledger is not None and event is not None and signals:
-        await asyncio.to_thread(ledger.record_signals, event, signals)
-    if account_book is not None and event is not None and signals:
-        placed_bets = await asyncio.to_thread(account_book.place, event, signals)
-        if placed_bets:
-            from .notify import notify_webhook
-            for p in placed_bets:
-                if p.get("webhook_url"):
-                    asyncio.create_task(notify_webhook(p["webhook_url"], p))
+    async with _event_lock(event_id):
+        if event_id in _terminal_events or event_id in _finalized:
+            return
+        signals = recompute(event_id)
+        _notify_subscribers()  # push the fresh snapshot to the dashboard immediately
+        event = store.events.get(event_id)
+        # Ledger commits fsync to disk; keep that off the event loop.
+        if ledger is not None and event is not None and signals:
+            await asyncio.to_thread(ledger.record_signals, event, signals)
+        # A terminal state can arrive while the ledger write is in flight. It
+        # closes the gate immediately; do not begin a new account entry after it.
+        if event_id in _terminal_events or event_id in _finalized:
+            return
+        if account_book is not None and event is not None and signals:
+            placed_bets = await asyncio.to_thread(account_book.place, event, signals)
+            if placed_bets:
+                from .notify import notify_webhook
+                for p in placed_bets:
+                    if p.get("webhook_url"):
+                        asyncio.create_task(notify_webhook(p["webhook_url"], p))
 
 
 def _winner_labels(event: Event, home_score: float, away_score: float) -> set[str]:
@@ -161,38 +225,64 @@ def _winner_labels(event: Event, home_score: float, away_score: float) -> set[st
     return {"draw", "Draw"}  # a tie settles the Draw outcome, not nothing
 
 
-async def finalize_event(event_id: str) -> None:
-    """Cancel the event's feeds, snapshot the closing consensus (CLV), settle."""
+async def finalize_event(event_id: str, *, canceled: bool = False) -> None:
+    """Stop entry, snapshot/settle a final, or void a provider cancellation.
+
+    Every write is idempotent. The in-memory finalized marker and persisted
+    event deletion happen only after all writes succeed, so a transient failure
+    can be retried by a later terminal update or process restart.
+    """
     if event_id in _finalized:
         return
-    _finalized.add(event_id)
-    for task in tasks.pop(event_id, []):  # stop paid pollers / streams for a dead game
-        task.cancel()
-    if ledger is None:
-        return
-    event = store.events.get(event_id)
-    signals = store.signals.get(event_id) or []
-    fair_by_selection = {
-        (s.market, s.outcome): (s.market_fair_prob or s.model_probability)
-        for s in signals
-        if (s.market_fair_prob or s.model_probability)
-    }
-    states = store.states.get(event_id) or []
-    winners = _winner_labels(event, states[-1].home_score, states[-1].away_score) \
-        if (event and states) else set()
+    if _terminal_events.get(event_id) == "canceled":
+        canceled = True
+    terminal = "canceled" if canceled else "final"
+    _terminal_events.setdefault(event_id, terminal)
+    async with _event_lock(event_id):
+        if event_id in _finalized:
+            return
 
-    def _writes():
-        ledger.snapshot_closing(event_id, fair_by_selection)
-        if winners:
-            ledger.settle_moneyline(event_id, winners)
-        if account_book is not None and event is not None and states:
-            account_book.settle(event, states[-1].home_score, states[-1].away_score)
-        if history_db is not None and event is not None:
-            prior = _pregame.get(event_id, {})
-            final_state = states[-1] if states else None
-            history_db.log_outcome(event, prior.get("spread"), prior.get("total"), final_state)
+        # Entry callbacks for this event have drained before this lock was
+        # acquired. Cancel and await the infinite feed loops before settlement.
+        await _cancel_tasks(tasks.pop(event_id, []))
 
-    await asyncio.to_thread(_writes)
+        event = store.events.get(event_id)
+        states = store.states.get(event_id) or []
+        if event is not None:
+            # Refresh the closing fair for CLV without invoking record(), which
+            # would also create ledger/account entries.
+            recompute(event_id)
+            _notify_subscribers()
+        signals = store.signals.get(event_id) or []
+        fair_by_selection = {
+            (s.market, s.outcome): (s.market_fair_prob or s.model_probability)
+            for s in signals
+            if (s.market_fair_prob or s.model_probability)
+        }
+        winners = _winner_labels(event, states[-1].home_score, states[-1].away_score) \
+            if (event and states and not canceled) else set()
+
+        def _writes():
+            if canceled:
+                if account_book is not None:
+                    account_book.void_event(event_id)
+                return
+            if ledger is not None:
+                ledger.snapshot_closing(event_id, fair_by_selection)
+                if winners:
+                    ledger.settle_moneyline(event_id, winners)
+            if account_book is not None and event is not None and states:
+                account_book.settle(event, states[-1].home_score, states[-1].away_score)
+            if history_db is not None and event is not None:
+                prior = _pregame.get(event_id, {})
+                final_state = states[-1] if states else None
+                history_db.log_outcome(event, prior.get("spread"), prior.get("total"), final_state)
+
+        await asyncio.to_thread(_writes)
+        if monitor_state is not None:
+            await asyncio.to_thread(monitor_state.delete_event, event_id)
+        _finalized.add(event_id)
+        _terminal_events[event_id] = "canceled" if canceled else "final"
 
 
 async def auto_monitor_loop():
@@ -206,34 +296,83 @@ async def auto_monitor_loop():
                         if slug and not any(e.polymarket_slug == slug for e in store.events.values()):
                             try:
                                 await add_event(EventIn(polymarket_url=f"https://polymarket.com/event/{slug}"))
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                logger.warning("Auto-monitor could not add %s: %s", slug, exc)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Auto-monitor discovery failed: %s", exc)
         await asyncio.sleep(60)
+
+
+def _start_event_feeds(event: Event) -> None:
+    group = []
+    if event.polymarket_slug:
+        group.append(asyncio.create_task(polymarket_market_stream(event, on_quotes)))
+    if event.odds_api_sport:
+        group.append(asyncio.create_task(odds_api_poll(event, on_quotes)))
+        group.append(asyncio.create_task(action_network_poll(event, on_quotes)))
+        group.append(asyncio.create_task(pinnacle_poll(event, on_quotes)))
+    tasks[event.id] = group
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global ledger, account_book, history_db
-    ledger = Ledger()
-    account_book = AccountBook()
-    history_db = HistoryDB()
-    account_book.seed(DEFAULT_STRATEGIES)
-    sports_task = asyncio.create_task(polymarket_sports_stream(
-        lambda: list(store.events.values()), on_state, on_sports_status))
-    auto_task = asyncio.create_task(auto_monitor_loop())
-    yield
-    sports_task.cancel()
-    auto_task.cancel()
-    for group in tasks.values():
-        for task in group:
-            task.cancel()
-    ledger.close()
-    account_book.close()
-    history_db.close()
+    global ledger, account_book, history_db, monitor_state
+    sports_task: asyncio.Task | None = None
+    auto_task: asyncio.Task | None = None
+    try:
+        ledger = Ledger()
+        account_book = AccountBook()
+        history_db = HistoryDB()
+        monitor_state = MonitorState()
+        account_book.seed(DEFAULT_STRATEGIES)
+        _config_state["auto_monitor"] = monitor_state.auto_monitor(False)
+        for event in monitor_state.events():
+            store.add_event(event)
+            _finalized.discard(event.id)
+            _terminal_events.pop(event.id, None)
+            _start_event_feeds(event)
+        sports_task = asyncio.create_task(polymarket_sports_stream(
+            lambda: list(store.events.values()), on_state, on_sports_status))
+        auto_task = asyncio.create_task(auto_monitor_loop())
+        yield
+    finally:
+        # Close the entry gate, then let any already-running record() section
+        # finish before canceling feed tasks and closing database connections.
+        for event_id in list(store.events):
+            _terminal_events.setdefault(event_id, "shutdown")
+        for lock in list(_event_locks.values()):
+            async with lock:
+                pass
+        background = [task for group in tasks.values() for task in group]
+        tasks.clear()
+        if sports_task is not None:
+            background.append(sports_task)
+        if auto_task is not None:
+            background.append(auto_task)
+        await _cancel_tasks(background)
+
+        for database_store in (ledger, account_book, history_db, monitor_state):
+            if database_store is not None:
+                try:
+                    await asyncio.to_thread(database_store.close)
+                except Exception as exc:
+                    logger.warning("Could not close %s cleanly: %s",
+                                   type(database_store).__name__, exc)
+        ledger = None
+        account_book = None
+        history_db = None
+        monitor_state = None
+        with store.lock:
+            store.events.clear()
+            store.states.clear()
+            store.quotes.clear()
+            store.signals.clear()
+        _pregame.clear()
+        _finalized.clear()
+        _terminal_events.clear()
+        _event_locks.clear()
 
 
 app = FastAPI(title="Live Sports Signal Monitor", version=__version__, lifespan=lifespan)
@@ -250,6 +389,7 @@ class EventIn(BaseModel):
     polymarket_slug: str | None = None
     odds_api_sport: str | None = None
     odds_api_event_id: str | None = None
+    game_start: str | None = None
 
 
 class PositionIn(BaseModel):
@@ -313,6 +453,8 @@ async def config():
 @app.post("/api/config", dependencies=[Depends(verify_auth)])
 async def update_config(payload: ConfigIn):
     _config_state["auto_monitor"] = payload.auto_monitor
+    if monitor_state is not None:
+        await asyncio.to_thread(monitor_state.set_auto_monitor, payload.auto_monitor)
     return await config()
 
 
@@ -380,6 +522,7 @@ def event_view(event_id: str):
     return {"event": as_json(event),
             "latest_state": as_json(store.states[event_id][-1]) if store.states[event_id] else None,
             "signals": as_json(signals),
+            "edge_health": edge_health(store.quotes[event_id], signals, engine.max_age_seconds),
             "actionable_markets": market_views(store.quotes[event_id], signals, engine.edge_threshold),
             "positions": position_views(positions, store.quotes[event_id], signals,
                                           engine.confidence_threshold),
@@ -431,6 +574,7 @@ async def add_event(payload: EventIn):
             "home": payload.home or inferred["home"],
             "away": payload.away or inferred["away"],
             "odds_api_sport": payload.odds_api_sport or inferred["odds_api_sport"],
+            "game_start": payload.game_start or inferred["game_start"],
         })
         # We now defer match_odds_api_event to the background polling task so the POST returns instantly.
     required = ("name", "sport", "home", "away")
@@ -439,15 +583,15 @@ async def add_event(payload: EventIn):
         raise HTTPException(400, f"Missing required fields: {', '.join(missing)}")
     _require_safe_id(values.get("odds_api_sport"), "odds_api_sport")
     _require_safe_id(values.get("odds_api_event_id"), "odds_api_event_id")
-    event = store.add_event(Event(**values))
-    group = []
-    if event.polymarket_slug:
-        group.append(asyncio.create_task(polymarket_market_stream(event, on_quotes)))
-    if event.odds_api_sport:
-        group.append(asyncio.create_task(odds_api_poll(event, on_quotes)))
-        group.append(asyncio.create_task(action_network_poll(event, on_quotes)))
-        group.append(asyncio.create_task(pinnacle_poll(event, on_quotes)))
-    tasks[event.id] = group
+    tracked_slug = values.get("polymarket_slug")
+    if tracked_slug and any(existing.polymarket_slug == tracked_slug
+                            for existing in store.events.values()):
+        raise HTTPException(409, "This Polymarket event is already being tracked")
+    event = Event(**values)
+    if monitor_state is not None:
+        await asyncio.to_thread(monitor_state.save_event, event)
+    store.add_event(event)
+    _start_event_feeds(event)
     _notify_subscribers()
     return event_view(event.id)
 
@@ -526,17 +670,28 @@ async def bets(event_id: str | None = None):
 async def delete_event(event_id: str):
     if event_id not in store.events:
         raise HTTPException(404, "event not found")
-    await finalize_event(event_id)
-    if ledger is not None:
-        ledger.delete_event_positions(event_id)
-    for task in tasks.pop(event_id, []):
-        task.cancel()
-    _finalized.discard(event_id)
-    _pregame.pop(event_id, None)
-    del store.events[event_id]
-    store.states.pop(event_id, None)
-    store.quotes.pop(event_id, None)
-    store.signals.pop(event_id, None)
-    _notify_subscribers()
+    # Manual removal is not evidence of a final result. Block new entries,
+    # drain any in-flight placement, refund open bot bets, and remove tracking
+    # without score settlement or a completed history outcome.
+    _terminal_events.setdefault(event_id, "deleted")
+    lock = _event_lock(event_id)
+    async with lock:
+        await _cancel_tasks(tasks.pop(event_id, []))
+        if account_book is not None:
+            await asyncio.to_thread(account_book.void_event, event_id)
+        if ledger is not None:
+            await asyncio.to_thread(ledger.delete_event_positions, event_id)
+        if monitor_state is not None:
+            await asyncio.to_thread(monitor_state.delete_event, event_id)
+        _finalized.discard(event_id)
+        _pregame.pop(event_id, None)
+        with store.lock:
+            store.events.pop(event_id, None)
+            store.states.pop(event_id, None)
+            store.quotes.pop(event_id, None)
+            store.signals.pop(event_id, None)
+        _notify_subscribers()
+    _terminal_events.pop(event_id, None)
+    _event_locks.pop(event_id, None)
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -49,6 +50,16 @@ def classify_source(name: str) -> tuple[float, bool]:
     return (0.35, False)  # unknown book: modest default weight
 
 
+def canonical_source(name: str) -> str:
+    """Stable identity for one book across direct and aggregator adapters."""
+    compact = re.sub(r"[^a-z0-9]+", "", (name or "").casefold())
+    aliases = {
+        "williamhill": "caesars",
+        "williamhillus": "caesars",
+    }
+    return aliases.get(compact, compact or "unknown")
+
+
 @dataclass(slots=True)
 class Event:
     name: str
@@ -61,6 +72,7 @@ class Event:
     polymarket_restricted: bool = False
     odds_api_sport: str | None = None
     odds_api_event_id: str | None = None
+    game_start: str | None = None
     id: str = field(default_factory=lambda: str(uuid4()))
     created_at: datetime = field(default_factory=now_utc)
 

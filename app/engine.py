@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 
 from .gameclock import game_progress
-from .lines import quote_line_side
-from .models import GameState, Quote, Signal, classify_source
+from .lines import is_spread_market, is_total_market, quote_line_side
+from .models import GameState, Quote, Signal, canonical_source, classify_source
 
 try:
     from ._native_engine import evaluate_json
@@ -70,9 +70,15 @@ class SignalEngine:
     def _quote_payload(q: Quote, home_outcome: str = "", away_outcome: str = "") -> dict:
         weight, is_exchange = classify_source(q.source)
         point, side = quote_line_side(q.market, q.outcome, home_outcome, away_outcome)
+        market_key, outcome_key = SignalEngine._comparison_keys(
+            q.market, q.outcome, home_outcome, away_outcome, point, side
+        )
         return {
             "market": q.market,
             "outcome": q.outcome,
+            "comparison_market": market_key,
+            "comparison_outcome": outcome_key,
+            "comparison_source": SignalEngine._source_key(q.source),
             "probability": q.probability,
             "source": q.source,
             "observed_at": q.observed_at.timestamp(),
@@ -82,7 +88,39 @@ class SignalEngine:
             "is_exchange": is_exchange,
             "decimal_odds": q.decimal_odds,
             "liquidity": q.liquidity,
+            "ask_size": q.ask_size,
             "point": point,
             "side": side,
         }
+
+    @staticmethod
+    def _source_key(source: str) -> str:
+        """Canonicalize one underlying book across direct and aggregator feeds."""
+        return canonical_source(source)
+
+    @staticmethod
+    def _comparison_keys(market: str, outcome: str, home: str, away: str,
+                         point: float | None, side: str | None) -> tuple[str, str]:
+        """Return stable cross-provider keys without changing display labels.
+
+        The line is part of the market identity. Grouping every alternate
+        spread/total together makes de-vigging treat many unrelated two-way
+        books as one giant market and can inflate overround above 500%.
+        """
+        market_key = (market or "market").strip().casefold()
+        outcome_key = (outcome or "").strip().casefold()
+        if is_spread_market(market_key) and point is not None and side in {"home", "away"}:
+            home_line = point if side == "home" else -point
+            if abs(home_line) < 1e-9:
+                home_line = 0.0
+            return f"spread:{home_line:g}", side
+        if is_total_market(market_key) and point is not None and side in {"over", "under"}:
+            return f"total:{point:g}", side
+        if point is not None and side in {"over", "under"}:
+            return f"{market_key}:{point:g}", side
+        if outcome_key in {"home", (home or "").strip().casefold()}:
+            outcome_key = "home"
+        elif outcome_key in {"away", (away or "").strip().casefold()}:
+            outcome_key = "away"
+        return market_key, outcome_key
 

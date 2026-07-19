@@ -13,13 +13,11 @@ need data the system does not yet ingest.
 """
 from __future__ import annotations
 
-import os
-import psycopg2
-import psycopg2.extras
 import threading
 import time
 from typing import Iterable
 
+from .database import Database
 from .models import Event, Signal
 
 _SCHEMA = """
@@ -75,24 +73,22 @@ def _now() -> float:
 
 
 class Ledger:
-    """Thread-safe PostgreSQL append log for paper bets and closing lines."""
+    """Thread-safe append log backed by PostgreSQL or local SQLite."""
 
     def __init__(self, path: str | None = None):
-        self.path = path or os.getenv("DATABASE_URL")
-        if not self.path:
-            raise ValueError("DATABASE_URL environment variable is required for Supabase")
-        # A single shared connection guarded by a lock; the app writes at ~1/s.
-        self._conn = psycopg2.connect(self.path)
-        self._conn.autocommit = False
+        self._db = Database.open(
+            path, sqlite_envs=("LEDGER_DB",), sqlite_default="ledger.db"
+        )
+        self.path = self._db.target
+        self.backend = self._db.backend
+        self._conn = self._db.connection
         self._lock = threading.Lock()
         with self._lock:
-            with self._conn.cursor() as cur:
-                cur.execute(_SCHEMA)
-            self._conn.commit()
+            self._db.initialize(_SCHEMA)
 
     def close(self) -> None:
         with self._lock:
-            self._conn.close()
+            self._db.close()
 
     def record_signals(self, event: Event, signals: Iterable[Signal]) -> int:
         """Log the entry snapshot of every PAPER_BET, once per selection."""
@@ -109,19 +105,21 @@ class Ledger:
         if not rows:
             return 0
         with self._lock:
-            with self._conn.cursor() as cur:
-                from psycopg2.extras import execute_batch
-                execute_batch(cur,
-                    """INSERT INTO bets
-                       (event_id, event_name, sport, market, outcome, quote_source,
-                        entry_ts, entry_executable, entry_fair_prob, entry_edge,
-                        confidence, devig_method, overround, n_reference_sources)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                       ON CONFLICT (event_id, market, outcome) DO NOTHING""",
-                    rows,
-                )
-            self._conn.commit()
-            return len(rows)
+            inserted = 0
+            with self._db.transaction() as cur:
+                for row in rows:
+                    self._db.execute(
+                        cur,
+                        """INSERT INTO bets
+                           (event_id, event_name, sport, market, outcome, quote_source,
+                            entry_ts, entry_executable, entry_fair_prob, entry_edge,
+                            confidence, devig_method, overround, n_reference_sources)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT (event_id, market, outcome) DO NOTHING""",
+                        row,
+                    )
+                    inserted += max(cur.rowcount, 0)
+            return inserted
 
     def snapshot_closing(self, event_id: str, fair_by_selection: dict[tuple[str, str], float]) -> None:
         """Record the closing consensus fair and compute CLV for open bets."""
@@ -129,9 +127,10 @@ class Ledger:
             return
         now = _now()
         with self._lock:
-            with self._conn.cursor() as cur:
+            with self._db.transaction() as cur:
                 for (market, outcome), fair in fair_by_selection.items():
-                    cur.execute(
+                    self._db.execute(
+                        cur,
                         """INSERT INTO closing_lines (event_id, market, outcome, closing_fair_prob, closing_ts)
                            VALUES (%s,%s,%s,%s,%s)
                            ON CONFLICT(event_id, market, outcome)
@@ -140,13 +139,13 @@ class Ledger:
                         (event_id, market, outcome, fair, now),
                     )
                     # CLV = closing fair prob - the price we entered at. Only set once.
-                    cur.execute(
+                    self._db.execute(
+                        cur,
                         """UPDATE bets
                            SET closing_fair_prob=%s, clv=%s - entry_executable, closing_ts=%s
                            WHERE event_id=%s AND market=%s AND outcome=%s AND closing_fair_prob IS NULL""",
                         (fair, fair, now, event_id, market, outcome),
                     )
-            self._conn.commit()
 
     def settle_moneyline(self, event_id: str, winner_labels: set[str]) -> None:
         """Settle moneyline-style bets from the final result (win=1, loss=0)."""
@@ -154,8 +153,9 @@ class Ledger:
             return
         now = _now()
         with self._lock:
-            with self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                cur.execute(
+            with self._db.transaction(dict_rows=True) as cur:
+                self._db.execute(
+                    cur,
                     """SELECT id, market, outcome FROM bets
                        WHERE event_id=%s AND settled_result IS NULL""",
                     (event_id,),
@@ -166,23 +166,23 @@ class Ledger:
                     if row["market"].lower() in _MONEYLINE_MARKETS
                 ]
                 if updates:
-                    from psycopg2.extras import execute_batch
-                    execute_batch(cur,
-                        "UPDATE bets SET settled_result=%s, settled_ts=%s WHERE id=%s", updates
+                    self._db.execute_many(
+                        cur,
+                        "UPDATE bets SET settled_result=%s, settled_ts=%s WHERE id=%s",
+                        updates,
                     )
-            self._conn.commit()
 
     def all_bets(self) -> list[dict]:
         with self._lock:
-            with self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                cur.execute("SELECT * FROM bets ORDER BY entry_ts")
+            with self._db.cursor(dict_rows=True) as cur:
+                self._db.execute(cur, "SELECT * FROM bets ORDER BY entry_ts")
                 return [dict(row) for row in cur.fetchall()]
 
     def event_bets(self, event_id: str) -> list[dict]:
         with self._lock:
-            with self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                cur.execute(
-                    "SELECT * FROM bets WHERE event_id=%s ORDER BY entry_ts", (event_id,)
+            with self._db.cursor(dict_rows=True) as cur:
+                self._db.execute(
+                    cur, "SELECT * FROM bets WHERE event_id=%s ORDER BY entry_ts", (event_id,)
                 )
                 return [dict(row) for row in cur.fetchall()]
 
@@ -190,8 +190,9 @@ class Ledger:
                         shares: float, avg_entry_price: float) -> dict:
         now = _now()
         with self._lock:
-            with self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                cur.execute(
+            with self._db.transaction(dict_rows=True) as cur:
+                self._db.execute(
+                    cur,
                     """INSERT INTO positions
                        (event_id, token_id, market, outcome, shares, avg_entry_price, created_ts, updated_ts)
                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
@@ -200,32 +201,32 @@ class Ledger:
                          avg_entry_price=EXCLUDED.avg_entry_price, updated_ts=EXCLUDED.updated_ts""",
                     (event_id, token_id, market, outcome, shares, avg_entry_price, now, now),
                 )
-                self._conn.commit()
-                cur.execute(
+                self._db.execute(
+                    cur,
                     "SELECT * FROM positions WHERE event_id=%s AND token_id=%s", (event_id, token_id)
                 )
                 return dict(cur.fetchone())
 
     def event_positions(self, event_id: str) -> list[dict]:
         with self._lock:
-            with self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                cur.execute(
+            with self._db.cursor(dict_rows=True) as cur:
+                self._db.execute(
+                    cur,
                     "SELECT * FROM positions WHERE event_id=%s ORDER BY updated_ts DESC", (event_id,)
                 )
                 return [dict(row) for row in cur.fetchall()]
 
     def delete_position(self, event_id: str, token_id: str) -> bool:
         with self._lock:
-            with self._conn.cursor() as cur:
-                cur.execute(
+            with self._db.transaction() as cur:
+                self._db.execute(
+                    cur,
                     "DELETE FROM positions WHERE event_id=%s AND token_id=%s", (event_id, token_id)
                 )
                 rc = cur.rowcount
-            self._conn.commit()
             return rc > 0
 
     def delete_event_positions(self, event_id: str) -> None:
         with self._lock:
-            with self._conn.cursor() as cur:
-                cur.execute("DELETE FROM positions WHERE event_id=%s", (event_id,))
-            self._conn.commit()
+            with self._db.transaction() as cur:
+                self._db.execute(cur, "DELETE FROM positions WHERE event_id=%s", (event_id,))

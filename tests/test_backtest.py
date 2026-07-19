@@ -115,6 +115,7 @@ def test_watch_page_serves():
 
 def test_metrics_endpoint_is_available():
     with TestClient(app) as client:
+        assert client.post("/api/login", data={"username": "admin", "password": "admin"}).status_code == 200
         response = client.get("/api/metrics")
         assert response.status_code == 200
         body = response.json()

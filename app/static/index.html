@@ -451,17 +451,22 @@
   }
 
   function fallbackSignal(signal) {
-    return `<div class="market" data-line="${lineType(signal.market,signal.outcome)}"><div class="market-top"><div class="outcome">${lineBadge(signal.market,signal.outcome)}${esc(signal.outcome)}<small>${esc(signal.market)} demo signal</small></div><span class="tag ${signal.action === "PAPER_BET" ? "entry" : "wait"}">${esc(signal.action.replace("_"," "))}</span></div>
+    return `<div class="market" data-line="${lineType(signal.market,signal.outcome)}"><div class="market-top"><div class="outcome">${lineBadge(signal.market,signal.outcome)}${esc(signal.outcome)}<small>${esc(signal.market)} reference signal</small></div><span class="tag ${signal.action === "PAPER_BET" ? "entry" : "wait"}">${esc(signal.action.replace("_"," "))}</span></div>
       <div class="figs"><div class="fig"><div class="key">Model prob</div><div class="value">${pct(signal.model_probability)}</div><div class="hint">${signal.model_live_prob == null ? "Market consensus" : `Live model ${pct(signal.model_live_prob)}`}</div></div><div class="fig"><div class="key">Estimated edge</div><div class="value">${signedCents(signal.edge)}</div></div><div class="fig"><div class="key">Quality</div><div class="value">${signal.confidence.toFixed(0)}/100</div></div></div></div>`;
   }
 
   function eventCard(view, openDetails) {
     const {event,state_points,quote_points,latest_state:state,actionable_markets:markets,positions,signals} = view;
+    const health = view.edge_health;
     const usingFallback = !markets.length && !event.polymarket_slug;
     const anyReference = markets.some(m => (m.reference_sources||0) >= 1);
-    const priceOnly = markets.length && !anyReference
+    let priceOnly = markets.length && !anyReference
       ? '<div class="notice price-only"><strong>Price only</strong> · no sportsbook reference matched yet, so there\'s no validated edge here.</div>'
       : "";
+    if (health) {
+      const sources = health.fresh_reference_sources.length ? health.fresh_reference_sources.map(esc).join(", ") : "none";
+      priceOnly = `<div class="notice"><strong>Edge pipeline: ${esc(health.status.replaceAll("_"," "))}</strong> · ${esc(health.message)} Fresh references: ${sources}.</div>` + priceOnly;
+    }
     let mkts = markets, sigs = signals.slice(0,3);
     if (activeLine !== "all") {
       mkts = markets.filter(m => lineType(m.market,m.outcome) === activeLine);
@@ -474,7 +479,7 @@
       : (usingFallback && sigs.length) ? sigs.map(fallbackSignal).join("")
       : activeLine !== "all" ? '<div class="pending">No matching lines for this filter.</div>'
       : '<div class="pending">Waiting for a fresh executable ask and reference prices…</div>';
-    const link = event.polymarket_url ? `<a href="${esc(event.polymarket_url)}" target="_blank" rel="noopener">Open event ↗</a>` : "demo";
+    const link = event.polymarket_url ? `<a href="${esc(event.polymarket_url)}" target="_blank" rel="noopener">Open event ↗</a>` : "manual event";
     const restriction = event.polymarket_restricted ? '<strong>Region notice:</strong> Polymarket marks this event restricted. The monitor shows public data only and does not bypass availability rules.' : 'Only selections accepting orders with a visible ask are listed.';
     return `<article class="event" data-event-id="${esc(event.id)}"><div class="event-head"><div><div class="name">${esc(event.name)}</div><div class="meta">${esc(event.sport)} · ${link} · ${state_points} state / ${quote_points} updates</div></div><div class="event-actions"><button class="ghost" style="padding:6px 9px; margin:0; width:auto; font-size:10px; border-color:var(--cyan)" data-chart-event="${esc(event.id)}" data-chart-title="${esc(event.name)}">View Chart</button><div class="score">${score}</div><button class="remove" data-remove-event="${esc(event.id)}">Remove</button></div></div>
       <div class="notice">${restriction}</div>${priceOnly}${portfolio}<div class="section-strip"><span>Actionable selections</span> · buy, sell, margin, and risk</div><div>${marketBody}</div></article>`;
@@ -633,7 +638,7 @@
     if(!discoverGames.length){list.innerHTML='<div class="discover-empty">No live or upcoming games found right now.</div>';return}
     const q=(document.querySelector("#discover-search").value||"").toLowerCase();
     const shown=discoverGames.filter(g=>!q||`${g.title} ${g.league||""}`.toLowerCase().includes(q));
-    list.innerHTML=shown.length?shown.map(g=>`<div class="game" data-slug="${esc(g.slug)}" role="button" tabindex="0" title="${esc(g.title)}"><div><div class="g-title">${esc(g.title)}</div><div class="g-league">${discoverStatus(g)}${esc(g.league||"sports")}</div></div><span class="g-add">+ Monitor</span></div>`).join(""):'<div class="discover-empty">No games match.</div>';
+    list.innerHTML=shown.length?shown.map(g=>`<div class="game" data-slug="${esc(g.slug)}" role="button" tabindex="0" title="${esc(g.title)}"><div><div class="g-title">${esc(g.title)}</div><div class="g-league">${discoverStatus(g)}${esc(g.league||"sports")}${g.reference_adapter===false?' · PRICE ONLY — NO REFERENCE ADAPTER':''}</div></div><span class="g-add">+ Monitor</span></div>`).join(""):'<div class="discover-empty">No games match.</div>';
   }
   async function loadDiscover() {
     const list=document.querySelector("#discover-list");

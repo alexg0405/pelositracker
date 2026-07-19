@@ -11,6 +11,7 @@ from typing import Awaitable, Callable
 import httpx
 
 from .models import Event, Quote
+from .matching import best_team_pair_match
 
 logger = logging.getLogger(__name__)
 
@@ -40,23 +41,18 @@ def _implied_prob(american: int | float | None) -> float:
 
 
 def _match_pinnacle_game(event: Event, matchups: list[dict]) -> dict | None:
-    """Match an Event to a Pinnacle matchup by team name."""
-    target_home = event.home.lower().split()[-1]
-    target_away = event.away.lower().split()[-1]
-
-    for m in matchups:
-        if m.get("type") != "matchup":
-            continue
-        if m.get("special"):
-            continue
-        parts = m.get("participants", [])
-        if len(parts) != 2:
-            continue
-        names = [p.get("name", "").lower() for p in parts]
-        combined = " ".join(names)
-        if target_home in combined and target_away in combined:
-            return m
-    return None
+    """Match both normalized team identities, then disambiguate by start time."""
+    eligible = [matchup for matchup in matchups
+                if matchup.get("type") == "matchup" and not matchup.get("special")]
+    return best_team_pair_match(
+        eligible,
+        event.home,
+        event.away,
+        lambda matchup: [participant.get("name", "")
+                          for participant in matchup.get("participants", [])],
+        event.game_start,
+        lambda matchup: matchup.get("startTime"),
+    )
 
 
 def _parse_pinnacle_quotes(event: Event, matchup: dict, markets: list[dict]) -> list[Quote]:
@@ -75,7 +71,7 @@ def _parse_pinnacle_quotes(event: Event, matchup: dict, markets: list[dict]) -> 
 
         if mk_type == "moneyline":
             for p in prices:
-                desig = p.get("designation", "")
+                desig = str(p.get("designation", "")).casefold()
                 price = p.get("price")
                 if price is None:
                     continue
@@ -92,6 +88,14 @@ def _parse_pinnacle_quotes(event: Event, matchup: dict, markets: list[dict]) -> 
                         event_id=event.id,
                         market="moneyline",
                         outcome=event.away,
+                        probability=_implied_prob(price),
+                        source="pinnacle",
+                    ))
+                elif desig in {"draw", "tie"}:
+                    quotes.append(Quote(
+                        event_id=event.id,
+                        market="moneyline",
+                        outcome="Draw",
                         probability=_implied_prob(price),
                         source="pinnacle",
                     ))
@@ -207,4 +211,4 @@ async def pinnacle_poll(event: Event, emit: Callable[[list[Quote]], Awaitable[No
             except Exception as e:
                 logger.error(f"Pinnacle poll error for {event.name}: {e}")
 
-            await asyncio.sleep(45)  # Pinnacle lines move slowly; 45s is plenty
+            await asyncio.sleep(20)  # Keep quotes fresh within max_age window
