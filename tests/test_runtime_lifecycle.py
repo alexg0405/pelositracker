@@ -71,10 +71,12 @@ def _quotes(event: Event) -> list[Quote]:
     return [
         Quote(event.id, "moneyline", event.home, .445, "Polymarket",
               observed, bid=.44, ask=.45, ask_size=1_000, depth_complete=True,
-              fee_rate=0.0, ask_levels=((.45, 1_000.0),)),
+              fee_rate=0.0, token_id="token-home",
+              bid_levels=((.44, 1_000.0),), ask_levels=((.45, 1_000.0),)),
         Quote(event.id, "moneyline", event.away, .555, "Polymarket",
               observed, bid=.55, ask=.56, ask_size=1_000, depth_complete=True,
-              fee_rate=0.0, ask_levels=((.56, 1_000.0),)),
+              fee_rate=0.0, token_id="token-away",
+              bid_levels=((.55, 1_000.0),), ask_levels=((.56, 1_000.0),)),
         Quote(event.id, "moneyline", event.home, .62, "Pinnacle", observed),
         Quote(event.id, "moneyline", event.away, .38, "Pinnacle", observed),
         Quote(event.id, "moneyline", event.home, .62, "Circa", observed),
@@ -160,25 +162,27 @@ def test_finalization_failure_keeps_restore_state_and_retries_without_double_cre
     assert attempts == 2
 
 
-def test_manual_delete_voids_open_bets_without_writing_completed_outcome(runtime):
+def test_manual_delete_is_blocked_while_paper_bot_positions_are_open(runtime):
     event = _event()
     _register(runtime, event)
 
     async def scenario():
         await main.on_quotes(_quotes(event))
         main.store.add_state(_state(event, "in_progress", 70, 60))
-        await main.delete_event(event.id)
+        with pytest.raises(main.HTTPException) as error:
+            await main.delete_event(event.id)
+        assert error.value.status_code == 409
 
     asyncio.run(scenario())
 
     bet = runtime["accounts"].account_bets("Active")[0]
-    assert bet["status"] == "void"
-    assert bet["pnl"] == pytest.approx(0)
-    assert runtime["accounts"].leaderboard()[0]["bankroll"] == pytest.approx(1_000)
+    assert bet["status"] == "open"
+    assert bet["pnl"] is None
+    assert runtime["accounts"].leaderboard()[0]["bankroll"] < 1_000
     assert runtime["ledger"].event_bets(event.id)[0]["settled_result"] is None
     assert _outcome_count(runtime["history"]) == 0
-    assert runtime["monitor"].events() == []
-    assert event.id not in main.store.events
+    assert [saved.id for saved in runtime["monitor"].events()] == [event.id]
+    assert event.id in main.store.events
 
 
 def test_provider_cancellation_voids_instead_of_grading_score(runtime):

@@ -19,7 +19,8 @@ def test_fresh_shared_sqlite_database_applies_each_component_once(tmp_path):
             "SELECT component, version FROM schema_migrations ORDER BY component, version"
         ).fetchall()
     assert versions == [
-        ("accounts", 1), ("accounts", 2),
+        ("account_marks", 1),
+        ("accounts", 1), ("accounts", 2), ("accounts", 3),
         ("history", 1), ("history", 2), ("history", 3),
         ("history", 4),
         ("history", 5),

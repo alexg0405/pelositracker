@@ -41,6 +41,28 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "data-save-position" in javascript
         assert "Signal quality" in javascript
         assert "Edge buffer" in javascript or "edge_buffer" in javascript
+        assert "Allow logical automatic cash-out" in html
+        assert "data-cashout-toggle" in javascript
+
+
+def test_bot_cashout_toggle_and_mark_feed_are_authenticated_api_contracts():
+    with TestClient(app) as client:
+        login(client)
+        updated = client.patch(
+            "/api/accounts/Engine%20Kelly", json={"cash_out_enabled": True}
+        )
+        assert updated.status_code == 200
+        assert updated.json()["cash_out_enabled"] is True
+
+        board = client.get("/api/leaderboard").json()
+        account = next(item for item in board if item["name"] == "Engine Kelly")
+        assert account["cash_out_enabled"] is True
+        assert client.get("/api/accounts/Engine%20Kelly/marks").json() == []
+
+        restored = client.patch(
+            "/api/accounts/Engine%20Kelly", json={"cash_out_enabled": False}
+        )
+        assert restored.status_code == 200
 
 
 def test_position_can_be_saved_and_removed_for_a_visible_selection():

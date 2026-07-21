@@ -2,7 +2,13 @@ from decimal import Decimal
 
 import pytest
 
-from app.execution import BookLevel, PartialFillPolicy, polymarket_fee, simulate_buy
+from app.execution import (
+    BookLevel,
+    PartialFillPolicy,
+    polymarket_fee,
+    simulate_buy,
+    simulate_sell,
+)
 from app.orderbook import BookGapError, OrderBookState
 
 
@@ -80,3 +86,28 @@ def test_minimum_order_and_tick_alignment_are_enforced():
     )
     assert not too_small.complete and "minimum" in too_small.reason
     assert not off_tick.complete and "tick" in off_tick.reason
+
+
+def test_sell_walks_best_bids_and_deducts_fees():
+    result = simulate_sell(
+        levels(("0.55", "100"), ("0.50", "200")),
+        shares="150",
+        fee_rate="0.03",
+    )
+    assert result.complete
+    assert result.levels_consumed == 2
+    assert result.vwap == Decimal("0.5333333333333333333333333333")
+    assert result.fee > 0
+    assert result.net_proceeds < result.gross_proceeds
+    assert result.effective_probability < result.vwap
+
+
+def test_sell_fails_closed_without_full_depth_or_fee_metadata():
+    shallow = simulate_sell(levels(("0.50", "1")), shares="10", fee_rate="0")
+    unknown_fee = simulate_sell(levels(("0.50", "10")), shares="10", fee_rate=None)
+    incomplete = simulate_sell(
+        levels(("0.50", "10")), shares="10", fee_rate="0", depth_complete=False
+    )
+    assert not shallow.complete and shallow.net_proceeds == 0
+    assert not unknown_fee.complete and "fee metadata" in unknown_fee.reason
+    assert not incomplete.complete and "depth" in incomplete.reason

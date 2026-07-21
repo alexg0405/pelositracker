@@ -19,3 +19,10 @@ Milestone F advances the ledger to v6. It adds nullable independent-model
 probability, model/calibration versions and hashes, test sample/event counts,
 and registry lineage to decision marks and eligible paper-fill rows. Historical
 rows remain explicitly unknown and are not backfilled from later model output.
+
+The paper-bot lifecycle advances accounts to v3 and adds the independent
+`account_marks` v1 component. Accounts v3 persists the per-bot cash-out switch,
+exact market identity, entry depth/fee lineage, executable marks, high-water
+P/L, and exit economics. `account_marks` stores append-only valuation and
+cash-out decision observations, including fail-closed unpriced reasons. No
+historical entry, mark, or exit value is synthesized during migration.

@@ -229,17 +229,27 @@
       if (!r.ok) throw new Error();
       const bets = await r.json();
       if (!bets.length) { document.querySelector("#bot-modal-content").innerHTML = '<div class="empty">No bets placed yet.</div>'; return; }
-      const rows = bets.map(b => `<div class="game bot-bet">
+      const rows = bets.map(b => {
+        const displayedPnl = b.status === "open" ? b.last_mark_pnl : b.pnl;
+        const mark = b.last_mark_value == null
+          ? "Unpriced — no complete executable bid mark"
+          : `Net cash-out value: $${b.last_mark_value.toFixed(2)} at ${cents(b.last_mark_price)}`;
+        const exit = b.status === "cashed_out"
+          ? `<span>Exit: ${cents(b.exit_price)} · fee $${(b.exit_fee || 0).toFixed(2)}</span><span>${esc(b.exit_reason || "")}</span>`
+          : `<span>${esc(mark)}</span>`;
+        return `<div class="game bot-bet">
         <div class="bot-bet-head">
           <div><div class="g-title">${esc(b.event_name)}</div><div class="g-league">${esc(b.market)}: ${esc(b.outcome)}</div></div>
-          <div class="align-right"><div class="${b.pnl > 0 ? 'positive' : b.pnl < 0 ? 'negative' : ''}">${money(b.pnl || 0)}</div><div class="g-league">${b.status.toUpperCase()}</div></div>
+          <div class="align-right"><div class="${displayedPnl > 0 ? 'positive' : displayedPnl < 0 ? 'negative' : ''}">${displayedPnl == null ? "—" : money(displayedPnl)}</div><div class="g-league">${b.status.replaceAll("_", " ").toUpperCase()}</div></div>
         </div>
         <div class="bot-bet-meta">
           <span>Stake: $${b.stake.toFixed(2)}</span>
-          <span>Entry: ${cents(b.entry_price)}</span>
+          <span>All-in entry: ${cents(b.entry_price)}</span>
+          <span>Entry fee: $${(b.entry_fee || 0).toFixed(2)}</span>
           <span>Edge: ${pct(b.edge)}</span>
+          ${exit}
         </div>
-      </div>`).join("");
+      </div>`}).join("");
       document.querySelector("#bot-modal-content").innerHTML = rows;
     } catch { document.querySelector("#bot-modal-content").innerHTML = '<div class="error">Failed to load activity</div>'; }
   }
@@ -254,7 +264,19 @@
         body.innerHTML = '<div class="metrics-empty">No dummy accounts seeded.</div>';
         return;
       }
-      const columns = leaderboard.map(account => `<div class="mtile" title="${esc(account.strategy)}" data-bot="${esc(account.name)}"><div class="k bot-name">${esc(account.name)}</div><div class="v ${account.roi >= 0 ? "good" : "bad"}">${pct(account.roi)}</div><div class="sub2">$${account.equity.toFixed(2)} eq · ${account.win_rate == null ? "—" : pct(account.win_rate)} WR</div><div class="sub2 bot-count">${account.n_bets} bets (${account.wins}W-${account.losses}L)</div></div>`).join("");
+      const columns = leaderboard.map(account => {
+        const equity = account.equity == null ? `$${account.known_equity.toFixed(2)} known` : `$${account.equity.toFixed(2)} eq`;
+        const roi = account.roi == null ? "UNPRICED" : pct(account.roi);
+        const roiClass = account.roi == null ? "" : account.roi >= 0 ? "good" : "bad";
+        const unpriced = account.unpriced_open_positions ? ` · ${account.unpriced_open_positions} unpriced` : "";
+        return `<div class="mtile" title="${esc(account.strategy)}" data-bot="${esc(account.name)}">
+          <div class="k bot-name">${esc(account.name)}</div>
+          <div class="v ${roiClass}">${roi}</div>
+          <div class="sub2">${equity}${unpriced} · ${account.win_rate == null ? "—" : pct(account.win_rate)} WR</div>
+          <div class="sub2 bot-count">${account.n_bets} positions · ${account.n_cashouts} cash-outs · fees $${account.execution_fees.toFixed(2)}</div>
+          <label class="cashout-label bot-cashout-label"><input type="checkbox" data-cashout-toggle data-account="${esc(account.name)}" ${account.cash_out_enabled ? "checked" : ""}> Auto cash-out</label>
+        </div>`;
+      }).join("");
       body.innerHTML = `<div class="metric-tiles">${columns}</div>`;
     } catch {}
   }
@@ -309,7 +331,8 @@
       kelly_multiplier: sizing === "kelly" ? mult : 1.0,
       flat_stake: sizing === "flat" ? mult : 100.0,
       start_bankroll: 10000.0,
-      webhook_url: form.querySelector("#bot-webhook").value || ""
+      webhook_url: form.querySelector("#bot-webhook").value || "",
+      cash_out_enabled: form.querySelector("#bot-cashout").checked
     };
     try {
       const r = await fetch("/api/accounts", { method: "POST", headers: {"content-type":"application/json"}, body: JSON.stringify(payload) });
@@ -413,6 +436,21 @@
   document.addEventListener("click", event => {
     const close = event.target.closest("[data-close-dialog]");
     if (close) document.getElementById(close.dataset.closeDialog)?.close();
+    const cashout = event.target.closest("[data-cashout-toggle]");
+    if (cashout) {
+      event.stopPropagation();
+      cashout.disabled = true;
+      fetch(`/api/accounts/${encodeURIComponent(cashout.dataset.account)}`, {
+        method: "PATCH",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify({cash_out_enabled: cashout.checked})
+      }).then(response => {
+        if (!response.ok) throw new Error();
+        return refreshLeaderboard();
+      }).catch(() => { cashout.checked = !cashout.checked; })
+        .finally(() => { cashout.disabled = false; });
+      return;
+    }
     const bot = event.target.closest("[data-bot]");
     if (bot) viewBot(bot.dataset.bot);
   });

@@ -1,7 +1,7 @@
 import pytest
 
 from app.accounts import AccountBook, Strategy, qualification_failures, qualifies, stake_for
-from app.models import Event, Signal
+from app.models import Event, Quote, Signal
 
 
 def valid_signal(**overrides):
@@ -13,9 +13,19 @@ def valid_signal(**overrides):
         required_edge=.04, kelly_fraction=.05,
         consensus_probability=.60, calibrated_consensus_probability=.60,
         probability_net_ev_positive=.99, net_expected_value_total=5.0,
+        token_id="token-home",
     )
     values.update(overrides)
     return Signal(**values)
+
+
+def executable_quote(event: Event, token_id: str, market: str, outcome: str,
+                     *, ask: float = .50, bid: float = .48) -> Quote:
+    return Quote(
+        event.id, market, outcome, ask, "Polymarket", token_id=token_id,
+        ask=ask, bid=bid, ask_levels=((ask, 10_000.0),),
+        bid_levels=((bid, 10_000.0),), depth_complete=True, fee_rate=0.0,
+    )
 
 
 @pytest.mark.parametrize("changes, expected", [
@@ -63,15 +73,20 @@ def test_sport_and_correlated_group_caps_are_durable_and_enforced(tmp_path):
     )
     spread = valid_signal(
         event_id=first.id, market="spread", outcome="A -1.5",
-        decision_id="decision-2", fillable_size=1000,
+        decision_id="decision-2", fillable_size=1000, token_id="token-spread",
     )
     other_event = valid_signal(
         event_id=second.id, outcome="C", decision_id="decision-3",
-        fillable_size=1000,
+        fillable_size=1000, token_id="token-other",
     )
     try:
-        placed_first = book.place(first, [moneyline, spread])
-        placed_second = book.place(second, [other_event])
+        placed_first = book.place(first, [moneyline, spread], [
+            executable_quote(first, "token-home", "moneyline", "A"),
+            executable_quote(first, "token-spread", "spread", "A -1.5"),
+        ])
+        placed_second = book.place(second, [other_event], [
+            executable_quote(second, "token-other", "moneyline", "C"),
+        ])
         rows = book.account_bets("risk-test")
     finally:
         book.close()
@@ -81,3 +96,167 @@ def test_sport_and_correlated_group_caps_are_durable_and_enforced(tmp_path):
     assert sum(row["stake"] for row in rows) == pytest.approx(80.0)
     assert {row["sport"] for row in rows} == {"basketball"}
     assert all(row["correlation_group"] and row["decision_id"] for row in rows)
+
+
+def test_ungradeable_prop_is_rejected_before_it_can_be_voided(tmp_path):
+    book = AccountBook(str(tmp_path / "accounts.db"))
+    event = Event("A vs B", "basketball", "A", "B", id="event")
+    strategy = Strategy("bot", sizing="flat", flat_stake=100, start_bankroll=1_000)
+    prop = valid_signal(
+        event_id=event.id, market="player points", outcome="Player over 20.5",
+        token_id="token-prop",
+    )
+    quote = executable_quote(
+        event, "token-prop", "player points", "Player over 20.5"
+    )
+    try:
+        book.seed([strategy])
+        assert book.place(event, [prop], [quote], as_of=1_000) == []
+        assert book.account_bets("bot") == []
+    finally:
+        book.close()
+
+
+@pytest.mark.parametrize("signal_changes, quote_changes", [
+    ({}, {"ask": .58}),
+    ({"order_book_snapshot_id": "decision-book"}, {"book_hash": "new-book"}),
+])
+def test_entry_rechecks_actual_depth_price_and_book_identity(
+        tmp_path, signal_changes, quote_changes):
+    book = AccountBook(str(tmp_path / "accounts.db"))
+    event = Event("A vs B", "basketball", "A", "B", id="event")
+    strategy = Strategy("bot", sizing="flat", flat_stake=100, start_bankroll=1_000)
+    signal = valid_signal(event_id=event.id, outcome="A", **signal_changes)
+    ask = quote_changes.get("ask", .50)
+    quote = executable_quote(event, "token-home", "moneyline", "A", ask=ask)
+    for key, value in quote_changes.items():
+        if key != "ask":
+            setattr(quote, key, value)
+    try:
+        book.seed([strategy])
+        assert book.place(event, [signal], [quote], as_of=1_000) == []
+        assert book.account_bets("bot") == []
+    finally:
+        book.close()
+
+
+def test_marks_include_spread_and_both_fees_in_liquidation_value(tmp_path):
+    book = AccountBook(str(tmp_path / "accounts.db"))
+    event = Event("A vs B", "basketball", "A", "B", id="event")
+    strategy = Strategy("bot", sizing="flat", flat_stake=100, start_bankroll=1_000)
+    signal = valid_signal(event_id=event.id, outcome="A")
+    entry = executable_quote(event, "token-home", "moneyline", "A", ask=.50, bid=.49)
+    entry.fee_rate = .03
+    mark = executable_quote(event, "token-home", "moneyline", "A", ask=.51, bid=.49)
+    mark.fee_rate = .03
+    try:
+        book.seed([strategy])
+        book.place(event, [signal], [entry], as_of=1_000)
+        book.mark_and_cash_out(event, [mark], [signal], as_of=1_121)
+        bet = book.account_bets("bot")[0]
+        marks = book.bet_marks("bot", bet["id"])
+    finally:
+        book.close()
+
+    assert bet["entry_fee"] > 0
+    assert bet["last_mark_value"] < bet["stake"]
+    assert bet["last_mark_pnl"] < 0
+    assert marks[0]["exit_fee"] > 0
+    assert marks[0]["decision_action"] == "MARK_ONLY"
+
+
+def test_cashout_ignores_a_penny_move_then_takes_meaningful_model_reversal_profit(
+        tmp_path):
+    book = AccountBook(str(tmp_path / "accounts.db"))
+    event = Event("A vs B", "basketball", "A", "B", id="event")
+    strategy = Strategy(
+        "bot", sizing="flat", flat_stake=100, start_bankroll=1_000,
+        cash_out_enabled=True,
+    )
+    entry_signal = valid_signal(event_id=event.id, outcome="A")
+    reversed_signal = valid_signal(
+        event_id=event.id, outcome="A", consensus_probability=.50,
+        calibrated_consensus_probability=.50, model_probability=.50,
+        independent_model_probability=.90,
+    )
+    entry = executable_quote(event, "token-home", "moneyline", "A", ask=.50, bid=.48)
+    penny = executable_quote(event, "token-home", "moneyline", "A", ask=.52, bid=.51)
+    meaningful = executable_quote(event, "token-home", "moneyline", "A", ask=.57, bid=.56)
+    try:
+        book.seed([strategy])
+        book.place(event, [entry_signal], [entry], as_of=1_000)
+        assert book.mark_and_cash_out(
+            event, [penny], [reversed_signal], as_of=1_121
+        ) == []
+        assert book.account_bets("bot")[0]["status"] == "open"
+
+        exits = book.mark_and_cash_out(
+            event, [meaningful], [reversed_signal], as_of=1_166
+        )
+        bet = book.account_bets("bot")[0]
+        bankroll = book.leaderboard()[0]["bankroll"]
+        assert book.mark_and_cash_out(
+            event, [meaningful], [reversed_signal], as_of=1_200
+        ) == []
+    finally:
+        book.close()
+
+    assert len(exits) == 1
+    assert bet["status"] == "cashed_out"
+    assert bet["pnl"] == pytest.approx(12.0)
+    assert bankroll == pytest.approx(1_012.0)
+    assert "meaningful net profit" in bet["exit_reason"]
+
+
+def test_cashout_toggle_off_marks_but_never_closes(tmp_path):
+    book = AccountBook(str(tmp_path / "accounts.db"))
+    event = Event("A vs B", "basketball", "A", "B", id="event")
+    strategy = Strategy("bot", sizing="flat", flat_stake=100, start_bankroll=1_000)
+    signal = valid_signal(event_id=event.id, outcome="A")
+    entry = executable_quote(event, "token-home", "moneyline", "A", ask=.50, bid=.48)
+    surge = executable_quote(event, "token-home", "moneyline", "A", ask=.76, bid=.75)
+    try:
+        book.seed([strategy])
+        book.place(event, [signal], [entry], as_of=1_000)
+        exits = book.mark_and_cash_out(event, [surge], [signal], as_of=1_500)
+        bet = book.account_bets("bot")[0]
+        marks = book.bet_marks("bot", bet["id"])
+        assert book.set_cash_out("bot", True)
+        assert book.leaderboard()[0]["cash_out_enabled"] is True
+    finally:
+        book.close()
+
+    assert exits == []
+    assert bet["status"] == "open"
+    assert bet["last_mark_pnl"] == pytest.approx(50.0)
+    assert marks[0]["decision_action"] == "MARK_ONLY"
+
+
+def test_missing_sell_depth_is_recorded_as_unpriced_and_cannot_exit(tmp_path):
+    book = AccountBook(str(tmp_path / "accounts.db"))
+    event = Event("A vs B", "basketball", "A", "B", id="event")
+    strategy = Strategy(
+        "bot", sizing="flat", flat_stake=100, start_bankroll=1_000,
+        cash_out_enabled=True,
+    )
+    signal = valid_signal(event_id=event.id, outcome="A")
+    entry = executable_quote(event, "token-home", "moneyline", "A")
+    unavailable = executable_quote(event, "token-home", "moneyline", "A", bid=.70)
+    unavailable.bid_levels = ()
+    try:
+        book.seed([strategy])
+        book.place(event, [signal], [entry], as_of=1_000)
+        assert book.mark_and_cash_out(
+            event, [unavailable], [signal], as_of=1_500
+        ) == []
+        bet = book.account_bets("bot")[0]
+        marks = book.bet_marks("bot", bet["id"])
+        board = book.leaderboard()[0]
+    finally:
+        book.close()
+
+    assert bet["last_mark_value"] is None
+    assert marks[0]["decision_action"] == "UNPRICED"
+    assert "bid depth" in marks[0]["execution_reason"]
+    assert board["equity"] is None
+    assert board["unpriced_open_positions"] == 1

@@ -107,6 +107,13 @@
           <label>Discord/Slack Webhook URL (Optional)</label>
           <input id="bot-webhook" name="webhook_url" type="url" placeholder="https://discord.com/api/webhooks/...">
         </div>
+        <div class="full-row cashout-create-row">
+          <label class="cashout-label" for="bot-cashout">
+            <input id="bot-cashout" name="cash_out_enabled" type="checkbox">
+            Allow logical automatic cash-out
+          </label>
+          <div class="field-note">Paper only. Exits require a minimum hold and a meaningful profit, trailing-profit, or model-reversal threshold after the bid/ask spread and fees.</div>
+        </div>
         <div class="full-row">
           <div id="bot-submit-error" class="error bot-submit-error" hidden></div>
           <button class="primary no-top-margin" type="submit">Launch Bot</button>
@@ -116,6 +123,7 @@
 
     <section class="panel metrics-panel leaderboard-panel" aria-labelledby="leaderboard-heading">
       <div class="metrics-head"><h2 class="title glitch accent-text" data-text="Strategy Calibration · Dummy Accounts" id="leaderboard-heading">Strategy Calibration · Dummy Accounts</h2></div>
+      <div class="metrics-sub">Fake money only. Open equity uses executable net bid value; an unavailable full-depth mark is shown as unpriced instead of estimated at cost.</div>
       <div id="leaderboard-body" aria-live="polite"></div>
     </section>
     

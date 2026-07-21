@@ -152,6 +152,19 @@ Ambiguous doubleheaders are quarantined, not guessed.
 - **PAPER_BET**: all gates passed for a simulated paper order only.
 - **CLV**: last valid executable close minus recorded paper fill price.
 
+## Paper bots
+
+Paper bots use fake bankrolls only. Entries walk complete Polymarket ask depth
+and include fees. Open positions are valued at full executable bid depth after
+sell fees, so the bid/ask spread is visible immediately instead of being hidden
+by cost-based valuation. Each bot has an automatic cash-out switch; enabled
+bots apply minimum-hold, minimum-move, net-profit, trailing-profit, calibrated-
+estimate reversal, and stop thresholds. A provider cancellation may void an
+open position, but manually removing an event cannot.
+
+See [paper-bot lifecycle](docs/paper-bot-lifecycle.md) for the exact policy,
+stored research fields, and analysis endpoints.
+
 ## Repository map
 
 - `app/domain/`: canonical time, gate, and quality contracts.
@@ -168,6 +181,7 @@ Design and operating records are in [architecture](docs/architecture.md),
 [consensus model card](docs/model-card-consensus.md),
 [independent-model registry](docs/independent-model-registry.md),
 [backtesting methodology](docs/backtesting-methodology.md),
+[paper-bot lifecycle](docs/paper-bot-lifecycle.md),
 [security](docs/security.md), and [operations](docs/operations.md).
 
 ## Offline calibration workflow

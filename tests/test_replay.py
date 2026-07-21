@@ -19,8 +19,11 @@ def _moneyline_quote(event: Event, source: str, outcome: str, probability: float
         ask=ask,
         observed_at=observed_at,
         ask_size=1000.0 if is_polymarket else None,
+        bid_size=1000.0 if is_polymarket else None,
+        token_id=(f"token-{outcome.casefold()}" if is_polymarket else None),
         depth_complete=is_polymarket,
         fee_rate=0.0 if is_polymarket else None,
+        bid_levels=((bid, 1000.0),) if is_polymarket and bid is not None else (),
         ask_levels=((ask, 1000.0),) if is_polymarket and ask is not None else (),
     )
 

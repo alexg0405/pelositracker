@@ -24,6 +24,16 @@ def _paper_signal(event_id: str) -> Signal:
         quote_source="Polymarket",
         market_fair_prob=0.60,
         n_reference_sources=2,
+        token_id="token-home",
+    )
+
+
+def _paper_quote(event: Event) -> Quote:
+    return Quote(
+        event.id, "moneyline", "home", 0.50, "Polymarket",
+        token_id="token-home", bid=0.48, ask=0.50,
+        bid_levels=((0.48, 1_000.0),), ask_levels=((0.50, 1_000.0),),
+        depth_complete=True, fee_rate=0.0,
     )
 
 
@@ -117,9 +127,9 @@ def test_account_book_places_dedupes_settles_and_lists_every_account(tmp_path):
     )
     try:
         book.seed([active, idle])
-        placed = book.place(event, [_paper_signal(event.id)])
+        placed = book.place(event, [_paper_signal(event.id)], [_paper_quote(event)])
         assert [bet["bot_name"] for bet in placed] == ["Active"]
-        assert book.place(event, [_paper_signal(event.id)]) == []
+        assert book.place(event, [_paper_signal(event.id)], [_paper_quote(event)]) == []
 
         before = {row["name"]: row for row in book.leaderboard()}
         assert set(before) == {"Active", "Idle"}

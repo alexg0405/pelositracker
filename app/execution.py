@@ -43,6 +43,20 @@ class ExecutionResult:
     levels_consumed: int
 
 
+@dataclass(frozen=True, slots=True)
+class SaleResult:
+    requested_shares: Decimal
+    filled_shares: Decimal
+    gross_proceeds: Decimal
+    net_proceeds: Decimal
+    vwap: Decimal | None
+    fee: Decimal
+    effective_probability: Decimal | None
+    complete: bool
+    reason: str
+    levels_consumed: int
+
+
 def polymarket_fee(shares: Decimal, price: Decimal, fee_rate: Decimal) -> Decimal:
     """Documented CLOB fee curve, rounded deterministically to 1e-8 USDC."""
     if fee_rate < 0:
@@ -137,3 +151,85 @@ def simulate_buy(
     effective = (cost + fee) / shares
     return ExecutionResult(requested, cost + fee, shares, vwap, fee, effective,
                            complete, "full fill" if complete else "partial fill", consumed)
+
+
+def simulate_sell(
+    bids: Iterable[BookLevel],
+    *,
+    shares: object,
+    fee_rate: object | None,
+    partial_policy: PartialFillPolicy = PartialFillPolicy.REJECT,
+    tick_size: object | None = None,
+    min_order_size: object | None = None,
+    active: bool = True,
+    resolved: bool = False,
+    restricted: bool = False,
+    accepting_orders: bool = True,
+    depth_complete: bool = True,
+    identity_ambiguous: bool = False,
+) -> SaleResult:
+    """Walk bids for a paper sale and return proceeds after venue fees.
+
+    A rejected full-fill returns zero proceeds so callers cannot accidentally
+    value a complete position using only the liquid portion of the book.
+    """
+    requested = D(shares)
+    if requested <= 0:
+        raise ValueError("shares must be positive")
+
+    def rejected(reason: str, consumed: int = 0) -> SaleResult:
+        return SaleResult(requested, D(0), D(0), D(0), None, D(0), None,
+                          False, reason, consumed)
+
+    if identity_ambiguous:
+        return rejected("market identity is ambiguous")
+    if not active or resolved or restricted or not accepting_orders:
+        return rejected("market is not open for paper execution")
+    if not depth_complete:
+        return rejected("complete order-book depth unavailable")
+    if fee_rate is None:
+        return rejected("fee metadata unavailable")
+    rate = D(fee_rate)
+    if rate < 0:
+        return rejected("invalid fee rate")
+    tick = D(tick_size) if tick_size is not None else None
+    if tick is not None and (tick <= 0 or tick >= 1):
+        return rejected("invalid tick size")
+    minimum = D(min_order_size) if min_order_size is not None else None
+    if minimum is not None and minimum <= 0:
+        return rejected("invalid minimum order size")
+    if minimum is not None and requested < minimum:
+        return rejected("minimum order size not satisfied")
+
+    remaining = requested
+    filled = D(0)
+    gross = D(0)
+    fee = D(0)
+    consumed = 0
+    ordered = sorted((level for level in bids if level.size > 0),
+                     key=lambda level: level.price, reverse=True)
+    if tick is not None and any(level.price % tick != 0 for level in ordered):
+        return rejected("bid price is not aligned to tick size")
+    for level in ordered:
+        take = min(level.size, remaining)
+        if take <= 0:
+            continue
+        filled += take
+        gross += take * level.price
+        fee += polymarket_fee(take, level.price, rate)
+        remaining -= take
+        consumed += 1
+        if remaining <= Decimal("0.00000001"):
+            remaining = D(0)
+            break
+
+    complete = remaining == 0
+    if filled == 0:
+        return rejected("no executable bid depth", consumed)
+    if not complete and partial_policy is PartialFillPolicy.REJECT:
+        return rejected("insufficient depth for full-fill policy", consumed)
+    vwap = gross / filled
+    net = gross - fee
+    effective = net / filled
+    return SaleResult(requested, filled, gross, net, vwap, fee, effective,
+                      complete, "full fill" if complete else "partial fill", consumed)

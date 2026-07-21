@@ -213,4 +213,10 @@ dialog::backdrop { background: rgba(0,0,0,0.7); }
 .bot-bet-head { display:flex; justify-content:space-between; width:100%; }
 .align-right { text-align:right; }
 .bot-bet-meta { display:flex; gap:12px; margin-top:6px; font-size:10px; font-family:var(--mono); color:var(--muted); }
+.bot-bet-meta { flex-wrap:wrap; }
+.cashout-label { display:flex; align-items:center; gap:8px; color:var(--text); font:11px var(--mono); cursor:pointer; }
+.cashout-label input { width:auto; margin:0; accent-color:var(--cyan); }
+.cashout-create-row { padding:10px 12px; border:1px solid var(--line); background:var(--panel2); }
+.field-note { margin-top:7px; color:var(--faint); font:10px/1.45 var(--mono); }
+.bot-cashout-label { margin-top:9px; padding-top:7px; border-top:1px solid var(--line); }
 .reliability-meter { width:100%; height:36px; writing-mode:vertical-lr; direction:rtl; }

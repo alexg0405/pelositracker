@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased — Cost-aware paper-bot exits
+
+- Replaced signal-price bot entries with exact full-depth Decimal ask walks,
+  including fee, market-status, tick, minimum-size, identity, and depth gates.
+- Added append-only executable bid marks, net open valuation, fee/P&L lineage,
+  high-water tracking, and idempotent fake-money cash-outs.
+- Added a persistent per-bot automatic cash-out switch and minimum-hold,
+  minimum-move, hard-profit, trailing-profit, model-reversal, and stop policies.
+- Rejected ungradeable markets before entry and blocked manual event removal
+  while paper positions are open; authoritative provider cancellations still
+  void positions.
+- Added bot mark APIs and dashboard controls without adding wallets, signing,
+  exchange credentials, or real-order routing.
+
 ## 0.6.0 — Independent-model evidence registry
 
 - Added a fail-closed exact sport/league/market registry for independently

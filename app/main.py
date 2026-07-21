@@ -161,7 +161,8 @@ async def on_state(state: GameState):
         # to quote callbacks that might otherwise place a known-result bet.
         _terminal_events.setdefault(state.event_id, terminal)
     event = store.events.get(state.event_id)
-    previous = (store.states.get(state.event_id) or [None])[-1]
+    previous_states = store.states.get(state.event_id)
+    previous = previous_states[-1] if previous_states else None
     if terminal is None and event is not None and not state.quarantined:
         validation = validate_state_transition(
             sport=event.sport, league=event.league, period=state.period, clock=state.clock,
@@ -278,7 +279,8 @@ async def record(event_id: str, *, as_of: datetime | None = None) -> None:
     async with _event_lock(event_id):
         if event_id in _terminal_events or event_id in _finalized:
             return
-        signals = recompute(event_id, as_of=as_of or datetime.now(timezone.utc))
+        decision_at = as_of or datetime.now(timezone.utc)
+        signals = recompute(event_id, as_of=decision_at)
         _notify_subscribers()  # push the fresh snapshot to the dashboard immediately
         event = store.events.get(event_id)
         # Ledger commits fsync to disk; keep that off the event loop.
@@ -288,12 +290,21 @@ async def record(event_id: str, *, as_of: datetime | None = None) -> None:
         # closes the gate immediately; do not begin a new account entry after it.
         if event_id in _terminal_events or event_id in _finalized:
             return
-        if account_book is not None and event is not None and signals:
-            placed_bets = await asyncio.to_thread(account_book.place, event, signals)
-            if placed_bets:
-                for p in placed_bets:
-                    if p.get("webhook_url"):
-                        _schedule_notification(p)
+        if account_book is not None and event is not None:
+            quotes = store.quotes[event_id]
+            exited_bets = await asyncio.to_thread(
+                account_book.mark_and_cash_out, event, quotes, signals, as_of=decision_at
+            )
+            for paper_event in exited_bets:
+                if paper_event.get("webhook_url"):
+                    _schedule_notification(paper_event)
+            if signals:
+                placed_bets = await asyncio.to_thread(
+                    account_book.place, event, signals, quotes, as_of=decision_at
+                )
+                for paper_event in placed_bets:
+                    if paper_event.get("webhook_url"):
+                        _schedule_notification(paper_event)
 
 
 def _winner_labels(event: Event, home_score: float, away_score: float) -> set[str]:
@@ -506,6 +517,11 @@ class StrategyIn(BaseModel):
     flat_stake: float = 100.0
     start_bankroll: float = 10000.0
     webhook_url: str = ""
+    cash_out_enabled: bool = False
+
+
+class StrategyUpdateIn(BaseModel):
+    cash_out_enabled: bool
 
 
 class ConfigIn(BaseModel):
@@ -814,7 +830,8 @@ async def create_account(payload: StrategyIn):
         kelly_multiplier=payload.kelly_multiplier,
         flat_stake=payload.flat_stake,
         start_bankroll=payload.start_bankroll,
-        webhook_url=payload.webhook_url
+        webhook_url=payload.webhook_url,
+        cash_out_enabled=payload.cash_out_enabled,
     )
     await asyncio.to_thread(account_book.seed, [strat])
     return {"status": "ok"}
@@ -827,29 +844,61 @@ async def get_account_bets(name: str):
     return await asyncio.to_thread(account_book.account_bets, name)
 
 
+@app.get("/api/accounts/{name}/marks", dependencies=[Depends(verify_auth)])
+async def get_account_marks(name: str):
+    if account_book is None:
+        return []
+    return await asyncio.to_thread(account_book.account_marks, name)
+
+
+@app.patch("/api/accounts/{name}", dependencies=[Depends(verify_auth)])
+async def update_account(name: str, payload: StrategyUpdateIn):
+    if account_book is None:
+        raise HTTPException(503, "Account book is not initialized")
+    updated = await asyncio.to_thread(
+        account_book.set_cash_out, name, payload.cash_out_enabled
+    )
+    if not updated:
+        raise HTTPException(404, "paper bot not found")
+    return {"name": name, "cash_out_enabled": payload.cash_out_enabled}
+
+
+@app.get("/api/accounts/{name}/bets/{bet_id}/marks",
+         dependencies=[Depends(verify_auth)])
+async def get_account_bet_marks(name: str, bet_id: int):
+    if account_book is None:
+        return []
+    return await asyncio.to_thread(account_book.bet_marks, name, bet_id)
+
+
 @app.get("/api/bets", dependencies=[Depends(verify_auth)])
 async def bets(event_id: str | None = None):
     if ledger is None:
         return []
-    return await asyncio.to_thread(
-        ledger.event_bets if event_id else ledger.all_bets,
-        *([event_id] if event_id else []),
-    )
+    if event_id:
+        return await asyncio.to_thread(ledger.event_bets, event_id)
+    return await asyncio.to_thread(ledger.all_bets)
 
 
 @app.delete("/api/events/{event_id}", status_code=204, dependencies=[Depends(verify_auth)])
 async def delete_event(event_id: str):
     if event_id not in store.events:
         raise HTTPException(404, "event not found")
-    # Manual removal is not evidence of a final result. Block new entries,
-    # drain any in-flight placement, refund open bot bets, and remove tracking
-    # without score settlement or a completed history outcome.
-    _terminal_events.setdefault(event_id, "deleted")
+    # Manual removal is not evidence of a final result. Keep an event monitored
+    # while any fake-money bot position is open so positions cannot disappear
+    # into a misleading administrative void/refund.
     lock = _event_lock(event_id)
     async with lock:
+        open_positions = (await asyncio.to_thread(account_book.open_count, event_id)
+                          if account_book is not None else 0)
+        if open_positions > 0:
+            raise HTTPException(
+                409,
+                "This event has open paper-bot positions. Leave it monitored until "
+                "they settle or cash out; only a provider cancellation may void them.",
+            )
+        _terminal_events.setdefault(event_id, "deleted")
         await _cancel_tasks(tasks.pop(event_id, []))
-        if account_book is not None:
-            await asyncio.to_thread(account_book.void_event, event_id)
         if ledger is not None:
             await asyncio.to_thread(ledger.delete_event_positions, event_id)
         if monitor_state is not None:

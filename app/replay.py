@@ -228,26 +228,29 @@ def run_replay(history_db_path: str | os.PathLike[str] = "history.db", *,
                     pregame_total=event_row["pregame_total"],
                     as_of=tick_at,
                 )
+                current = list(current_quotes.values())
+                accounts.mark_and_cash_out(event, current, signals, as_of=tick_at)
                 if signals:
-                    accounts.place(event, signals)
+                    accounts.place(event, signals, current, as_of=tick_at)
 
             home_score = event_row["final_home_score"]
             away_score = event_row["final_away_score"]
             outcome_terminal = _terminal_kind(event_row["final_status"])
             if replay_terminal == "canceled" or outcome_terminal == "canceled":
-                accounts.void_event(event.id)
+                accounts.void_event(event.id, as_of=terminal_at)
             elif home_score is not None and away_score is not None:
-                accounts.settle(event, home_score, away_score)
+                accounts.settle(event, home_score, away_score, as_of=terminal_at)
 
         board = accounts.leaderboard()
         print("\n" + "=" * 50)
         print("BACKTEST RESULTS (LEADERBOARD)")
         print("=" * 50)
         for rank, bot in enumerate(board, 1):
-            roi = bot["roi"] * 100
+            roi = (bot["roi"] or 0) * 100
             win_rate = (bot["win_rate"] * 100) if bot["win_rate"] is not None else 0
+            equity = bot["equity"] if bot["equity"] is not None else bot["known_equity"]
             print(
-                f"{rank}. {bot['name']:<25} | Equity: ${bot['equity']:<8.2f} | "
+                f"{rank}. {bot['name']:<25} | Equity: ${equity:<8.2f} | "
                 f"ROI: {roi:>6.2f}% | WR: {win_rate:>5.1f}% | Bets: {bot['n_bets']}"
             )
         return board

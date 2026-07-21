@@ -8,8 +8,10 @@ finalizes, moneyline / spread / total bets are graded from the final score and
 the bankroll is credited. Running several accounts side by side is a live
 strategy-calibration harness (compare ROI, win rate, exposure).
 
-Realized only — open bets are held at cost (no mark-to-market), and player
-props can't be graded from the score so they're voided (refunded) at settle.
+Every entry and optional cash-out is simulated against complete Polymarket CLOB
+depth with the recorded fee schedule. Open positions are marked at executable
+net liquidation value; unsupported markets are rejected before entry rather
+than silently voided later.
 """
 from __future__ import annotations
 
@@ -17,10 +19,12 @@ import json
 import threading
 import time
 from dataclasses import asdict, dataclass, fields
+from datetime import datetime
 
 from .database import Database
+from .execution import BookLevel, simulate_buy, simulate_sell
 from .lines import is_spread_market, is_total_market, quote_line_side
-from .models import Event, Signal
+from .models import Event, Quote, Signal
 
 _MONEYLINE = {"moneyline", "h2h", "winner", "match_winner"}
 
@@ -53,6 +57,36 @@ CREATE TABLE IF NOT EXISTS account_bets (
 );
 """
 
+_MARKS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS account_bet_marks (
+    id                       SERIAL PRIMARY KEY,
+    bet_id                   INTEGER NOT NULL,
+    account                  TEXT NOT NULL,
+    event_id                 TEXT NOT NULL,
+    token_id                 TEXT NOT NULL,
+    marked_ts                DOUBLE PRECISION NOT NULL,
+    provider_ts              DOUBLE PRECISION,
+    received_ts              DOUBLE PRECISION,
+    bid_vwap                 DOUBLE PRECISION,
+    effective_sell_price     DOUBLE PRECISION,
+    gross_value              DOUBLE PRECISION,
+    net_value                DOUBLE PRECISION,
+    exit_fee                 DOUBLE PRECISION,
+    unrealized_pnl           DOUBLE PRECISION,
+    model_prob               DOUBLE PRECISION,
+    hold_edge                DOUBLE PRECISION,
+    book_hash                TEXT,
+    decision_id              TEXT,
+    decision_action          TEXT NOT NULL,
+    decision_reason          TEXT NOT NULL,
+    execution_reason         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_account_bet_marks_bet_time
+    ON account_bet_marks(bet_id, marked_ts);
+CREATE INDEX IF NOT EXISTS idx_account_bet_marks_event_time
+    ON account_bet_marks(event_id, marked_ts);
+"""
+
 
 @dataclass
 class Strategy:
@@ -73,6 +107,16 @@ class Strategy:
     max_total_exposure_pct: float = 0.40
     start_bankroll: float = 10_000.0
     webhook_url: str = ""
+    cash_out_enabled: bool = False
+    cash_out_min_hold_seconds: float = 120.0
+    cash_out_min_price_move: float = 0.03
+    cash_out_min_profit_dollars: float = 2.0
+    cash_out_min_profit_pct: float = 0.08
+    cash_out_hard_profit_pct: float = 0.20
+    cash_out_trailing_activation_pct: float = 0.12
+    cash_out_trailing_drawdown_pct: float = 0.35
+    cash_out_model_reversal_margin: float = 0.02
+    cash_out_stop_loss_pct: float = 0.18
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))
@@ -223,8 +267,93 @@ def _now() -> float:
     return time.time()
 
 
+def _timestamp(value: datetime | float | None) -> float:
+    if isinstance(value, datetime):
+        return value.timestamp()
+    return float(value) if value is not None else _now()
+
+
+def _book_levels(values: tuple[tuple[float, float], ...]) -> list[BookLevel]:
+    try:
+        return [BookLevel.create(price, size) for price, size in values]
+    except (TypeError, ValueError):
+        return []
+
+
+def _latest_quotes(quotes: list[Quote]) -> dict[str, Quote]:
+    latest: dict[str, Quote] = {}
+    for quote in quotes:
+        if quote.source.casefold() != "polymarket" or not quote.token_id:
+            continue
+        previous = latest.get(quote.token_id)
+        if previous is None or quote.processed_at >= previous.processed_at:
+            latest[quote.token_id] = quote
+    return latest
+
+
+def _decision_probability(signal: Signal | None) -> float | None:
+    if signal is None:
+        return None
+    for value in (
+        signal.calibrated_consensus_probability,
+        signal.model_probability,
+        signal.consensus_probability,
+    ):
+        if value is not None and 0 < value < 1:
+            return float(value)
+    return None
+
+
+def _gradeable(event: Event, market: str, outcome: str) -> bool:
+    kind = line_type(market)
+    if kind == "moneyline":
+        return any(_matches(outcome, label) for label in ("home", "away", "draw",
+                                                           event.home, event.away))
+    point, side = quote_line_side(market, outcome, event.home, event.away)
+    if kind == "spread":
+        return point is not None and side in {"home", "away"}
+    if kind == "total":
+        return point is not None and side in {"over", "under"}
+    return False
+
+
+def _cashout_decision(strategy: Strategy, row, *, net_value: float,
+                      effective_price: float, model_prob: float | None,
+                      marked_at: float, high_water: float) -> tuple[bool, str]:
+    hold_seconds = max(0.0, marked_at - float(row["placed_ts"]))
+    pnl = net_value - float(row["stake"])
+    stake = float(row["stake"])
+    return_pct = pnl / stake if stake else 0.0
+    price_move = effective_price - float(row["entry_price"])
+    if hold_seconds < strategy.cash_out_min_hold_seconds:
+        return False, f"minimum hold not reached ({hold_seconds:.0f}s)"
+
+    if (return_pct >= strategy.cash_out_hard_profit_pct
+            and price_move >= strategy.cash_out_min_price_move):
+        return True, "hard profit target reached after costs"
+
+    activation = strategy.cash_out_trailing_activation_pct * stake
+    retained = high_water * (1.0 - strategy.cash_out_trailing_drawdown_pct)
+    required_profit = max(strategy.cash_out_min_profit_dollars,
+                          strategy.cash_out_min_profit_pct * stake)
+    if (high_water >= activation and pnl >= required_profit and pnl <= retained
+            and price_move >= strategy.cash_out_min_price_move):
+        return True, "trailing profit protection triggered after costs"
+
+    if model_prob is None:
+        return False, "no current calibrated decision estimate"
+    hold_edge = model_prob - effective_price
+    reversed_model = hold_edge <= -strategy.cash_out_model_reversal_margin
+    if (reversed_model and pnl >= required_profit
+            and price_move >= strategy.cash_out_min_price_move):
+        return True, "calibrated estimate reversed; meaningful net profit protected"
+    if reversed_model and return_pct <= -strategy.cash_out_stop_loss_pct:
+        return True, "calibrated estimate reversed; cost-aware stop loss triggered"
+    return False, "cash-out thresholds not met after spread and fees"
+
+
 class AccountBook:
-    """Thread-safe PostgreSQL/SQLite store of paper accounts and bets."""
+    """Thread-safe store for auditable, fake-money bot positions."""
 
     def __init__(self, path: str | None = None):
         self._db = Database.open(
@@ -245,36 +374,89 @@ class AccountBook:
                     "decision_id": "TEXT",
                 },
             })
+            self._db.migrate_columns("accounts", 3, {
+                "accounts": {
+                    "cash_out_enabled": "INTEGER NOT NULL DEFAULT 0",
+                },
+                "account_bets": {
+                    "token_id": "TEXT",
+                    "condition_id": "TEXT",
+                    "provider_market_id": "TEXT",
+                    "entry_vwap": "DOUBLE PRECISION",
+                    "entry_fee": "DOUBLE PRECISION",
+                    "entry_book_hash": "TEXT",
+                    "entry_provider_ts": "DOUBLE PRECISION",
+                    "entry_received_ts": "DOUBLE PRECISION",
+                    "last_mark_price": "DOUBLE PRECISION",
+                    "last_mark_value": "DOUBLE PRECISION",
+                    "last_mark_pnl": "DOUBLE PRECISION",
+                    "last_mark_ts": "DOUBLE PRECISION",
+                    "high_water_pnl": "DOUBLE PRECISION",
+                    "exit_price": "DOUBLE PRECISION",
+                    "exit_value": "DOUBLE PRECISION",
+                    "exit_fee": "DOUBLE PRECISION",
+                    "exit_ts": "DOUBLE PRECISION",
+                    "exit_reason": "TEXT",
+                },
+            })
+            self._db.initialize(_MARKS_SCHEMA, component="account_marks", version=1)
 
     def close(self) -> None:
         with self._lock:
             self._db.close()
 
     def seed(self, strategies: list[Strategy]) -> None:
-        """Create any missing preset accounts (idempotent)."""
+        """Create missing preset accounts without overwriting a user's toggle."""
         now = _now()
         with self._lock:
             with self._db.transaction() as cur:
                 for strat in strategies:
                     self._db.execute(
                         cur,
-                        """INSERT INTO accounts (name, strategy, start_bankroll, bankroll, created_ts)
-                           VALUES (%s,%s,%s,%s,%s) ON CONFLICT (name) DO UPDATE SET
+                        """INSERT INTO accounts
+                           (name, strategy, start_bankroll, bankroll, created_ts,
+                            cash_out_enabled)
+                           VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (name) DO UPDATE SET
                            strategy=EXCLUDED.strategy""",
-                        (strat.name, strat.to_json(), strat.start_bankroll, strat.start_bankroll, now),
+                        (strat.name, strat.to_json(), strat.start_bankroll,
+                         strat.start_bankroll, now, int(strat.cash_out_enabled)),
                     )
 
-    def place(self, event: Event, signals: list[Signal]) -> list[dict]:
-        """Let every account bet the signals that clear its own bar (once each)."""
-        now = _now()
+    def set_cash_out(self, name: str, enabled: bool) -> bool:
+        with self._lock:
+            with self._db.transaction() as cur:
+                self._db.execute(
+                    cur, "UPDATE accounts SET cash_out_enabled=%s WHERE name=%s",
+                    (int(enabled), name),
+                )
+                return bool(cur.rowcount)
+
+    def open_count(self, event_id: str) -> int:
+        with self._lock:
+            with self._db.cursor() as cur:
+                self._db.execute(
+                    cur,
+                    "SELECT COUNT(*) FROM account_bets WHERE event_id=%s AND status='open'",
+                    (event_id,),
+                )
+                return int(cur.fetchone()[0])
+
+    def place(self, event: Event, signals: list[Signal], quotes: list[Quote] | None = None,
+              *, as_of: datetime | float | None = None) -> list[dict]:
+        """Open paper positions only after an exact full-depth simulated fill."""
+        now = _timestamp(as_of)
+        quote_by_token = _latest_quotes(quotes or [])
         placed_bets = []
         with self._lock:
             with self._db.transaction(dict_rows=True) as cur:
-                self._db.execute(cur, "SELECT name, strategy, bankroll, start_bankroll FROM accounts")
+                self._db.execute(
+                    cur,
+                    "SELECT name, strategy, bankroll, start_bankroll FROM accounts",
+                )
                 accounts = cur.fetchall()
                 for account in accounts:
                     strategy = Strategy.from_json(account["strategy"])
-                    bankroll = account["bankroll"]
+                    bankroll = float(account["bankroll"])
                     self._db.execute(
                         cur,
                         """SELECT COALESCE(SUM(stake),0) AS total_open,
@@ -289,9 +471,17 @@ class AccountBook:
                     total_open = float(exposure["total_open"] or 0)
                     event_open = float(exposure["event_open"] or 0)
                     sport_open = float(exposure["sport_open"] or 0)
-                    equity = bankroll + total_open
+                    equity_for_caps = bankroll + total_open
                     for signal in signals:
-                        if signal.market_probability <= 0 or not qualifies(strategy, signal):
+                        if not signal.token_id or not _gradeable(
+                                event, signal.market, signal.outcome):
+                            continue
+                        quote = quote_by_token.get(signal.token_id)
+                        if quote is None or signal.market_probability <= 0 \
+                                or not qualifies(strategy, signal):
+                            continue
+                        if (signal.order_book_snapshot_id
+                                and signal.order_book_snapshot_id != quote.book_hash):
                             continue
                         correlation_group = _correlation_group(event, signal)
                         self._db.execute(
@@ -302,63 +492,230 @@ class AccountBook:
                             (account["name"], correlation_group),
                         )
                         correlated_open = float(cur.fetchone()["correlated_open"] or 0)
-                        stake = stake_for(strategy, signal, bankroll)
-                        stake = min(
-                            stake,
-                            max(0.0, strategy.max_event_exposure_pct * equity - event_open),
-                            max(0.0, strategy.max_sport_exposure_pct * equity - sport_open),
-                            max(0.0, strategy.max_correlated_exposure_pct * equity
+                        requested_stake = stake_for(strategy, signal, bankroll)
+                        requested_stake = min(
+                            requested_stake,
+                            max(0.0, strategy.max_event_exposure_pct * equity_for_caps
+                                - event_open),
+                            max(0.0, strategy.max_sport_exposure_pct * equity_for_caps
+                                - sport_open),
+                            max(0.0, strategy.max_correlated_exposure_pct * equity_for_caps
                                 - correlated_open),
-                            max(0.0, strategy.max_total_exposure_pct * equity - total_open),
+                            max(0.0, strategy.max_total_exposure_pct * equity_for_caps
+                                - total_open),
                         )
-                        if stake < 1.0:  # dust or out of funds
+                        if requested_stake < 1.0:
+                            continue
+                        execution = simulate_buy(
+                            _book_levels(quote.ask_levels),
+                            cash=requested_stake,
+                            fee_rate=quote.fee_rate,
+                            tick_size=quote.tick_size,
+                            min_order_size=quote.min_order_size,
+                            active=quote.active,
+                            resolved=quote.resolved,
+                            restricted=quote.restricted,
+                            accepting_orders=quote.accepting_orders,
+                            depth_complete=quote.depth_complete,
+                        )
+                        if (not execution.complete or execution.effective_probability is None
+                                or execution.vwap is None):
+                            continue
+                        stake = float(execution.filled_cash)
+                        shares = float(execution.filled_shares)
+                        entry_price = float(execution.effective_probability)
+                        model_probability = _decision_probability(signal)
+                        if model_probability is None:
+                            continue
+                        actual_edge = model_probability - entry_price
+                        if actual_edge < max(signal.required_edge, strategy.edge_threshold):
                             continue
                         self._db.execute(
                             cur,
                             """INSERT INTO account_bets
                                (account, event_id, event_name, market, outcome, entry_price, stake,
                                 shares, model_prob, edge, placed_ts, status, sport,
-                                correlation_group, decision_id)
-                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, 'open',%s,%s,%s)
+                                correlation_group, decision_id, token_id, condition_id,
+                                provider_market_id, entry_vwap, entry_fee, entry_book_hash,
+                                entry_provider_ts, entry_received_ts)
+                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open',%s,%s,%s,
+                                       %s,%s,%s,%s,%s,%s,%s,%s)
                                ON CONFLICT (account, event_id, market, outcome) DO NOTHING""",
                             (account["name"], event.id, event.name, signal.market, signal.outcome,
-                             signal.market_probability, stake, stake / signal.market_probability,
-                             signal.consensus_probability, signal.edge, now,
-                             event.sport.casefold(), correlation_group,
-                             signal.decision_id or None),
+                             entry_price, stake, shares, model_probability,
+                             actual_edge, now, event.sport.casefold(), correlation_group,
+                             signal.decision_id or None, quote.token_id, quote.condition_id,
+                             quote.provider_market_id, float(execution.vwap),
+                             float(execution.fee), quote.book_hash,
+                             _timestamp(quote.provider_timestamp)
+                             if quote.provider_timestamp is not None else None,
+                             _timestamp(quote.received_at)),
                         )
-                        if cur.rowcount:
-                            bankroll -= stake
-                            total_open += stake
-                            event_open += stake
-                            sport_open += stake
-                            placed_bets.append({
-                                "bot_name": account["name"],
-                                "webhook_url": strategy.webhook_url,
-                                "event_name": event.name,
-                                "market": signal.market,
-                                "outcome": signal.outcome,
-                                "action": "PAPER_BET",
-                                "stake": stake,
-                                "entry_price": signal.market_probability,
-                                "edge": signal.edge,
-                            })
-                            self._db.execute(
-                                cur,
-                                "UPDATE accounts SET bankroll=%s WHERE name=%s",
-                                (bankroll, account["name"]),
-                            )
+                        if not cur.rowcount:
+                            continue
+                        bankroll -= stake
+                        total_open += stake
+                        event_open += stake
+                        sport_open += stake
+                        placed_bets.append({
+                            "bot_name": account["name"],
+                            "webhook_url": strategy.webhook_url,
+                            "event_name": event.name,
+                            "market": signal.market,
+                            "outcome": signal.outcome,
+                            "action": "PAPER_BET",
+                            "stake": stake,
+                            "entry_price": entry_price,
+                            "entry_vwap": float(execution.vwap),
+                            "entry_fee": float(execution.fee),
+                            "edge": actual_edge,
+                        })
+                        self._db.execute(
+                            cur, "UPDATE accounts SET bankroll=%s WHERE name=%s",
+                            (bankroll, account["name"]),
+                        )
         return placed_bets
 
-    def settle(self, event: Event, home_score: float, away_score: float) -> int:
-        """Grade every open bet on the event and credit each account's bankroll."""
-        now = _now()
+    def mark_and_cash_out(self, event: Event, quotes: list[Quote], signals: list[Signal],
+                          *, as_of: datetime | float | None = None) -> list[dict]:
+        """Persist executable marks and optionally close positions exactly once."""
+        now = _timestamp(as_of)
+        quote_by_token = _latest_quotes(quotes)
+        signal_by_token = {signal.token_id: signal for signal in signals if signal.token_id}
+        exits: list[dict] = []
+        with self._lock:
+            with self._db.transaction(dict_rows=True) as cur:
+                self._db.execute(
+                    cur,
+                    """SELECT b.*, a.strategy, a.cash_out_enabled
+                       FROM account_bets b JOIN accounts a ON a.name=b.account
+                       WHERE b.event_id=%s AND b.status='open'""",
+                    (event.id,),
+                )
+                rows = cur.fetchall()
+                for row in rows:
+                    token_id = row["token_id"]
+                    if not token_id:
+                        continue  # legacy rows remain settle-only; no identity is invented.
+                    quote = quote_by_token.get(token_id)
+                    signal = signal_by_token.get(token_id)
+                    model_prob = _decision_probability(signal)
+                    strategy = Strategy.from_json(row["strategy"])
+                    action = "UNPRICED"
+                    reason = "exact current Polymarket order book unavailable"
+                    execution_reason = reason
+                    result = None
+                    if quote is not None:
+                        result = simulate_sell(
+                            _book_levels(quote.bid_levels),
+                            shares=row["shares"],
+                            fee_rate=quote.fee_rate,
+                            tick_size=quote.tick_size,
+                            min_order_size=quote.min_order_size,
+                            active=quote.active,
+                            resolved=quote.resolved,
+                            restricted=quote.restricted,
+                            accepting_orders=quote.accepting_orders,
+                            depth_complete=quote.depth_complete,
+                        )
+                        execution_reason = result.reason
+
+                    bid_vwap = effective = gross = net = exit_fee = pnl = hold_edge = None
+                    if (result is not None and result.complete
+                            and result.effective_probability is not None
+                            and result.vwap is not None):
+                        bid_vwap = float(result.vwap)
+                        effective = float(result.effective_probability)
+                        gross = float(result.gross_proceeds)
+                        net = float(result.net_proceeds)
+                        exit_fee = float(result.fee)
+                        pnl = net - float(row["stake"])
+                        hold_edge = model_prob - effective if model_prob is not None else None
+                        previous_high = (float(row["high_water_pnl"])
+                                         if row["high_water_pnl"] is not None else pnl)
+                        high_water = max(previous_high, pnl)
+                        enabled = bool(row["cash_out_enabled"])
+                        should_exit, reason = _cashout_decision(
+                            strategy, row, net_value=net, effective_price=effective,
+                            model_prob=model_prob, marked_at=now, high_water=previous_high,
+                        )
+                        if not enabled:
+                            action = "MARK_ONLY"
+                            reason = "automatic cash-out is disabled for this bot"
+                            should_exit = False
+                        elif should_exit:
+                            action = "CASH_OUT"
+                        else:
+                            action = "HOLD"
+                        self._db.execute(
+                            cur,
+                            """UPDATE account_bets SET last_mark_price=%s, last_mark_value=%s,
+                               last_mark_pnl=%s, last_mark_ts=%s, high_water_pnl=%s
+                               WHERE id=%s AND status='open'""",
+                            (effective, net, pnl, now, high_water, row["id"]),
+                        )
+                    elif result is not None:
+                        reason = result.reason
+
+                    self._db.execute(
+                        cur,
+                        """INSERT INTO account_bet_marks
+                           (bet_id, account, event_id, token_id, marked_ts, provider_ts,
+                            received_ts, bid_vwap, effective_sell_price, gross_value,
+                            net_value, exit_fee, unrealized_pnl, model_prob, hold_edge,
+                            book_hash, decision_id, decision_action, decision_reason,
+                            execution_reason)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                                   %s,%s,%s)""",
+                        (row["id"], row["account"], row["event_id"], token_id, now,
+                         (_timestamp(quote.provider_timestamp)
+                          if quote is not None and quote.provider_timestamp is not None else None),
+                         (_timestamp(quote.received_at) if quote is not None else None),
+                         bid_vwap, effective, gross, net, exit_fee, pnl, model_prob,
+                         hold_edge, quote.book_hash if quote is not None else None,
+                         signal.decision_id if signal is not None else None,
+                         action, reason, execution_reason),
+                    )
+                    if action != "CASH_OUT" or net is None:
+                        continue
+                    self._db.execute(
+                        cur,
+                        """UPDATE account_bets SET status='cashed_out', pnl=%s,
+                           settled_ts=%s, exit_price=%s, exit_value=%s, exit_fee=%s,
+                           exit_ts=%s, exit_reason=%s WHERE id=%s AND status='open'""",
+                        (pnl, now, effective, net, exit_fee, now, reason, row["id"]),
+                    )
+                    if not cur.rowcount:
+                        continue
+                    self._db.execute(
+                        cur, "UPDATE accounts SET bankroll=bankroll+%s WHERE name=%s",
+                        (net, row["account"]),
+                    )
+                    exits.append({
+                        "bot_name": row["account"],
+                        "webhook_url": strategy.webhook_url,
+                        "event_name": row["event_name"],
+                        "market": row["market"],
+                        "outcome": row["outcome"],
+                        "action": "PAPER_CASH_OUT",
+                        "exit_value": net,
+                        "exit_price": effective,
+                        "pnl": pnl,
+                        "reason": reason,
+                    })
+        return exits
+
+    def settle(self, event: Event, home_score: float, away_score: float,
+               *, as_of: datetime | float | None = None) -> int:
+        """Grade every remaining open position and credit the fake bankroll."""
+        now = _timestamp(as_of)
         settled = 0
         with self._lock:
             with self._db.transaction(dict_rows=True) as cur:
                 self._db.execute(
                     cur,
-                    "SELECT * FROM account_bets WHERE event_id=%s AND status='open'", (event.id,)
+                    "SELECT * FROM account_bets WHERE event_id=%s AND status='open'",
+                    (event.id,),
                 )
                 rows = cur.fetchall()
                 credits: dict[str, float] = {}
@@ -370,7 +727,7 @@ class AccountBook:
                         payout, pnl, result = row["shares"], row["shares"] - row["stake"], 1.0
                     elif verdict == "loss":
                         payout, pnl, result = 0.0, -row["stake"], 0.0
-                    else:  # push or void -> refund the stake
+                    else:
                         payout, pnl, result = row["stake"], 0.0, None
                     credits[row["account"]] = credits.get(row["account"], 0.0) + payout
                     updates.append((verdict, result, pnl, now, row["id"]))
@@ -378,25 +735,20 @@ class AccountBook:
                 if updates:
                     self._db.execute_many(
                         cur,
-                        "UPDATE account_bets SET status=%s, result=%s, pnl=%s, settled_ts=%s WHERE id=%s",
+                        "UPDATE account_bets SET status=%s, result=%s, pnl=%s, "
+                        "settled_ts=%s WHERE id=%s",
                         updates,
                     )
                     for name, credit in credits.items():
                         self._db.execute(
-                            cur,
-                            "UPDATE accounts SET bankroll=bankroll+%s WHERE name=%s",
+                            cur, "UPDATE accounts SET bankroll=bankroll+%s WHERE name=%s",
                             (credit, name),
                         )
         return settled
 
-    def void_event(self, event_id: str) -> int:
-        """Void every open bet on an event and refund its stake exactly once.
-
-        This is deliberately separate from score-based settlement. Stopping
-        tracking manually, or receiving a provider cancellation, must never
-        turn the latest in-progress score into a final result.
-        """
-        now = _now()
+    def void_event(self, event_id: str, *, as_of: datetime | float | None = None) -> int:
+        """Void open positions only for an authoritative provider cancellation."""
+        now = _timestamp(as_of)
         with self._lock:
             with self._db.transaction(dict_rows=True) as cur:
                 self._db.execute(
@@ -421,8 +773,7 @@ class AccountBook:
                 )
                 for name, credit in credits.items():
                     self._db.execute(
-                        cur,
-                        "UPDATE accounts SET bankroll=bankroll+%s WHERE name=%s",
+                        cur, "UPDATE accounts SET bankroll=bankroll+%s WHERE name=%s",
                         (credit, name),
                     )
                 return len(rows)
@@ -438,36 +789,75 @@ class AccountBook:
                         cur,
                         """SELECT
                              COUNT(*) AS n_bets,
-                             COALESCE(SUM(CASE WHEN status='open' THEN 1 ELSE 0 END), 0) AS n_open,
-                             COALESCE(SUM(CASE WHEN status IN ('win','loss','push','void') THEN 1 ELSE 0 END), 0) AS n_settled,
-                             COALESCE(SUM(CASE WHEN status='win' THEN 1 ELSE 0 END), 0) AS wins,
-                             COALESCE(SUM(CASE WHEN status='loss' THEN 1 ELSE 0 END), 0) AS losses,
-                             COALESCE(SUM(CASE WHEN status='open' THEN stake ELSE 0 END), 0) AS open_stake,
-                             COALESCE(SUM(pnl), 0) AS realized_pnl
+                             COALESCE(SUM(CASE WHEN status='open' THEN 1 ELSE 0 END),0) AS n_open,
+                             COALESCE(SUM(CASE WHEN status<>'open' THEN 1 ELSE 0 END),0) AS n_settled,
+                             COALESCE(SUM(CASE WHEN status='win' THEN 1 ELSE 0 END),0) AS wins,
+                             COALESCE(SUM(CASE WHEN status='loss' THEN 1 ELSE 0 END),0) AS losses,
+                             COALESCE(SUM(CASE WHEN status='cashed_out' THEN 1 ELSE 0 END),0)
+                               AS n_cashouts,
+                             COALESCE(SUM(CASE WHEN status='open' THEN stake ELSE 0 END),0)
+                               AS open_stake,
+                             COALESCE(SUM(CASE WHEN status='open' AND last_mark_value IS NOT NULL
+                                              THEN last_mark_value ELSE 0 END),0)
+                               AS marked_open_value,
+                             COALESCE(SUM(CASE WHEN status='open' AND last_mark_value IS NULL
+                                              THEN 1 ELSE 0 END),0) AS unpriced_open,
+                             COALESCE(SUM(CASE WHEN status='open' AND last_mark_value IS NULL
+                                              THEN stake ELSE 0 END),0) AS unpriced_open_stake,
+                             COALESCE(SUM(CASE WHEN status='open' AND last_mark_pnl IS NOT NULL
+                                              THEN last_mark_pnl ELSE 0 END),0)
+                               AS open_unrealized_pnl,
+                             COALESCE(SUM(pnl),0) AS realized_pnl,
+                             COALESCE(SUM(CASE WHEN status='cashed_out' THEN pnl ELSE 0 END),0)
+                               AS cashout_pnl,
+                             COALESCE(SUM(entry_fee),0)+COALESCE(SUM(exit_fee),0) AS fees,
+                             AVG(CASE WHEN status='cashed_out' THEN exit_ts-placed_ts END)
+                               AS avg_cashout_hold_seconds
                            FROM account_bets WHERE account=%s""",
                         (account["name"],),
                     )
                     agg = cur.fetchone()
-                    start = account["start_bankroll"]
-                    equity = account["bankroll"] + agg["open_stake"]
-                    decided = (agg["wins"] or 0) + (agg["losses"] or 0)
+                    start = float(account["start_bankroll"])
+                    unpriced = int(agg["unpriced_open"] or 0)
+                    known_equity = float(account["bankroll"]) + float(
+                        agg["marked_open_value"] or 0)
+                    equity = known_equity if not unpriced else None
+                    decided = int(agg["wins"] or 0) + int(agg["losses"] or 0)
                     board.append({
                         "name": account["name"],
                         "strategy": Strategy.from_json(account["strategy"]).blurb,
-                        "bankroll": account["bankroll"],
+                        "cash_out_enabled": bool(account["cash_out_enabled"]),
+                        "bankroll": float(account["bankroll"]),
                         "start_bankroll": start,
                         "equity": equity,
-                        "roi": (equity - start) / start if start else 0.0,
-                        "realized_pnl": agg["realized_pnl"] or 0.0,
-                        "n_bets": agg["n_bets"] or 0,
-                        "n_open": agg["n_open"] or 0,
-                        "n_settled": agg["n_settled"] or 0,
-                        "wins": agg["wins"] or 0,
-                        "losses": agg["losses"] or 0,
-                        "win_rate": (agg["wins"] / decided) if decided else None,
-                        "open_stake": agg["open_stake"] or 0.0,
+                        "known_equity": known_equity,
+                        "roi": ((equity - start) / start if equity is not None and start
+                                else None),
+                        "realized_pnl": float(agg["realized_pnl"] or 0),
+                        "n_bets": int(agg["n_bets"] or 0),
+                        "n_open": int(agg["n_open"] or 0),
+                        "n_settled": int(agg["n_settled"] or 0),
+                        "n_cashouts": int(agg["n_cashouts"] or 0),
+                        "wins": int(agg["wins"] or 0),
+                        "losses": int(agg["losses"] or 0),
+                        "win_rate": (int(agg["wins"] or 0) / decided) if decided else None,
+                        "open_stake": float(agg["open_stake"] or 0),
+                        "open_unrealized_pnl": float(agg["open_unrealized_pnl"] or 0),
+                        "unpriced_open_positions": unpriced,
+                        "unpriced_open_stake": float(agg["unpriced_open_stake"] or 0),
+                        "cashout_pnl": float(agg["cashout_pnl"] or 0),
+                        "execution_fees": float(agg["fees"] or 0),
+                        "avg_cashout_hold_seconds": (
+                            float(agg["avg_cashout_hold_seconds"])
+                            if agg["avg_cashout_hold_seconds"] is not None else None
+                        ),
                     })
-            board.sort(key=lambda a: a["equity"], reverse=True)
+            board.sort(
+                key=lambda item: (item["equity"] is not None,
+                                  item["equity"] if item["equity"] is not None
+                                  else item["known_equity"]),
+                reverse=True,
+            )
             return board
 
     def account_bets(self, name: str, limit: int = 100) -> list[dict]:
@@ -476,13 +866,40 @@ class AccountBook:
                 self._db.execute(
                     cur,
                     "SELECT * FROM account_bets WHERE account=%s ORDER BY placed_ts DESC LIMIT %s",
-                    (name, limit))
-                return [dict(r) for r in cur.fetchall()]
+                    (name, limit),
+                )
+                return [dict(row) for row in cur.fetchall()]
+
+    def bet_marks(self, name: str, bet_id: int, limit: int = 500) -> list[dict]:
+        with self._lock:
+            with self._db.cursor(dict_rows=True) as cur:
+                self._db.execute(
+                    cur,
+                    """SELECT * FROM account_bet_marks
+                       WHERE account=%s AND bet_id=%s ORDER BY marked_ts DESC LIMIT %s""",
+                    (name, bet_id, limit),
+                )
+                return [dict(row) for row in cur.fetchall()]
+
+    def account_marks(self, name: str, limit: int = 5_000) -> list[dict]:
+        """Latest decision/valuation rows, returned in chronological order."""
+        with self._lock:
+            with self._db.cursor(dict_rows=True) as cur:
+                self._db.execute(
+                    cur,
+                    """SELECT * FROM account_bet_marks
+                       WHERE account=%s ORDER BY marked_ts DESC, id DESC LIMIT %s""",
+                    (name, limit),
+                )
+                rows = [dict(row) for row in cur.fetchall()]
+                rows.reverse()
+                return rows
 
     def reset(self, strategies: list[Strategy]) -> None:
-        """Wipe all bets and restore every account to its starting bankroll."""
+        """Wipe all paper observations and restore starting fake bankrolls."""
         with self._lock:
             with self._db.transaction() as cur:
+                self._db.execute(cur, "DELETE FROM account_bet_marks")
                 self._db.execute(cur, "DELETE FROM account_bets")
                 self._db.execute(cur, "DELETE FROM accounts")
         self.seed(strategies)
