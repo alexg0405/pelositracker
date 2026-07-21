@@ -34,8 +34,8 @@ jobs:
         run: |
           docker run -d --name lem -p 8000:8000 live-edge-monitor:ci
           for i in $(seq 1 30); do
-            if curl -fsS http://localhost:8000/api/config >/dev/null; then
-              echo "server is up"; curl -fsS http://localhost:8000/api/config; exit 0
+            if curl -fsS http://localhost:8000/api/ready >/dev/null; then
+              echo "server is ready"; curl -fsS http://localhost:8000/api/ready; exit 0
             fi
             sleep 2
           done
