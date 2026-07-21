@@ -72,10 +72,25 @@ def market_views(quotes: list[Quote], signals: list[Signal], edge_threshold: flo
                                 if quote.provider_timestamp else None)
         receipt_age_seconds = max(0.0, (now - quote.received_at).total_seconds())
         spread = quote.ask - quote.bid if quote.bid is not None else None
-        model_probability = signal.model_probability if signal else None
-        entry_margin = model_probability - quote.ask if model_probability is not None else None
+        consensus_probability = signal.consensus_probability if signal else None
+        calibrated_probability = signal.calibrated_consensus_probability if signal else None
+        decision_probability = calibrated_probability
+        entry_margin = signal.net_expected_value_per_share if signal else None
         required_edge = max(edge_threshold, signal.required_edge) if signal else None
-        price_ceiling = max(0.0, model_probability - required_edge) if signal else None
+        expected_execution_cost_offset = (
+            decision_probability - signal.market_probability - entry_margin
+            if (decision_probability is not None and signal is not None
+                and entry_margin is not None) else None
+        )
+        execution_premium = (
+            signal.market_probability - quote.ask + expected_execution_cost_offset
+            if signal is not None and expected_execution_cost_offset is not None else None
+        )
+        price_ceiling = (
+            max(0.0, decision_probability - required_edge - execution_premium)
+            if (decision_probability is not None and required_edge is not None
+                and execution_premium is not None) else None
+        )
         room_to_ceiling = price_ceiling - quote.ask if price_ceiling is not None else None
         edge_buffer = entry_margin - required_edge if entry_margin is not None and required_edge is not None else None
         if signal and signal.action == "PAPER_BET" and edge_buffer is not None and edge_buffer >= 0:
@@ -85,10 +100,8 @@ def market_views(quotes: list[Quote], signals: list[Signal], edge_threshold: flo
         else:
             entry_action = "MARKET ONLY"
         risks = _risk_flags(quote, signal, provider_age_seconds)
-        uncertainty_low = (max(0.0, model_probability - 1.96 * signal.fair_stderr)
-                           if signal and model_probability is not None else None)
-        uncertainty_high = (min(1.0, model_probability + 1.96 * signal.fair_stderr)
-                            if signal and model_probability is not None else None)
+        uncertainty_low = signal.uncertainty_low if signal else None
+        uncertainty_high = signal.uncertainty_high if signal else None
         views.append({
             "token_id": quote.token_id,
             "market": quote.market,
@@ -107,19 +120,25 @@ def market_views(quotes: list[Quote], signals: list[Signal], edge_threshold: flo
             "provider_age_seconds": provider_age_seconds,
             "receipt_age_seconds": receipt_age_seconds,
             "entry_action": entry_action,
-            "model_probability": model_probability,
-            "consensus_probability": model_probability,
-            "calibrated_consensus_probability": (
-                signal.calibrated_consensus_probability if signal else None),
+            "model_probability": consensus_probability,
+            "consensus_probability": consensus_probability,
+            "calibrated_consensus_probability": calibrated_probability,
             "model_live_prob": signal.model_live_prob if signal else None,
             "independent_model_probability": (
                 signal.independent_model_probability if signal else None),
             "uncertainty_low": uncertainty_low,
             "uncertainty_high": uncertainty_high,
+            "probability_net_ev_positive": (
+                signal.probability_net_ev_positive if signal else None),
+            "net_expected_value_per_share": (
+                signal.net_expected_value_per_share if signal else None),
+            "net_expected_value_total": signal.net_expected_value_total if signal else None,
             "net_ev_per_stake": signal.ev_per_stake if signal else None,
             "requested_cash": signal.requested_cash if signal else None,
             "requested_size_vwap": signal.execution_vwap if signal else None,
+            "requested_effective_cost": signal.market_probability if signal else None,
             "execution_fee": signal.execution_fee if signal else None,
+            "expected_execution_cost_offset": expected_execution_cost_offset,
             "paper_fillable_size": signal.fillable_size if signal else None,
             "entry_margin": entry_margin,
             "edge": entry_margin,
@@ -130,14 +149,18 @@ def market_views(quotes: list[Quote], signals: list[Signal], edge_threshold: flo
             "confidence": signal.confidence if signal else None,
             "reference_sources": signal.n_reference_sources if signal else 0,
             "quality_components": ({
-                "freshness": signal.quality_freshness,
-                "agreement": signal.quality_agreement,
-                "sources": signal.quality_sources,
-                "execution": signal.quality_execution,
-                "calibration": signal.quality_calibration,
+                "data_completeness": signal.quality_data_completeness,
+                "provider_freshness": signal.quality_provider_freshness,
+                "identity_confidence": signal.quality_identity,
+                "execution_quality": signal.quality_execution,
+                "model_sample_support": signal.quality_model_sample_support,
+                "calibration_support": signal.quality_calibration_support,
+                "source_independence": signal.quality_source_independence,
             } if signal else None),
-            "gate_results": ([{"gate": "paper_policy", "status": signal.action,
-                                "reasons": signal.reasons}] if signal else []),
+            "gate_results": signal.gate_results if signal else [],
+            "consensus_method": signal.consensus_method if signal else None,
+            "model_sample_size": signal.model_sample_size if signal else 0,
+            "calibration_sample_size": signal.calibration_sample_size if signal else 0,
             "engine_version": signal.engine_version if signal else None,
             "configuration_hash": signal.configuration_hash if signal else None,
             "model_version": signal.model_version if signal else None,
@@ -169,8 +192,14 @@ def position_views(positions: list[dict], quotes: list[Quote], signals: list[Sig
         cash_value = shares * bid if bid is not None else None
         pnl = shares * (bid - entry) if bid is not None else None
         roi = (bid - entry) / entry if bid is not None and entry > 0 else None
-        fair = signal.model_probability if signal else None
+        fair = signal.calibrated_consensus_probability if signal else None
         remaining_edge = fair - bid if fair is not None and bid is not None else None
+        uncertainty_low = signal.uncertainty_low if signal else None
+        uncertainty_high = signal.uncertainty_high if signal else None
+        conservative_hold_edge = (
+            uncertainty_low - bid
+            if uncertainty_low is not None and bid is not None else None
+        )
         reasons = []
         if bid is None:
             action = "EXIT WATCH"
@@ -178,27 +207,39 @@ def position_views(positions: list[dict], quotes: list[Quote], signals: list[Sig
         elif spread is None or spread > 0.05:
             action = "EXIT WATCH"
             reasons.append("The exit spread is wide; use a limit price and watch fill risk.")
-        elif signal and remaining_edge is not None and remaining_edge < -0.02:
+        elif signal and uncertainty_high is not None and uncertainty_high < bid:
             action = "CONSIDER CASH"
-            reasons.append("The executable bid is more than 2¢ above the current model fair value.")
+            reasons.append(
+                "The executable bid is above the 95% historical bootstrap interval."
+            )
         elif roi is not None and roi >= 0.20 and (remaining_edge is None or remaining_edge < 0.02):
             action = "CONSIDER CASH"
             reasons.append("The position is up at least 20% and little validated edge remains.")
         elif roi is not None and roi <= -0.15 and (remaining_edge is None or remaining_edge <= 0):
             action = "CONSIDER CASH"
             reasons.append("The position is down at least 15% without positive validated hold edge.")
-        elif signal and remaining_edge is not None and remaining_edge >= 0.02 and signal.confidence >= confidence_threshold:
+        elif (signal and conservative_hold_edge is not None
+              and conservative_hold_edge >= 0.02
+              and signal.confidence >= confidence_threshold):
             action = "HOLD"
-            reasons.append("Model fair value remains at least 2¢ above the executable exit price.")
+            reasons.append(
+                "Even the lower historical bootstrap bound remains at least 2¢ "
+                "above the executable exit price."
+            )
         else:
             action = "HOLD / MONITOR"
             reasons.append("No strong exit trigger is present, but the remaining edge is not decisive.")
         if signal:
             reasons.extend(signal.reasons[:2])
         else:
-            reasons.append("No independent fair-value signal is available; treat this as price/P&L monitoring only.")
+            reasons.append("No calibrated consensus is available; treat this as price/P&L monitoring only.")
         views.append({**position, "current_bid": bid, "current_ask": quote.ask if quote else None,
                       "spread": spread, "cash_value": cash_value, "unrealized_pnl": pnl,
-                      "roi": roi, "model_probability": fair, "remaining_hold_edge": remaining_edge,
+                      "roi": roi, "model_probability": fair,
+                      "calibrated_consensus_probability": fair,
+                      "uncertainty_low": uncertainty_low,
+                      "uncertainty_high": uncertainty_high,
+                      "remaining_hold_edge": remaining_edge,
+                      "conservative_hold_edge": conservative_hold_edge,
                       "advice": action, "reasons": reasons})
     return views

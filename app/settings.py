@@ -50,7 +50,6 @@ class Settings:
     confidence_threshold: float
     edge_threshold: float
     kelly_fraction: float
-    edge_z: float
     odds_api_key: str
     odds_regions: str
     odds_markets: str
@@ -79,7 +78,6 @@ class Settings:
             confidence_threshold=_float(values, "SIGNAL_CONFIDENCE_THRESHOLD", 0.0),
             edge_threshold=_float(values, "SIGNAL_EDGE_THRESHOLD", 0.0),
             kelly_fraction=_float(values, "SIGNAL_KELLY_FRACTION", 0.25),
-            edge_z=_float(values, "SIGNAL_EDGE_Z", 1.0),
             odds_api_key=values.get("THE_ODDS_API_KEY", "").strip(),
             odds_regions=values.get("ODDS_REGIONS", "us").strip(),
             odds_markets=values.get("ODDS_MARKETS", "h2h,spreads,totals").strip(),

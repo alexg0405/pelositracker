@@ -18,6 +18,8 @@ struct QuoteInput {
     observed_at: f64,
     #[serde(default)]
     timestamp_trusted: bool,
+    #[serde(default = "default_true")]
+    identity_valid: bool,
     bid: Option<f64>,
     ask: Option<f64>,
     // Phase 0 additions (all optional so older callers still deserialize):
@@ -88,6 +90,53 @@ struct StateInput {
     state_valid: bool,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct ModelPolicyInput {
+    market: String,
+    devig_method: String,
+    consensus_method: String,
+    calibration_method: String,
+    beta_coefficients: Vec<f64>,
+    #[serde(default)]
+    beta_bootstrap_coefficients: Vec<Vec<f64>>,
+    #[serde(default)]
+    execution_cost_offsets: Vec<f64>,
+    min_probability_positive: f64,
+    min_expected_value_dollars: f64,
+    sample_size: usize,
+    #[serde(default)]
+    model_sample_size: Option<usize>,
+    #[serde(default)]
+    sharp_source_family: Option<String>,
+    #[serde(default)]
+    consensus_intercept: f64,
+    #[serde(default)]
+    family_coefficients: BTreeMap<String, f64>,
+    #[serde(default)]
+    missing_family_coefficients: BTreeMap<String, f64>,
+    #[serde(default)]
+    uncertainty_draws: Vec<UncertaintyDrawInput>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct UncertaintyDrawInput {
+    #[allow(dead_code)]
+    #[serde(default)]
+    pipeline: String,
+    devig_method: String,
+    consensus_method: String,
+    beta_coefficients: Vec<f64>,
+    execution_cost_offset: f64,
+    #[serde(default)]
+    sharp_source_family: Option<String>,
+    #[serde(default)]
+    consensus_intercept: f64,
+    #[serde(default)]
+    family_coefficients: BTreeMap<String, f64>,
+    #[serde(default)]
+    missing_family_coefficients: BTreeMap<String, f64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct EvaluateRequest {
     as_of: f64,
@@ -109,20 +158,27 @@ struct EvaluateRequest {
     #[allow(dead_code)]
     #[serde(default)]
     pregame_total: Option<f64>,
-    // Phase 4: required-edge z-multiplier on consensus uncertainty, and the
-    // fractional-Kelly lambda applied to the shrunk edge.
-    #[serde(default)]
-    edge_z: Option<f64>,
+    // Fractional-Kelly lambda applied to the historically estimated lower bound.
     #[serde(default)]
     kelly_fraction: Option<f64>,
     #[serde(default)]
     enable_independent_model: bool,
     #[serde(default)]
-    calibrated_markets: Vec<String>,
+    model_policies: Vec<ModelPolicyInput>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+#[derive(Debug, Serialize)]
+struct GateOutput {
+    code: String,
+    passed: Option<bool>,
+    status: String,
+    value: Option<f64>,
+    threshold: Option<f64>,
+    explanation: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -145,11 +201,11 @@ struct SignalOutput {
     // Phase 2a: independent live win-probability (moneyline only, when game
     // state is available). null otherwise. A cross-check, not the edge basis.
     model_live_prob: Option<f64>,
-    // Phase 4: sizing & risk-normalized gating.
-    ev_per_stake: f64,   // fair/executable - 1
-    kelly_fraction: f64, // fractional Kelly on the uncertainty-shrunk edge
-    required_edge: f64,  // base + z*consensus_stderr + market premium
-    fair_stderr: f64,    // standard error of the consensus fair
+    // Legacy sizing aliases retained at the Python boundary.
+    ev_per_stake: f64,   // calibrated consensus / executable - 1
+    kelly_fraction: f64, // fractional Kelly on the historical lower bound
+    required_edge: f64,  // configured base + market premium
+    fair_stderr: f64,    // compatibility approximation from the bootstrap interval
     fillable_size: Option<f64>,
     // Auditable data-quality components (0-100). Edge is deliberately absent:
     // opportunity size must not make the underlying data look more reliable.
@@ -158,6 +214,24 @@ struct SignalOutput {
     quality_sources: f64,
     quality_execution: f64,
     quality_calibration: f64,
+    quality_data_completeness: f64,
+    quality_provider_freshness: f64,
+    quality_identity: f64,
+    quality_model_sample_support: f64,
+    quality_calibration_support: f64,
+    quality_source_independence: f64,
+    consensus_probability: f64,
+    calibrated_consensus_probability: Option<f64>,
+    independent_model_probability: Option<f64>,
+    uncertainty_low: Option<f64>,
+    uncertainty_high: Option<f64>,
+    probability_net_ev_positive: Option<f64>,
+    net_expected_value_per_share: Option<f64>,
+    net_expected_value_total: Option<f64>,
+    consensus_method: String,
+    model_sample_size: usize,
+    calibration_sample_size: usize,
+    gate_results: Vec<GateOutput>,
 }
 
 fn clamp(value: f64, low: f64, high: f64) -> f64 {
@@ -185,6 +259,104 @@ fn logit(p: f64) -> f64 {
 
 fn inv_logit(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
+}
+
+fn beta_calibrate(probability: f64, coefficients: &[f64]) -> Option<f64> {
+    if coefficients.len() != 3
+        || coefficients.iter().any(|value| !value.is_finite())
+        || coefficients[0] < 0.0
+        || coefficients[1] < 0.0
+        || !probability.is_finite()
+        || !(0.0..1.0).contains(&probability)
+    {
+        return None;
+    }
+    let p = clamp(probability, 1e-9, 1.0 - 1e-9);
+    Some(clamp(
+        inv_logit(coefficients[0] * p.ln() - coefficients[1] * (-p).ln_1p() + coefficients[2]),
+        1e-9,
+        1.0 - 1e-9,
+    ))
+}
+
+fn quantile(values: &[f64], probability: f64) -> Option<f64> {
+    if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let mut ordered = values.to_vec();
+    ordered.sort_by(f64::total_cmp);
+    let position = clamp(probability, 0.0, 1.0) * (ordered.len() - 1) as f64;
+    let lower = position.floor() as usize;
+    let upper = position.ceil() as usize;
+    let weight = position - lower as f64;
+    Some(ordered[lower] * (1.0 - weight) + ordered[upper] * weight)
+}
+
+fn consensus_probability(
+    reference: &[&Fair],
+    method: &str,
+    sharp_source_family: Option<&str>,
+    intercept: f64,
+    family_coefficients: &BTreeMap<String, f64>,
+    missing_family_coefficients: &BTreeMap<String, f64>,
+) -> Option<f64> {
+    if reference.is_empty() {
+        return None;
+    }
+    let equal_family = clamp(
+        inv_logit(
+            reference.iter().map(|fair| logit(fair.prob)).sum::<f64>() / reference.len() as f64,
+        ),
+        0.001,
+        0.999,
+    );
+    match method {
+        "equal_family_logit" => Some(equal_family),
+        "sharp_source" => sharp_source_family.and_then(|source| {
+            reference
+                .iter()
+                .find(|fair| fair.source_key.eq_ignore_ascii_case(source))
+                .map(|fair| fair.prob)
+        }),
+        "stacked_logit" if !family_coefficients.is_empty() => {
+            let mut linear = intercept;
+            for (family, coefficient) in family_coefficients {
+                if let Some(source) = reference
+                    .iter()
+                    .find(|fair| fair.source_key.eq_ignore_ascii_case(family))
+                {
+                    linear += coefficient * logit(source.prob);
+                } else {
+                    let missing = missing_family_coefficients.get(family)?;
+                    linear += missing;
+                }
+            }
+            Some(clamp(inv_logit(linear), 0.001, 0.999))
+        }
+        _ => None,
+    }
+}
+
+fn gate(
+    code: &str,
+    passed: Option<bool>,
+    value: Option<f64>,
+    threshold: Option<f64>,
+    explanation: impl Into<String>,
+) -> GateOutput {
+    GateOutput {
+        code: code.to_string(),
+        passed,
+        status: match passed {
+            Some(true) => "pass",
+            Some(false) => "fail",
+            None => "unknown",
+        }
+        .to_string(),
+        value,
+        threshold,
+        explanation: explanation.into(),
+    }
 }
 
 /// Abramowitz & Stegun 7.1.26 approximation of erf (max abs error ~1.5e-7).
@@ -434,7 +606,11 @@ struct Fair {
 /// Compute one source's fair value for `outcome` given all of its quotes in the
 /// market. Exchanges are read at their mid (already ~de-vigged); traditional
 /// books are de-vigged with Shin, falling back to proportional.
-fn source_fair(outcome_key: &str, source_quotes: &[&QuoteInput]) -> Option<Fair> {
+fn source_fair(
+    outcome_key: &str,
+    source_quotes: &[&QuoteInput],
+    selected_method: Option<&str>,
+) -> Option<Fair> {
     let target = source_quotes
         .iter()
         .find(|q| q.outcome_key() == outcome_key)?;
@@ -456,9 +632,17 @@ fn source_fair(outcome_key: &str, source_quotes: &[&QuoteInput]) -> Option<Fair>
             .unwrap();
         // Shin handles the vig; for a ~zero-hold 2-way book (booksum <= 1) it
         // returns None and we fall back to proportional (which is ~identity).
-        match devig_shin(&implied) {
-            Some(fairs) => (fairs[idx], "shin"),
-            None => (devig_proportional(&implied)[idx], "proportional"),
+        match selected_method {
+            Some("proportional") => (devig_proportional(&implied)[idx], "proportional"),
+            Some("shin") if booksum <= 1.0 + 1e-12 => {
+                (devig_proportional(&implied)[idx], "proportional-zero-hold")
+            }
+            Some("shin") => (devig_shin(&implied)?[idx], "shin"),
+            Some(_) => return None,
+            None => match devig_shin(&implied) {
+                Some(fairs) => (fairs[idx], "shin"),
+                None => (devig_proportional(&implied)[idx], "proportional"),
+            },
         }
     };
 
@@ -555,6 +739,10 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
             continue;
         }
         let market_type = target_quotes[0].market.clone();
+        let policy = request
+            .model_policies
+            .iter()
+            .find(|candidate| candidate.market.eq_ignore_ascii_case(&market_type));
         let expected_outcomes: BTreeSet<&str> = same_market
             .iter()
             .map(|quote| quote.outcome_key())
@@ -600,11 +788,11 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         let sources: BTreeSet<String> =
             same_market.iter().map(|quote| quote.source_key()).collect();
         let mut fairs: Vec<Fair> = Vec::new();
-        for source in sources {
+        for source in &sources {
             let source_quotes: Vec<&QuoteInput> = same_market
                 .iter()
                 .copied()
-                .filter(|quote| quote.source_key() == source)
+                .filter(|quote| quote.source_key() == *source)
                 .collect();
             let source_outcomes: BTreeSet<&str> = source_quotes
                 .iter()
@@ -618,7 +806,11 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
             {
                 continue;
             }
-            if let Some(fair) = source_fair(&outcome_key, &source_quotes) {
+            if let Some(fair) = source_fair(
+                &outcome_key,
+                &source_quotes,
+                policy.map(|value| value.devig_method.as_str()),
+            ) {
                 fairs.push(fair);
             }
         }
@@ -659,10 +851,7 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         let target_source_key = best.source_key().to_string();
         let display_market = best.market.clone();
         let display_outcome = best.outcome.clone();
-        let market_is_calibrated = request
-            .calibrated_markets
-            .iter()
-            .any(|market| market.eq_ignore_ascii_case(&display_market));
+        let market_is_calibrated = policy.is_some();
         let target_booksum = fairs
             .iter()
             .find(|f| f.source_key == target_source_key)
@@ -756,54 +945,204 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
                 quality_sources: 0.0,
                 quality_execution: (spread_score * 1000.0).round() / 10.0,
                 quality_calibration: if market_is_calibrated { 100.0 } else { 0.0 },
+                quality_data_completeness: 0.0,
+                quality_provider_freshness: (freshness_score * 1000.0).round() / 10.0,
+                quality_identity: if best.identity_valid { 100.0 } else { 0.0 },
+                quality_model_sample_support: 0.0,
+                quality_calibration_support: 0.0,
+                quality_source_independence: 0.0,
+                consensus_probability: own,
+                calibrated_consensus_probability: None,
+                independent_model_probability: model_live,
+                uncertainty_low: None,
+                uncertainty_high: None,
+                probability_net_ev_positive: None,
+                net_expected_value_per_share: None,
+                net_expected_value_total: None,
+                consensus_method: policy
+                    .map(|value| value.consensus_method.clone())
+                    .unwrap_or_else(|| "display_only".to_string()),
+                model_sample_size: policy
+                    .map(|value| value.model_sample_size.unwrap_or(value.sample_size))
+                    .unwrap_or(0),
+                calibration_sample_size: policy.map(|value| value.sample_size).unwrap_or(0),
+                gate_results: vec![gate(
+                    "reference_source_support",
+                    Some(false),
+                    Some(0.0),
+                    Some(2.0),
+                    "no independent reference source family is available",
+                )],
             });
             continue;
         }
 
-        // Equal-weight consensus in log-odds space, one observation per
-        // canonical source family. Freshness is a gate and quality dimension,
-        // not an undocumented brand/recency weight.
+        // One observation per canonical source family. A versioned artifact
+        // may select a sharp-family baseline or regularized stacked logit;
+        // otherwise equal-family logit remains display-only.
         let ref_probs: Vec<f64> = reference.iter().map(|f| f.prob).collect();
-        let fair = clamp(
+        let equal_family_fair = clamp(
             inv_logit(
                 reference.iter().map(|f| logit(f.prob)).sum::<f64>() / reference.len() as f64,
             ),
             0.001,
             0.999,
         );
+        let consensus_method = policy
+            .map(|value| value.consensus_method.as_str())
+            .unwrap_or("equal_family_logit");
+        let selected_consensus = policy.and_then(|model| {
+            consensus_probability(
+                &reference,
+                &model.consensus_method,
+                model.sharp_source_family.as_deref(),
+                model.consensus_intercept,
+                &model.family_coefficients,
+                &model.missing_family_coefficients,
+            )
+        });
+        let consensus_supported = policy.is_none() || selected_consensus.is_some();
+        let fair = selected_consensus.unwrap_or(equal_family_fair);
 
-        let edge = fair - executable;
         let dispersion = if ref_probs.len() > 1 {
             population_std_dev(&ref_probs)
         } else {
             0.08
         };
         let source_count = reference.len();
-
-        // Phase 4: sizing & risk-normalized required edge.
-        let z = request.edge_z.unwrap_or(1.0);
-        let lambda = request.kelly_fraction.unwrap_or(0.25);
-        // Conservative uncertainty half-width. Disagreement is not divided by
-        // sqrt(source count); a finite calibration floor always remains.
-        let fair_stderr = dispersion.max(0.015);
-        let required_edge =
-            request.edge_threshold + z * fair_stderr + market_premium(&display_market);
-        let ev_per_stake = if executable > 1e-6 {
-            fair / executable - 1.0
-        } else {
-            0.0
-        };
-        // Shrink the edge by its uncertainty before sizing (optimizer's curse).
-        let edge_shrunk = (edge - z * fair_stderr).max(0.0);
-        let kelly_fraction = if executable < 0.999 {
-            (lambda * edge_shrunk / (1.0 - executable)).max(0.0)
-        } else {
-            0.0
-        };
         let fillable_size = if best.exchange() {
             best.ask_size
         } else {
             best.liquidity
+        };
+
+        let calibrated = policy.and_then(|model| match model.calibration_method.as_str() {
+            "identity" => Some(fair),
+            "beta" => beta_calibrate(fair, &model.beta_coefficients),
+            _ => None,
+        });
+        let mut probability_samples = Vec::new();
+        let mut net_samples = Vec::new();
+        let mut execution_cost_offsets = Vec::new();
+        if let Some(model) = policy {
+            if !model.uncertainty_draws.is_empty() {
+                for draw in &model.uncertainty_draws {
+                    let mut draw_fairs: Vec<Fair> = Vec::new();
+                    for source in &sources {
+                        let source_quotes: Vec<&QuoteInput> = same_market
+                            .iter()
+                            .copied()
+                            .filter(|quote| quote.source_key() == *source)
+                            .collect();
+                        let source_outcomes: BTreeSet<&str> = source_quotes
+                            .iter()
+                            .map(|quote| quote.outcome_key())
+                            .collect();
+                        if !source_quotes.iter().any(|quote| quote.exchange())
+                            && source_outcomes != expected_outcomes
+                        {
+                            continue;
+                        }
+                        if let Some(draw_fair) =
+                            source_fair(&outcome_key, &source_quotes, Some(&draw.devig_method))
+                        {
+                            draw_fairs.push(draw_fair);
+                        }
+                    }
+                    let draw_reference: Vec<&Fair> = draw_fairs
+                        .iter()
+                        .filter(|draw_fair| {
+                            draw_fair.source_key != target_source_key
+                                && draw_fair.timestamp_trusted
+                                && now_seconds >= draw_fair.observed_at
+                                && (now_seconds - draw_fair.observed_at) <= max_age
+                        })
+                        .collect();
+                    let draw_consensus = consensus_probability(
+                        &draw_reference,
+                        &draw.consensus_method,
+                        draw.sharp_source_family.as_deref(),
+                        draw.consensus_intercept,
+                        &draw.family_coefficients,
+                        &draw.missing_family_coefficients,
+                    );
+                    if let Some(sample) = draw_consensus.and_then(|probability| {
+                        beta_calibrate(probability, &draw.beta_coefficients)
+                    }) {
+                        if draw.execution_cost_offset.is_finite() {
+                            probability_samples.push(sample);
+                            net_samples.push(sample - executable - draw.execution_cost_offset);
+                            execution_cost_offsets.push(draw.execution_cost_offset);
+                        }
+                    }
+                }
+            } else if model.beta_bootstrap_coefficients.len() == model.execution_cost_offsets.len()
+            {
+                for (coefficients, cost_offset) in model
+                    .beta_bootstrap_coefficients
+                    .iter()
+                    .zip(model.execution_cost_offsets.iter())
+                {
+                    let sample = beta_calibrate(fair, coefficients);
+                    if let Some(probability) = sample {
+                        if cost_offset.is_finite() {
+                            probability_samples.push(probability);
+                            net_samples.push(probability - executable - cost_offset);
+                            execution_cost_offsets.push(*cost_offset);
+                        }
+                    }
+                }
+            }
+        }
+        let uncertainty_low = quantile(&probability_samples, 0.025);
+        let uncertainty_high = quantile(&probability_samples, 0.975);
+        let net_uncertainty_low = quantile(&net_samples, 0.025);
+        let expected_execution_cost_offset = if execution_cost_offsets.is_empty() {
+            None
+        } else {
+            Some(mean(&execution_cost_offsets))
+        };
+        let probability_net_ev_positive = if net_samples.is_empty() {
+            None
+        } else {
+            Some(
+                net_samples.iter().filter(|value| **value > 0.0).count() as f64
+                    / net_samples.len() as f64,
+            )
+        };
+        let decision_probability = calibrated.unwrap_or(fair);
+        let gross_probability_gap = decision_probability - executable;
+        let net_expected_value_per_share = calibrated
+            .zip(expected_execution_cost_offset)
+            .map(|(value, cost_offset)| value - executable - cost_offset);
+        let net_expected_value_total = net_expected_value_per_share
+            .zip(fillable_size)
+            .map(|(value, shares)| value * shares);
+        let edge = net_expected_value_per_share.unwrap_or(gross_probability_gap);
+
+        // Fractional Kelly uses the lower historically bootstrapped probability
+        // bound. Cross-book dispersion is a quality dimension, not a standard error.
+        let lambda = request.kelly_fraction.unwrap_or(0.25);
+        let fair_stderr = match (uncertainty_low, uncertainty_high) {
+            (Some(low), Some(high)) => (high - low) / (2.0 * 1.96),
+            _ => 0.0,
+        };
+        let required_edge = request.edge_threshold + market_premium(&display_market);
+        let expected_executable_cost = clamp(
+            executable + expected_execution_cost_offset.unwrap_or(0.0),
+            0.001,
+            0.999,
+        );
+        let ev_per_stake = if expected_executable_cost > 1e-6 {
+            decision_probability / expected_executable_cost - 1.0
+        } else {
+            0.0
+        };
+        let edge_shrunk = net_uncertainty_low.unwrap_or(0.0).max(0.0);
+        let kelly_fraction = if expected_executable_cost < 0.999 {
+            (lambda * edge_shrunk / (1.0 - expected_executable_cost)).max(0.0)
+        } else {
+            0.0
         };
 
         let agreement_score = (1.0 - dispersion / 0.12).max(0.0);
@@ -827,7 +1166,8 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
             .unwrap_or("n/a");
 
         reasons.push(format!(
-            "reference fair {:.1}% from {} independent book(s), dispersion {:.1}% (leave-one-out)",
+            "{} consensus {:.1}% from {} independent source families; dispersion {:.1}% is quality-only",
+            consensus_method,
             fair * 100.0,
             source_count,
             dispersion * 100.0
@@ -841,29 +1181,44 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         ));
         if let (Some(p), Some(st)) = (model_live, latest_state) {
             reasons.push(format!(
-                "live model {:.1}% ({:+.1}pp vs market fair, {:.0}% game left)",
+                "independent live model {:.1}% ({:+.1}pp vs consensus, {:.0}% game left)",
                 p * 100.0,
                 (p - fair) * 100.0,
                 st.fraction_remaining.unwrap_or(0.0) * 100.0
             ));
         }
+        if let Some(probability) = calibrated {
+            reasons.push(format!(
+                "calibrated consensus {:.1}% with P(net EV > 0) {} and net EV {}",
+                probability * 100.0,
+                probability_net_ev_positive
+                    .map(|value| format!("{:.1}%", value * 100.0))
+                    .unwrap_or_else(|| "unavailable".to_string()),
+                net_expected_value_total
+                    .map(|value| format!("${value:+.2}"))
+                    .unwrap_or_else(|| "unavailable".to_string()),
+            ));
+        }
         reasons.push(format!(
-            "EV {:+.1}%/stake · Kelly {:.1}% bankroll · required edge {:.1}%{}",
+            "EV {:+.1}%/stake; Kelly {:.1}% bankroll; required edge {:.1}%{}",
             ev_per_stake * 100.0,
             kelly_fraction * 100.0,
             required_edge * 100.0,
-            match fillable_size {
-                Some(size) => format!(" · fillable {size:.0}"),
-                None => String::new(),
-            }
+            fillable_size
+                .map(|size| format!("; fillable {size:.0} shares"))
+                .unwrap_or_default(),
         ));
 
         let mut blockers = Vec::new();
+        let mut gate_results = Vec::new();
         if age > max_age {
             blockers.push(format!("quote stale ({age:.0}s)"));
         }
         if !best.timestamp_trusted {
             blockers.push("provider timestamp unavailable or untrusted".to_string());
+        }
+        if !best.identity_valid {
+            blockers.push("market identity is ambiguous or quarantined".to_string());
         }
         if best.observed_at > now_seconds + 5.0 {
             blockers.push("provider timestamp is in the future".to_string());
@@ -885,20 +1240,64 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         if best.exchange() && !best.fee_metadata_known {
             blockers.push("fee metadata unavailable".to_string());
         }
+        let execution_ready = best.ask.is_some()
+            && best.depth_complete
+            && best.fee_metadata_known
+            && fillable_size.is_some_and(|size| size > 0.0)
+            && best.accepting_orders;
+        if !execution_ready && !best.exchange() {
+            blockers.push(
+                "sportsbook quote is reference-only; complete executable depth unavailable"
+                    .to_string(),
+            );
+        }
         if !best.accepting_orders {
             blockers.push("market is not accepting orders".to_string());
         }
-        if !market_is_calibrated {
+        if !consensus_supported {
+            blockers.push("selected consensus model lacks required source families".to_string());
+        }
+        if !market_is_calibrated || calibrated.is_none() {
             blockers.push("validated calibration artifact unavailable for market".to_string());
+        }
+        if let Some(model) = policy {
+            if model.model_sample_size.unwrap_or(model.sample_size) < 1000 {
+                blockers.push("chronological model-selection sample is below 1,000".to_string());
+            }
+            if model.sample_size < 1000 {
+                blockers.push("chronological calibration sample is below 1,000".to_string());
+            }
+        }
+        if probability_samples.len() < 200 || probability_net_ev_positive.is_none() {
+            blockers.push("historically estimated event-block uncertainty unavailable".to_string());
         }
         if edge < required_edge {
             blockers.push(format!(
-                "edge {:.1}% below required {:.1}% (base {:.1}% + risk {:.1}%)",
+                "net edge {:.1}% below required {:.1}% (base {:.1}% + market premium {:.1}%)",
                 edge * 100.0,
                 required_edge * 100.0,
                 request.edge_threshold * 100.0,
                 (required_edge - request.edge_threshold) * 100.0
             ));
+        }
+        if let (Some(model), Some(probability)) = (policy, probability_net_ev_positive) {
+            if probability < model.min_probability_positive {
+                blockers.push(format!(
+                    "P(net EV > 0) {:.1}% below required {:.1}%",
+                    probability * 100.0,
+                    model.min_probability_positive * 100.0,
+                ));
+            }
+        }
+        if let Some(model) = policy {
+            match net_expected_value_total {
+                Some(value) if value >= model.min_expected_value_dollars => {}
+                Some(value) => blockers.push(format!(
+                    "net expected value ${value:.2} below required ${:.2}",
+                    model.min_expected_value_dollars,
+                )),
+                None => blockers.push("net expected dollar value unavailable".to_string()),
+            }
         }
         if confidence < request.confidence_threshold {
             blockers.push(format!(
@@ -906,6 +1305,101 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
                 request.confidence_threshold
             ));
         }
+        gate_results.push(gate(
+            "provider_freshness",
+            Some(age <= max_age && best.timestamp_trusted && best.observed_at <= now_seconds + 5.0),
+            Some(age),
+            Some(max_age),
+            "provider time is trusted, non-future, and within the configured age limit",
+        ));
+        gate_results.push(gate(
+            "reference_source_support",
+            Some(source_count >= 2),
+            Some(source_count as f64),
+            Some(2.0),
+            "at least two leave-one-out source families are required",
+        ));
+        gate_results.push(gate(
+            "market_identity",
+            Some(best.identity_valid),
+            None,
+            None,
+            "canonical event, market, line, scope, and outcome identity must be unambiguous",
+        ));
+        gate_results.push(gate(
+            "market_status",
+            Some(best.accepting_orders),
+            None,
+            None,
+            "target market must be active, unresolved, unrestricted, and accepting orders",
+        ));
+        gate_results.push(gate(
+            "executable_fill",
+            Some(execution_ready),
+            fillable_size,
+            Some(0.0),
+            "target requires an ask, complete depth, fee metadata, and a positive simulated fill",
+        ));
+        gate_results.push(gate(
+            "consensus_policy",
+            policy.map(|_| consensus_supported),
+            None,
+            None,
+            format!("selected consensus method: {consensus_method}"),
+        ));
+        gate_results.push(gate(
+            "model_sample_support",
+            policy.map(|model| model.model_sample_size.unwrap_or(model.sample_size) >= 1000),
+            policy.map(|model| model.model_sample_size.unwrap_or(model.sample_size) as f64),
+            Some(1000.0),
+            "chronological model-selection sample must meet the policy minimum",
+        ));
+        gate_results.push(gate(
+            "calibration_support",
+            policy.map(|_| calibrated.is_some()),
+            policy.map(|model| model.sample_size as f64),
+            Some(1000.0),
+            "versioned chronological calibration policy is required",
+        ));
+        gate_results.push(gate(
+            "uncertainty_support",
+            policy.map(|_| probability_samples.len() >= 200),
+            Some(probability_samples.len() as f64),
+            Some(200.0),
+            "event-block bootstrap draws must cover calibration and execution cost",
+        ));
+        gate_results.push(gate(
+            "probability_net_ev_positive",
+            policy.and_then(|model| {
+                probability_net_ev_positive.map(|value| value >= model.min_probability_positive)
+            }),
+            probability_net_ev_positive,
+            policy.map(|model| model.min_probability_positive),
+            "historical bootstrap probability that net EV is positive",
+        ));
+        gate_results.push(gate(
+            "minimum_expected_value",
+            policy.and_then(|model| {
+                net_expected_value_total.map(|value| value >= model.min_expected_value_dollars)
+            }),
+            net_expected_value_total,
+            policy.map(|model| model.min_expected_value_dollars),
+            "minimum expected paper dollars after executable cost",
+        ));
+        gate_results.push(gate(
+            "net_edge",
+            Some(edge >= required_edge),
+            Some(edge),
+            Some(required_edge),
+            "calibrated probability minus executable cost exceeds the policy floor",
+        ));
+        gate_results.push(gate(
+            "signal_quality",
+            Some(confidence >= request.confidence_threshold),
+            Some(confidence),
+            Some(request.confidence_threshold),
+            "policy summary of data reliability; not a win probability",
+        ));
         let action = if blockers.is_empty() {
             "PAPER_BET"
         } else {
@@ -917,9 +1411,8 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
             event_id: request.event_id.clone(),
             market: display_market,
             outcome: display_outcome,
-            // Phase 0 has no independent model, so the model probability IS the
-            // sharp leave-one-out consensus. These diverge once a projection
-            // model is added (Phase 3).
+            // Legacy transport alias; canonical fields below keep consensus
+            // and independent-model output separate.
             model_probability: fair,
             market_probability: executable,
             edge,
@@ -941,7 +1434,43 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
             quality_agreement: (agreement_score * 1000.0).round() / 10.0,
             quality_sources: (source_score * 1000.0).round() / 10.0,
             quality_execution: (spread_score * 1000.0).round() / 10.0,
-            quality_calibration: if market_is_calibrated { 100.0 } else { 0.0 },
+            quality_calibration: policy
+                .map(|model| (model.sample_size as f64 / 1000.0).min(1.0) * 100.0)
+                .unwrap_or(0.0),
+            quality_data_completeness: if best.depth_complete
+                && best.fee_metadata_known
+                && fillable_size.is_some()
+            {
+                100.0
+            } else {
+                0.0
+            },
+            quality_provider_freshness: (quality_freshness * 1000.0).round() / 10.0,
+            quality_identity: if best.identity_valid { 100.0 } else { 0.0 },
+            quality_model_sample_support: policy
+                .map(|model| {
+                    (model.model_sample_size.unwrap_or(model.sample_size) as f64 / 1000.0).min(1.0)
+                        * 100.0
+                })
+                .unwrap_or(0.0),
+            quality_calibration_support: policy
+                .map(|model| (model.sample_size as f64 / 1000.0).min(1.0) * 100.0)
+                .unwrap_or(0.0),
+            quality_source_independence: (source_score * 1000.0).round() / 10.0,
+            consensus_probability: fair,
+            calibrated_consensus_probability: calibrated,
+            independent_model_probability: model_live,
+            uncertainty_low,
+            uncertainty_high,
+            probability_net_ev_positive,
+            net_expected_value_per_share,
+            net_expected_value_total,
+            consensus_method: consensus_method.to_string(),
+            model_sample_size: policy
+                .map(|model| model.model_sample_size.unwrap_or(model.sample_size))
+                .unwrap_or(0),
+            calibration_sample_size: policy.map(|model| model.sample_size).unwrap_or(0),
+            gate_results,
         });
     }
 
@@ -990,6 +1519,7 @@ mod tests {
             source: source.to_string(),
             observed_at: now,
             timestamp_trusted: true,
+            identity_valid: true,
             bid: Some(probability - 0.01),
             ask: Some(probability + 0.01),
             source_weight: Some(1.0),
@@ -1014,6 +1544,24 @@ mod tests {
         states: Vec<StateInput>,
         sport: Option<String>,
     ) -> EvaluateRequest {
+        let policy = ModelPolicyInput {
+            market: "moneyline".to_string(),
+            devig_method: "shin".to_string(),
+            consensus_method: "equal_family_logit".to_string(),
+            calibration_method: "identity".to_string(),
+            beta_coefficients: vec![1.0, 1.0, 0.0],
+            beta_bootstrap_coefficients: vec![vec![1.0, 1.0, 0.0]; 200],
+            execution_cost_offsets: vec![0.0; 200],
+            min_probability_positive: 0.95,
+            min_expected_value_dollars: 0.0,
+            sample_size: 1000,
+            model_sample_size: Some(1000),
+            sharp_source_family: None,
+            consensus_intercept: 0.0,
+            family_coefficients: BTreeMap::new(),
+            missing_family_coefficients: BTreeMap::new(),
+            uncertainty_draws: Vec::new(),
+        };
         EvaluateRequest {
             as_of: 1_000.0,
             event_id: "e".to_string(),
@@ -1026,10 +1574,9 @@ mod tests {
             sport,
             pregame_spread: None,
             pregame_total: None,
-            edge_z: None,
             kelly_fraction: None,
             enable_independent_model: true,
-            calibrated_markets: vec!["moneyline".to_string()],
+            model_policies: vec![policy],
         }
     }
 
@@ -1212,8 +1759,9 @@ mod tests {
             .unwrap();
         // EV per stake = fair/executable - 1 = 0.60/0.55 - 1 ~ 0.0909.
         assert!((home.ev_per_stake - (0.60 / 0.55 - 1.0)).abs() < 0.02);
-        // Even unanimous sources retain the 1.5pp calibration floor.
-        assert!((home.required_edge - 0.035).abs() < 1e-6);
+        // Historically estimated uncertainty is gated separately from the
+        // declared base edge; cross-book dispersion is not added as a fake SE.
+        assert!((home.required_edge - 0.02).abs() < 1e-6);
         assert!(home.kelly_fraction > 0.0 && home.kelly_fraction < 0.25);
         assert_eq!(home.fillable_size, Some(1234.0));
         assert_eq!(home.action, "PAPER_BET");

@@ -52,6 +52,7 @@ def run_replay(history_db_path: str | os.PathLike[str] = "history.db", *,
     try:
         accounts.seed(DEFAULT_STRATEGIES)
         engine = SignalEngine(confidence_threshold=72.0, edge_threshold=0.035)
+        engine.allow_fixture_policies = calibrated_markets is not None
         engine.calibrated_markets = set(calibrated_markets or ())
 
         conn = sqlite3.connect(os.fspath(history_path))

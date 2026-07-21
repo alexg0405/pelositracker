@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 
+import pytest
+
 from app.advice import market_views, position_views
 from app.models import Quote, Signal
 
@@ -20,7 +22,21 @@ def signal(model=.62, action="PAPER_BET", confidence=82, required_edge=0.0):
                   quote_source="Polymarket", market_fair_prob=model,
                   devig_method="exchange", n_reference_sources=2,
                   required_edge=required_edge, quality_freshness=90,
-                  quality_agreement=80, quality_sources=67, quality_execution=95)
+                  quality_agreement=80, quality_sources=67, quality_execution=95,
+                  quality_data_completeness=100,
+                  quality_provider_freshness=90, quality_identity=100,
+                  quality_model_sample_support=100,
+                  quality_calibration_support=100,
+                  quality_source_independence=67,
+                  consensus_probability=model,
+                  calibrated_consensus_probability=model,
+                  uncertainty_low=model - .02, uncertainty_high=model + .02,
+                  probability_net_ev_positive=.98,
+                  net_expected_value_per_share=model - .56,
+                  net_expected_value_total=80 * (model - .56),
+                  consensus_method="equal_family_logit",
+                  calibration_sample_size=1500,
+                  gate_results=[{"code": "paper_policy", "status": "pass"}])
 
 
 def test_actionable_market_has_executable_prices_and_entry_ceiling():
@@ -31,7 +47,7 @@ def test_actionable_market_has_executable_prices_and_entry_ceiling():
     assert views[0]["sell_price"] == .54
     assert abs(views[0]["price_ceiling"] - .585) < 1e-9
     assert views[0]["edge"] == views[0]["entry_margin"]
-    assert views[0]["quality_components"]["freshness"] == 90
+    assert views[0]["quality_components"]["provider_freshness"] == 90
 
 
 def test_entry_ceiling_uses_risk_adjusted_required_edge():
@@ -39,6 +55,20 @@ def test_entry_ceiling_uses_risk_adjusted_required_edge():
     assert abs(views[0]["price_ceiling"] - .56) < 1e-9
     assert views[0]["required_edge"] == .06
     assert abs(views[0]["edge_buffer"] - 0.0) < 1e-9
+
+
+def test_entry_ceiling_includes_depth_fee_and_historical_execution_costs():
+    value = signal(required_edge=.035)
+    value.market_probability = .58
+    value.net_expected_value_per_share = .02
+
+    view = market_views([poly_quote()], [value], edge_threshold=.035)[0]
+
+    assert view["expected_execution_cost_offset"] == pytest.approx(.02)
+    assert view["requested_effective_cost"] == pytest.approx(.58)
+    assert view["edge"] == pytest.approx(.02)
+    assert view["price_ceiling"] == pytest.approx(.545)
+    assert view["room_to_ceiling"] == pytest.approx(-.015)
 
 
 def test_market_without_an_ask_is_not_shown_as_placeable():

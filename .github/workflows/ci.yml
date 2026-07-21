@@ -36,12 +36,13 @@ jobs:
           . .venv/bin/activate
           coverage run --branch -m pytest -q
           coverage report --fail-under=70
+          coverage report --include='app/calibration.py,app/model_training.py,app/engine.py,app/backtest.py,app/accounts.py' --fail-under=75
 
       - name: Python lint and focused types
         run: |
           . .venv/bin/activate
           ruff check app tests
-          mypy app/domain app/execution.py app/identity.py app/security.py app/settings.py
+          mypy app/domain app/execution.py app/identity.py app/security.py app/settings.py app/calibration.py app/model_training.py
 
       - name: Dependency audit
         run: |

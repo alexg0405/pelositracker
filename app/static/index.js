@@ -95,23 +95,26 @@
         : `<strong>Wait for ${cents(market.price_ceiling)} or lower</strong> · current ask is ${cents(-market.room_to_ceiling)} above the ceiling.`;
     const risks = market.risk_flags.length ? market.risk_flags : ["No elevated execution flags detected; continue watching price and news latency."];
     const quality = market.quality_components;
-    const qualityReason = quality ? `<li>Quality breakdown: freshness ${quality.freshness.toFixed(0)}, agreement ${quality.agreement.toFixed(0)}, source-family coverage ${quality.sources.toFixed(0)}, execution ${quality.execution.toFixed(0)}, calibration ${quality.calibration.toFixed(0)}.</li>` : "";
+    const qualityReason = quality ? `<li>Signal-quality policy: completeness ${quality.data_completeness.toFixed(0)}, provider freshness ${quality.provider_freshness.toFixed(0)}, identity ${quality.identity_confidence.toFixed(0)}, execution ${quality.execution_quality.toFixed(0)}, source independence ${quality.source_independence.toFixed(0)}, model sample support ${quality.model_sample_support.toFixed(0)}, calibration support ${quality.calibration_support.toFixed(0)}. These are reliability checks, not a win probability.</li>` : "";
     const ages = `Provider age ${market.provider_age_seconds == null ? "unknown" : market.provider_age_seconds.toFixed(0)+"s"} · receipt age ${market.receipt_age_seconds == null ? "unknown" : market.receipt_age_seconds.toFixed(0)+"s"}`;
-    const uncertainty = market.uncertainty_low == null ? "unavailable" : `${pct(market.uncertainty_low)}–${pct(market.uncertainty_high)} policy range`;
+    const uncertainty = market.uncertainty_low == null ? "unavailable" : `${pct(market.uncertainty_low)}–${pct(market.uncertainty_high)} historical bootstrap interval`;
     const calibration = market.calibrated_consensus_probability == null ? "unavailable" : pct(market.calibrated_consensus_probability);
-    const executionAudit = `<li>Requested-size VWAP ${cents(market.requested_size_vwap)}; simulated fee ${market.execution_fee == null ? "unknown" : "$"+market.execution_fee.toFixed(4)}; fillable ${market.paper_fillable_size == null ? "unknown" : market.paper_fillable_size.toFixed(2)+" shares"}.</li>`;
-    const lineage = `<li>Engine ${esc(market.engine_version||"unavailable")} · model ${esc(market.model_version||"unavailable")} · calibration ${esc(market.calibration_version||"unavailable")} · execution ${esc(market.execution_policy_version||"unavailable")} · config ${esc((market.configuration_hash||"unavailable").slice(0,12))}.</li>`;
+    const positiveEv = market.probability_net_ev_positive == null ? "unavailable" : pct(market.probability_net_ev_positive);
+    const netEv = market.net_expected_value_total == null ? "unavailable" : money(market.net_expected_value_total);
+    const executionAudit = `<li>Requested-size VWAP ${cents(market.requested_size_vwap)}; fee-adjusted requested cost ${cents(market.requested_effective_cost)}; simulated fee ${market.execution_fee == null ? "unknown" : "$"+market.execution_fee.toFixed(4)}; historical execution-cost adjustment ${signedCents(market.expected_execution_cost_offset)}; fillable ${market.paper_fillable_size == null ? "unknown" : market.paper_fillable_size.toFixed(2)+" shares"}.</li>`;
+    const lineage = `<li>Engine ${esc(market.engine_version||"unavailable")} · model ${esc(market.model_version||"unavailable")} (selection n=${Number(market.model_sample_size||0)}) · calibration ${esc(market.calibration_version||"unavailable")} (n=${Number(market.calibration_sample_size||0)}) · execution ${esc(market.execution_policy_version||"unavailable")} · config ${esc((market.configuration_hash||"unavailable").slice(0,12))}.</li>`;
+    const gates = (market.gate_results||[]).map(gate => `<li class="${gate.status === "fail" ? "risk" : ""}">Gate ${esc(gate.code)}: ${esc(gate.status)} · ${esc(gate.explanation||"")}${gate.value == null ? "" : ` · value ${Number(gate.value).toFixed(4)}`}${gate.threshold == null ? "" : ` · threshold ${Number(gate.threshold).toFixed(4)}`}</li>`).join("");
     return `<div class="market" data-line="${lineType(market.market,market.outcome)}" data-token-id="${esc(market.token_id)}">
       <div class="market-top"><div class="outcome">${lineBadge(market.market,market.outcome)}${esc(market.outcome)}<small>${esc(market.question)}</small></div><span class="tag ${tagClass(market.entry_action)}">${esc(market.entry_action)}</span></div>
       <div class="figs">
         <div class="fig"><div class="key">Buy now</div><div class="value">${cents(market.buy_price)}</div><div class="hint">Executable ask</div></div>
         <div class="fig"><div class="key">Sell now</div><div class="value">${cents(market.sell_price)}</div><div class="hint">Executable bid</div></div>
-        <div class="fig"><div class="key">Edge</div><div class="value ${modelClass}">${signedCents(market.edge)}</div><div class="hint">Need ${cents(market.required_edge)} · buffer ${signedCents(market.edge_buffer)}</div></div>
+        <div class="fig"><div class="key">Net edge</div><div class="value ${modelClass}">${signedCents(market.edge)}</div><div class="hint">After execution costs · need ${cents(market.required_edge)} · buffer ${signedCents(market.edge_buffer)}</div></div>
         <div class="fig"><div class="key">Signal quality</div><div class="value">${market.confidence == null ? "—" : market.confidence.toFixed(0)+"/100"}</div><div class="hint">Data reliability · ${market.reference_sources} source family/families</div></div>
       </div>
-      <div class="guide">${guide} Consensus ${pct(market.consensus_probability)} · calibrated consensus ${calibration} · independent model ${pct(market.independent_model_probability)} · uncertainty ${uncertainty} · net EV/stake ${signedCents(market.net_ev_per_stake)}. Spread ${cents(market.spread)} · ask depth ${market.ask_size == null ? "—" : market.ask_size.toFixed(1)+" shares"} · liquidity ${market.market_liquidity == null ? "—" : "$"+Number(market.market_liquidity).toLocaleString(undefined,{maximumFractionDigits:0})}.</div>
+      <div class="guide">${guide} ${esc(market.consensus_method||"display-only")} consensus ${pct(market.consensus_probability)} · calibrated consensus ${calibration} · independent model ${pct(market.independent_model_probability)} · uncertainty ${uncertainty} · P(net EV &gt; 0) ${positiveEv} · net EV ${netEv}. Spread ${cents(market.spread)} · ask depth ${market.ask_size == null ? "—" : market.ask_size.toFixed(1)+" shares"} · liquidity ${market.market_liquidity == null ? "—" : "$"+Number(market.market_liquidity).toLocaleString(undefined,{maximumFractionDigits:0})}.</div>
       <details class="why" data-detail-key="${detailKey}"${openDetails.has(detailKey) ? " open" : ""}><summary>What to look out for</summary>
-        <ul><li>${ages}</li>${executionAudit}${qualityReason}${lineage}${market.reasons.map(reason => `<li>${esc(reason)}</li>`).join("")}${risks.map(risk => `<li class="risk">${esc(risk)}</li>`).join("")}</ul></details>
+        <ul><li>${ages}</li>${executionAudit}${qualityReason}${lineage}${gates}${market.reasons.map(reason => `<li>${esc(reason)}</li>`).join("")}${risks.map(risk => `<li class="risk">${esc(risk)}</li>`).join("")}</ul></details>
       <details class="why"><summary>Add or update my position</summary>
         <form class="position-form" data-save-position data-event-id="${esc(eventId)}" data-token-id="${esc(market.token_id)}" data-market="${esc(market.market)}" data-outcome="${esc(market.outcome)}">
           <div><label>Shares</label><input name="shares" type="number" min="0.01" max="1000000" step="0.01" required placeholder="25"></div>
@@ -131,7 +134,7 @@
         <div class="fig"><div class="key">Cash-out bid</div><div class="value">${cents(position.current_bid)}</div><div class="hint">Before fees/slippage</div></div>
         <div class="fig"><div class="key">Cash value</div><div class="value">${position.cash_value == null ? "—" : "$"+position.cash_value.toFixed(2)}</div><div class="hint">Shares × bid</div></div>
         <div class="fig"><div class="key">Unrealized P/L</div><div class="value ${pnlClass}">${money(position.unrealized_pnl)}</div><div class="hint">${position.roi == null ? "—" : pct(position.roi)} return</div></div>
-        <div class="fig"><div class="key">Remaining hold edge</div><div class="value">${signedCents(position.remaining_hold_edge)}</div><div class="hint">Consensus probability minus executable bid</div></div>
+        <div class="fig"><div class="key">Remaining hold edge</div><div class="value">${signedCents(position.remaining_hold_edge)}</div><div class="hint">Calibrated consensus minus executable bid · lower-bound edge ${signedCents(position.conservative_hold_edge)}</div></div>
       </div>
       <details class="why" data-detail-key="${detailKey}"${openDetails.has(detailKey) ? " open" : ""}><summary>Why this hold/cash status?</summary><ul>${position.reasons.map(reason => `<li>${esc(reason)}</li>`).join("")}</ul></details>
       <button class="position-remove" type="button" data-remove-position data-event-id="${esc(eventId)}" data-token-id="${esc(position.token_id)}">Remove position</button>
@@ -140,7 +143,7 @@
 
   function fallbackSignal(signal) {
     return `<div class="market" data-line="${lineType(signal.market,signal.outcome)}"><div class="market-top"><div class="outcome">${lineBadge(signal.market,signal.outcome)}${esc(signal.outcome)}<small>${esc(signal.market)} reference signal</small></div><span class="tag ${signal.action === "PAPER_BET" ? "entry" : "wait"}">${esc(signal.action.replace("_"," "))}</span></div>
-      <div class="figs"><div class="fig"><div class="key">Consensus prob</div><div class="value">${pct(signal.model_probability)}</div><div class="hint">Equal-weight independent source families</div></div><div class="fig"><div class="key">Gross edge</div><div class="value">${signedCents(signal.edge)}</div></div><div class="fig"><div class="key">Signal quality</div><div class="value">${signal.confidence.toFixed(0)}/100</div><div class="hint">Reliability, not win probability</div></div></div></div>`;
+      <div class="figs"><div class="fig"><div class="key">Consensus prob</div><div class="value">${pct(signal.consensus_probability??signal.model_probability)}</div><div class="hint">One observation per source family</div></div><div class="fig"><div class="key">Display gap</div><div class="value">${signedCents(signal.edge)}</div><div class="hint">Not actionable without calibration and execution gates</div></div><div class="fig"><div class="key">Signal quality</div><div class="value">${signal.confidence.toFixed(0)}/100</div><div class="hint">Reliability, not win probability</div></div></div></div>`;
   }
 
   function eventCard(view, openDetails) {
@@ -177,7 +180,36 @@
   function metricTile(key,value,cls="",sub="") { return `<div class="mtile"><div class="k">${key}</div><div class="v ${cls}">${value}</div>${sub?`<div class="sub2">${sub}</div>`:""}</div>`; }
   function reliabilityView(bins) { if(!bins?.length)return "";const columns=bins.map(bin=>`<div class="rbin" title="predicted ${pct(bin.mean_predicted)} · actual ${pct(bin.empirical_rate)} · n=${bin.count}"><meter class="reliability-meter" min="0" max="1" value="${Number(bin.empirical_rate).toFixed(4)}">${pct(bin.empirical_rate)}</meter><div class="rlabel">${Math.round(bin.lo*100)} · p ${Math.round(bin.mean_predicted*100)}</div></div>`).join("");return `<div class="reliability">${columns}</div><div class="metrics-sub">Meter = actual win rate · label p = predicted probability</div>`; }
 
-  async function refreshMetrics() { const body=document.querySelector("#metrics-body"),sub=document.querySelector("#metrics-sub");try{const response=await fetch("/api/metrics");if(!response.ok)return;const m=await response.json();if(!m?.n_bets){sub.textContent="";body.innerHTML='<div class="metrics-empty">No eligible paper fills yet. Close-price CLV and calibration appear only after validated signals and event closure.</div>';return}const clv=m.clv||{},model=m.model||{},base=m.market_baseline||{};sub.textContent=`${m.n_bets} paper fill(s) · ${m.n_settled} settled`;const tiles=[metricTile("Beat close",clv.beat_close_rate==null?"—":pct(clv.beat_close_rate),clv.beat_close_rate>=.5?"good":"bad",clv.n?`n=${clv.n}`:"awaiting closes"),metricTile("Mean CLV",clv.mean_clv==null?"—":signedCents(clv.mean_clv),clv.mean_clv>=0?"good":"bad","fill vs last executable close"),metricTile("Settled",String(m.n_settled),"","moneyline"),metricTile("Consensus Brier",model.brier==null?"—":model.brier.toFixed(3),model.brier!=null&&base.brier!=null&&model.brier<base.brier?"good":"",base.brier==null?"awaiting settle":`market ${base.brier.toFixed(3)}`)];if(model.log_loss!=null)tiles.push(metricTile("Log loss",model.log_loss.toFixed(3)));if(model.ece!=null)tiles.push(metricTile("ECE",model.ece.toFixed(3),"","calibration gap"));body.innerHTML=`<div class="metric-tiles">${tiles.join("")}</div>`+reliabilityView(m.reliability)}catch{}}
+  async function refreshMetrics() {
+    const body=document.querySelector("#metrics-body"), sub=document.querySelector("#metrics-sub");
+    try {
+      const response=await fetch("/api/metrics");
+      if(!response.ok)return;
+      const m=await response.json();
+      if(!m?.n_bets){
+        sub.textContent="";
+        body.innerHTML='<div class="metrics-empty">No eligible paper fills yet. Close-price CLV and calibration appear only after validated signals and event closure.</div>';
+        return;
+      }
+      const clv=m.clv||{}, model=m.model||{}, base=m.market_baseline||{};
+      const execution=m.execution||{}, portfolio=m.portfolio||{}, coverage=m.eligibility_coverage||{};
+      const opportunities=coverage.all_opportunities==null?"coverage unavailable":`${coverage.all_opportunities} evaluated decision(s)`;
+      sub.textContent=`${m.n_bets} paper fill(s) · ${m.n_settled} settled · ${opportunities}`;
+      const tiles=[
+        metricTile("Beat close",clv.beat_close_rate==null?"—":pct(clv.beat_close_rate),clv.beat_close_rate>=.5?"good":"bad",clv.n?`n=${clv.n}`:"awaiting closes"),
+        metricTile("Mean CLV",clv.mean_clv==null?"—":signedCents(clv.mean_clv),clv.mean_clv>=0?"good":"bad","fill vs last executable close"),
+        metricTile("Fill rate",execution.fill_rate==null?"—":pct(execution.fill_rate),"",`${execution.filled||0}/${execution.submitted||0} simulated orders`),
+        metricTile("Net paper return",execution.net_paper_return==null?"—":money(execution.net_paper_return),execution.net_paper_return>=0?"good":"bad",execution.turnover==null?"":`$${Number(execution.turnover).toFixed(2)} turnover`),
+        metricTile("Max drawdown",portfolio.max_drawdown_dollars==null?"—":`$${Number(portfolio.max_drawdown_dollars).toFixed(2)}`,"","settled paper sequence"),
+        metricTile("Consensus Brier",model.brier==null?"—":model.brier.toFixed(3),model.brier!=null&&base.brier!=null&&model.brier<base.brier?"good":"",base.brier==null?"awaiting settle":`executable baseline ${base.brier.toFixed(3)}`)
+      ];
+      if(model.log_loss!=null)tiles.push(metricTile("Log loss",model.log_loss.toFixed(3)));
+      if(model.ece!=null)tiles.push(metricTile("ECE",model.ece.toFixed(3),"","calibration gap"));
+      if(model.calibration?.slope!=null)tiles.push(metricTile("Calibration slope",model.calibration.slope.toFixed(2),"",`intercept ${model.calibration.intercept.toFixed(2)}`));
+      const rejected=Object.entries(coverage.rejection_gates||{}).map(([code,count])=>`${esc(code)} ${count}`).join(" · ")||"none recorded";
+      body.innerHTML=`<div class="metric-tiles">${tiles.join("")}</div>`+reliabilityView(m.reliability)+`<div class="metrics-sub">Failed-gate counts: ${rejected}. No statistical edge claim is supported by this report.</div>`;
+    } catch {}
+  }
 
   async function viewBot(name) {
     const dialog = document.querySelector("#bot-modal");

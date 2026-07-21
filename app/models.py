@@ -202,6 +202,12 @@ class Signal:
     quality_sources: float = 0.0
     quality_execution: float = 0.0
     quality_calibration: float = 0.0
+    quality_data_completeness: float = 0.0
+    quality_provider_freshness: float = 0.0
+    quality_identity: float = 0.0
+    quality_model_sample_support: float = 0.0
+    quality_calibration_support: float = 0.0
+    quality_source_independence: float = 0.0
     decision_hash: str = ""
     requested_cash: float | None = None
     filled_cash: float | None = None
@@ -221,21 +227,20 @@ class Signal:
     input_snapshot_json: str = ""
     token_id: str | None = None
     order_book_snapshot_id: str | None = None
-
-    @property
-    def consensus_probability(self) -> float:
-        """Canonical name for the legacy `model_probability` transport field."""
-        return self.model_probability
-
-    @property
-    def calibrated_consensus_probability(self) -> float | None:
-        """Identity-calibrated consensus when an eligible artifact is installed."""
-        return (self.model_probability
-                if self.calibration_version not in {"", "unavailable"} else None)
-
-    @property
-    def independent_model_probability(self) -> float | None:
-        return self.model_live_prob
+    # Canonical Milestone E outputs. The legacy transport fields above remain
+    # populated for old ledger/API readers but must not be relabelled in new UI.
+    consensus_probability: float = 0.0
+    calibrated_consensus_probability: float | None = None
+    independent_model_probability: float | None = None
+    uncertainty_low: float | None = None
+    uncertainty_high: float | None = None
+    probability_net_ev_positive: float | None = None
+    net_expected_value_per_share: float | None = None
+    net_expected_value_total: float | None = None
+    consensus_method: str = ""
+    model_sample_size: int = 0
+    calibration_sample_size: int = 0
+    gate_results: list[dict[str, Any]] = field(default_factory=list)
 
 
 def as_json(value: Any) -> Any:

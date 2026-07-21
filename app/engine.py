@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import hashlib
 from datetime import datetime
+from typing import Any
 
+from .calibration import CalibrationArtifact
 from .gameclock import game_progress
 from .domain.time import ensure_utc
 from .lines import is_spread_market, is_total_market, quote_line_side
@@ -13,10 +15,10 @@ from .models import GameState, Quote, Signal, canonical_source, classify_source
 from .execution import BookLevel, simulate_buy
 
 
-ENGINE_VERSION = "live-edge-engine-0.4.0"
-REQUEST_SCHEMA_VERSION = "decision-request-v2"
+ENGINE_VERSION = "live-edge-engine-0.5.0"
+REQUEST_SCHEMA_VERSION = "decision-request-v3"
 SOURCE_MAPPING_VERSION = "canonical-source-family-v1"
-DEFAULT_MODEL_VERSION = "equal-family-logit-consensus-v1"
+DEFAULT_MODEL_VERSION = "equal-family-logit-consensus-v2-display-only"
 EXECUTION_POLICY_VERSION = "paper-depth-v1"
 
 try:
@@ -38,12 +40,70 @@ class SignalEngine:
         self.edge_threshold = edge_threshold
         self.max_age_seconds = max_age_seconds
         self.kelly_fraction = kelly_fraction
-        self.edge_z = edge_z
+        # ``edge_z`` remains an accepted constructor argument for old callers,
+        # but dispersion-based pseudo-standard-errors are intentionally retired.
         self.enable_independent_model = enable_independent_model
         self.paper_notional = 100.0
+        self.allow_fixture_policies = False
         self.calibrated_markets: set[str] = set()
+        self.calibration_artifact: CalibrationArtifact | None = None
+        self.model_policy_overrides: dict[str, dict[str, Any]] = {}
         self.model_version = DEFAULT_MODEL_VERSION
         self.calibration_version = "unavailable"
+
+    def install_calibration(self, artifact: CalibrationArtifact) -> None:
+        """Install a validated artifact without making legacy v1 files actionable."""
+        self.calibration_artifact = artifact
+        self.model_version = artifact.model_version
+        self.calibration_version = (
+            f"{artifact.artifact_version}:{artifact.calibration_method}:"
+            f"{artifact.model_hash[:12] or 'legacy-display-only'}"
+        )
+
+    @staticmethod
+    def _legacy_test_policy(market: str) -> dict[str, Any]:
+        """Compatibility for deterministic unit/replay fixtures only.
+
+        Production configuration never populates ``calibrated_markets``. This
+        explicit override keeps old replay fixtures useful without turning a
+        version-1 display allowlist into deployable statistical evidence.
+        """
+        return {
+            "market": market.strip().casefold(),
+            "devig_method": "shin",
+            "consensus_method": "equal_family_logit",
+            "calibration_method": "identity",
+            "beta_coefficients": [1.0, 1.0, 0.0],
+            "beta_bootstrap_coefficients": [[1.0, 1.0, 0.0]] * 200,
+            "execution_cost_offsets": [0.0] * 200,
+            "min_probability_positive": 0.95,
+            "min_expected_value_dollars": 0.0,
+            "sample_size": 1000,
+            "model_sample_size": 1000,
+            "sharp_source_family": None,
+            "consensus_intercept": 0.0,
+            "family_coefficients": {},
+            "missing_family_coefficients": {},
+            "policy_source": "explicit-test-override",
+        }
+
+    def _model_policies(self, quotes: list[Quote], sport: str, league: str) -> list[dict]:
+        policies: dict[str, dict[str, Any]] = {
+            market.strip().casefold(): dict(policy)
+            for market, policy in self.model_policy_overrides.items()
+        }
+        artifact = self.calibration_artifact
+        if artifact is not None and artifact.eligible_for_action:
+            for market in sorted({quote.market.strip().casefold() for quote in quotes}):
+                policy = artifact.policy_for(sport, league, market)
+                if policy is not None:
+                    policies[market] = policy.to_engine_dict()
+                    policies[market]["policy_source"] = "versioned-artifact"
+        if self.allow_fixture_policies:
+            for market in self.calibrated_markets:
+                key = market.strip().casefold()
+                policies.setdefault(key, self._legacy_test_policy(key))
+        return [policies[key] for key in sorted(policies)]
 
     def evaluate(self, event_id: str, quotes: list[Quote], states: list[GameState],
                  away_outcome: str = "away", sport: str = "", league: str = "",
@@ -55,6 +115,7 @@ class SignalEngine:
         if as_of is None:
             raise ValueError("as_of is required for deterministic evaluation")
         as_of = ensure_utc(as_of)
+        model_policies = self._model_policies(quotes, sport, league)
         quote_payloads = [
             self._quote_payload(q, home_outcome, away_outcome, self.paper_notional)
             for q in quotes
@@ -63,11 +124,10 @@ class SignalEngine:
             "confidence_threshold": self.confidence_threshold,
             "edge_threshold": self.edge_threshold,
             "max_age_seconds": self.max_age_seconds,
-            "edge_z": self.edge_z,
             "kelly_fraction": self.kelly_fraction,
             "paper_notional": self.paper_notional,
             "enable_independent_model": self.enable_independent_model,
-            "calibrated_markets": sorted(self.calibrated_markets),
+            "model_policies": model_policies,
         }
         canonical_configuration = json.dumps(
             configuration, separators=(",", ":"), sort_keys=True, allow_nan=False
@@ -203,6 +263,7 @@ class SignalEngine:
             "received_at": q.received_at.timestamp(),
             "processed_at": q.processed_at.timestamp(),
             "timestamp_trusted": q.timestamp_trusted and not q.quarantined,
+            "identity_valid": not q.quarantined,
             "bid": q.bid,
             "ask": executable_ask,
             "source_weight": weight,

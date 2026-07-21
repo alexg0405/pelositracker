@@ -57,15 +57,10 @@ engine = SignalEngine(settings.confidence_threshold,
                       settings.edge_threshold,
                       settings.max_data_age_seconds,
                       kelly_fraction=settings.kelly_fraction,
-                      edge_z=settings.edge_z,
                       enable_independent_model=settings.enable_independent_models)
 calibration_artifact = load_calibration(os.getenv("CALIBRATION_ARTIFACT"))
 if calibration_artifact is not None:
-    engine.calibrated_markets = set(calibration_artifact.supported_markets)
-    engine.model_version = calibration_artifact.model_version
-    engine.calibration_version = (
-        f"{calibration_artifact.artifact_version}:{calibration_artifact.calibration_method}"
-    )
+    engine.install_calibration(calibration_artifact)
 tasks: dict[str, list[asyncio.Task]] = {}
 _finalized: set[str] = set()
 _terminal_events: dict[str, str] = {}  # event_id -> final | canceled | deleted | shutdown
@@ -623,10 +618,12 @@ def _sort_events_by_edge():
 
 @app.get("/api/events", dependencies=[Depends(verify_auth)])
 async def list_events():
-    return [event_view(event.id) for event in _sort_events_by_edge()]
+    return await asyncio.gather(*(event_view(event.id) for event in _sort_events_by_edge()))
 
-def _events_snapshot_sse() -> str:
-    payload = json.dumps([event_view(event.id) for event in _sort_events_by_edge()], default=str)
+
+async def _events_snapshot_sse() -> str:
+    views = await asyncio.gather(*(event_view(event.id) for event in _sort_events_by_edge()))
+    payload = json.dumps(views, default=str)
     return f"data: {payload}\n\n"
 
 
@@ -637,11 +634,11 @@ async def stream():
         queue: asyncio.Queue = asyncio.Queue(maxsize=1)
         _subscribers.add(queue)
         try:
-            yield _events_snapshot_sse()  # initial state
+            yield await _events_snapshot_sse()  # initial state
             while True:
                 try:
                     await asyncio.wait_for(queue.get(), timeout=15)
-                    yield _events_snapshot_sse()
+                    yield await _events_snapshot_sse()
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"  # keep the connection warm
         finally:
@@ -651,12 +648,13 @@ async def stream():
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-def event_view(event_id: str):
+async def event_view(event_id: str):
     event = store.events.get(event_id)
     if not event:
         raise HTTPException(404, "event not found")
     signals = store.signals[event_id]
-    positions = ledger.event_positions(event_id) if ledger is not None else []
+    positions = (await asyncio.to_thread(ledger.event_positions, event_id)
+                 if ledger is not None else [])
     return {"event": as_json(event),
             "latest_state": as_json(store.states[event_id][-1]) if store.states[event_id] else None,
             "signals": as_json(signals),
@@ -672,12 +670,12 @@ def event_view(event_id: str):
 async def get_event_history_api(event_id: str):
     if history_db is None:
         raise HTTPException(503, "History database not available")
-    return history_db.get_event_history(event_id)
+    return await asyncio.to_thread(history_db.get_event_history, event_id)
 
 
 @app.get("/api/events/{event_id}", dependencies=[Depends(verify_auth)])
 async def get_event(event_id: str):
-    return event_view(event_id)
+    return await event_view(event_id)
 
 
 @app.post("/api/events", status_code=201, dependencies=[Depends(verify_auth)])
@@ -751,7 +749,7 @@ async def add_event(payload: EventIn):
     store.add_event(event)
     _start_event_feeds(event)
     _notify_subscribers()
-    return event_view(event.id)
+    return await event_view(event.id)
 
 
 @app.put("/api/events/{event_id}/positions", dependencies=[Depends(verify_auth)])
@@ -764,15 +762,19 @@ async def save_position(event_id: str, payload: PositionIn):
                     if quote.source.casefold() == "polymarket" and quote.token_id}
     if payload.token_id not in valid_tokens:
         raise HTTPException(400, "That selection is not available for this event")
-    ledger.upsert_position(event_id, payload.token_id, payload.market, payload.outcome,
-                           payload.shares, payload.avg_entry_price)
+    await asyncio.to_thread(
+        ledger.upsert_position, event_id, payload.token_id, payload.market,
+        payload.outcome, payload.shares, payload.avg_entry_price,
+    )
     _notify_subscribers()
-    return event_view(event_id)
+    return await event_view(event_id)
 
 
 @app.delete("/api/events/{event_id}/positions/{token_id}", status_code=204, dependencies=[Depends(verify_auth)])
 async def remove_position(event_id: str, token_id: str):
-    if ledger is None or not ledger.delete_position(event_id, token_id):
+    if ledger is None or not await asyncio.to_thread(
+        ledger.delete_position, event_id, token_id
+    ):
         raise HTTPException(404, "position not found")
     _notify_subscribers()
 
@@ -781,14 +783,18 @@ async def remove_position(event_id: str, token_id: str):
 async def metrics():
     if ledger is None:
         return {"n_bets": 0, "n_settled": 0}
-    return backtest.summary(ledger.all_bets())
+    bet_rows, decisions = await asyncio.gather(
+        asyncio.to_thread(ledger.all_bets),
+        asyncio.to_thread(ledger.all_decisions),
+    )
+    return await asyncio.to_thread(backtest.summary, bet_rows, decisions)
 
 
 @app.get("/api/leaderboard", dependencies=[Depends(verify_auth)])
 async def get_leaderboard():
     if account_book is None:
         return []
-    return account_book.leaderboard()
+    return await asyncio.to_thread(account_book.leaderboard)
 
 
 @app.post("/api/accounts", status_code=201, dependencies=[Depends(verify_auth)])
@@ -806,7 +812,7 @@ async def create_account(payload: StrategyIn):
         start_bankroll=payload.start_bankroll,
         webhook_url=payload.webhook_url
     )
-    account_book.seed([strat])
+    await asyncio.to_thread(account_book.seed, [strat])
     return {"status": "ok"}
 
 
@@ -814,14 +820,17 @@ async def create_account(payload: StrategyIn):
 async def get_account_bets(name: str):
     if account_book is None:
         return []
-    return account_book.account_bets(name)
+    return await asyncio.to_thread(account_book.account_bets, name)
 
 
 @app.get("/api/bets", dependencies=[Depends(verify_auth)])
 async def bets(event_id: str | None = None):
     if ledger is None:
         return []
-    return ledger.event_bets(event_id) if event_id else ledger.all_bets()
+    return await asyncio.to_thread(
+        ledger.event_bets if event_id else ledger.all_bets,
+        *([event_id] if event_id else []),
+    )
 
 
 @app.delete("/api/events/{event_id}", status_code=204, dependencies=[Depends(verify_auth)])

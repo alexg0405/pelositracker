@@ -29,8 +29,9 @@ eligible paper fill. See [model support](docs/model-support.md).
    are disabled unless explicitly enabled and credentialed.
 4. Provider time, receipt time, and processing time remain distinct. Unknown
    provider time never falls back to local receipt time for policy eligibility.
-5. One de-vigged probability per independent source family is aggregated with an
-   equal-weight logit consensus. The target venue is excluded.
+5. One de-vigged probability per independent source family is aggregated with
+   the reviewed artifact's consensus method. Equal-family logit pooling is the
+   fail-safe default; the target venue is excluded.
 6. Decimal execution walks full ask depth for the configured paper notional and
    includes the market fee curve. Incomplete fills are rejected by default.
 7. The Rust boundary receives an explicit UTC `as_of`; identical canonical input
@@ -67,7 +68,6 @@ MAX_DATA_AGE_SECONDS=120
 SIGNAL_CONFIDENCE_THRESHOLD=0
 SIGNAL_EDGE_THRESHOLD=0
 SIGNAL_KELLY_FRACTION=0.25
-SIGNAL_EDGE_Z=1.0
 
 ENABLE_ACTION_NETWORK=false
 ENABLE_PINNACLE_GUEST=false
@@ -131,14 +131,21 @@ Ambiguous doubleheaders are quarantined, not guessed.
 
 ## Reading the dashboard
 
-- **Consensus probability**: equal-weight logit aggregation of independent source
-  families, excluding the target venue.
+- **Consensus probability**: the selected transformation of one price per
+  independent source family, excluding the target venue. It is not a sport model.
+- **Calibrated consensus**: consensus transformed by a reviewed chronological
+  identity/beta calibration artifact; unavailable means display-only.
+- **Independent model**: a separately validated sport model, when available.
+  None is enabled in the repository today.
 - **Market probability**: fee/slippage-adjusted executable paper price.
-- **Gross edge**: consensus probability minus executable market probability.
-- **Net EV/stake**: expected paper value after the simulated execution price.
-- **Required edge**: base floor plus conservative uncertainty and market premium.
-- **Signal quality**: freshness, agreement, source coverage, execution, identity,
-  state, and calibration quality. It is not a probability.
+- **Net EV**: calibrated probability minus depth-weighted executable cost and
+  fees, per share and for the simulated fill.
+- **P(net EV > 0)**: share of aligned historical event-block draws whose net EV
+  is positive. It is unavailable without an eligible artifact.
+- **Required edge**: configured base floor plus the declared market premium.
+- **Signal quality**: a policy score over completeness, provider freshness,
+  identity, execution, source independence, sample support, and calibration
+  support. It is not a win probability.
 - **WATCH**: at least one mandatory gate failed or is unknown.
 - **PAPER_BET**: all gates passed for a simulated paper order only.
 - **CLV**: last valid executable close minus recorded paper fill price.
@@ -160,12 +167,27 @@ Design and operating records are in [architecture](docs/architecture.md),
 [backtesting methodology](docs/backtesting-methodology.md),
 [security](docs/security.md), and [operations](docs/operations.md).
 
+## Offline calibration workflow
+
+Milestone E artifacts are built offline; the live service never trains or
+promotes itself. Export settled, point-in-time/out-of-fold observations as
+JSONL and declare candidate pipeline metadata in JSON, then run:
+
+```cmd
+.venv\Scripts\python.exe -m app.model_training observations.jsonl candidates.json calibration-v2.json --selection-through 2024-06-30T23:59:59Z --calibration-through 2024-12-31T23:59:59Z --validation-through 2025-03-31T23:59:59Z --model-version consensus-2025q1 --sport basketball --league nba --market moneyline
+```
+
+The builder refuses mixed segments, event leakage, fewer than 1,000 observations
+in any fold, and fewer than 200 event-block draws. Review the artifact and its
+test metrics before setting `CALIBRATION_ARTIFACT`; producing a file does not
+establish a statistical or profitable edge.
+
 ## Verification
 
 ```cmd
 .venv\Scripts\python.exe -m pytest -q --basetemp=.pytest-tmp
 .venv\Scripts\python.exe -m ruff check app tests
-.venv\Scripts\python.exe -m mypy app/domain app/execution.py app/identity.py app/security.py app/settings.py
+.venv\Scripts\python.exe -m mypy app/domain app/execution.py app/identity.py app/security.py app/settings.py app/calibration.py app/model_training.py
 cargo fmt --manifest-path native_engine\Cargo.toml -- --check
 cargo test --manifest-path native_engine\Cargo.toml
 cargo clippy --manifest-path native_engine\Cargo.toml --all-targets -- -D warnings

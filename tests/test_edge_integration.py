@@ -17,6 +17,7 @@ _SignalEngine = SignalEngine
 class SignalEngine(_SignalEngine):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.allow_fixture_policies = True
         self.calibrated_markets = {
             "moneyline", "spread", "total",
             "jalen brunson — points", "karl-anthony towns — rebounds",

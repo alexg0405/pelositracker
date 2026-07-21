@@ -16,6 +16,7 @@ from __future__ import annotations
 import threading
 import time
 import hashlib
+import json
 from typing import Iterable
 
 from .database import Database
@@ -168,6 +169,31 @@ class Ledger:
                     "execution_fee": "DOUBLE PRECISION",
                 },
             })
+            self._db.migrate_columns("ledger", 5, {
+                "decision_marks": {
+                    "calibrated_probability": "DOUBLE PRECISION",
+                    "uncertainty_low": "DOUBLE PRECISION",
+                    "uncertainty_high": "DOUBLE PRECISION",
+                    "probability_net_ev_positive": "DOUBLE PRECISION",
+                    "net_ev_per_share": "DOUBLE PRECISION",
+                    "net_ev_total": "DOUBLE PRECISION",
+                    "consensus_method": "TEXT",
+                    "calibration_sample_size": "INTEGER",
+                    "gate_results_json": "TEXT",
+                },
+                "bets": {
+                    "entry_calibrated_prob": "DOUBLE PRECISION",
+                    "probability_net_ev_positive": "DOUBLE PRECISION",
+                    "net_ev_per_share": "DOUBLE PRECISION",
+                    "net_ev_total": "DOUBLE PRECISION",
+                    "requested_cash": "DOUBLE PRECISION",
+                    "filled_cash": "DOUBLE PRECISION",
+                    "filled_shares": "DOUBLE PRECISION",
+                    "execution_fee": "DOUBLE PRECISION",
+                    "consensus_method": "TEXT",
+                    "calibration_sample_size": "INTEGER",
+                },
+            })
 
     def close(self) -> None:
         with self._lock:
@@ -176,18 +202,27 @@ class Ledger:
     def record_signals(self, event: Event, signals: Iterable[Signal]) -> int:
         """Log the entry snapshot of every PAPER_BET, once per selection."""
         signals = list(signals)
-        signal_by_selection = {(signal.market, signal.outcome): signal for signal in signals}
         now = max((signal.observed_at.timestamp() for signal in signals), default=_now())
         rows = [
             (
                 event.id, event.name, event.sport, s.market, s.outcome, s.quote_source,
-                now, s.market_probability, s.market_fair_prob, s.edge, s.confidence,
+                now, s.market_probability,
+                s.consensus_probability or s.market_fair_prob, s.edge, s.confidence,
                 s.devig_method, s.overround, s.n_reference_sources, s.decision_hash,
+                (s.calibrated_consensus_probability
+                 if s.calibrated_consensus_probability is not None else s.market_fair_prob),
+                s.probability_net_ev_positive, s.net_expected_value_per_share,
+                s.net_expected_value_total, s.requested_cash, s.filled_cash,
+                s.filled_shares, s.execution_fee, s.consensus_method,
+                s.calibration_sample_size,
             )
             for s in signals
             if s.action == "PAPER_BET"
-            and (s.requested_cash is None or s.requested_cash > 0)
-            and (s.filled_shares is None or s.filled_shares > 0)
+            and s.execution_complete
+            and s.requested_cash is not None and s.requested_cash > 0
+            and s.filled_cash is not None and s.filled_cash > 0
+            and s.filled_shares is not None and s.filled_shares > 0
+            and s.execution_fee is not None and s.execution_fee >= 0
         ]
         with self._lock:
             inserted = 0
@@ -205,10 +240,14 @@ class Ledger:
                             net_ev_per_stake, policy_action, reasons, decision_id,
                             engine_version, configuration_hash, source_mapping_version,
                             model_version, calibration_version, execution_policy_version,
-                            input_snapshot_json, token_id, order_book_snapshot_id,
-                            requested_cash, execution_vwap, execution_fee)
+                             input_snapshot_json, token_id, order_book_snapshot_id,
+                             requested_cash, execution_vwap, execution_fee,
+                             calibrated_probability, uncertainty_low, uncertainty_high,
+                             probability_net_ev_positive, net_ev_per_share, net_ev_total,
+                             consensus_method, calibration_sample_size, gate_results_json)
                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                                   %s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                                    %s,%s,%s,%s,%s)
                            ON CONFLICT(decision_hash, market, outcome) DO NOTHING""",
                         (signal.decision_hash, event.id, signal.market, signal.outcome,
                          signal.observed_at.timestamp(), signal.consensus_probability,
@@ -218,8 +257,13 @@ class Ledger:
                          signal.source_mapping_version, signal.model_version,
                          signal.calibration_version, signal.execution_policy_version,
                          signal.input_snapshot_json, signal.token_id,
-                         signal.order_book_snapshot_id, signal.requested_cash,
-                         signal.execution_vwap, signal.execution_fee),
+                          signal.order_book_snapshot_id, signal.requested_cash,
+                          signal.execution_vwap, signal.execution_fee,
+                          signal.calibrated_consensus_probability, signal.uncertainty_low,
+                          signal.uncertainty_high, signal.probability_net_ev_positive,
+                          signal.net_expected_value_per_share, signal.net_expected_value_total,
+                          signal.consensus_method, signal.calibration_sample_size,
+                          json.dumps(signal.gate_results, sort_keys=True, separators=(",", ":"))),
                     )
                     reasons = " ".join(signal.reasons).casefold()
                     if (signal.market_probability > 0
@@ -247,22 +291,24 @@ class Ledger:
                         """INSERT INTO bets
                            (event_id, event_name, sport, market, outcome, quote_source,
                             entry_ts, entry_executable, entry_fair_prob, entry_edge,
-                            confidence, devig_method, overround, n_reference_sources,
-                            decision_hash)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                             confidence, devig_method, overround, n_reference_sources,
+                             decision_hash, entry_calibrated_prob,
+                             probability_net_ev_positive, net_ev_per_share, net_ev_total,
+                             requested_cash, filled_cash, filled_shares, execution_fee,
+                             consensus_method, calibration_sample_size)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                            ON CONFLICT (event_id, market, outcome) DO NOTHING""",
                         row,
                     )
                     inserted += max(cur.rowcount, 0)
                     if cur.rowcount:
-                        signal = signal_by_selection[(row[3], row[4])]
                         order_id = hashlib.sha256(
                             f"{row[14]}:{row[3]}:{row[4]}".encode("utf-8")
                         ).hexdigest()
-                        requested_cash = signal.requested_cash or 100.0
-                        filled_cash = signal.filled_cash or requested_cash
-                        filled_shares = signal.filled_shares or (
-                            (filled_cash / row[7]) if row[7] else 0.0)
+                        requested_cash = float(row[19])
+                        filled_cash = float(row[20])
+                        filled_shares = float(row[21])
                         self._db.execute(
                             cur,
                             """INSERT INTO paper_orders
@@ -282,7 +328,7 @@ class Ledger:
                                ON CONFLICT(fill_id) DO NOTHING""",
                             (hashlib.sha256(f"fill:{order_id}".encode()).hexdigest(),
                              order_id, filled_cash, filled_shares,
-                             row[7], signal.execution_fee or 0.0, now),
+                             row[7], float(row[22]), now),
                         )
             return inserted
 
@@ -379,6 +425,13 @@ class Ledger:
         with self._lock:
             with self._db.cursor(dict_rows=True) as cur:
                 self._db.execute(cur, "SELECT * FROM bets ORDER BY entry_ts")
+                return [dict(row) for row in cur.fetchall()]
+
+    def all_decisions(self) -> list[dict]:
+        """Return every evaluated opportunity, including WATCH/rejected rows."""
+        with self._lock:
+            with self._db.cursor(dict_rows=True) as cur:
+                self._db.execute(cur, "SELECT * FROM decision_marks ORDER BY as_of")
                 return [dict(row) for row in cur.fetchall()]
 
     def event_bets(self, event_id: str) -> list[dict]:

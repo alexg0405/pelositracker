@@ -9,13 +9,18 @@
 4. Evaluation receives an explicit UTC `as_of` and a canonical input snapshot.
    The snapshot embeds the configuration and its SHA-256, engine, mapping,
    model, calibration, execution-policy, event, quote, and state lineage.
-5. The SHA-256 decision hash and selection-specific decision ID identify the
+5. A reviewed v2 model policy contributes the selected de-vig/consensus method,
+   calibration coefficients, aligned event-block draws, thresholds, sample
+   count, version, and model hash to that configuration snapshot. Missing
+   policy evidence remains explicit and display-only.
+6. The SHA-256 decision hash and selection-specific decision ID identify the
    resulting decision. `decision_marks` persists the full canonical request and
-   lineage even when the policy output is `WATCH`.
-6. A `PAPER_BET` can create a paper order/fill only when requested and filled
+   lineage, canonical probabilities/EV, and every machine gate even when the
+   policy output is `WATCH`.
+7. A `PAPER_BET` can create a paper order/fill only when requested and filled
    size are positive. Full ask depth and the declared fee schedule determine
    VWAP and effective price.
-7. `close_marks` continuously retain only valid tradable observations and are
+8. `close_marks` continuously retain only valid tradable observations and are
    frozen on suspension/finalization. Settlement is a separate idempotent mark;
    it never supplies the closing price.
 

@@ -68,6 +68,8 @@ class Strategy:
     flat_pct: float = 0.02
     max_stake_pct: float = 0.10
     max_event_exposure_pct: float = 0.15
+    max_sport_exposure_pct: float = 0.25
+    max_correlated_exposure_pct: float = 0.10
     max_total_exposure_pct: float = 0.40
     start_bankroll: float = 10_000.0
     webhook_url: str = ""
@@ -116,6 +118,34 @@ def line_type(market: str) -> str:
 
 def market_allowed(strategy: Strategy, market: str) -> bool:
     return "all" in strategy.markets or line_type(market) in strategy.markets
+
+
+def _correlation_group(event: Event, signal: Signal) -> str:
+    """Transparent, conservative grouping for paper exposure caps.
+
+    Game-side moneylines and spreads share a home/away group; game totals share
+    a total group. Props are grouped by their normalized market label. This is
+    a policy grouping, not a fitted covariance estimate.
+    """
+    market_kind = line_type(signal.market)
+    _, side = quote_line_side(
+        signal.market, signal.outcome, event.home, event.away
+    )
+    if market_kind == "moneyline":
+        outcome = signal.outcome.strip().casefold()
+        if outcome in {"home", event.home.strip().casefold()}:
+            side = "home"
+        elif outcome in {"away", event.away.strip().casefold()}:
+            side = "away"
+        elif outcome == "draw":
+            side = "draw"
+    if market_kind in {"moneyline", "spread"} and side in {"home", "away", "draw"}:
+        group = f"team-side:{side}"
+    elif market_kind == "total":
+        group = "game-total"
+    else:
+        group = f"prop:{signal.market.strip().casefold()}"
+    return f"{event.id}:{group}"
 
 
 def qualification_failures(strategy: Strategy, signal: Signal) -> list[str]:
@@ -208,6 +238,13 @@ class AccountBook:
         self._lock = threading.Lock()
         with self._lock:
             self._db.initialize(_SCHEMA, component="accounts", version=1)
+            self._db.migrate_columns("accounts", 2, {
+                "account_bets": {
+                    "sport": "TEXT",
+                    "correlation_group": "TEXT",
+                    "decision_id": "TEXT",
+                },
+            })
 
     def close(self) -> None:
         with self._lock:
@@ -242,21 +279,36 @@ class AccountBook:
                         cur,
                         """SELECT COALESCE(SUM(stake),0) AS total_open,
                                   COALESCE(SUM(CASE WHEN event_id=%s THEN stake ELSE 0 END),0)
-                                    AS event_open
+                                    AS event_open,
+                                  COALESCE(SUM(CASE WHEN sport=%s THEN stake ELSE 0 END),0)
+                                    AS sport_open
                            FROM account_bets WHERE account=%s AND status='open'""",
-                        (event.id, account["name"]),
+                        (event.id, event.sport.casefold(), account["name"]),
                     )
                     exposure = cur.fetchone()
                     total_open = float(exposure["total_open"] or 0)
                     event_open = float(exposure["event_open"] or 0)
+                    sport_open = float(exposure["sport_open"] or 0)
                     equity = bankroll + total_open
                     for signal in signals:
                         if signal.market_probability <= 0 or not qualifies(strategy, signal):
                             continue
+                        correlation_group = _correlation_group(event, signal)
+                        self._db.execute(
+                            cur,
+                            "SELECT COALESCE(SUM(stake),0) AS correlated_open "
+                            "FROM account_bets WHERE account=%s AND status='open' "
+                            "AND correlation_group=%s",
+                            (account["name"], correlation_group),
+                        )
+                        correlated_open = float(cur.fetchone()["correlated_open"] or 0)
                         stake = stake_for(strategy, signal, bankroll)
                         stake = min(
                             stake,
                             max(0.0, strategy.max_event_exposure_pct * equity - event_open),
+                            max(0.0, strategy.max_sport_exposure_pct * equity - sport_open),
+                            max(0.0, strategy.max_correlated_exposure_pct * equity
+                                - correlated_open),
                             max(0.0, strategy.max_total_exposure_pct * equity - total_open),
                         )
                         if stake < 1.0:  # dust or out of funds
@@ -265,17 +317,21 @@ class AccountBook:
                             cur,
                             """INSERT INTO account_bets
                                (account, event_id, event_name, market, outcome, entry_price, stake,
-                                shares, model_prob, edge, placed_ts, status)
-                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, 'open')
+                                shares, model_prob, edge, placed_ts, status, sport,
+                                correlation_group, decision_id)
+                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, 'open',%s,%s,%s)
                                ON CONFLICT (account, event_id, market, outcome) DO NOTHING""",
                             (account["name"], event.id, event.name, signal.market, signal.outcome,
                              signal.market_probability, stake, stake / signal.market_probability,
-                             signal.model_probability, signal.edge, now),
+                             signal.consensus_probability, signal.edge, now,
+                             event.sport.casefold(), correlation_group,
+                             signal.decision_id or None),
                         )
                         if cur.rowcount:
                             bankroll -= stake
                             total_open += stake
                             event_open += stake
+                            sport_open += stake
                             placed_bets.append({
                                 "bot_name": account["name"],
                                 "webhook_url": strategy.webhook_url,

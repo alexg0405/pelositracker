@@ -13,7 +13,18 @@ eligible opportunities and rejection coverage separately from selected paper
 signals, plus fill/slippage/fees, Brier and log score, reliability, executable
 CLV, turnover, drawdown, concentration, and event-block uncertainty intervals.
 
+The report emits calibrated-consensus Brier/log loss, binned reliability,
+Murphy reliability/resolution/uncertainty decomposition, calibration intercept
+and slope, submitted/filled/fill-rate/turnover/fees/net paper return, maximum
+drawdown, sport/event concentration, and an event-block interval for executable
+CLV. Target-executable and reference-consensus CLV are named separately.
+Decision-mark coverage includes every evaluated `WATCH` and `PAPER_BET` row plus
+failed-gate counts. Target-mid close marks remain explicitly unavailable; they
+are never synthesized from settlement.
+
 Required benchmarks are executable target price, equal-family consensus,
 sharp-source consensus when independently defined, uncalibrated consensus, and
 no-independent-model policy. Searching many thresholds requires an explicit
 multiple-comparison warning. No artifact is promoted merely from in-sample ROI.
+The machine-readable report always sets `statistical_claim_supported=false`
+until a separately reviewed evaluation establishes otherwise.

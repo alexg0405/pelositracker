@@ -20,7 +20,11 @@ Per-session authentication, CSRF/rate limits/security headers, webhook SSRF cont
 
 ## E — Consensus, calibration, uncertainty, and risk
 
-Source-family aggregation, calibration artifacts, uncertainty dimensions, net-EV policy gates, exposure controls, and outcome-level explainability.
+Implemented in engine/tooling: chronological de-vig/consensus comparison,
+monotone beta/identity artifacts, event-block uncertainty, net-EV gates,
+per-decision/event/sport/correlated/aggregate exposure caps, persisted lineage,
+and outcome-level explainability. No fitted artifact ships, so the default
+remains display-only `WATCH` and no edge claim is made.
 
 ## F — Validated models only
 

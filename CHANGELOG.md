@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.0 — Chronological calibration and paper risk controls
+
+- Added a v2 fitted-artifact contract with event-grouped nested chronological
+  folds, de-vig/consensus candidate metrics, monotone beta-or-identity
+  calibration, model hashes, and aligned event-block pipeline/calibration/
+  execution-cost uncertainty draws.
+- Replaced dispersion-based pseudo-confidence with explicit calibrated
+  probability intervals, probability of positive net EV, net EV after
+  executable cost, and machine-readable policy gates.
+- Added per-decision, event, sport, transparent correlated-group, and aggregate
+  paper exposure caps plus decision lineage.
+- Persisted Milestone E decision/fill fields in forward-only ledger v5 and
+  accounts v2 migrations and expanded evaluation with scoring decomposition,
+  execution, drawdown, concentration, and event-block summaries.
+- Kept v1 artifacts and every unsupported sport model display-only. No fitted
+  artifact, real-order capability, or statistical edge claim is shipped.
+
 ## Unreleased -- Auditable paper-research remediation
 
 - Added explicit provider/receipt/processing/as-of timestamps and fail-closed freshness gates.

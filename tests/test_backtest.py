@@ -11,11 +11,15 @@ from app.models import Event, Signal
 
 
 def paper_signal(outcome, model_p, exec_p, edge):
+    shares = 20.0
+    cash = shares * exec_p
     return Signal("e", "moneyline", outcome, model_probability=model_p,
                   market_probability=exec_p, edge=edge, confidence=90.0,
                   action="PAPER_BET", reasons=[], quote_source="DraftKings",
                   market_fair_prob=model_p, devig_method="shin", overround=1.05,
-                  n_reference_sources=2)
+                  n_reference_sources=2, requested_cash=cash,
+                  filled_cash=cash, filled_shares=shares,
+                  execution_fee=0.0, execution_complete=True)
 
 
 def test_pure_metrics_match_hand_computed_values():
@@ -36,11 +40,95 @@ def test_pure_metrics_match_hand_computed_values():
     assert backtest.expected_calibration_error(bins) == pytest.approx(0.35)
 
 
+def test_evaluation_reports_calibration_decomposition_execution_and_event_blocks():
+    bets = []
+    for index, (probability, result, profit_direction) in enumerate((
+        (.7, 1.0, 1), (.6, 1.0, 1), (.4, 0.0, -1), (.3, 0.0, -1),
+    )):
+        shares = 20.0
+        cash = shares * .5
+        bets.append({
+            "event_id": f"event-{index // 2}",
+            "sport": "basketball",
+            "market": "moneyline",
+            "entry_ts": float(index),
+            "settled_ts": float(index + 10),
+            "entry_fair_prob": probability,
+            "entry_calibrated_prob": probability,
+            "entry_executable": .5,
+            "closing_executable": .52 + index * .01,
+            "closing_fair_prob": .53 + index * .01,
+            "clv": .02 + index * .01,
+            "settled_result": result,
+            "requested_cash": cash,
+            "filled_cash": cash,
+            "filled_shares": shares,
+            "execution_fee": .05,
+            "profit_direction": profit_direction,
+        })
+
+    decomposition = backtest.brier_decomposition(bets)
+    assert decomposition is not None
+    assert decomposition["reconstructed_brier"] == pytest.approx(
+        decomposition["reliability"] - decomposition["resolution"]
+        + decomposition["uncertainty"]
+    )
+    interval = backtest.event_block_interval(bets, "clv", draws=200, seed=7)
+    assert interval is not None and interval["events"] == 2
+    assert interval["lower"] <= interval["mean"] <= interval["upper"]
+
+    decisions = [
+        {"policy_action": "PAPER_BET", "gate_results_json": "[]"},
+        {"policy_action": "WATCH", "gate_results_json": (
+            '[{"code":"uncertainty_support","passed":false}]'
+        )},
+    ]
+    report = backtest.summary(bets, decisions)
+    assert report["execution"]["fill_rate"] == 1.0
+    assert report["execution"]["turnover"] == pytest.approx(40.0)
+    assert report["portfolio"]["largest_sport_turnover_share"] == 1.0
+    assert report["bootstrap"]["mean_executable_clv"]["events"] == 2
+    assert report["eligibility_coverage"]["all_opportunities"] == 2
+    assert report["eligibility_coverage"]["rejection_gates"] == {
+        "uncertainty_support": 1
+    }
+    assert report["statistical_claim_supported"] is False
+
+
 def test_metrics_ignore_unsettled_and_unclosed():
     bets = [{"entry_fair_prob": 0.5, "entry_executable": 0.5, "clv": None, "settled_result": None}]
     assert backtest.clv_summary(bets)["n"] == 0
     assert backtest.brier_score(bets) is None
     assert backtest.log_loss(bets) is None
+
+
+def test_net_return_does_not_subtract_execution_fee_twice():
+    bets = [{
+        "settled_result": 1.0,
+        "filled_shares": 20.0,
+        "filled_cash": 10.05,
+        "execution_fee": 0.05,
+        "requested_cash": 10.05,
+    }]
+
+    report = backtest.execution_summary(bets)
+
+    assert report["fees"] == pytest.approx(0.05)
+    assert report["net_paper_return"] == pytest.approx(9.95)
+
+
+def test_ledger_never_invents_a_fill_when_execution_lineage_is_missing(tmp_path):
+    ledger = Ledger(str(tmp_path / "missing-fill.db"))
+    try:
+        event = Event(name="A vs B", sport="basketball", home="A", away="B")
+        signal = paper_signal("A", .6, .5, .1)
+        signal.execution_complete = False
+        signal.filled_shares = 0.0
+        assert ledger.record_signals(event, [signal]) == 0
+        assert ledger.all_bets() == []
+        assert len(ledger.all_decisions()) == 1
+    finally:
+        ledger.close()
 
 
 def test_ledger_roundtrip_clv_and_settlement(tmp_path):
@@ -86,7 +174,9 @@ def test_draw_settles_the_draw_outcome_not_nothing(tmp_path):
                        market_probability=0.33, edge=0.03, confidence=80.0,
                        action="PAPER_BET", reasons=[], quote_source="Book",
                        market_fair_prob=0.33, devig_method="shin", overround=1.06,
-                       n_reference_sources=2),
+                       n_reference_sources=2, requested_cash=6.6,
+                       filled_cash=6.6, filled_shares=20,
+                       execution_fee=0.0, execution_complete=True),
             ])
         # 1-1 final -> Draw wins.
         ledger.settle_moneyline(event.id, {"draw", "Draw"})
@@ -104,7 +194,9 @@ def test_empty_winner_set_settles_nothing(tmp_path):
             Signal(event.id, "h2h", "A", model_probability=0.5, market_probability=0.5,
                    edge=0.03, confidence=80.0, action="PAPER_BET", reasons=[],
                    quote_source="Book", market_fair_prob=0.5, devig_method="shin",
-                   overround=1.05, n_reference_sources=2),
+                   overround=1.05, n_reference_sources=2, requested_cash=10,
+                   filled_cash=10, filled_shares=20,
+                   execution_fee=0.0, execution_complete=True),
         ])
         ledger.settle_moneyline(event.id, set())  # unknown result must not mis-settle
         assert ledger.all_bets()[0]["settled_result"] is None

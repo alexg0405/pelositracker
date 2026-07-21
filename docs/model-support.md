@@ -2,39 +2,38 @@
 
 No independent sport model is enabled in this repository.
 
-The Rust routines for basketball/football/hockey score-and-clock projections and
-spread/total approximations are research benchmarks only. They are not policy
-eligible because the repository contains no versioned training data, leakage
-audit, walk-forward evaluation, calibration bins, or out-of-sample artifact for
-any sport/league/market/game-phase combination.
+The Rust routines for basketball, football, hockey, and other score/clock
+projections are research benchmarks only. They are not policy eligible because
+the repository contains no versioned training data, leakage audit, walk-forward
+evaluation, calibration bins, or out-of-sample artifact for any exact
+sport/league/market/game-phase combination.
 
-The live system can still display:
-
-- normalized Polymarket books;
-- independent sportsbook source-family prices;
-- an equal-family logit consensus;
-- gross edge and fee/slippage-adjusted paper execution estimates; and
-- explicit reasons every policy gate passed, failed, or is unknown.
-
-Without `CALIBRATION_ARTIFACT`, all selections remain `WATCH`. Setting
-`ENABLE_INDEPENDENT_MODELS=true` alone does not make a selection actionable;
-both valid state provenance and a validated artifact are required.
+The live system can still display normalized Polymarket books, independent
+sportsbook source-family prices, source-family consensus, executable paper
+costs, and explicit policy gates. Without `CALIBRATION_ARTIFACT`, all selections
+remain `WATCH`. Setting `ENABLE_INDEPENDENT_MODELS=true` alone cannot promote a
+model.
 
 ## Calibration artifact contract
 
-Version 1 JSON requires:
+Legacy v1 JSON remains readable for historical dashboards but is never action
+eligible. Actionable v2 JSON requires:
 
-- `artifact_version`, `model_version`;
-- `trained_through`, `evaluated_from`, `evaluated_through` UTC timestamps;
-- at least 1,000 genuinely out-of-sample observations;
-- `brier_score`, `log_loss`; and
-- exact lower-case `supported_markets`.
-- `calibration_method: identity`, meaning chronological evaluation explicitly
-  validated the untransformed consensus. Learned transforms are not accepted
-  until their coefficients and parity tests are implemented.
+- a SHA-256 model hash and model/calibration versions;
+- explicit model-selection, calibration, validation, and untouched-test dates;
+- at least 1,000 observations in every chronological fold;
+- method-specific de-vig and consensus candidate scores;
+- monotone identity or beta calibration; and
+- at least 200 aligned event-block calibration and execution-cost draws per
+  segment.
 
-The evaluation interval must begin after the training cutoff. Invalid or missing
-artifacts stop action eligibility rather than silently falling back.
+Invalid, undersized, leaking, or missing artifacts stop action eligibility
+rather than silently falling back.
+
+The offline builder is `python -m app.model_training`. Its JSONL observations
+must be settled, point-in-time/out-of-fold rows with durable event IDs,
+candidate probabilities, executable cost, and realized execution-cost error.
+It writes a reviewable artifact but never installs or promotes it.
 
 ## Promotion process
 
@@ -42,3 +41,10 @@ Promotion requires reproducible data lineage, participant/event/market identity
 audit, purged chronological splits, leakage tests, execution-aware evaluation,
 calibration/reliability results, and rollback criteria. The artifact must be
 reviewed and versioned separately from application code.
+
+## Milestone F status
+
+Milestone F remains disabled. The feed does not yet provide the complete,
+audited feature sets and sport/league-specific out-of-sample evidence required
+for basketball, soccer, hockey, baseball, football, or player-prop models.
+Hard-coded projections remain non-eligible research benchmarks only.

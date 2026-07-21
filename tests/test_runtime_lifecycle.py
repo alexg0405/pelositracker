@@ -37,6 +37,7 @@ def runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "_event_locks", {})
     monkeypatch.setattr(main, "_pregame", {})
     monkeypatch.setattr(main, "_subscribers", set())
+    monkeypatch.setattr(main.engine, "allow_fixture_policies", True)
     monkeypatch.setattr(main.engine, "calibrated_markets", {"moneyline"})
 
     try:
