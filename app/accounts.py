@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, fields
 
 from .database import Database
 from .lines import is_spread_market, is_total_market, quote_line_side
@@ -67,6 +67,8 @@ class Strategy:
     flat_stake: float = 100.0
     flat_pct: float = 0.02
     max_stake_pct: float = 0.10
+    max_event_exposure_pct: float = 0.15
+    max_total_exposure_pct: float = 0.40
     start_bankroll: float = 10_000.0
     webhook_url: str = ""
 
@@ -205,7 +207,7 @@ class AccountBook:
         self._conn = self._db.connection
         self._lock = threading.Lock()
         with self._lock:
-            self._db.initialize(_SCHEMA)
+            self._db.initialize(_SCHEMA, component="accounts", version=1)
 
     def close(self) -> None:
         with self._lock:
@@ -231,15 +233,32 @@ class AccountBook:
         placed_bets = []
         with self._lock:
             with self._db.transaction(dict_rows=True) as cur:
-                self._db.execute(cur, "SELECT name, strategy, bankroll FROM accounts")
+                self._db.execute(cur, "SELECT name, strategy, bankroll, start_bankroll FROM accounts")
                 accounts = cur.fetchall()
                 for account in accounts:
                     strategy = Strategy.from_json(account["strategy"])
                     bankroll = account["bankroll"]
+                    self._db.execute(
+                        cur,
+                        """SELECT COALESCE(SUM(stake),0) AS total_open,
+                                  COALESCE(SUM(CASE WHEN event_id=%s THEN stake ELSE 0 END),0)
+                                    AS event_open
+                           FROM account_bets WHERE account=%s AND status='open'""",
+                        (event.id, account["name"]),
+                    )
+                    exposure = cur.fetchone()
+                    total_open = float(exposure["total_open"] or 0)
+                    event_open = float(exposure["event_open"] or 0)
+                    equity = bankroll + total_open
                     for signal in signals:
                         if signal.market_probability <= 0 or not qualifies(strategy, signal):
                             continue
                         stake = stake_for(strategy, signal, bankroll)
+                        stake = min(
+                            stake,
+                            max(0.0, strategy.max_event_exposure_pct * equity - event_open),
+                            max(0.0, strategy.max_total_exposure_pct * equity - total_open),
+                        )
                         if stake < 1.0:  # dust or out of funds
                             continue
                         self._db.execute(
@@ -255,6 +274,8 @@ class AccountBook:
                         )
                         if cur.rowcount:
                             bankroll -= stake
+                            total_open += stake
+                            event_open += stake
                             placed_bets.append({
                                 "bot_name": account["name"],
                                 "webhook_url": strategy.webhook_url,

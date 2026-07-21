@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 import threading
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -36,6 +37,7 @@ def runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "_event_locks", {})
     monkeypatch.setattr(main, "_pregame", {})
     monkeypatch.setattr(main, "_subscribers", set())
+    monkeypatch.setattr(main.engine, "calibrated_markets", {"moneyline"})
 
     try:
         yield {
@@ -64,22 +66,26 @@ def _event() -> Event:
 
 
 def _quotes(event: Event) -> list[Quote]:
+    observed = datetime.now(timezone.utc)
     return [
         Quote(event.id, "moneyline", event.home, .445, "Polymarket",
-              bid=.44, ask=.45, ask_size=1_000),
+              observed, bid=.44, ask=.45, ask_size=1_000, depth_complete=True,
+              fee_rate=0.0, ask_levels=((.45, 1_000.0),)),
         Quote(event.id, "moneyline", event.away, .555, "Polymarket",
-              bid=.55, ask=.56, ask_size=1_000),
-        Quote(event.id, "moneyline", event.home, .62, "Pinnacle"),
-        Quote(event.id, "moneyline", event.away, .38, "Pinnacle"),
-        Quote(event.id, "moneyline", event.home, .62, "Circa"),
-        Quote(event.id, "moneyline", event.away, .38, "Circa"),
+              observed, bid=.55, ask=.56, ask_size=1_000, depth_complete=True,
+              fee_rate=0.0, ask_levels=((.56, 1_000.0),)),
+        Quote(event.id, "moneyline", event.home, .62, "Pinnacle", observed),
+        Quote(event.id, "moneyline", event.away, .38, "Pinnacle", observed),
+        Quote(event.id, "moneyline", event.home, .62, "Circa", observed),
+        Quote(event.id, "moneyline", event.away, .38, "Circa", observed),
     ]
 
 
 def _state(event: Event, status: str, home_score: float = 112,
            away_score: float = 104) -> GameState:
     return GameState(
-        event.id, home_score, away_score, "4", "00:00", "fixture", status=status
+        event.id, home_score, away_score, "4", "00:00", "fixture",
+        observed_at=datetime.now(timezone.utc), status=status
     )
 
 

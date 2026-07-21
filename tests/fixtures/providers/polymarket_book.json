@@ -1,0 +1,18 @@
+{
+  "market": "0xcondition",
+  "asset_id": "token-home",
+  "timestamp": "1784563200000",
+  "hash": "fixture-book-hash",
+  "bids": [
+    {"price": "0.54", "size": "125.5"},
+    {"price": "0.53", "size": "400"}
+  ],
+  "asks": [
+    {"price": "0.56", "size": "80"},
+    {"price": "0.57", "size": "250"}
+  ],
+  "min_order_size": "5",
+  "tick_size": "0.01",
+  "neg_risk": false,
+  "last_trade_price": "0.55"
+}

@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased -- Auditable paper-research remediation
+
+- Added explicit provider/receipt/processing/as-of timestamps and fail-closed freshness gates.
+- Added canonical event/market identity decisions, quarantine states, versioned migration records, and lossless quote/state history.
+- Made replay deterministic and tied decisions to canonical hashes and declared engine/config/model/calibration/execution versions.
+- Added full-depth paper execution with fee, status, minimum-size, tick, partial-fill, portfolio, and closing-mark controls.
+- Replaced subjective source weights with one observation per canonical source family and disabled actionable signals without chronological calibration support.
+- Added Argon2id authentication, per-session revocation, CSRF protection, rate limits, SSRF-safe notifications, strict CSP, security headers, and local pinned frontend assets.
+- Added provider supervision, readiness/runtime diagnostics, a single-worker production guard, non-root container execution, and broader CI checks.
+- Preserved the paper-only boundary: no wallets, signing, exchange credentials, or real order routing were added.
+
 ## Unreleased — Live-status and signal audit
 
 - Replaced the five-hour schedule guess with fresh Polymarket `sport_result` status for `LIVE`; schedule-only games now show `STARTED · VERIFYING`.

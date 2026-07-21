@@ -1,0 +1,24 @@
+{
+  "id": "odds-event-1",
+  "sport_key": "basketball_nba",
+  "commence_time": "2026-07-20T19:00:00Z",
+  "home_team": "New York Knicks",
+  "away_team": "Boston Celtics",
+  "bookmakers": [
+    {
+      "key": "fixturebook",
+      "title": "Fixture Book",
+      "last_update": "2026-07-20T19:12:30Z",
+      "markets": [
+        {
+          "key": "h2h",
+          "last_update": "2026-07-20T19:12:31Z",
+          "outcomes": [
+            {"name": "New York Knicks", "price": -120},
+            {"name": "Boston Celtics", "price": 105}
+          ]
+        }
+      ]
+    }
+  ]
+}

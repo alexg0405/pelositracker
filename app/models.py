@@ -11,43 +11,19 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-# Source trust tiers used to weight the consensus fair value. Sharp books and
-# exchanges anchor the fair price; soft books contribute little. Keys are matched
-# as case-insensitive substrings of the quote source name.
-SOURCE_TIERS: dict[str, tuple[float, bool]] = {
-    # name fragment -> (weight, is_exchange)
-    "pinnacle": (1.0, False),
-    "circa": (1.0, False),
-    "bookmaker": (0.9, False),
-    "betonline": (0.7, False),
-    # exchanges: quotes already trade near a de-vigged mid
-    "polymarket": (0.9, True),
-    "betfair": (0.9, True),
-    "smarkets": (0.8, True),
-    "matchbook": (0.8, True),
-    "prophetx": (0.8, True),
-    "kalshi": (0.8, True),
-    # soft retail books (contribute little to fair value)
-    "draftkings": (0.2, False),
-    "fanduel": (0.2, False),
-    "betmgm": (0.2, False),
-    "caesars": (0.2, False),
-    "espn bet": (0.2, False),
-    "bet365": (0.25, False),
-    "pointsbet": (0.2, False),
-    # demo feed used offline
-    "demo exchange": (0.9, True),
-    "demobook": (0.3, False),
+# Source classification describes market mechanics only. Consensus weighting is
+# equal by independent source family unless a versioned calibration artifact says
+# otherwise; subjective brand weights are deliberately prohibited.
+_EXCHANGE_SOURCES = {
+    "polymarket", "betfair", "smarkets", "matchbook", "prophetx", "kalshi",
+    "demoexchange",
 }
 
 
 def classify_source(name: str) -> tuple[float, bool]:
-    """Return (fair-value weight, is_exchange) for a quote source name."""
-    lowered = (name or "").casefold()
-    for fragment, tier in SOURCE_TIERS.items():
-        if fragment in lowered:
-            return tier
-    return (0.35, False)  # unknown book: modest default weight
+    """Return an equal consensus weight and whether the venue is an exchange."""
+    source = canonical_source(name)
+    return (1.0, any(fragment in source for fragment in _EXCHANGE_SOURCES))
 
 
 def canonical_source(name: str) -> str:
@@ -73,6 +49,7 @@ class Event:
     odds_api_sport: str | None = None
     odds_api_event_id: str | None = None
     game_start: str | None = None
+    canonical_event_id: str | None = None
     id: str = field(default_factory=lambda: str(uuid4()))
     created_at: datetime = field(default_factory=now_utc)
 
@@ -85,9 +62,40 @@ class GameState:
     period: str
     clock: str
     source: str
-    observed_at: datetime = field(default_factory=now_utc)
+    # `observed_at` is a compatibility alias. New code must use the three
+    # provenance timestamps below and never substitute receipt time for provider time.
+    observed_at: datetime | None = None
     possession: str | None = None
     status: str = "in_progress"
+    provider_timestamp: datetime | None = None
+    received_at: datetime = field(default_factory=now_utc)
+    processed_at: datetime = field(default_factory=now_utc)
+    timestamp_trusted: bool = False
+    quarantined: bool = False
+    quarantine_reason: str | None = None
+    provider_event_id: str | None = None
+    canonical_event_id: str | None = None
+    league_id: str | None = None
+    sport_id: str | None = None
+    home_team_id: str | None = None
+    away_team_id: str | None = None
+    regulation_period: int | None = None
+    overtime_number: int | None = None
+    normalized_seconds_remaining: float | None = None
+    clock_direction: str | None = None
+    live: bool | None = None
+    ended: bool | None = None
+    sequence: int | None = None
+    state_hash: str | None = None
+    state_schema_version: str = "game-state-v2"
+    finished_timestamp: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.provider_timestamp is None and self.observed_at is not None:
+            self.provider_timestamp = self.observed_at
+        if self.observed_at is None:
+            self.observed_at = self.provider_timestamp or self.received_at
+        self.timestamp_trusted = self.provider_timestamp is not None
 
 
 @dataclass(slots=True)
@@ -97,7 +105,7 @@ class Quote:
     outcome: str
     probability: float
     source: str
-    observed_at: datetime = field(default_factory=now_utc)
+    observed_at: datetime | None = None
     decimal_odds: float | None = None
     bid: float | None = None
     ask: float | None = None
@@ -111,6 +119,52 @@ class Quote:
     min_order_size: float | None = None
     tick_size: float | None = None
     accepting_orders: bool = True
+    provider_timestamp: datetime | None = None
+    received_at: datetime = field(default_factory=now_utc)
+    processed_at: datetime = field(default_factory=now_utc)
+    timestamp_trusted: bool = False
+    quarantined: bool = False
+    quarantine_reason: str | None = None
+    source_family: str = ""
+    book_hash: str | None = None
+    sequence: int | None = None
+    depth_complete: bool = False
+    fee_rate: float | None = None
+    fee_schedule_id: str | None = None
+    bid_levels: tuple[tuple[float, float], ...] = ()
+    ask_levels: tuple[tuple[float, float], ...] = ()
+    internal_quote_id: str = field(default_factory=lambda: str(uuid4()))
+    provider_source_id: str | None = None
+    provider_event_id: str | None = None
+    canonical_event_id: str | None = None
+    provider_market_id: str | None = None
+    condition_id: str | None = None
+    market_scope: str = "unknown"
+    line: float | None = None
+    outcome_id: str | None = None
+    outcome_label: str | None = None
+    active: bool = True
+    resolved: bool = False
+    restricted: bool = False
+    negative_risk: bool | None = None
+    raw_payload_hash: str | None = None
+    normalization_version: str = "quote-v2"
+    mapping_decision_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.provider_timestamp is None and self.observed_at is not None:
+            self.provider_timestamp = self.observed_at
+        if self.observed_at is None:
+            self.observed_at = self.provider_timestamp or self.received_at
+        self.timestamp_trusted = self.provider_timestamp is not None
+        if not self.source_family:
+            self.source_family = canonical_source(self.source)
+        if self.provider_source_id is None:
+            self.provider_source_id = self.source
+        if self.outcome_label is None:
+            self.outcome_label = self.outcome
+        if self.raw_payload_hash is None:
+            self.raw_payload_hash = self.book_hash
 
     @property
     def executable_probability(self) -> float:
@@ -147,6 +201,41 @@ class Signal:
     quality_agreement: float = 0.0
     quality_sources: float = 0.0
     quality_execution: float = 0.0
+    quality_calibration: float = 0.0
+    decision_hash: str = ""
+    requested_cash: float | None = None
+    filled_cash: float | None = None
+    filled_shares: float | None = None
+    execution_fee: float | None = None
+    execution_vwap: float | None = None
+    execution_complete: bool = False
+    # Reproducibility lineage.  The legacy transport names above remain for
+    # compatibility; these fields are canonical for persisted decisions.
+    decision_id: str = ""
+    engine_version: str = ""
+    configuration_hash: str = ""
+    source_mapping_version: str = ""
+    model_version: str = ""
+    calibration_version: str = ""
+    execution_policy_version: str = ""
+    input_snapshot_json: str = ""
+    token_id: str | None = None
+    order_book_snapshot_id: str | None = None
+
+    @property
+    def consensus_probability(self) -> float:
+        """Canonical name for the legacy `model_probability` transport field."""
+        return self.model_probability
+
+    @property
+    def calibrated_consensus_probability(self) -> float | None:
+        """Identity-calibrated consensus when an eligible artifact is installed."""
+        return (self.model_probability
+                if self.calibration_version not in {"", "unavailable"} else None)
+
+    @property
+    def independent_model_probability(self) -> float | None:
+        return self.model_live_prob
 
 
 def as_json(value: Any) -> Any:
@@ -154,7 +243,7 @@ def as_json(value: Any) -> Any:
         return value.isoformat()
     if hasattr(value, "__dataclass_fields__"):
         return {key: as_json(getattr(value, key)) for key in value.__dataclass_fields__}
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [as_json(item) for item in value]
     if isinstance(value, dict):
         return {key: as_json(item) for key, item in value.items()}

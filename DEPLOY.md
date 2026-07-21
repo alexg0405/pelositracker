@@ -9,17 +9,19 @@ The included `Dockerfile` builds the Rust engine and runs the FastAPI app on the
 Set these deliberately in the host's environment:
 
 - `ADMIN_USERNAME` and a strong `ADMIN_PASSWORD`, or `AUTHORIZED_USERS` for multiple logins.
-- `ODDS_POLL_SECONDS=20` and `MAX_DATA_AGE_SECONDS=120`. The poll cadence must remain shorter than the accepted quote age.
+- `APP_ENV=production` and `WEB_CONCURRENCY=1`. Startup rejects default credentials and duplicate feed-owning workers.
+- `ODDS_POLL_SECONDS=45` and `MAX_DATA_AGE_SECONDS=120`. The poll cadence must remain shorter than the accepted quote age.
 - `SIGNAL_CONFIDENCE_THRESHOLD=0` and `SIGNAL_EDGE_THRESHOLD=0` when custom paper bots should enforce their own thresholds.
 - `THE_ODDS_API_KEY` only when the paid sportsbook feed is wanted.
 - `DATABASE_URL` for optional PostgreSQL persistence.
+- `CALIBRATION_ARTIFACT` only for a reviewed, versioned chronological artifact. Without one, the safe policy output remains `WATCH`.
 
 If `DATABASE_URL` is unset, the app falls back to SQLite. `LEDGER_DB` stores positions, accounts, tracked events, and auto-monitor settings, and `HISTORY_DB` stores quote/outcome history. Container-local SQLite files may disappear after a restart or redeploy unless the host supplies a persistent volume.
 
 ## Render blueprint
 
 1. Push the repository to GitHub.
-2. In Render, create a Blueprint from the repository; `render.yaml` defines the Docker web service and `/api/config` health check.
+2. In Render, create a Blueprint from the repository; `render.yaml` defines the Docker web service and `/api/ready` readiness check.
 3. Supply authentication credentials and any optional feed/database values prompted by the Blueprint.
 4. Deploy, sign in, then add an active market from **Discovery** or paste a Polymarket event link.
 
@@ -49,6 +51,12 @@ docker run --env-file .env -p 8000:8000 live-edge-monitor
 ```
 
 If using SQLite, also mount the directory containing `LEDGER_DB` and `HISTORY_DB`. Do not bake `.env` or credentials into the image.
+
+The image runs as a non-root user and intentionally starts exactly one Uvicorn
+worker. `GET /api/health` is liveness, `GET /api/ready` is dependency
+readiness, and authenticated `GET /api/runtime` reports feed/quota counters.
+Back up the database before deployment; migrations are forward-only and a
+checksum mismatch intentionally aborts startup.
 
 ## Serverless frontends
 

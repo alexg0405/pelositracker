@@ -40,6 +40,8 @@ def test_drops_futures_submarkets_untradeable_and_nonsports():
         _ev("Reds vs. Cubs", ["MLB"], accepting=False),            # not accepting orders
         _ev("Trump vs. Biden debate winner", ["Politics"]),        # not sports
         _ev("Who will Alexander Volkanovski fight next?", ["UFC"]), # "vs" inside a name
+        _ev("Who will perform at the 2027 Big Game halftime show?", ["NFL"]),
+        _ev("Who will be UFC champion at the end of 2026?", ["UFC"]),
     ]
     assert filter_sports_games(events) == []
 

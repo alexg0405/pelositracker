@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
-import random
 import re
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
@@ -14,10 +14,23 @@ import httpx
 import websockets
 
 from .models import Event, GameState, Quote
-from .matching import closest_start
+from .matching import closest_start, team_match_score
+from .domain.time import parse_provider_timestamp
+from .orderbook import BookGapError, OrderBookState
+from .execution import D
+from .resilience import RetryBackoff
+from .telemetry import runtime_telemetry
 
 
 logger = logging.getLogger(__name__)
+_odds_quota: dict[str, str] = {}
+
+
+def _provider_time(value: object) -> datetime | None:
+    try:
+        return parse_provider_timestamp(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 _SPORT_KEYS = {
     "wnba": ("basketball", "basketball_wnba"),
@@ -265,6 +278,19 @@ _SPORTS_TAGS = (
     "cricket", "world cup", "sports", "cfb", "cbb", "wnba",
 )
 _MATCHUP_RE = re.compile(r"\b(?:vs\.?|at)\b", re.IGNORECASE)
+
+
+def _matchup_separator(title: str) -> re.Match | None:
+    """Return a team-v-team separator, excluding question prose using "at"."""
+    match = _MATCHUP_RE.search(title)
+    if match is None:
+        return None
+    if match.group().casefold() == "at" and (
+        "?" in title or re.match(r"^\s*(who|what|which|when|where|how|will)\b",
+                                  title, re.IGNORECASE)
+    ):
+        return None
+    return match
 _LIVE_GAME_STATUSES = {"live", "in progress", "inprogress", "playing", "halftime", "intermission"}
 _FINAL_GAME_STATUSES = {"final", "ended", "closed", "complete", "completed", "finished", "cancelled", "canceled"}
 _UPCOMING_GAME_STATUSES = {"scheduled", "upcoming", "not started", "pregame", "pre game", "delayed", "postponed"}
@@ -318,7 +344,7 @@ def filter_sports_games(events: list[dict]) -> list[dict]:
     games = []
     for event in events:
         title = str(event.get("title", ""))
-        if not _MATCHUP_RE.search(title) or " - " in title:  # matchups, not names containing "vs"
+        if _matchup_separator(title) is None or " - " in title:
             continue
         if not event.get("enableOrderBook", False) or not _is_sports_event(event):
             continue
@@ -454,25 +480,25 @@ async def match_odds_api_event(sport_key: str | None, title: str,
     async with httpx.AsyncClient(timeout=15) as client:
         response = await client.get(url, params={"apiKey": key, "dateFormat": "iso"})
         response.raise_for_status()
-    normalized_title = re.sub(r"[^a-z0-9]+", " ", title.casefold())
-    ranked = []
+    participants = [part.strip() for part in _MATCHUP_RE.split(title, maxsplit=1)]
+    if len(participants) != 2 or not all(participants):
+        return None
+    matched = []
     for game in response.json():
         home = str(game.get("home_team", ""))
         away = str(game.get("away_team", ""))
-        names = [re.sub(r"[^a-z0-9]+", " ", name.casefold()).strip() for name in (home, away)]
-        score = sum(2 if name and name in normalized_title else
-                    1 if name.split() and name.split()[-1] in normalized_title.split() else 0
-                    for name in names)
-        if score:
-            ranked.append((score, game))
-    if not ranked:
+        direct = (team_match_score(participants[0], home),
+                  team_match_score(participants[1], away))
+        reverse = (team_match_score(participants[0], away),
+                   team_match_score(participants[1], home))
+        if any(all(score is not None for score in orientation)
+               for orientation in (direct, reverse)):
+            matched.append(game)
+    if not matched:
         return None
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    if ranked[0][0] < 2:
-        return None
-    best_score = ranked[0][0]
-    candidates = [game for score, game in ranked if score == best_score]
-    return closest_start(candidates, game_start, lambda game: game.get("commence_time"))
+    if game_start is None:
+        return matched[0] if len(matched) == 1 else None
+    return closest_start(matched, game_start, lambda game: game.get("commence_time"))
 
 
 def _polymarket_token_meta(data: dict) -> dict[str, dict]:
@@ -499,11 +525,25 @@ def _polymarket_token_meta(data: dict) -> dict[str, dict]:
                 "min_order_size": _to_float(market.get("orderMinSize")),
                 "tick_size": _to_float(market.get("orderPriceMinTickSize")),
                 "accepting_orders": True,
+                "fee_rate": (0.0 if market.get("feesEnabled") is False else
+                             _to_float(market.get("feeRate") or market.get("takerFee"))),
+                "fee_schedule_id": str(market.get("feeScheduleId") or "") or None,
+                "provider_event_id": str(data.get("id") or data.get("slug") or "") or None,
+                "provider_market_id": str(market.get("id") or market.get("slug") or "") or None,
+                "condition_id": str(market.get("conditionId") or "") or None,
+                "market_scope": str(market.get("marketScope") or "unknown").casefold(),
+                "line": _to_float(market.get("line")),
+                "active": bool(market.get("active", True)),
+                "resolved": bool(market.get("closed", False)),
+                "restricted": bool(data.get("restricted", False) or market.get("restricted", False)),
+                "negative_risk": (bool(market.get("negRisk"))
+                                  if market.get("negRisk") is not None else None),
             }
     return token_meta
 
 
 def _quote_from_book(event: Event, token: str, meta: dict, book: dict) -> Quote | None:
+    received_at = datetime.now(timezone.utc)
     bids, asks = book.get("bids", []), book.get("asks", [])
     bid_prices = [price for level in bids if (price := _to_float(level.get("price"))) is not None]
     ask_prices = [price for level in asks if (price := _to_float(level.get("price"))) is not None]
@@ -524,6 +564,30 @@ def _quote_from_book(event: Event, token: str, meta: dict, book: dict) -> Quote 
         min_order_size=_to_float(book.get("min_order_size")) or meta.get("min_order_size"),
         tick_size=_to_float(book.get("tick_size")) or meta.get("tick_size"),
         accepting_orders=meta.get("accepting_orders", True),
+        provider_timestamp=_provider_time(book.get("timestamp")),
+        received_at=received_at, processed_at=datetime.now(timezone.utc),
+        book_hash=str(book.get("hash")) if book.get("hash") else None,
+        depth_complete=True,
+        fee_rate=(_to_float(book.get("fee_rate"))
+                  if book.get("fee_rate") is not None else meta.get("fee_rate")),
+        fee_schedule_id=(str(book.get("fee_schedule_id"))
+                         if book.get("fee_schedule_id") else meta.get("fee_schedule_id")),
+        bid_levels=tuple((float(level["price"]), float(level["size"])) for level in bids
+                         if _to_float(level.get("price")) is not None
+                         and _to_float(level.get("size")) is not None),
+        ask_levels=tuple((float(level["price"]), float(level["size"])) for level in asks
+                         if _to_float(level.get("price")) is not None
+                         and _to_float(level.get("size")) is not None),
+        provider_event_id=meta.get("provider_event_id"),
+        canonical_event_id=event.canonical_event_id,
+        provider_market_id=meta.get("provider_market_id"),
+        condition_id=meta.get("condition_id"), market_scope=meta.get("market_scope", "unknown"),
+        line=meta.get("line"), outcome_id=token, active=meta.get("active", True),
+        resolved=meta.get("resolved", False), restricted=meta.get("restricted", False),
+        negative_risk=meta.get("negative_risk"), raw_payload_hash=(
+            hashlib.sha256(json.dumps(book, sort_keys=True, separators=(",", ":"))
+                           .encode("utf-8")).hexdigest()
+        ),
     )
 
 
@@ -574,6 +638,7 @@ def _quote_from_ws_change(event: Event, token: str, meta: dict, message: dict,
                    else ask if ask is not None else bid)
     if probability is None:
         return None
+    received_at = datetime.now(timezone.utc)
     return Quote(
         event.id, meta["market"], meta["outcome"], probability, "Polymarket",
         bid=bid, ask=ask, liquidity=_visible_liquidity(bid_size, ask_size),
@@ -581,28 +646,42 @@ def _quote_from_ws_change(event: Event, token: str, meta: dict, message: dict,
         market_slug=meta.get("market_slug"), question=meta.get("question"),
         bid_size=bid_size, ask_size=ask_size,
         min_order_size=meta.get("min_order_size"), tick_size=meta.get("tick_size"),
-        accepting_orders=True,
+        accepting_orders=meta.get("accepting_orders", False),
+        provider_timestamp=_provider_time(message.get("timestamp")),
+        received_at=received_at, processed_at=datetime.now(timezone.utc),
+        book_hash=str(message.get("hash")) if message.get("hash") else None,
+        depth_complete=message.get("event_type") == "book",
     )
 
 
 async def _initial_polymarket_quotes(event: Event, token_meta: dict[str, dict]) -> list[Quote]:
-    semaphore = asyncio.Semaphore(10)
+    """Fetch complete snapshots through the documented bulk endpoint (max 500)."""
+    tokens = list(token_meta)
+    quotes: list[Quote] = []
     async with httpx.AsyncClient(timeout=15) as client:
-        async def fetch(token: str) -> Quote | None:
-            async with semaphore:
-                response = await client.get("https://clob.polymarket.com/book",
-                                            params={"token_id": token})
-                if response.status_code == 404:
-                    return None
-                response.raise_for_status()
-                return _quote_from_book(event, token, token_meta[token], response.json())
-        return [quote for quote in await asyncio.gather(*(fetch(token) for token in token_meta))
-                if quote is not None]
+        for start in range(0, len(tokens), 500):
+            batch = tokens[start:start + 500]
+            response = await client.post(
+                "https://clob.polymarket.com/books",
+                json=[{"token_id": token} for token in batch],
+            )
+            response.raise_for_status()
+            payload = response.json()
+            books = payload if isinstance(payload, list) else payload.get("data", [])
+            for book in books:
+                token = str(book.get("asset_id") or book.get("token_id") or "")
+                if token not in token_meta:
+                    continue
+                quote = _quote_from_book(event, token, token_meta[token], book)
+                if quote is not None:
+                    quotes.append(quote)
+    return quotes
 
 
 async def polymarket_market_stream(event: Event, emit: Callable[[list[Quote]], Awaitable[None]]):
     if not event.polymarket_slug:
         return
+    backoff = RetryBackoff(base_seconds=1, cap_seconds=60)
     while True:
         try:
             data = await polymarket_event(event.polymarket_slug)
@@ -612,9 +691,23 @@ async def polymarket_market_stream(event: Event, emit: Callable[[list[Quote]], A
                 continue
             initial = await _initial_polymarket_quotes(event, token_meta)
             latest_quotes = {quote.token_id: quote for quote in initial if quote.token_id}
+            book_states: dict[str, OrderBookState] = {}
+            for quote in initial:
+                if not quote.token_id:
+                    continue
+                state = OrderBookState(quote.token_id)
+                state.bids = {D(price): D(size) for price, size in quote.bid_levels}
+                state.asks = {D(price): D(size) for price, size in quote.ask_levels}
+                state.book_hash = quote.book_hash
+                state.timestamp_ms = (int(quote.provider_timestamp.timestamp() * 1000)
+                                      if quote.provider_timestamp else None)
+                state.synchronized = bool(state.book_hash and state.timestamp_ms)
+                book_states[quote.token_id] = state
             if initial:
                 await emit(initial)
+                runtime_telemetry.increment("polymarket_quotes", len(initial))
             async with websockets.connect("wss://ws-subscriptions-clob.polymarket.com/ws/market") as ws:
+                backoff.reset()
                 await ws.send(json.dumps({"type": "market", "assets_ids": list(token_meta),
                                           "custom_feature_enabled": True}))
                 async for raw in ws:
@@ -625,7 +718,23 @@ async def polymarket_market_stream(event: Event, emit: Callable[[list[Quote]], A
                     messages = payload if isinstance(payload, list) else [payload]
                     quotes = []
                     for message in messages:
-                        if message.get("event_type") not in {"book", "best_bid_ask", "price_change"}:
+                        event_type = message.get("event_type")
+                        if event_type == "new_market":
+                            raise BookGapError("market universe changed; resnapshot required")
+                        if event_type == "market_resolved":
+                            token = str(message.get("asset_id", ""))
+                            if token in token_meta:
+                                token_meta[token]["accepting_orders"] = False
+                                token_meta[token]["active"] = False
+                                token_meta[token]["resolved"] = True
+                            continue
+                        if event_type == "tick_size_change":
+                            token = str(message.get("asset_id", ""))
+                            tick = _to_float(message.get("new_tick_size") or message.get("tick_size"))
+                            if token in token_meta and tick is not None:
+                                token_meta[token]["tick_size"] = tick
+                            continue
+                        if event_type not in {"book", "best_bid_ask", "price_change"}:
                             continue
                         changes = message.get("price_changes") or [message]
                         for change in changes:
@@ -633,26 +742,55 @@ async def polymarket_market_stream(event: Event, emit: Callable[[list[Quote]], A
                             if token not in token_meta:
                                 continue
                             meta = token_meta[token]
-                            quote = _quote_from_ws_change(
-                                event, token, meta, message, change, latest_quotes.get(token)
-                            )
+                            state = book_states.setdefault(token, OrderBookState(token))
+                            if event_type == "book":
+                                state.apply_snapshot(message)
+                            elif event_type == "price_change":
+                                state.apply_change(message, change)
+                            else:
+                                best_bid = state.best_bid()
+                                best_ask = state.best_ask()
+                                offered_bid = _to_float(change.get("best_bid"))
+                                offered_ask = _to_float(change.get("best_ask"))
+                                if (not state.synchronized or best_bid is None or best_ask is None
+                                        or offered_bid != float(best_bid.price)
+                                        or offered_ask != float(best_ask.price)):
+                                    state.synchronized = False
+                                    raise BookGapError("top-of-book event cannot be reconciled")
+                            snapshot = {
+                                "asset_id": token,
+                                "timestamp": str(state.timestamp_ms) if state.timestamp_ms else None,
+                                "hash": state.book_hash,
+                                "bids": [{"price": str(price), "size": str(size)}
+                                         for price, size in state.bids.items()],
+                                "asks": [{"price": str(price), "size": str(size)}
+                                         for price, size in state.asks.items()],
+                                "fee_rate": meta.get("fee_rate"),
+                                "fee_schedule_id": meta.get("fee_schedule_id"),
+                            }
+                            quote = _quote_from_book(event, token, meta, snapshot)
                             if quote is not None:
                                 latest_quotes[token] = quote
                                 quotes.append(quote)
                     if quotes:
                         await emit(quotes)
+                        runtime_telemetry.increment("polymarket_quotes", len(quotes))
         except asyncio.CancelledError:
             raise
-        except Exception:
-            await asyncio.sleep(3)
+        except Exception as exc:
+            runtime_telemetry.increment(f"polymarket_error_{type(exc).__name__}")
+            runtime_telemetry.increment("polymarket_reconnects")
+            await asyncio.sleep(backoff.next_delay())
 
 
 async def polymarket_sports_stream(events: Callable[[], list[Event]],
                                     emit: Callable[[GameState], Awaitable[None]],
                                     status_emit: Callable[[str, dict], Awaitable[None]] | None = None):
+    backoff = RetryBackoff(base_seconds=1, cap_seconds=60)
     while True:
         try:
             async with websockets.connect("wss://sports-api.polymarket.com/ws") as ws:
+                backoff.reset()
                 async for raw in ws:
                     if raw == "ping":
                         await ws.send("pong")
@@ -664,20 +802,66 @@ async def polymarket_sports_stream(events: Callable[[], list[Event]],
                     matched = next((e for e in events() if e.polymarket_slug == slug), None)
                     if not matched:
                         continue
-                    score = str(data.get("score", "0-0")).split("-")
-                    if len(score) != 2:
-                        continue
-                    home_score, away_score = _to_float(score[0]), _to_float(score[1])
-                    if home_score is None or away_score is None:
-                        continue  # skip one bad message, don't drop the shared socket
-                    await emit(GameState(matched.id, home_score, away_score,
-                                         str(data.get("period", "")), str(data.get("elapsed", "")),
-                                         "Polymarket sports", possession=data.get("turn"),
-                                         status=str(data.get("status", "in_progress"))))
+                    state = _game_state_from_sports_payload(matched, data)
+                    if state is not None:
+                        await emit(state)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            await asyncio.sleep(3)
+        except Exception as exc:
+            runtime_telemetry.increment(f"sports_feed_error_{type(exc).__name__}")
+            runtime_telemetry.increment("sports_feed_reconnects")
+            await asyncio.sleep(backoff.next_delay())
+
+
+def _game_state_from_sports_payload(event: Event, data: dict) -> GameState | None:
+    """Parse a sports update while retaining uncertainty about score orientation."""
+    score = str(data.get("score", "")).split("-")
+    if len(score) != 2:
+        return None
+    first, second = _to_float(score[0]), _to_float(score[1])
+    if first is None or second is None:
+        return None
+
+    provider_home = str(data.get("homeTeam") or data.get("home_team") or "").strip()
+    provider_away = str(data.get("awayTeam") or data.get("away_team") or "").strip()
+    orientation_verified = bool(
+        provider_home and provider_away
+        and team_match_score(event.home, provider_home) is not None
+        and team_match_score(event.away, provider_away) is not None
+    )
+    received_at = datetime.now(timezone.utc)
+    provider_timestamp = _provider_time(
+        data.get("timestamp") or data.get("updatedAt") or data.get("last_updated")
+        or data.get("last_update")
+    )
+    return GameState(
+        event.id,
+        first,
+        second,
+        str(data.get("period", "")),
+        str(data.get("clock") or data.get("elapsed") or ""),
+        "Polymarket sports",
+        possession=data.get("turn"),
+        status=str(data.get("status", "in_progress")),
+        provider_timestamp=provider_timestamp,
+        received_at=received_at,
+        processed_at=datetime.now(timezone.utc),
+        quarantined=not orientation_verified,
+        quarantine_reason=None if orientation_verified else "score orientation not verified",
+        provider_event_id=str(data.get("gameId") or data.get("game_id") or "") or None,
+        canonical_event_id=event.canonical_event_id,
+        league_id=str(data.get("leagueAbbreviation") or event.league or "") or None,
+        sport_id=event.sport or None,
+        home_team_id=provider_home or None,
+        away_team_id=provider_away or None,
+        live=(bool(data.get("live")) if data.get("live") is not None else None),
+        ended=(bool(data.get("ended")) if data.get("ended") is not None else None),
+        sequence=(int(data["sequence"]) if str(data.get("sequence", "")).isdigit() else None),
+        state_hash=hashlib.sha256(
+            json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        finished_timestamp=_provider_time(data.get("finished_timestamp")),
+    )
 
 
 def american_probability(price: float) -> float:
@@ -763,6 +947,10 @@ def odds_api_quotes(event: Event, payload: dict | list[dict]) -> list[Quote]:
         for bookmaker in game.get("bookmakers", []):
             source = bookmaker.get("title") or bookmaker.get("key", "sportsbook")
             for market in bookmaker.get("markets", []):
+                provider_timestamp = _provider_time(
+                    market.get("last_update") or bookmaker.get("last_update")
+                    or game.get("last_update")
+                )
                 provider_key = market.get("key", "h2h")
                 prop = is_player_prop(provider_key)
                 for outcome in market.get("outcomes", []):
@@ -791,6 +979,21 @@ def odds_api_quotes(event: Event, payload: dict | list[dict]) -> list[Quote]:
                         american_probability(price),
                         source,
                         decimal_odds=(price / 100 + 1 if price > 0 else 100 / -price + 1),
+                        provider_timestamp=provider_timestamp,
+                        received_at=datetime.now(timezone.utc),
+                        processed_at=datetime.now(timezone.utc),
+                        source_family=str(bookmaker.get("key") or source),
+                        provider_source_id=str(bookmaker.get("key") or source),
+                        provider_event_id=str(game.get("id") or "") or None,
+                        canonical_event_id=event.canonical_event_id,
+                        provider_market_id=str(provider_key),
+                        market_scope=("player_prop" if prop else "full_game"),
+                        line=_to_float(outcome.get("point")),
+                        outcome_id=str(outcome.get("name") or outcome_label),
+                        raw_payload_hash=hashlib.sha256(
+                            json.dumps(outcome, sort_keys=True, separators=(",", ":"))
+                            .encode("utf-8")
+                        ).hexdigest(),
                     ))
     return quotes
 
@@ -802,9 +1005,11 @@ async def odds_api_poll(event: Event, emit: Callable[[list[Quote]], Awaitable[No
 
     # Lower interval = fresher sportsbook lines but more (paid) API credits.
     # Polymarket streams in real time regardless; this only paces The Odds API.
-    interval = max(1.0, float(os.getenv("ODDS_POLL_SECONDS", "20")))
+    interval = max(5.0, float(os.getenv("ODDS_POLL_SECONDS", "45")))
+    backoff = RetryBackoff(base_seconds=5, cap_seconds=180)
     async with httpx.AsyncClient(timeout=15) as client:
         while True:
+            failed = False
             try:
                 if not event.odds_api_event_id:
                     matched = await match_odds_api_event(
@@ -820,18 +1025,28 @@ async def odds_api_poll(event: Event, emit: Callable[[list[Quote]], Awaitable[No
                 url, params = odds_api_request(event, key)
                 response = await client.get(url, params=params)
                 response.raise_for_status()
+                for header in ("x-requests-remaining", "x-requests-used",
+                               "x-requests-last"):
+                    if header in response.headers:
+                        _odds_quota[header] = response.headers[header]
                 quotes = odds_api_quotes(event, response.json())
                 if quotes:
                     await emit(quotes)
+                    runtime_telemetry.increment("odds_api_quotes", len(quotes))
+                backoff.reset()
             except asyncio.CancelledError:
                 raise
             except httpx.HTTPStatusError as exc:
+                failed = True
+                runtime_telemetry.increment(f"odds_api_http_{exc.response.status_code}")
                 logger.warning("The Odds API returned HTTP %s for %s",
                                exc.response.status_code, event.name)
             except Exception as exc:
+                failed = True
+                runtime_telemetry.increment(f"odds_api_error_{type(exc).__name__}")
                 logger.warning("The Odds API poll failed for %s (%s)", event.name,
                                type(exc).__name__)
-            await asyncio.sleep(interval)
+            await asyncio.sleep(max(interval, backoff.next_delay()) if failed else interval)
 
 
 

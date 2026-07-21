@@ -25,36 +25,54 @@ from .advice import market_views, position_views
 from .history import HistoryDB
 from .ledger import Ledger
 from .lines import pregame_priors
+from .gameclock import validate_state_transition
 from .models import Event, GameState, Quote, as_json
 from .monitor_state import MonitorState
-from .sources import (extract_polymarket_slug, infer_polymarket_event,
-                      match_odds_api_event, odds_api_poll, polymarket_event,
+from .sources import (_odds_quota, extract_polymarket_slug, infer_polymarket_event,
+                      odds_api_poll, polymarket_event,
                       polymarket_market_stream, polymarket_sports_events,
                       polymarket_sports_stream, sports_game_status)
 from .actionnetwork import action_network_poll
 from .pinnacle import pinnacle_poll
 from .store import Store
+from .settings import Settings
+from .security import AuthManager, SlidingWindowLimiter
+from .calibration import load_calibration
+from .telemetry import runtime_telemetry
+from .identity import (CanonicalEvent, MappingDecision, MappingStatus)
+from .domain.time import parse_provider_timestamp
+from .notify import notify_webhook
 
 
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+settings = Settings.from_env()
 store = Store()
 ledger: Ledger | None = None
 account_book: AccountBook | None = None
 history_db: HistoryDB | None = None
 monitor_state: MonitorState | None = None
-engine = SignalEngine(float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", "0.0")),
-                      float(os.getenv("SIGNAL_EDGE_THRESHOLD", "0.0")),
-                      float(os.getenv("MAX_DATA_AGE_SECONDS", "120")),
-                      kelly_fraction=float(os.getenv("SIGNAL_KELLY_FRACTION", "0.25")),
-                      edge_z=float(os.getenv("SIGNAL_EDGE_Z", "1.0")))
+engine = SignalEngine(settings.confidence_threshold,
+                      settings.edge_threshold,
+                      settings.max_data_age_seconds,
+                      kelly_fraction=settings.kelly_fraction,
+                      edge_z=settings.edge_z,
+                      enable_independent_model=settings.enable_independent_models)
+calibration_artifact = load_calibration(os.getenv("CALIBRATION_ARTIFACT"))
+if calibration_artifact is not None:
+    engine.calibrated_markets = set(calibration_artifact.supported_markets)
+    engine.model_version = calibration_artifact.model_version
+    engine.calibration_version = (
+        f"{calibration_artifact.artifact_version}:{calibration_artifact.calibration_method}"
+    )
 tasks: dict[str, list[asyncio.Task]] = {}
 _finalized: set[str] = set()
 _terminal_events: dict[str, str] = {}  # event_id -> final | canceled | deleted | shutdown
 _event_locks: dict[str, asyncio.Lock] = {}
 _pregame: dict[str, dict] = {}  # event_id -> {"spread": home point, "total": line}, captured near tip
 _subscribers: set[asyncio.Queue] = set()  # SSE clients for real-time dashboard pushes
+_notification_tasks: set[asyncio.Task] = set()
 _sports_status: dict[str, dict] = {}  # latest public Polymarket sport_result by event slug
 _config_state = {"auto_monitor": False}
 
@@ -70,11 +88,25 @@ else:
         os.getenv("ADMIN_USERNAME", "admin"): os.getenv("ADMIN_PASSWORD", "admin")
     }
 
-AUTH_TOKEN = secrets.token_urlsafe(32)
+auth_manager = AuthManager.from_plaintext(AUTHORIZED_USERS)
+login_limiter = SlidingWindowLimiter(10, 5 * 60)
+api_limiter = SlidingWindowLimiter(300, 60)
+
+
+def _cookie_name(base: str) -> str:
+    return f"__Host-{base}" if settings.environment in {"production", "prod"} else base
 
 async def verify_auth(request: Request):
-    if request.cookies.get("auth_token") != AUTH_TOKEN:
+    session = auth_manager.verify(request.cookies.get(_cookie_name("session_token")))
+    if session is None:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        header = request.headers.get("x-csrf-token", "")
+        cookie = request.cookies.get(_cookie_name("csrf_token"), "")
+        if (not header or not cookie or not secrets.compare_digest(header, cookie)
+                or not secrets.compare_digest(header, session.csrf_token)):
+            raise HTTPException(status_code=403, detail="CSRF validation failed")
+    request.state.session = session
 
 def _notify_subscribers() -> None:
     """Wake every SSE client that a snapshot changed (coalesced per client)."""
@@ -84,6 +116,12 @@ def _notify_subscribers() -> None:
                 queue.put_nowait(1)
             except asyncio.QueueFull:
                 pass
+
+
+def _schedule_notification(payload: dict) -> None:
+    task = asyncio.create_task(notify_webhook(payload["webhook_url"], payload))
+    _notification_tasks.add(task)
+    task.add_done_callback(_notification_tasks.discard)
 _FINAL_STATUSES = {"final", "ended", "closed", "complete", "completed", "finished"}
 _CANCELED_STATUSES = {"canceled", "cancelled", "abandoned", "void", "voided"}
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -123,6 +161,20 @@ async def on_state(state: GameState):
         # Close the entry gate synchronously, before history I/O yields control
         # to quote callbacks that might otherwise place a known-result bet.
         _terminal_events.setdefault(state.event_id, terminal)
+    event = store.events.get(state.event_id)
+    previous = (store.states.get(state.event_id) or [None])[-1]
+    if terminal is None and event is not None and not state.quarantined:
+        validation = validate_state_transition(
+            sport=event.sport, league=event.league, period=state.period, clock=state.clock,
+            home_score=state.home_score, away_score=state.away_score,
+            previous_period=previous.period if previous else None,
+            previous_clock=previous.clock if previous else None,
+            previous_home_score=previous.home_score if previous else None,
+            previous_away_score=previous.away_score if previous else None,
+        )
+        if not validation.valid:
+            state.quarantined = True
+            state.quarantine_reason = validation.reason
     store.add_state(state)
     if history_db is not None:
         try:
@@ -132,7 +184,7 @@ async def on_state(state: GameState):
     if terminal is not None:
         await finalize_event(state.event_id, canceled=terminal == "canceled")
     else:
-        await record(state.event_id)
+        await record(state.event_id, as_of=state.processed_at)
 
 
 async def on_sports_status(slug: str, payload: dict) -> None:
@@ -168,16 +220,43 @@ async def on_sports_status(slug: str, payload: dict) -> None:
 
 async def on_quotes(quotes: list[Quote]):
     store.add_quotes(quotes)
+    event = store.events.get(quotes[0].event_id) if quotes else None
+    if event is not None and monitor_state is not None and event.odds_api_event_id:
+        # Background matching may resolve this ID after registration.
+        await asyncio.to_thread(monitor_state.save_event, event)
     if history_db is not None and quotes:
         try:
             await asyncio.to_thread(history_db.log_quotes, quotes)
+            odds_provider_ids = {
+                q.provider_event_id for q in quotes
+                if q.provider_event_id and not q.condition_id
+                and q.provider_event_id == event.odds_api_event_id
+            } if event is not None else set()
+            if event is not None and event.canonical_event_id and odds_provider_ids:
+                try:
+                    start = parse_provider_timestamp(event.game_start)
+                except (TypeError, ValueError, OverflowError):
+                    start = None
+                canonical = CanonicalEvent.create(
+                    event.sport, event.league, start, event.home, event.away
+                )
+                for provider_id in odds_provider_ids:
+                    await asyncio.to_thread(
+                        history_db.log_event_identity, canonical,
+                        MappingDecision(
+                            "the-odds-api", provider_id, event.canonical_event_id,
+                            MappingStatus.MAPPED, 1.0,
+                            "shared matcher verified participants and start window",
+                            orientation="direct",
+                        ),
+                    )
         except Exception as exc:
             logger.warning("Could not persist quote telemetry for %s: %s", quotes[0].event_id, exc)
     if quotes:
-        await record(quotes[0].event_id)
+        await record(quotes[0].event_id, as_of=max(quote.processed_at for quote in quotes))
 
 
-def recompute(event_id: str) -> list:
+def recompute(event_id: str, *, as_of: datetime) -> list:
     event = store.events.get(event_id)
     if event is None:  # event removed between emit and callback
         return []
@@ -188,17 +267,19 @@ def recompute(event_id: str) -> list:
         prior["spread"] = prior["spread"] if prior["spread"] is not None else spread
         prior["total"] = prior["total"] if prior["total"] is not None else total
     signals = engine.evaluate(event_id, quotes, store.states[event_id], event.away,
-                              sport=event.sport, home_outcome=event.home,
-                              pregame_spread=prior["spread"], pregame_total=prior["total"])
+                              sport=event.sport, league=event.league,
+                              home_outcome=event.home,
+                              pregame_spread=prior["spread"], pregame_total=prior["total"],
+                              as_of=as_of, canonical_event_id=event.canonical_event_id)
     store.set_signals(event_id, signals)
     return signals
 
 
-async def record(event_id: str) -> None:
+async def record(event_id: str, *, as_of: datetime | None = None) -> None:
     async with _event_lock(event_id):
         if event_id in _terminal_events or event_id in _finalized:
             return
-        signals = recompute(event_id)
+        signals = recompute(event_id, as_of=as_of or datetime.now(timezone.utc))
         _notify_subscribers()  # push the fresh snapshot to the dashboard immediately
         event = store.events.get(event_id)
         # Ledger commits fsync to disk; keep that off the event loop.
@@ -211,10 +292,9 @@ async def record(event_id: str) -> None:
         if account_book is not None and event is not None and signals:
             placed_bets = await asyncio.to_thread(account_book.place, event, signals)
             if placed_bets:
-                from .notify import notify_webhook
                 for p in placed_bets:
                     if p.get("webhook_url"):
-                        asyncio.create_task(notify_webhook(p["webhook_url"], p))
+                        _schedule_notification(p)
 
 
 def _winner_labels(event: Event, home_score: float, away_score: float) -> set[str]:
@@ -248,27 +328,20 @@ async def finalize_event(event_id: str, *, canceled: bool = False) -> None:
 
         event = store.events.get(event_id)
         states = store.states.get(event_id) or []
-        if event is not None:
-            # Refresh the closing fair for CLV without invoking record(), which
-            # would also create ledger/account entries.
-            recompute(event_id)
-            _notify_subscribers()
-        signals = store.signals.get(event_id) or []
-        fair_by_selection = {
-            (s.market, s.outcome): (s.market_fair_prob or s.model_probability)
-            for s in signals
-            if (s.market_fair_prob or s.model_probability)
-        }
+        # The close mark is the last valid observation recorded before the
+        # terminal gate closed. Never synthesize a fresh consensus after suspension.
         winners = _winner_labels(event, states[-1].home_score, states[-1].away_score) \
             if (event and states and not canceled) else set()
 
         def _writes():
             if canceled:
+                if ledger is not None:
+                    ledger.void_event(event_id, status="canceled")
                 if account_book is not None:
                     account_book.void_event(event_id)
                 return
             if ledger is not None:
-                ledger.snapshot_closing(event_id, fair_by_selection)
+                ledger.snapshot_closing(event_id)
                 if winners:
                     ledger.settle_moneyline(event_id, winners)
             if account_book is not None and event is not None and states:
@@ -311,8 +384,11 @@ def _start_event_feeds(event: Event) -> None:
         group.append(asyncio.create_task(polymarket_market_stream(event, on_quotes)))
     if event.odds_api_sport:
         group.append(asyncio.create_task(odds_api_poll(event, on_quotes)))
-        group.append(asyncio.create_task(action_network_poll(event, on_quotes)))
-        group.append(asyncio.create_task(pinnacle_poll(event, on_quotes)))
+        if settings.enable_action_network:
+            group.append(asyncio.create_task(action_network_poll(event, on_quotes)))
+        if settings.enable_pinnacle_guest:
+            group.append(asyncio.create_task(pinnacle_poll(
+                event, on_quotes, api_key=settings.pinnacle_guest_api_key)))
     tasks[event.id] = group
 
 
@@ -351,6 +427,8 @@ async def lifespan(_: FastAPI):
             background.append(sports_task)
         if auto_task is not None:
             background.append(auto_task)
+        background.extend(_notification_tasks)
+        _notification_tasks.clear()
         await _cancel_tasks(background)
 
         for database_store in (ledger, account_book, history_db, monitor_state):
@@ -377,6 +455,27 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="Live Sports Signal Monitor", version=__version__, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    client = request.client.host if request.client else "unknown"
+    if request.url.path.startswith("/api/") and not api_limiter.allow(client):
+        return Response(status_code=429, content="rate limit exceeded")
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self'; "
+        "style-src 'self'; img-src 'self' data:; connect-src 'self' "
+        "https://*.polymarket.com wss://*.polymarket.com; object-src 'none'; "
+        "base-uri 'none'; frame-ancestors 'none'"
+    )
+    if settings.environment in {"production", "prod"}:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
 
 
 class EventIn(BaseModel):
@@ -426,25 +525,64 @@ async def watch():
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "live", "version": __version__}
+
+
+@app.get("/api/ready")
+async def ready():
+    dependencies = {
+        "ledger": ledger is not None,
+        "accounts": account_book is not None,
+        "history": history_db is not None,
+        "monitor_state": monitor_state is not None,
+        "native_engine": engine is not None,
+    }
+    if not all(dependencies.values()):
+        raise HTTPException(status_code=503, detail={"status": "not_ready",
+                                                     "dependencies": dependencies})
+    return {"status": "ready", "dependencies": dependencies,
+            "tracked_events": len(store.events), "background_groups": len(tasks)}
+
+
+@app.get("/api/runtime", dependencies=[Depends(verify_auth)])
+async def runtime_status():
+    return {
+        "counters": runtime_telemetry.snapshot(),
+        "odds_api_quota": dict(_odds_quota),
+        "tracked_events": len(store.events),
+        "feed_groups": {event_id: len(group) for event_id, group in tasks.items()},
+        "notifications_in_flight": len(_notification_tasks),
+    }
 
 
 @app.post("/api/login")
-async def login(response: Response, username: str = Form(...), password: str = Form(...)):
-    for auth_u, auth_p in AUTHORIZED_USERS.items():
-        if secrets.compare_digest(username, auth_u) and secrets.compare_digest(password, auth_p):
-            response.set_cookie(key="auth_token", value=AUTH_TOKEN, httponly=True, samesite="strict")
-            return {"status": "ok"}
+async def login(request: Request, response: Response, username: str = Form(...),
+                password: str = Form(...)):
+    client = request.client.host if request.client else "unknown"
+    if not login_limiter.allow(client):
+        raise HTTPException(status_code=429, detail="Too many login attempts")
+    authenticated = auth_manager.login(username, password)
+    if authenticated:
+        token, session = authenticated
+        secure = settings.environment in {"production", "prod"}
+        response.set_cookie(key=_cookie_name("session_token"), value=token, httponly=True,
+                            secure=secure, samesite="strict", path="/")
+        response.set_cookie(key=_cookie_name("csrf_token"), value=session.csrf_token, httponly=False,
+                            secure=secure, samesite="strict", path="/")
+        return {"status": "ok", "csrf_token": session.csrf_token,
+                "expires_at": session.expires_at.isoformat()}
     raise HTTPException(status_code=401, detail="Invalid credentials")
 
 
-@app.post("/api/logout")
-async def logout(response: Response):
-    response.delete_cookie("auth_token")
+@app.post("/api/logout", dependencies=[Depends(verify_auth)])
+async def logout(request: Request, response: Response):
+    auth_manager.revoke(request.cookies.get(_cookie_name("session_token")))
+    response.delete_cookie(_cookie_name("session_token"), path="/")
+    response.delete_cookie(_cookie_name("csrf_token"), path="/")
     return {"status": "ok"}
 
 
-@app.get("/api/config")
+@app.get("/api/config", dependencies=[Depends(verify_auth)])
 async def config():
     return {"confidence_threshold": engine.confidence_threshold, "edge_threshold": engine.edge_threshold,
             "max_age_seconds": engine.max_age_seconds, "auto_monitor": _config_state["auto_monitor"]}
@@ -588,8 +726,28 @@ async def add_event(payload: EventIn):
                             for existing in store.events.values()):
         raise HTTPException(409, "This Polymarket event is already being tracked")
     event = Event(**values)
+    try:
+        start_time = parse_provider_timestamp(event.game_start)
+    except (TypeError, ValueError, OverflowError):
+        start_time = None
+    canonical = CanonicalEvent.create(event.sport, event.league, start_time,
+                                      event.home, event.away)
+    event.canonical_event_id = canonical.canonical_event_id
     if monitor_state is not None:
         await asyncio.to_thread(monitor_state.save_event, event)
+    if history_db is not None:
+        mapping = None
+        if event.polymarket_slug:
+            mapping = MappingDecision(
+                "polymarket", event.polymarket_slug,
+                canonical.canonical_event_id if start_time else None,
+                MappingStatus.MAPPED if start_time else MappingStatus.QUARANTINED,
+                1.0 if start_time else 0.5,
+                "event slug and canonical participants/start" if start_time
+                else "event start unavailable; provider mapping quarantined",
+                orientation="direct",
+            )
+        await asyncio.to_thread(history_db.log_event_identity, canonical, mapping)
     store.add_event(event)
     _start_event_feeds(event)
     _notify_subscribers()

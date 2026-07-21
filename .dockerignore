@@ -5,6 +5,9 @@ venv/
 **/__pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest-tmp*/
+.coverage
+htmlcov/
 native_engine/target/
 target/
 *.pyd

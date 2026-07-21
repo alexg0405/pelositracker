@@ -34,7 +34,7 @@ class MonitorState:
         self.backend = self._db.backend
         self._lock = threading.Lock()
         with self._lock:
-            self._db.initialize(_SCHEMA)
+            self._db.initialize(_SCHEMA, component="monitor_state", version=1)
 
     def close(self) -> None:
         with self._lock:

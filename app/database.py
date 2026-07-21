@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+import hashlib
+import json
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
@@ -80,18 +82,140 @@ class Database:
     def sql(self, statement: str) -> str:
         return statement if self.backend == "postgres" else statement.replace("%s", "?")
 
-    def initialize(self, schema: str) -> None:
+    def initialize(self, schema: str, *, component: str = "legacy", version: int = 1) -> None:
+        """Apply one immutable, versioned schema migration.
+
+        Every store records its own component/version/checksum in the shared
+        migration ledger, so stores can safely share a database.
+        """
+        if not re.fullmatch(r"[a-z][a-z0-9_]*", component) or version < 1:
+            raise ValueError("invalid migration identity")
+        checksum = hashlib.sha256(schema.encode("utf-8")).hexdigest()
+        ledger = """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            component TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            checksum TEXT NOT NULL,
+            applied_at DOUBLE PRECISION NOT NULL,
+            PRIMARY KEY (component, version)
+        )
+        """
+        import time
         if self.backend == "postgres":
             with self.transaction() as cur:
+                cur.execute(ledger)
+                cur.execute(
+                    "SELECT checksum FROM schema_migrations WHERE component=%s AND version=%s",
+                    (component, version),
+                )
+                existing = cur.fetchone()
+                if existing:
+                    if existing[0] != checksum:
+                        raise RuntimeError(f"migration checksum mismatch: {component} v{version}")
+                    return
                 cur.execute(schema)
+                cur.execute(
+                    "INSERT INTO schema_migrations(component, version, checksum, applied_at) "
+                    "VALUES (%s,%s,%s,%s)",
+                    (component, version, checksum, time.time()),
+                )
             return
 
         sqlite_schema = _SERIAL_PRIMARY_KEY.sub("INTEGER PRIMARY KEY AUTOINCREMENT", schema)
         try:
-            self.connection.executescript(f"BEGIN;\n{sqlite_schema}\nCOMMIT;")
+            self.connection.execute(ledger)
+            self.connection.commit()
+            existing = self.connection.execute(
+                "SELECT checksum FROM schema_migrations WHERE component=? AND version=?",
+                (component, version),
+            ).fetchone()
+            if existing:
+                if existing[0] != checksum:
+                    raise RuntimeError(f"migration checksum mismatch: {component} v{version}")
+                return
+            safe_component = component.replace("'", "''")
+            safe_checksum = checksum.replace("'", "''")
+            self.connection.executescript(
+                "BEGIN;\n"
+                f"{sqlite_schema}\n"
+                "INSERT INTO schema_migrations(component, version, checksum, applied_at) "
+                f"VALUES ('{safe_component}',{int(version)},'{safe_checksum}',{time.time()});\n"
+                "COMMIT;"
+            )
         except BaseException:
             self.connection.rollback()
             raise
+
+    def columns(self, table: str) -> set[str]:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table):
+            raise ValueError("unsafe table name")
+        with self.cursor() as cur:
+            if self.backend == "postgres":
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema=current_schema() AND table_name=%s",
+                    (table,),
+                )
+                return {row[0] for row in cur.fetchall()}
+            cur.execute(f"PRAGMA table_info({table})")
+            return {row[1] for row in cur.fetchall()}
+
+    def ensure_columns(self, table: str, columns: dict[str, str]) -> None:
+        """Compatibility migration for databases created before the ledger."""
+        existing = self.columns(table)
+        with self.transaction() as cur:
+            for name, sql_type in columns.items():
+                if name not in existing:
+                    cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
+
+    def migrate_columns(self, component: str, version: int,
+                        tables: dict[str, dict[str, str]]) -> None:
+        """Transactionally add compatibility columns and record their checksum."""
+        if not re.fullmatch(r"[a-z][a-z0-9_]*", component) or version < 1:
+            raise ValueError("invalid migration identity")
+        for table, columns in tables.items():
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table):
+                raise ValueError("unsafe migration table")
+            for name, sql_type in columns.items():
+                if (not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+                        or not re.fullmatch(r"[A-Z][A-Z0-9 ]*", sql_type)):
+                    raise ValueError("unsafe migration column")
+        descriptor = json.dumps(tables, sort_keys=True, separators=(",", ":"))
+        checksum = hashlib.sha256(descriptor.encode("utf-8")).hexdigest()
+        import time
+        with self.transaction() as cur:
+            self.execute(
+                cur,
+                """CREATE TABLE IF NOT EXISTS schema_migrations (
+                    component TEXT NOT NULL, version INTEGER NOT NULL,
+                    checksum TEXT NOT NULL, applied_at DOUBLE PRECISION NOT NULL,
+                    PRIMARY KEY(component, version))""",
+            )
+            self.execute(
+                cur, "SELECT checksum FROM schema_migrations "
+                     "WHERE component=%s AND version=%s", (component, version))
+            existing_migration = cur.fetchone()
+            if existing_migration:
+                if existing_migration[0] != checksum:
+                    raise RuntimeError(f"migration checksum mismatch: {component} v{version}")
+                return
+            for table, columns in tables.items():
+                if self.backend == "postgres":
+                    cur.execute(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema=current_schema() AND table_name=%s", (table,))
+                    existing = {row[0] for row in cur.fetchall()}
+                else:
+                    cur.execute(f"PRAGMA table_info({table})")
+                    existing = {row[1] for row in cur.fetchall()}
+                for name, sql_type in columns.items():
+                    if name not in existing:
+                        cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
+            self.execute(
+                cur,
+                "INSERT INTO schema_migrations(component, version, checksum, applied_at) "
+                "VALUES (%s,%s,%s,%s)", (component, version, checksum, time.time()),
+            )
 
     def _cursor(self, dict_rows: bool = False):
         if self.backend == "postgres" and dict_rows:

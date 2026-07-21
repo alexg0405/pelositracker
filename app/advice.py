@@ -30,7 +30,8 @@ def _signal_map(signals: list[Signal]) -> dict[tuple[str, str], Signal]:
     return selected
 
 
-def _risk_flags(quote: Quote, signal: Signal | None, age_seconds: float) -> list[str]:
+def _risk_flags(quote: Quote, signal: Signal | None,
+                provider_age_seconds: float | None) -> list[str]:
     flags = []
     spread = quote.ask - quote.bid if quote.ask is not None and quote.bid is not None else None
     if spread is None:
@@ -45,8 +46,10 @@ def _risk_flags(quote: Quote, signal: Signal | None, age_seconds: float) -> list
         flags.append("Less than 20 shares are visible at the best bid and ask levels.")
     if quote.ask is not None and (quote.ask <= 0.05 or quote.ask >= 0.95):
         flags.append("Extreme prices leave little room for error and can move abruptly.")
-    if age_seconds > 90:
-        flags.append(f"Quote is {age_seconds:.0f}s old; wait for a fresh order-book update.")
+    if provider_age_seconds is None:
+        flags.append("Provider timestamp is unknown; freshness cannot pass.")
+    elif provider_age_seconds > 90:
+        flags.append(f"Provider quote is {provider_age_seconds:.0f}s old; wait for an update.")
     if signal is None or signal.n_reference_sources < 1:
         flags.append("No independent reference price is available; edge cannot be validated.")
     elif signal.confidence < 60:
@@ -65,7 +68,9 @@ def market_views(quotes: list[Quote], signals: list[Signal], edge_threshold: flo
         signal = signal_by_selection.get((quote.market, quote.outcome))
         if signal is not None and signal.n_reference_sources < 1:
             signal = None
-        age_seconds = max(0.0, (now - quote.observed_at).total_seconds())
+        provider_age_seconds = (max(0.0, (now - quote.provider_timestamp).total_seconds())
+                                if quote.provider_timestamp else None)
+        receipt_age_seconds = max(0.0, (now - quote.received_at).total_seconds())
         spread = quote.ask - quote.bid if quote.bid is not None else None
         model_probability = signal.model_probability if signal else None
         entry_margin = model_probability - quote.ask if model_probability is not None else None
@@ -79,7 +84,11 @@ def market_views(quotes: list[Quote], signals: list[Signal], edge_threshold: flo
             entry_action = "WAIT"
         else:
             entry_action = "MARKET ONLY"
-        risks = _risk_flags(quote, signal, age_seconds)
+        risks = _risk_flags(quote, signal, provider_age_seconds)
+        uncertainty_low = (max(0.0, model_probability - 1.96 * signal.fair_stderr)
+                           if signal and model_probability is not None else None)
+        uncertainty_high = (min(1.0, model_probability + 1.96 * signal.fair_stderr)
+                            if signal and model_probability is not None else None)
         views.append({
             "token_id": quote.token_id,
             "market": quote.market,
@@ -95,10 +104,23 @@ def market_views(quotes: list[Quote], signals: list[Signal], edge_threshold: flo
             "market_liquidity": quote.market_liquidity,
             "min_order_size": quote.min_order_size,
             "tick_size": quote.tick_size,
-            "age_seconds": age_seconds,
+            "provider_age_seconds": provider_age_seconds,
+            "receipt_age_seconds": receipt_age_seconds,
             "entry_action": entry_action,
             "model_probability": model_probability,
+            "consensus_probability": model_probability,
+            "calibrated_consensus_probability": (
+                signal.calibrated_consensus_probability if signal else None),
             "model_live_prob": signal.model_live_prob if signal else None,
+            "independent_model_probability": (
+                signal.independent_model_probability if signal else None),
+            "uncertainty_low": uncertainty_low,
+            "uncertainty_high": uncertainty_high,
+            "net_ev_per_stake": signal.ev_per_stake if signal else None,
+            "requested_cash": signal.requested_cash if signal else None,
+            "requested_size_vwap": signal.execution_vwap if signal else None,
+            "execution_fee": signal.execution_fee if signal else None,
+            "paper_fillable_size": signal.fillable_size if signal else None,
             "entry_margin": entry_margin,
             "edge": entry_margin,
             "required_edge": required_edge,
@@ -112,7 +134,15 @@ def market_views(quotes: list[Quote], signals: list[Signal], edge_threshold: flo
                 "agreement": signal.quality_agreement,
                 "sources": signal.quality_sources,
                 "execution": signal.quality_execution,
+                "calibration": signal.quality_calibration,
             } if signal else None),
+            "gate_results": ([{"gate": "paper_policy", "status": signal.action,
+                                "reasons": signal.reasons}] if signal else []),
+            "engine_version": signal.engine_version if signal else None,
+            "configuration_hash": signal.configuration_hash if signal else None,
+            "model_version": signal.model_version if signal else None,
+            "calibration_version": signal.calibration_version if signal else None,
+            "execution_policy_version": signal.execution_policy_version if signal else None,
             "reasons": signal.reasons if signal else ["Waiting for an independent sportsbook reference."],
             "risk_flags": risks,
         })

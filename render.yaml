@@ -6,7 +6,7 @@ services:
     name: live-edge-monitor
     runtime: docker
     plan: free
-    healthCheckPath: /api/config
+    healthCheckPath: /api/ready
     autoDeploy: true
     envVars:
       - key: ADMIN_USERNAME
@@ -16,7 +16,11 @@ services:
       - key: THE_ODDS_API_KEY   # optional; public Polymarket feeds need no key
         sync: false
       - key: ODDS_POLL_SECONDS
-        value: "20"
+        value: "45"
+      - key: APP_ENV
+        value: production
+      - key: WEB_CONCURRENCY
+        value: "1"
       - key: MAX_DATA_AGE_SECONDS
         value: "120"
       # Keep global floors neutral so custom bots apply their own thresholds.

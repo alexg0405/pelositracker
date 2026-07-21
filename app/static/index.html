@@ -6,191 +6,8 @@
   <meta name="description" content="Paper-only Polymarket entry and position monitor">
   <title>PelosiTracker Dashboard</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <style>
-    :root {
-      color-scheme: dark;
-      --bg:#07080a; --panel:#0c0f13; --panel2:#12171f; --line:#1d2530; --bright:#2b3947;
-      --text:#e9efe8; --muted:#829094; --faint:#4d5961; --coral:#ff4d2e; --cyan:#29e7d6;
-      --yellow:#ffcf3f; --red:#ff6b5f; --mono:ui-monospace,"Cascadia Mono",Consolas,monospace;
-      --sans:"Segoe UI",system-ui,-apple-system,sans-serif;
-    }
-    *{box-sizing:border-box} html{-webkit-text-size-adjust:100%} body{margin:0;color:var(--text);font:14px/1.5 var(--sans);
-      background:radial-gradient(100% 70% at 90% -10%,rgba(255,77,46,.1),transparent 55%),
-      radial-gradient(80% 70% at 0 0,rgba(41,231,214,.06),transparent 50%),linear-gradient(#0b0d11,var(--bg));
-      background-attachment:fixed} body:after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9;
-      background:repeating-linear-gradient(0deg,rgba(0,0,0,.15) 0,rgba(0,0,0,.15) 1px,transparent 2px,transparent 3px)}
-    button,input,select{font:inherit}.wrap{max-width:960px;margin:auto;padding:24px 18px 72px;position:relative;z-index:1}
-    header{display:flex;justify-content:space-between;align-items:center;gap:16px;padding-bottom:18px;margin-bottom:16px;border-bottom:1px solid var(--line)}
-    .brand{display:flex;align-items:center;gap:12px}.dot{width:9px;height:9px;border-radius:50%;background:var(--cyan);box-shadow:0 0 12px var(--cyan);animation:pulse 1.6s infinite}
-    @keyframes pulse{50%{opacity:.35}}h1{margin:0;font:700 17px var(--mono);letter-spacing:.12em;text-transform:uppercase}.brand small{display:block;color:var(--muted);font:11px var(--mono);margin-top:4px}
-    .config{color:var(--cyan);font:11px var(--mono);letter-spacing:.05em;text-transform:uppercase;border:1px solid var(--bright);padding:7px 12px;background:rgba(41,231,214,.04)}
-    
-    /* Login Overlay */
-    #login-overlay {
-      position: fixed; inset: 0; z-index: 1000;
-      background: radial-gradient(circle at 50% -20%, rgba(41,231,214,0.15), var(--bg) 60%);
-      display: flex; align-items: center; justify-content: center;
-      transition: opacity 1.5s cubic-bezier(0.16, 1, 0.3, 1), filter 1.5s ease, transform 1.5s ease;
-      backdrop-filter: blur(10px);
-    }
-    #login-overlay.dissolve { opacity: 0; filter: blur(30px); transform: scale(1.1); pointer-events: none; }
-    
-    .login-box { 
-      background: rgba(12, 15, 19, 0.6);
-      backdrop-filter: blur(20px);
-      -webkit-backdrop-filter: blur(20px);
-      border: 1px solid rgba(41,231,214,0.2); 
-      border-radius: 16px;
-      padding: 48px 40px; 
-      width: 380px; 
-      box-shadow: 0 20px 60px rgba(0,0,0,0.5), 0 0 40px rgba(41,231,214,0.1) inset; 
-      position: relative; 
-      z-index: 2; 
-    }
-    .login-box h1 {
-      color: #fff;
-      font-size: 28px;
-      text-align: center;
-      margin-bottom: 4px;
-      text-shadow: 0 0 20px rgba(41,231,214,0.5);
-    }
-    .glitch { position: relative; display: inline-block; }
-    .glitch::before, .glitch::after {
-      content: attr(data-text);
-      position: absolute;
-      top: 0; left: 0; width: 100%; height: 100%;
-      background: transparent;
-      color: currentColor;
-    }
-    .glitch::before {
-      left: 2px;
-      text-shadow: -1px 0 var(--red);
-      clip-path: inset(10% 0 60% 0);
-      animation: glitch-anim-1 2s infinite linear alternate-reverse;
-    }
-    .glitch::after {
-      left: -2px;
-      text-shadow: -1px 0 var(--cyan);
-      clip-path: inset(80% 0 5% 0);
-      animation: glitch-anim-2 3s infinite linear alternate-reverse;
-    }
-    @keyframes glitch-anim-1 {
-      0% { clip-path: inset(20% 0 80% 0); }
-      20% { clip-path: inset(60% 0 10% 0); }
-      40% { clip-path: inset(10% 0 50% 0); }
-      60% { clip-path: inset(80% 0 5% 0); }
-      80% { clip-path: inset(30% 0 40% 0); }
-      100% { clip-path: inset(50% 0 30% 0); }
-    }
-    @keyframes glitch-anim-2 {
-      0% { clip-path: inset(10% 0 60% 0); }
-      20% { clip-path: inset(30% 0 20% 0); }
-      40% { clip-path: inset(70% 0 10% 0); }
-      60% { clip-path: inset(40% 0 50% 0); }
-      80% { clip-path: inset(80% 0 5% 0); }
-      100% { clip-path: inset(5% 0 80% 0); }
-    }
-    .login-box h1 span { color: var(--cyan); }
-    .login-box p {
-      color: var(--muted);
-      text-align: center;
-      font-size: 11px;
-      margin-bottom: 32px;
-      font-family: var(--mono);
-      letter-spacing: 0.15em;
-    }
-    .login-box label {
-      color: var(--cyan);
-      margin: 16px 0 6px;
-      font-size: 10px;
-    }
-    .login-box input {
-      background: rgba(0,0,0,0.3);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 12px 16px;
-      transition: all 0.2s;
-    }
-    .login-box input:focus {
-      background: rgba(0,0,0,0.5);
-      border-color: var(--cyan);
-      box-shadow: 0 0 15px rgba(41,231,214,0.2);
-    }
-    .login-box button {
-      margin-top: 28px;
-      background: linear-gradient(135deg, var(--cyan), #1b9b90);
-      color: #000;
-      border-radius: 8px;
-      padding: 14px;
-      font-size: 13px;
-      clip-path: none;
-      box-shadow: 0 4px 15px rgba(41,231,214,0.3);
-      transition: all 0.2s;
-    }
-    .login-box button:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 6px 20px rgba(41,231,214,0.4);
-      background: linear-gradient(135deg, #3ffceb, var(--cyan));
-    }
-    
-    .panel,.event,.empty{position:relative;background:linear-gradient(180deg,rgba(255,255,255,.015),transparent),var(--panel);border:1px solid var(--line)}
-    .panel:before,.event:before{content:"";position:absolute;top:-1px;left:-1px;width:13px;height:13px;border-left:1px solid var(--coral);border-top:1px solid var(--coral)}
-    .panel:after,.event:after{content:"";position:absolute;right:-1px;bottom:-1px;width:13px;height:13px;border-right:1px solid var(--coral);border-bottom:1px solid var(--coral)}
-    .pad{padding:18px}.title{margin:0 0 14px;color:var(--muted);font:700 12px var(--mono);letter-spacing:.16em;text-transform:uppercase}.title:before{content:"// ";color:var(--coral)}
-    label{display:block;margin:14px 0 5px;color:var(--muted);font:11px var(--mono);letter-spacing:.05em;text-transform:uppercase}label:first-of-type{margin-top:0}.optional{color:var(--faint);text-transform:none}
-    input,select{width:100%;padding:10px 11px;color:var(--text);background:var(--bg);border:1px solid var(--bright);border-radius:0;font:13px var(--mono)}input::placeholder{color:var(--faint)}input:focus,select:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)}
-    button{border:0;border-radius:0;padding:10px 13px;cursor:pointer;font:700 11px var(--mono);letter-spacing:.09em;text-transform:uppercase}button:disabled{opacity:.55;cursor:wait}button:focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
-    .primary{width:100%;margin-top:16px;color:#080504;background:var(--coral);clip-path:polygon(8px 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%,0 8px)}.primary:hover{background:#ff674b}
-    .ghost{width:100%;margin-top:10px;color:var(--cyan);background:transparent;border:1px solid var(--bright)}.ghost:hover{border-color:var(--cyan)}
-    .advanced{margin-top:14px;border-top:1px dashed var(--line);padding-top:12px}.advanced summary,.why summary{cursor:pointer;color:var(--muted);font:11px var(--mono);text-transform:uppercase;list-style:none}.advanced summary:before,.why summary:before{content:"[+] ";color:var(--coral)}.advanced[open] summary:before,.why[open] summary:before{content:"[-] "}
-    .note{margin:16px 0 0;padding-top:13px;border-top:1px dashed var(--line);color:var(--faint);font-size:11px}.error{margin-bottom:12px;padding:9px 11px;color:#ffc0bb;background:rgba(255,77,46,.1);border:1px solid rgba(255,77,46,.45);font:12px var(--mono)}[hidden]{display:none!important}
-    .stack{display:flex;flex-direction:column;gap:16px}.event{overflow:hidden}.event-head{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:15px 18px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.015)}
-    .name{font:700 14px var(--mono);letter-spacing:.04em;text-transform:uppercase}.meta{margin-top:3px;color:var(--muted);font:11px var(--mono)}.meta a{color:var(--cyan);text-decoration:none}.event-actions{display:flex;align-items:center;gap:12px}.score{font:700 23px var(--mono);white-space:nowrap}.sep{color:var(--coral);margin:0 4px}.remove,.position-remove{padding:6px 9px;color:var(--red);background:transparent;border:1px solid rgba(255,77,46,.45);font-size:10px}
-    .notice{padding:10px 18px;color:var(--muted);background:rgba(255,207,63,.04);border-bottom:1px solid var(--line);font-size:11px}.notice strong{color:var(--yellow)}
-    .section-strip{padding:9px 18px;color:var(--muted);background:var(--bg);border-bottom:1px solid var(--line);font:700 10px var(--mono);letter-spacing:.12em;text-transform:uppercase}.section-strip span{color:var(--cyan)}
-    .market,.position{padding:16px 18px;border-bottom:1px solid var(--line)}.market:last-child,.position:last-child{border-bottom:0}.market-top,.position-top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}.outcome{font:700 13px var(--mono);text-transform:uppercase}.outcome small{display:block;margin-top:3px;color:var(--muted);font:400 11px var(--mono);text-transform:none}
-    .tag{padding:4px 9px;border:1px solid currentColor;font:700 10px var(--mono);letter-spacing:.08em;white-space:nowrap}.entry,.hold{color:var(--cyan);background:rgba(41,231,214,.09)}.wait,.monitor{color:var(--yellow);background:rgba(255,207,63,.07)}.cash,.exit{color:var(--red);background:rgba(255,77,46,.09)}.marketonly{color:var(--muted)}
-    .figs{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-top:13px}.fig{padding:9px 10px;background:var(--panel2);border-left:2px solid var(--bright)}.key{color:var(--muted);font:10px var(--mono);text-transform:uppercase}.value{margin-top:3px;font:700 17px var(--mono);font-variant-numeric:tabular-nums}.hint{margin-top:2px;color:var(--faint);font-size:10px}.positive{color:var(--cyan)}.negative{color:var(--red)}
-    .guide{margin-top:12px;padding:10px 11px;background:rgba(41,231,214,.035);border:1px solid var(--line);font-size:12px}.guide strong{color:var(--cyan);font-family:var(--mono)}
-    .why{margin-top:11px}.why ul{margin:8px 0 0;padding-left:18px;color:var(--muted);font-size:12px}.why li{margin:4px 0}.risk{color:#d8c88d!important}
-    .position-form{display:grid;grid-template-columns:1fr 1fr auto;gap:8px;align-items:end;margin-top:11px;padding:11px;background:var(--panel2);border:1px solid var(--line)}.position-form label{margin:0 0 4px}.position-form button{height:38px;color:#06100f;background:var(--cyan)}
-    .portfolio{background:rgba(41,231,214,.025)}.pnl{font-weight:700}.pending{padding:18px;color:var(--muted);font:12px var(--mono)}.empty{padding:70px 20px;text-align:center;color:var(--muted)}.empty b{display:block;color:var(--text);font:700 14px var(--mono);text-transform:uppercase;margin-bottom:6px}
-    .metrics-panel{padding:18px;margin-bottom:20px}.metrics-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap}.metrics-head .title{margin:0}.metrics-sub{color:var(--faint);font:11px var(--mono)}.metric-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:10px;margin-top:14px}.mtile{padding:10px 12px;background:var(--panel2);border-left:2px solid var(--bright)}.mtile .k{color:var(--muted);font:10px var(--mono);text-transform:uppercase}.mtile .v{margin-top:4px;font:700 19px var(--mono)}.mtile .v.good{color:var(--cyan)}.mtile .v.bad{color:var(--red)}.mtile .sub2{color:var(--faint);font:10px var(--mono)}.metrics-empty{margin-top:12px;color:var(--muted);font:12px var(--mono)}.reliability{display:flex;align-items:flex-end;gap:6px;margin-top:16px;flex-wrap:wrap}.rbin{display:flex;flex-direction:column;align-items:center;gap:4px}.rtrack{position:relative;width:26px;height:58px;background:var(--panel2);border:1px solid var(--line)}.remp{position:absolute;left:0;right:0;bottom:0;background:rgba(255,77,46,.55)}.rpred{position:absolute;left:-1px;right:-1px;height:2px;background:var(--cyan)}.rlabel{color:var(--faint);font:9px var(--mono)}
-    
-    /* Tabs & Carousel */
-    .tab-carousel{display:flex;justify-content:center;gap:12px;padding:4px;margin-bottom:32px;background:rgba(0,0,0,0.2);border-radius:24px;border:1px solid var(--line);max-width:max-content;margin-left:auto;margin-right:auto}
-    .tab-carousel .pill{padding:8px 24px;border-radius:20px;border:none;background:transparent;color:var(--muted);font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;transition:all 0.2s}
-    .tab-carousel .pill:hover{color:var(--text)}
-    .tab-carousel .pill.active{background:var(--cyan);color:#04110f;box-shadow:0 0 15px rgba(41,231,214,0.3)}
-    
-    .carousel{display:flex;gap:8px;overflow-x:auto;padding:2px 2px 12px;margin-bottom:6px}
-    .carousel .pill{flex:0 0 auto;padding:6px 14px;border:1px solid var(--bright);background:var(--panel2);color:var(--muted);font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;cursor:pointer;white-space:nowrap}
-    .carousel .pill:hover{border-color:var(--cyan);color:var(--text)}
-    .carousel .pill.active{background:var(--cyan);color:#04110f;border-color:var(--cyan)}
-    
-    .line-badge{display:inline-block;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:2px 7px;margin-bottom:5px;border:1px solid currentColor}
-    .lt-ml{color:var(--cyan)} .lt-sp{color:var(--yellow)} .lt-ou{color:var(--coral)}
-    .notice.price-only{margin-top:8px;padding:8px 12px;border:1px solid var(--yellow);border-left-width:3px;background:rgba(255,207,63,.06);color:var(--text);font-size:12px;line-height:1.5}
-    .notice.price-only strong{color:var(--yellow);font-family:var(--mono);letter-spacing:.04em;text-transform:uppercase}
-    
-    /* Discovery list */
-    .browse-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
-    .browse-head .title{margin:0}
-    #discover-refresh{width:auto;padding:4px 8px;font-size:10px;background:transparent;color:var(--cyan);border:1px solid var(--bright)}
-    .discover-list{margin-top:12px;max-height:500px;overflow-y:auto;display:flex;flex-direction:column;gap:8px}
-    .game{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:12px 16px;border:1px solid var(--line);background:var(--panel2);cursor:pointer;transition:border-color .12s,background .12s}
-    .game:hover{border-color:var(--coral);background:rgba(255,77,46,.07)}
-    .game[aria-disabled=true]{opacity:.5;cursor:wait}
-    .game .g-title{font-size:14px;line-height:1.3;font-weight:600}
-    .game .g-league{margin-top:4px;color:var(--muted);font-family:var(--mono);font-size:10px;letter-spacing:.05em;text-transform:uppercase}
-    .game .g-live{color:var(--red);font-weight:700}.game .g-started{color:var(--yellow);font-weight:700}
-    .game .g-add{color:var(--cyan);font-family:var(--mono);font-size:11px;white-space:nowrap;font-weight:bold}
-    .discover-empty{color:var(--faint);font-size:12px;font-family:var(--mono)}
-    
-    @media(max-width:560px){.wrap{padding:14px 10px 50px}header,.event-head{align-items:flex-start;flex-direction:column}.event-actions{width:100%;justify-content:space-between}.position-form{grid-template-columns:1fr}.market-top,.position-top{align-items:flex-start}.config{white-space:normal}}
-    @media(prefers-reduced-motion:reduce){.dot{animation:none}}
-  </style>
+  <script src="/static/vendor/chart.umd.min.js" defer></script>
+  <link rel="stylesheet" href="/static/index.css">
 </head>
 <body>
 <div id="login-overlay">
@@ -210,7 +27,7 @@
 <main class="wrap">
   <header>
     <div class="brand"><span class="dot" aria-hidden="true"></span><div><h1 class="glitch" data-text="PelosiTracker">PelosiTracker</h1><small>Paper-only entry and position guidance</small></div></div>
-    <div style="display:flex;align-items:center;gap:10px">
+    <div class="header-brand">
       <div class="config" id="config">Loading thresholds…</div>
     </div>
   </header>
@@ -230,8 +47,8 @@
   </div>
 
   <!-- TAB 2: DISCOVERY -->
-  <div id="tab-discovery" class="tab-content" style="display:none">
-    <div class="panel pad" style="margin-bottom: 24px;">
+  <div id="tab-discovery" class="tab-content is-hidden">
+    <div class="panel pad section-gap">
       <h2 class="title">Paste Polymarket link</h2>
       <div class="error" id="form-error" role="alert" hidden></div>
       <form id="form">
@@ -251,23 +68,23 @@
     <div class="panel pad">
       <div class="browse-head">
         <h2 class="title">Live Polymarket games</h2>
-        <div style="display:flex; gap:10px; align-items:center;">
-          <label style="margin:0; display:flex; align-items:center; gap:6px; cursor:pointer"><input type="checkbox" id="auto-monitor-toggle" style="width:auto; margin:0;"> Auto-Monitor</label>
-          <button class="ghost" id="discover-refresh" type="button" style="margin:0">Refresh List</button>
+        <div class="inline-controls">
+          <label class="auto-monitor-label"><input class="compact-input" type="checkbox" id="auto-monitor-toggle"> Auto-Monitor</label>
+          <button class="ghost compact-button" id="discover-refresh" type="button">Refresh List</button>
         </div>
       </div>
-      <input id="discover-search" placeholder="Filter games…" autocomplete="off" style="margin-top: 12px">
+      <input class="search-gap" id="discover-search" placeholder="Filter games…" autocomplete="off">
       <div id="discover-list" class="discover-list" aria-live="polite"></div>
     </div>
   </div>
 
   <!-- TAB 3: CUSTOM BOTS & METRICS -->
-  <div id="tab-bots" class="tab-content" style="display:none">
-    <div class="panel pad" style="margin-bottom: 24px; border-color: var(--cyan);">
-      <h2 class="title" style="color:var(--cyan)">Create Custom Bot</h2>
+  <div id="tab-bots" class="tab-content is-hidden">
+    <div class="panel pad section-gap accent-border">
+      <h2 class="title accent-text">Create Custom Bot</h2>
       <div class="error" id="bot-error" role="alert" hidden></div>
-      <form id="bot-form" style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
-        <div style="grid-column: 1 / -1">
+      <form id="bot-form" class="bot-form">
+        <div class="full-row">
           <label>Bot Name</label>
           <input id="bot-name" name="name" required placeholder="My Custom Bot">
         </div>
@@ -279,26 +96,26 @@
           <label>Kelly Multiplier / Flat Stake ($)</label>
           <input id="bot-multiplier" name="multiplier" type="number" step="0.1" required placeholder="1.0 or 100">
         </div>
-        <div style="grid-column: 1 / -1">
+        <div class="full-row">
           <label>Sizing Strategy</label>
           <select id="bot-sizing" name="sizing">
             <option value="kelly">Kelly Fraction</option>
             <option value="flat">Flat Stake</option>
           </select>
         </div>
-        <div style="grid-column: 1 / -1">
+        <div class="full-row">
           <label>Discord/Slack Webhook URL (Optional)</label>
           <input id="bot-webhook" name="webhook_url" type="url" placeholder="https://discord.com/api/webhooks/...">
         </div>
-        <div style="grid-column: 1 / -1">
-          <div id="bot-error" class="error" hidden style="margin-bottom:12px; color:var(--red); font-size:12px"></div>
-          <button class="primary" type="submit" style="margin-top:0">Launch Bot</button>
+        <div class="full-row">
+          <div id="bot-submit-error" class="error bot-submit-error" hidden></div>
+          <button class="primary no-top-margin" type="submit">Launch Bot</button>
         </div>
       </form>
     </div>
 
-    <section class="panel metrics-panel" aria-labelledby="leaderboard-heading" style="border-color: var(--cyan); background: linear-gradient(180deg, rgba(41,231,214,.05), transparent), var(--panel);">
-      <div class="metrics-head"><h2 class="title glitch" data-text="Strategy Calibration · Dummy Accounts" id="leaderboard-heading" style="color: var(--cyan)">Strategy Calibration · Dummy Accounts</h2></div>
+    <section class="panel metrics-panel leaderboard-panel" aria-labelledby="leaderboard-heading">
+      <div class="metrics-head"><h2 class="title glitch accent-text" data-text="Strategy Calibration · Dummy Accounts" id="leaderboard-heading">Strategy Calibration · Dummy Accounts</h2></div>
       <div id="leaderboard-body" aria-live="polite"></div>
     </section>
     
@@ -310,397 +127,25 @@
 
 </main>
 
-<dialog id="bot-modal" class="panel pad" style="max-width:600px; width:90%; border:1px solid var(--cyan); background:var(--panel); color:var(--text); margin:auto; position:fixed; top:50%; left:50%; transform:translate(-50%, -50%); max-height:80vh; overflow-y:auto; z-index:99;">
-  <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:12px; border-bottom:1px solid var(--line); padding-bottom:8px">
-    <h2 class="title" id="bot-modal-title" style="margin:0; color:var(--cyan)">Bot Activity</h2>
-    <button class="ghost" style="padding:4px 8px; font-size:10px; width:auto; margin:0;" onclick="document.querySelector('#bot-modal').close()">Close</button>
+<dialog id="bot-modal" class="panel pad app-dialog bot-dialog">
+  <div class="dialog-head">
+    <h2 class="title dialog-title" id="bot-modal-title">Bot Activity</h2>
+    <button class="ghost dialog-close" data-close-dialog="bot-modal" type="button">Close</button>
   </div>
-  <div id="bot-modal-content" style="display:flex; flex-direction:column; gap:8px">Loading...</div>
+  <div id="bot-modal-content" class="dialog-content">Loading...</div>
 </dialog>
 
-<dialog id="chart-modal" class="panel pad" style="max-width:800px; width:95%; border:1px solid var(--cyan); background:var(--panel); color:var(--text); margin:auto; position:fixed; top:50%; left:50%; transform:translate(-50%, -50%); z-index:99;">
-  <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:12px; border-bottom:1px solid var(--line); padding-bottom:8px">
-    <h2 class="title" id="chart-modal-title" style="margin:0; color:var(--cyan)">Historical Odds</h2>
-    <button class="ghost" style="padding:4px 8px; font-size:10px; width:auto; margin:0;" onclick="document.querySelector('#chart-modal').close()">Close</button>
+<dialog id="chart-modal" class="panel pad app-dialog chart-dialog">
+  <div class="dialog-head">
+    <h2 class="title dialog-title" id="chart-modal-title">Historical Odds</h2>
+    <button class="ghost dialog-close" data-close-dialog="chart-modal" type="button">Close</button>
   </div>
-  <div style="position:relative; height:400px; width:100%">
+  <div class="chart-frame">
     <canvas id="historyChart"></canvas>
   </div>
 </dialog>
-<style>dialog::backdrop { background: rgba(0,0,0,0.7); }</style>
 
-<script>
-  // Tab Navigation Logic
-  document.querySelectorAll('.tab-carousel .pill').forEach(btn => {
-    btn.addEventListener('click', e => {
-      document.querySelectorAll('.tab-carousel .pill').forEach(b => b.classList.remove('active'));
-      e.target.classList.add('active');
-      document.querySelectorAll('.tab-content').forEach(tc => tc.style.display = 'none');
-      document.getElementById(e.target.dataset.tab).style.display = 'block';
-    });
-  });
 
-  // Auth & Login Logic
-  document.querySelector("#login-form").addEventListener("submit", async e => {
-    e.preventDefault();
-    const form = e.currentTarget;
-    const btn = form.querySelector("button");
-    const err = document.querySelector("#login-error");
-    btn.disabled = true; err.hidden = true;
-    try {
-      const r = await fetch("/api/login", {
-        method: "POST", 
-        body: new URLSearchParams(new FormData(form))
-      });
-      const data = await r.json().catch(()=>({}));
-      if (!r.ok) throw new Error(data.detail || "Invalid credentials");
-      
-      const overlay = document.querySelector("#login-overlay");
-      overlay.classList.add("dissolve");
-      setTimeout(() => { overlay.style.display = "none"; }, 1500);
-      
-      // Start the app!
-      startApp();
-    } catch(er) {
-      err.textContent = er.message; err.hidden = false;
-    } finally { btn.disabled = false; }
-  });
-
-  // The rest of the app logic...
-  const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"})[c]);
-  const pct = value => value == null ? "—" : `${(value * 100).toFixed(1)}%`;
-  const cents = value => value == null ? "—" : `${(value * 100).toFixed(1)}¢`;
-  const signedCents = value => value == null ? "—" : `${value >= 0 ? "+" : ""}${(value * 100).toFixed(1)}¢`;
-  const money = value => value == null ? "—" : `${value >= 0 ? "+" : "-"}$${Math.abs(value).toFixed(2)}`;
-  const keyFor = (...parts) => encodeURIComponent(parts.join("|"));
-  let refreshInFlight = false;
-
-  function tagClass(action) {
-    if (action === "ENTRY WINDOW") return "entry";
-    if (action === "HOLD") return "hold";
-    if (action === "CONSIDER CASH") return "cash";
-    if (action === "EXIT WATCH") return "exit";
-    if (action === "MARKET ONLY") return "marketonly";
-    return "wait";
-  }
-
-  let activeLine = "all", lastEvents = [];
-  const LINE_META = { moneyline:{label:"Moneyline",cls:"lt-ml"}, spread:{label:"Spread",cls:"lt-sp"}, total:{label:"Over / Under",cls:"lt-ou"} };
-  const LINE_ORDER = ["moneyline","spread","total"];
-  function lineType(market, outcome){
-    const m=(market||"").toLowerCase(), o=String(outcome||"").trim().toLowerCase();
-    if(o.startsWith("over")||o.startsWith("under")||/total|over.?under|o\/u/.test(m)) return "total";
-    if(/spread|handicap|run.?line|puck.?line|\bline\b/.test(m) || /[+-]\d/.test(String(outcome||""))) return "spread";
-    return "moneyline";
-  }
-  function lineBadge(market, outcome){ const meta=LINE_META[lineType(market,outcome)]; return `<span class="line-badge ${meta.cls}">${meta.label}</span>`; }
-  function renderCarousel(present){
-    const el=document.querySelector("#line-filter");
-    const types=LINE_ORDER.filter(t=>present.has(t));
-    if(types.length<=1){ el.innerHTML=""; return; }
-    const pill=(k,l)=>`<button class="pill${activeLine===k?" active":""}" data-line="${k}">${l}</button>`;
-    el.innerHTML=pill("all","All")+types.map(t=>pill(t,LINE_META[t].label)).join("");
-  }
-
-  function marketRow(eventId, market, openDetails) {
-    const detailKey = keyFor("market", eventId, market.token_id);
-    const modelClass = market.entry_margin == null ? "" : market.entry_margin >= 0 ? "positive" : "negative";
-    const guide = market.price_ceiling == null
-      ? "Add a matching sportsbook event to calculate a validated entry ceiling."
-      : market.room_to_ceiling >= 0
-        ? `<strong>Entry ceiling ${cents(market.price_ceiling)}</strong> · current ask is ${cents(market.room_to_ceiling)} below the ceiling.`
-        : `<strong>Wait for ${cents(market.price_ceiling)} or lower</strong> · current ask is ${cents(-market.room_to_ceiling)} above the ceiling.`;
-    const risks = market.risk_flags.length ? market.risk_flags : ["No elevated execution flags detected; continue watching price and news latency."];
-    const quality = market.quality_components;
-    const qualityReason = quality ? `<li>Quality breakdown: freshness ${quality.freshness.toFixed(0)}, agreement ${quality.agreement.toFixed(0)}, source coverage ${quality.sources.toFixed(0)}, execution ${quality.execution.toFixed(0)}.</li>` : "";
-    return `<div class="market" data-line="${lineType(market.market,market.outcome)}" data-token-id="${esc(market.token_id)}">
-      <div class="market-top"><div class="outcome">${lineBadge(market.market,market.outcome)}${esc(market.outcome)}<small>${esc(market.question)}</small></div><span class="tag ${tagClass(market.entry_action)}">${esc(market.entry_action)}</span></div>
-      <div class="figs">
-        <div class="fig"><div class="key">Buy now</div><div class="value">${cents(market.buy_price)}</div><div class="hint">Executable ask</div></div>
-        <div class="fig"><div class="key">Sell now</div><div class="value">${cents(market.sell_price)}</div><div class="hint">Executable bid</div></div>
-        <div class="fig"><div class="key">Edge</div><div class="value ${modelClass}">${signedCents(market.edge)}</div><div class="hint">Need ${cents(market.required_edge)} · buffer ${signedCents(market.edge_buffer)}</div></div>
-        <div class="fig"><div class="key">Signal quality</div><div class="value">${market.confidence == null ? "—" : market.confidence.toFixed(0)+"/100"}</div><div class="hint">Data reliability · ${market.reference_sources} reference source(s)</div></div>
-      </div>
-      <div class="guide">${guide}${market.model_live_prob == null ? "" : ` Independent live model ${pct(market.model_live_prob)}.`} Spread ${cents(market.spread)} · ask depth ${market.ask_size == null ? "—" : market.ask_size.toFixed(1)+" shares"} · liquidity ${market.market_liquidity == null ? "—" : "$"+Number(market.market_liquidity).toLocaleString(undefined,{maximumFractionDigits:0})}.</div>
-      <details class="why" data-detail-key="${detailKey}"${openDetails.has(detailKey) ? " open" : ""}><summary>What to look out for</summary>
-        <ul>${qualityReason}${market.reasons.map(reason => `<li>${esc(reason)}</li>`).join("")}${risks.map(risk => `<li class="risk">${esc(risk)}</li>`).join("")}</ul></details>
-      <details class="why"><summary>Add or update my position</summary>
-        <form class="position-form" data-save-position data-event-id="${esc(eventId)}" data-token-id="${esc(market.token_id)}" data-market="${esc(market.market)}" data-outcome="${esc(market.outcome)}">
-          <div><label>Shares</label><input name="shares" type="number" min="0.01" max="1000000" step="0.01" required placeholder="25"></div>
-          <div><label>Average entry (cents)</label><input name="entry_cents" type="number" min="0.1" max="99.9" step="0.1" required placeholder="52.5"></div>
-          <button type="submit">Save position</button>
-        </form>
-      </details>
-    </div>`;
-  }
-
-  function positionRow(eventId, position, openDetails) {
-    const detailKey = keyFor("position", eventId, position.token_id);
-    const pnlClass = position.unrealized_pnl == null ? "" : position.unrealized_pnl >= 0 ? "positive" : "negative";
-    return `<div class="position">
-      <div class="position-top"><div class="outcome">${esc(position.outcome)}<small>${position.shares.toFixed(2)} shares · average ${cents(position.avg_entry_price)}</small></div><span class="tag ${tagClass(position.advice)}">${esc(position.advice)}</span></div>
-      <div class="figs">
-        <div class="fig"><div class="key">Cash-out bid</div><div class="value">${cents(position.current_bid)}</div><div class="hint">Before fees/slippage</div></div>
-        <div class="fig"><div class="key">Cash value</div><div class="value">${position.cash_value == null ? "—" : "$"+position.cash_value.toFixed(2)}</div><div class="hint">Shares × bid</div></div>
-        <div class="fig"><div class="key">Unrealized P/L</div><div class="value ${pnlClass}">${money(position.unrealized_pnl)}</div><div class="hint">${position.roi == null ? "—" : pct(position.roi)} return</div></div>
-        <div class="fig"><div class="key">Remaining hold edge</div><div class="value">${signedCents(position.remaining_hold_edge)}</div><div class="hint">Model fair minus bid</div></div>
-      </div>
-      <details class="why" data-detail-key="${detailKey}"${openDetails.has(detailKey) ? " open" : ""}><summary>Why this hold/cash status?</summary><ul>${position.reasons.map(reason => `<li>${esc(reason)}</li>`).join("")}</ul></details>
-      <button class="position-remove" type="button" data-remove-position data-event-id="${esc(eventId)}" data-token-id="${esc(position.token_id)}">Remove position</button>
-    </div>`;
-  }
-
-  function fallbackSignal(signal) {
-    return `<div class="market" data-line="${lineType(signal.market,signal.outcome)}"><div class="market-top"><div class="outcome">${lineBadge(signal.market,signal.outcome)}${esc(signal.outcome)}<small>${esc(signal.market)} reference signal</small></div><span class="tag ${signal.action === "PAPER_BET" ? "entry" : "wait"}">${esc(signal.action.replace("_"," "))}</span></div>
-      <div class="figs"><div class="fig"><div class="key">Model prob</div><div class="value">${pct(signal.model_probability)}</div><div class="hint">${signal.model_live_prob == null ? "Market consensus" : `Live model ${pct(signal.model_live_prob)}`}</div></div><div class="fig"><div class="key">Estimated edge</div><div class="value">${signedCents(signal.edge)}</div></div><div class="fig"><div class="key">Quality</div><div class="value">${signal.confidence.toFixed(0)}/100</div></div></div></div>`;
-  }
-
-  function eventCard(view, openDetails) {
-    const {event,state_points,quote_points,latest_state:state,actionable_markets:markets,positions,signals} = view;
-    const health = view.edge_health;
-    const usingFallback = !markets.length && !event.polymarket_slug;
-    const anyReference = markets.some(m => (m.reference_sources||0) >= 1);
-    let priceOnly = markets.length && !anyReference
-      ? '<div class="notice price-only"><strong>Price only</strong> · no sportsbook reference matched yet, so there\'s no validated edge here.</div>'
-      : "";
-    if (health) {
-      const sources = health.fresh_reference_sources.length ? health.fresh_reference_sources.map(esc).join(", ") : "none";
-      priceOnly = `<div class="notice"><strong>Edge pipeline: ${esc(health.status.replaceAll("_"," "))}</strong> · ${esc(health.message)} Fresh references: ${sources}.</div>` + priceOnly;
-    }
-    let mkts = markets, sigs = signals.slice(0,3);
-    if (activeLine !== "all") {
-      mkts = markets.filter(m => lineType(m.market,m.outcome) === activeLine);
-      sigs = sigs.filter(s => lineType(s.market,s.outcome) === activeLine);
-    }
-    if (activeLine !== "all" && !mkts.length && !(usingFallback && sigs.length) && !positions.length) return "";
-    const score = state ? `${state.home_score}<span class="sep">–</span>${state.away_score}` : "—";
-    const portfolio = positions.length ? `<div class="section-strip"><span>My positions</span> · paper hold/cash monitor</div><div class="portfolio">${positions.map(p => positionRow(event.id,p,openDetails)).join("")}</div>` : "";
-    const marketBody = mkts.length ? mkts.map(m => marketRow(event.id,m,openDetails)).join("")
-      : (usingFallback && sigs.length) ? sigs.map(fallbackSignal).join("")
-      : activeLine !== "all" ? '<div class="pending">No matching lines for this filter.</div>'
-      : '<div class="pending">Waiting for a fresh executable ask and reference prices…</div>';
-    const link = event.polymarket_url ? `<a href="${esc(event.polymarket_url)}" target="_blank" rel="noopener">Open event ↗</a>` : "manual event";
-    const restriction = event.polymarket_restricted ? '<strong>Region notice:</strong> Polymarket marks this event restricted. The monitor shows public data only and does not bypass availability rules.' : 'Only selections accepting orders with a visible ask are listed.';
-    return `<article class="event" data-event-id="${esc(event.id)}"><div class="event-head"><div><div class="name">${esc(event.name)}</div><div class="meta">${esc(event.sport)} · ${link} · ${state_points} state / ${quote_points} updates</div></div><div class="event-actions"><button class="ghost" style="padding:6px 9px; margin:0; width:auto; font-size:10px; border-color:var(--cyan)" data-chart-event="${esc(event.id)}" data-chart-title="${esc(event.name)}">View Chart</button><div class="score">${score}</div><button class="remove" data-remove-event="${esc(event.id)}">Remove</button></div></div>
-      <div class="notice">${restriction}</div>${priceOnly}${portfolio}<div class="section-strip"><span>Actionable selections</span> · buy, sell, margin, and risk</div><div>${marketBody}</div></article>`;
-  }
-
-  function showActionError(message) { const box=document.querySelector("#action-error"); box.textContent=message; box.hidden=false; }
-  function metricTile(key,value,cls="",sub="") { return `<div class="mtile"><div class="k">${key}</div><div class="v ${cls}">${value}</div>${sub?`<div class="sub2">${sub}</div>`:""}</div>`; }
-  function reliabilityView(bins) { if(!bins?.length)return "";const columns=bins.map(bin=>`<div class="rbin" title="predicted ${pct(bin.mean_predicted)} · actual ${pct(bin.empirical_rate)} · n=${bin.count}"><div class="rtrack"><div class="remp" style="height:${(bin.empirical_rate*100).toFixed(1)}%"></div><div class="rpred" style="bottom:${(bin.mean_predicted*100).toFixed(1)}%"></div></div><div class="rlabel">${Math.round(bin.lo*100)}</div></div>`).join("");return `<div class="reliability">${columns}</div><div class="metrics-sub">Bar = actual win rate · line = predicted probability</div>`; }
-  
-  async function refreshMetrics() { const body=document.querySelector("#metrics-body"),sub=document.querySelector("#metrics-sub");try{const response=await fetch("/api/metrics");if(!response.ok)return;const m=await response.json();if(!m?.n_bets){sub.textContent="";body.innerHTML='<div class="metrics-empty">No paper bets logged yet. CLV and calibration appear after qualified signals and event closes.</div>';return}const clv=m.clv||{},model=m.model||{},base=m.market_baseline||{};sub.textContent=`${m.n_bets} paper bet(s) · ${m.n_settled} settled`;const tiles=[metricTile("Beat close",clv.beat_close_rate==null?"—":pct(clv.beat_close_rate),clv.beat_close_rate>=.5?"good":"bad",clv.n?`n=${clv.n}`:"awaiting closes"),metricTile("Mean CLV",clv.mean_clv==null?"—":signedCents(clv.mean_clv),clv.mean_clv>=0?"good":"bad","vs closing fair"),metricTile("Settled",String(m.n_settled),"","moneyline"),metricTile("Model Brier",model.brier==null?"—":model.brier.toFixed(3),model.brier!=null&&base.brier!=null&&model.brier<base.brier?"good":"",base.brier==null?"awaiting settle":`market ${base.brier.toFixed(3)}`)];if(model.log_loss!=null)tiles.push(metricTile("Log loss",model.log_loss.toFixed(3)));if(model.ece!=null)tiles.push(metricTile("ECE",model.ece.toFixed(3),"","calibration gap"));body.innerHTML=`<div class="metric-tiles">${tiles.join("")}</div>`+reliabilityView(m.reliability)}catch{}}
-  
-  async function viewBot(name) {
-    const dialog = document.querySelector("#bot-modal");
-    document.querySelector("#bot-modal-title").textContent = name + " Activity";
-    document.querySelector("#bot-modal-content").innerHTML = "Loading...";
-    dialog.showModal();
-    try {
-      const r = await fetch(`/api/accounts/${encodeURIComponent(name)}/bets`);
-      if (!r.ok) throw new Error();
-      const bets = await r.json();
-      if (!bets.length) { document.querySelector("#bot-modal-content").innerHTML = '<div class="empty">No bets placed yet.</div>'; return; }
-      const rows = bets.map(b => `<div class="game" style="flex-direction:column; align-items:flex-start">
-        <div style="display:flex; justify-content:space-between; width:100%">
-          <div><div class="g-title">${esc(b.event_name)}</div><div class="g-league">${esc(b.market)}: ${esc(b.outcome)}</div></div>
-          <div style="text-align:right"><div class="${b.pnl > 0 ? 'positive' : b.pnl < 0 ? 'negative' : ''}">${money(b.pnl || 0)}</div><div class="g-league">${b.status.toUpperCase()}</div></div>
-        </div>
-        <div style="display:flex; gap:12px; margin-top:6px; font-size:10px; font-family:var(--mono); color:var(--muted)">
-          <span>Stake: $${b.stake.toFixed(2)}</span>
-          <span>Entry: ${cents(b.entry_price)}</span>
-          <span>Edge: ${pct(b.edge)}</span>
-        </div>
-      </div>`).join("");
-      document.querySelector("#bot-modal-content").innerHTML = rows;
-    } catch { document.querySelector("#bot-modal-content").innerHTML = '<div class="error">Failed to load activity</div>'; }
-  }
-
-  async function refreshLeaderboard() { const body=document.querySelector("#leaderboard-body");try{const r=await fetch("/api/leaderboard");if(!r.ok)return;const lb=await r.json();if(!lb.length){body.innerHTML='<div class="metrics-empty">No dummy accounts seeded.</div>';return}const cols=lb.map(a=>`<div class="mtile" title="${esc(a.strategy)}" data-bot="${esc(a.name)}" style="cursor:pointer" onclick="viewBot('${esc(a.name).replace(/'/g, "\\'")}')"><div class="k" style="color:var(--cyan)">${esc(a.name)}</div><div class="v ${a.roi>=0?"good":"bad"}">${pct(a.roi)}</div><div class="sub2">$${a.equity.toFixed(2)} eq · ${a.win_rate==null?"—":pct(a.win_rate)} WR</div><div class="sub2" style="margin-top:2px">${a.n_bets} bets (${a.wins}W-${a.losses}L)</div></div>`).join("");body.innerHTML=`<div class="metric-tiles">${cols}</div>`;}catch{} }
-  function renderEvents(events) {
-    if (document.activeElement?.closest("[data-save-position]")) return;
-    lastEvents = events;
-    const root=document.querySelector("#events");
-    const openDetails=new Set([...root.querySelectorAll("details[open][data-detail-key]")].map(d=>d.dataset.detailKey));
-    const present=new Set();
-    for (const v of events) {
-      if ((v.actionable_markets||[]).length) v.actionable_markets.forEach(m=>present.add(lineType(m.market,m.outcome)));
-      else if (!v.event.polymarket_slug) (v.signals||[]).slice(0,3).forEach(s=>present.add(lineType(s.market,s.outcome)));
-    }
-    if (activeLine !== "all" && !present.has(activeLine)) activeLine = "all";
-    renderCarousel(present);
-    const cards = events.map(e=>eventCard(e,openDetails)).filter(Boolean).join("");
-    root.innerHTML = cards ? `<div class="stack">${cards}</div>`
-      : (events.length && activeLine !== "all"
-          ? `<div class="panel empty"><b>No ${LINE_META[activeLine].label} lines</b>Nothing matches this filter right now.</div>`
-          : '<div class="panel empty"><b>No events yet</b>Go to the Discovery tab to begin.</div>');
-  }
-  async function refresh() {
-    if (refreshInFlight || document.activeElement?.closest("[data-save-position]")) return;
-    refreshInFlight=true;
-    try { const response=await fetch("/api/events"); if(!response.ok) throw new Error(); renderEvents(await response.json()); }
-    catch { const root=document.querySelector("#events"); if(!root.children.length) root.innerHTML='<div class="panel empty"><b>Dashboard disconnected</b>Check your connection.</div>'; }
-    finally { refreshInFlight=false; }
-  }
-  function startStream() {
-    let source;
-    try { source = new EventSource("/api/stream"); } catch { return; }
-    source.onmessage = event => { if(!event.data) return; try { renderEvents(JSON.parse(event.data)); refreshMetrics(); } catch {} };
-  }
-
-  document.querySelector("#form").addEventListener("submit",async event=>{event.preventDefault();const form=event.currentTarget,button=document.querySelector("#submit-event"),box=document.querySelector("#form-error");
-    const payload=Object.fromEntries(new FormData(form));Object.keys(payload).forEach(k=>{if(!payload[k])delete payload[k]});button.disabled=true;box.hidden=true;
-    try{const response=await fetch("/api/events",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(payload)});const body=await response.json().catch(()=>({}));if(!response.ok)throw new Error(body.detail||`Could not monitor event (${response.status})`);form.reset();await refresh();
-      document.querySelector('[data-tab="tab-live"]').click();
-    }
-    catch(error){box.textContent=error.message;box.hidden=false}finally{button.disabled=false}});
-    
-  document.querySelector("#bot-form").addEventListener("submit", async e => {
-    e.preventDefault();
-    const form = e.currentTarget, btn = form.querySelector("button"), err = document.querySelector("#bot-error");
-    btn.disabled = true; err.hidden = true;
-    const sizing = form.querySelector("#bot-sizing").value;
-    const mult = Number(form.querySelector("#bot-multiplier").value);
-    const payload = {
-      name: form.querySelector("#bot-name").value,
-      edge_threshold: Number(form.querySelector("#bot-edge").value) / 100,
-      sizing: sizing,
-      kelly_multiplier: sizing === "kelly" ? mult : 1.0,
-      flat_stake: sizing === "flat" ? mult : 100.0,
-      start_bankroll: 10000.0,
-      webhook_url: form.querySelector("#bot-webhook").value || ""
-    };
-    try {
-      const r = await fetch("/api/accounts", { method: "POST", headers: {"content-type":"application/json"}, body: JSON.stringify(payload) });
-      const b = await r.json().catch(()=>({}));
-      if (!r.ok) throw new Error(b.detail || "Failed to create bot");
-      form.reset();
-      await refreshLeaderboard();
-    } catch (er) { err.textContent = er.message; err.hidden = false; }
-    finally { btn.disabled = false; }
-  });
-
-  document.querySelector("#events").addEventListener("submit",async event=>{const form=event.target.closest("[data-save-position]");if(!form)return;event.preventDefault();const button=form.querySelector("button"),data=new FormData(form);button.disabled=true;document.querySelector("#action-error").hidden=true;
-    const payload={token_id:form.dataset.tokenId,market:form.dataset.market,outcome:form.dataset.outcome,shares:Number(data.get("shares")),avg_entry_price:Number(data.get("entry_cents"))/100};
-    try{const response=await fetch(`/api/events/${encodeURIComponent(form.dataset.eventId)}/positions`,{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify(payload)});const body=await response.json().catch(()=>({}));if(!response.ok)throw new Error(body.detail||"Could not save position");document.activeElement.blur();await refresh()}
-    catch(error){showActionError(error.message)}finally{button.disabled=false}});
-  let currentChart = null;
-  async function viewChart(eventId, eventName) {
-    const dialog = document.querySelector("#chart-modal");
-    document.querySelector("#chart-modal-title").textContent = eventName + " History";
-    dialog.showModal();
-    try {
-      const r = await fetch(`/api/events/${encodeURIComponent(eventId)}/history`);
-      if (!r.ok) throw new Error();
-      const data = await r.json();
-      
-      const ctx = document.getElementById('historyChart').getContext('2d');
-      if (currentChart) currentChart.destroy();
-      
-      const datasets = [];
-      const colors = ['#29e7d6', '#ffcf3f', '#ff4d2e', '#a020f0', '#00ff00', '#ff00ff'];
-      let cIdx = 0;
-      
-      const byOutcome = {};
-      for (const q of data.quotes) {
-        if (!byOutcome[q.outcome]) byOutcome[q.outcome] = [];
-        byOutcome[q.outcome].push({x: q.observed_at * 1000, y: q.probability * 100});
-      }
-      for (const [outcome, pts] of Object.entries(byOutcome)) {
-        datasets.push({ label: outcome + ' Prob (%)', data: pts, borderColor: colors[cIdx % colors.length], fill: false, stepped: true });
-        cIdx++;
-      }
-      
-      const homeScores = data.states.filter(s => s.home_score != null).map(s => ({x: s.observed_at * 1000, y: s.home_score}));
-      if (homeScores.length > 0) datasets.push({ label: 'Home Score', data: homeScores, borderColor: '#ffffff', borderDash: [5, 5], stepped: true });
-      
-      currentChart = new Chart(ctx, {
-        type: 'line', data: { datasets },
-        options: { responsive: true, maintainAspectRatio: false, scales: { x: { type: 'linear', ticks: { callback: v => new Date(v).toLocaleTimeString() } }, y: { min: 0 } }, animation: false }
-      });
-    } catch {
-      console.error("Failed to load chart");
-    }
-  }
-
-  document.querySelector("#events").addEventListener("click",async event=>{const removeEvent=event.target.closest("[data-remove-event]"),removePosition=event.target.closest("[data-remove-position]"),chartBtn=event.target.closest("[data-chart-event]");
-    if(removeEvent){removeEvent.disabled=true;try{const response=await fetch(`/api/events/${encodeURIComponent(removeEvent.dataset.removeEvent)}`,{method:"DELETE"});if(response.ok){await refresh();await refreshMetrics()}}catch{}finally{removeEvent.disabled=false}}
-    if(removePosition){removePosition.disabled=true;try{const response=await fetch(`/api/events/${encodeURIComponent(removePosition.dataset.eventId)}/positions/${encodeURIComponent(removePosition.dataset.tokenId)}`,{method:"DELETE"});if(response.ok)await refresh()}catch{}finally{removePosition.disabled=false}}
-    if(chartBtn){viewChart(chartBtn.dataset.chartEvent, chartBtn.dataset.chartTitle)}});
-  let discoverGames = [];
-  function discoverStatus(game){
-    if(game.status==="live")return '<span class="g-live">● LIVE</span> ';
-    if(game.status==="started")return '<span class="g-started">◌ STARTED</span> ';
-    return "";
-  }
-  function renderDiscover() {
-    const list=document.querySelector("#discover-list");
-    if(!discoverGames.length){list.innerHTML='<div class="discover-empty">No live or upcoming games found right now.</div>';return}
-    const q=(document.querySelector("#discover-search").value||"").toLowerCase();
-    const shown=discoverGames.filter(g=>!q||`${g.title} ${g.league||""}`.toLowerCase().includes(q));
-    list.innerHTML=shown.length?shown.map(g=>`<div class="game" data-slug="${esc(g.slug)}" role="button" tabindex="0" title="${esc(g.title)}"><div><div class="g-title">${esc(g.title)}</div><div class="g-league">${discoverStatus(g)}${esc(g.league||"sports")}${g.reference_adapter===false?' · PRICE ONLY — NO REFERENCE ADAPTER':''}</div></div><span class="g-add">+ Monitor</span></div>`).join(""):'<div class="discover-empty">No games match.</div>';
-  }
-  async function loadDiscover() {
-    const list=document.querySelector("#discover-list");
-    try{const r=await fetch("/api/discover");if(!r.ok)throw new Error();discoverGames=await r.json();renderDiscover()}
-    catch{if(!discoverGames.length)list.innerHTML='<div class="discover-empty">Could not load games.</div>'}
-  }
-  async function monitorGame(slug,row) {
-    const box=document.querySelector("#form-error");
-    let addBtn = null;
-    if(row){
-      row.setAttribute("aria-disabled","true");
-      addBtn = row.querySelector(".g-add");
-      if(addBtn) addBtn.textContent = "Adding...";
-    }
-    box.hidden=true;
-    try{const r=await fetch("/api/events",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({polymarket_url:`https://polymarket.com/event/${slug}`})});
-      const body=await r.json().catch(()=>({}));if(!r.ok)throw new Error(body.detail||`Could not monitor (${r.status})`);await refresh();await refreshMetrics();
-      document.querySelector('[data-tab="tab-live"]').click();
-    }
-    catch(error){
-      box.textContent=error.message;box.hidden=false;
-      if(addBtn) addBtn.textContent = "+ Monitor";
-    }
-    finally{if(row)row.removeAttribute("aria-disabled")}
-  }
-  document.querySelector("#discover-list").addEventListener("click",e=>{const row=e.target.closest("[data-slug]");if(row&&row.getAttribute("aria-disabled")!=="true")monitorGame(row.dataset.slug,row)});
-  document.querySelector("#discover-search").addEventListener("input",renderDiscover);
-  document.querySelector("#discover-refresh").addEventListener("click",loadDiscover);
-  document.querySelector("#line-filter").addEventListener("click",e=>{const p=e.target.closest("[data-line]");if(!p)return;activeLine=p.dataset.line;renderEvents(lastEvents);});
-  
-  document.querySelector("#auto-monitor-toggle")?.addEventListener("change", async e => {
-    try { await fetch("/api/config", { method: "POST", headers: {"content-type":"application/json"}, body: JSON.stringify({ auto_monitor: e.target.checked }) }); } catch {}
-  });
-
-  // Only start the app data fetching after successful login or if already authenticated.
-  // We check if the events endpoint succeeds. If so, we are logged in, hide overlay immediately.
-  async function checkAuthAndStart() {
-    try {
-      const r = await fetch("/api/events");
-      if (r.ok) {
-        document.querySelector("#login-overlay").style.display = "none";
-        startApp();
-      }
-    } catch {}
-  }
-  
-  function startApp() {
-    fetch("/api/config").then(r=>r.json()).then(c=>{
-      document.querySelector("#config").textContent=`Quality ≥ ${c.confidence_threshold} · Base edge ≥ ${(c.edge_threshold*100).toFixed(1)}%`;
-      if(document.querySelector("#auto-monitor-toggle")) document.querySelector("#auto-monitor-toggle").checked = !!c.auto_monitor;
-    }).catch(()=>document.querySelector("#config").textContent="Thresholds unavailable");
-    
-    refresh();refreshMetrics();refreshLeaderboard();startStream();loadDiscover();
-    
-    // Set intervals
-    if (!window.intervalsStarted) {
-      window.intervalsStarted = true;
-      setInterval(refresh,10000);setInterval(refreshMetrics,5000);setInterval(refreshLeaderboard,5000);setInterval(loadDiscover,60000);
-    }
-  }
-
-  checkAuthAndStart();
-</script>
+<script src="/static/index.js" defer></script>
 </body>
 </html>

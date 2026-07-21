@@ -2,7 +2,6 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Deserialize)]
 struct QuoteInput {
@@ -17,10 +16,13 @@ struct QuoteInput {
     probability: f64,
     source: String,
     observed_at: f64,
+    #[serde(default)]
+    timestamp_trusted: bool,
     bid: Option<f64>,
     ask: Option<f64>,
     // Phase 0 additions (all optional so older callers still deserialize):
-    // relative trust of the source when forming the consensus fair value.
+    // Deprecated transport field; subjective source weights are ignored.
+    #[allow(dead_code)]
     source_weight: Option<f64>,
     // exchanges (Polymarket, Betfair) already trade near a de-vigged mid, so
     // we do NOT multiplicatively normalize them.
@@ -31,6 +33,12 @@ struct QuoteInput {
     liquidity: Option<f64>,
     #[serde(default)]
     ask_size: Option<f64>,
+    #[serde(default)]
+    depth_complete: bool,
+    #[serde(default)]
+    fee_metadata_known: bool,
+    #[serde(default = "default_true")]
+    accepting_orders: bool,
     // Phase 2b: parsed spread/total line and normalized side
     // (home | away | over | under), resolved in Python.
     #[serde(default)]
@@ -42,9 +50,6 @@ struct QuoteInput {
 impl QuoteInput {
     fn executable_probability(&self) -> f64 {
         self.ask.unwrap_or(self.probability)
-    }
-    fn weight(&self) -> f64 {
-        self.source_weight.unwrap_or(0.35).max(0.0)
     }
     fn exchange(&self) -> bool {
         self.is_exchange.unwrap_or(false)
@@ -77,10 +82,15 @@ struct StateInput {
     observed_at: f64,
     #[serde(default)]
     fraction_remaining: Option<f64>,
+    #[serde(default)]
+    timestamp_trusted: bool,
+    #[serde(default)]
+    state_valid: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct EvaluateRequest {
+    as_of: f64,
     event_id: String,
     confidence_threshold: f64,
     edge_threshold: f64,
@@ -105,6 +115,14 @@ struct EvaluateRequest {
     edge_z: Option<f64>,
     #[serde(default)]
     kelly_fraction: Option<f64>,
+    #[serde(default)]
+    enable_independent_model: bool,
+    #[serde(default)]
+    calibrated_markets: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -139,6 +157,7 @@ struct SignalOutput {
     quality_agreement: f64,
     quality_sources: f64,
     quality_execution: f64,
+    quality_calibration: f64,
 }
 
 fn clamp(value: f64, low: f64, high: f64) -> f64 {
@@ -408,8 +427,8 @@ struct Fair {
     prob: f64,
     booksum: f64,
     method: &'static str,
-    weight_base: f64,
     observed_at: f64,
+    timestamp_trusted: bool,
 }
 
 /// Compute one source's fair value for `outcome` given all of its quotes in the
@@ -448,7 +467,6 @@ fn source_fair(outcome_key: &str, source_quotes: &[&QuoteInput]) -> Option<Fair>
         prob: clamp(fair, 0.001, 0.999),
         booksum: booksum.max(1.0),
         method,
-        weight_base: target.weight(),
         // A fair price depends on every leg used in the de-vig.  Timestamp it
         // at the oldest component so a fresh favorite cannot revive a stale
         // opposing side.
@@ -456,6 +474,7 @@ fn source_fair(outcome_key: &str, source_quotes: &[&QuoteInput]) -> Option<Fair>
             .iter()
             .map(|quote| quote.observed_at)
             .fold(f64::INFINITY, f64::min),
+        timestamp_trusted: source_quotes.iter().all(|quote| quote.timestamp_trusted),
     })
 }
 
@@ -472,7 +491,14 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
     let latest_state = request
         .states
         .iter()
-        .filter(|s| s.fraction_remaining.is_some())
+        .filter(|s| {
+            request.enable_independent_model
+                && s.timestamp_trusted
+                && s.state_valid
+                && s.fraction_remaining.is_some()
+                && now_seconds >= s.observed_at
+                && now_seconds - s.observed_at <= max_age
+        })
         .max_by(|a, b| a.observed_at.total_cmp(&b.observed_at));
 
     // Keep the freshest quote per (market, outcome, source).
@@ -484,7 +510,7 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
             || quote.ask.is_some_and(|value| !valid_probability(value))
             || quote
                 .bid
-                .is_some_and(|value| !value.is_finite() || value < 0.0 || value >= 1.0)
+                .is_some_and(|value| !value.is_finite() || !(0.0..1.0).contains(&value))
             || quote.ask_size.is_some_and(|value| !valid_size(value))
             || quote.liquidity.is_some_and(|value| !valid_size(value))
         {
@@ -633,6 +659,10 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         let target_source_key = best.source_key().to_string();
         let display_market = best.market.clone();
         let display_outcome = best.outcome.clone();
+        let market_is_calibrated = request
+            .calibrated_markets
+            .iter()
+            .any(|market| market.eq_ignore_ascii_case(&display_market));
         let target_booksum = fairs
             .iter()
             .find(|f| f.source_key == target_source_key)
@@ -645,7 +675,10 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         let reference: Vec<&Fair> = fairs
             .iter()
             .filter(|f| {
-                f.source_key != target_source_key && (now_seconds - f.observed_at) <= max_age
+                f.source_key != target_source_key
+                    && f.timestamp_trusted
+                    && now_seconds >= f.observed_at
+                    && (now_seconds - f.observed_at) <= max_age
             })
             .collect();
 
@@ -722,31 +755,22 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
                 quality_agreement: 0.0,
                 quality_sources: 0.0,
                 quality_execution: (spread_score * 1000.0).round() / 10.0,
+                quality_calibration: if market_is_calibrated { 100.0 } else { 0.0 },
             });
             continue;
         }
 
-        // Weighted consensus in log-odds space.
-        // weight = source trust x recency x 1/overround.
-        let mut wsum = 0.0;
-        let mut logit_acc = 0.0;
+        // Equal-weight consensus in log-odds space, one observation per
+        // canonical source family. Freshness is a gate and quality dimension,
+        // not an undocumented brand/recency weight.
         let ref_probs: Vec<f64> = reference.iter().map(|f| f.prob).collect();
-        for f in &reference {
-            let ref_age = (now_seconds - f.observed_at).max(0.0);
-            // No floor: references are already age-gated to <= max_age, and a
-            // floor would keep a near-dead quote at fixed weight forever.
-            let recency = (-ref_age / max_age).exp();
-            let w = f.weight_base.max(0.0) * recency / f.booksum.max(1.0);
-            if w > 0.0 {
-                wsum += w;
-                logit_acc += w * logit(f.prob);
-            }
-        }
-        let fair = if wsum > 0.0 {
-            clamp(inv_logit(logit_acc / wsum), 0.001, 0.999)
-        } else {
-            clamp(mean(&ref_probs), 0.001, 0.999)
-        };
+        let fair = clamp(
+            inv_logit(
+                reference.iter().map(|f| logit(f.prob)).sum::<f64>() / reference.len() as f64,
+            ),
+            0.001,
+            0.999,
+        );
 
         let edge = fair - executable;
         let dispersion = if ref_probs.len() > 1 {
@@ -759,9 +783,9 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         // Phase 4: sizing & risk-normalized required edge.
         let z = request.edge_z.unwrap_or(1.0);
         let lambda = request.kelly_fraction.unwrap_or(0.25);
-        // Standard error of the consensus mean; more disagreement / fewer books
-        // -> less certain fair -> higher bar and smaller stake.
-        let fair_stderr = dispersion / (source_count as f64).max(1.0).sqrt();
+        // Conservative uncertainty half-width. Disagreement is not divided by
+        // sqrt(source count); a finite calibration floor always remains.
+        let fair_stderr = dispersion.max(0.015);
         let required_edge =
             request.edge_threshold + z * fair_stderr + market_premium(&display_market);
         let ev_per_stake = if executable > 1e-6 {
@@ -838,6 +862,12 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         if age > max_age {
             blockers.push(format!("quote stale ({age:.0}s)"));
         }
+        if !best.timestamp_trusted {
+            blockers.push("provider timestamp unavailable or untrusted".to_string());
+        }
+        if best.observed_at > now_seconds + 5.0 {
+            blockers.push("provider timestamp is in the future".to_string());
+        }
         if source_count < 2 {
             blockers.push("fewer than 2 independent reference sources".to_string());
         }
@@ -848,6 +878,18 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         }
         if best.exchange() && best.ask.is_none() {
             blockers.push("no executable ask for exchange quote".to_string());
+        }
+        if best.exchange() && !best.depth_complete {
+            blockers.push("complete executable order-book depth unavailable".to_string());
+        }
+        if best.exchange() && !best.fee_metadata_known {
+            blockers.push("fee metadata unavailable".to_string());
+        }
+        if !best.accepting_orders {
+            blockers.push("market is not accepting orders".to_string());
+        }
+        if !market_is_calibrated {
+            blockers.push("validated calibration artifact unavailable for market".to_string());
         }
         if edge < required_edge {
             blockers.push(format!(
@@ -899,6 +941,7 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
             quality_agreement: (agreement_score * 1000.0).round() / 10.0,
             quality_sources: (source_score * 1000.0).round() / 10.0,
             quality_execution: (spread_score * 1000.0).round() / 10.0,
+            quality_calibration: if market_is_calibrated { 100.0 } else { 0.0 },
         });
     }
 
@@ -916,11 +959,13 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
 fn evaluate_json(request_json: &str) -> PyResult<String> {
     let request: EvaluateRequest = serde_json::from_str(request_json)
         .map_err(|error| PyValueError::new_err(format!("invalid engine request: {error}")))?;
-    let now_seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| PyValueError::new_err(format!("system clock error: {error}")))?
-        .as_secs_f64();
-    serde_json::to_string(&evaluate(request, now_seconds))
+    if !request.as_of.is_finite() {
+        return Err(PyValueError::new_err(
+            "as_of must be a finite Unix timestamp",
+        ));
+    }
+    let as_of = request.as_of;
+    serde_json::to_string(&evaluate(request, as_of))
         .map_err(|error| PyValueError::new_err(format!("could not encode signals: {error}")))
 }
 
@@ -944,13 +989,17 @@ mod tests {
             probability,
             source: source.to_string(),
             observed_at: now,
+            timestamp_trusted: true,
             bid: Some(probability - 0.01),
             ask: Some(probability + 0.01),
             source_weight: Some(1.0),
             is_exchange: Some(true), // exchange-mid: no multiplicative devig in tests
             decimal_odds: None,
             liquidity: None,
-            ask_size: None,
+            ask_size: Some(100.0),
+            depth_complete: true,
+            fee_metadata_known: true,
+            accepting_orders: true,
             point: None,
             side: None,
         }
@@ -966,6 +1015,7 @@ mod tests {
         sport: Option<String>,
     ) -> EvaluateRequest {
         EvaluateRequest {
+            as_of: 1_000.0,
             event_id: "e".to_string(),
             confidence_threshold: 50.0,
             edge_threshold: 0.02,
@@ -978,6 +1028,8 @@ mod tests {
             pregame_total: None,
             edge_z: None,
             kelly_fraction: None,
+            enable_independent_model: true,
+            calibrated_markets: vec!["moneyline".to_string()],
         }
     }
 
@@ -987,6 +1039,8 @@ mod tests {
             away_score: away,
             observed_at: at,
             fraction_remaining: Some(frac),
+            timestamp_trusted: true,
+            state_valid: true,
         }
     }
 
@@ -1158,8 +1212,8 @@ mod tests {
             .unwrap();
         // EV per stake = fair/executable - 1 = 0.60/0.55 - 1 ~ 0.0909.
         assert!((home.ev_per_stake - (0.60 / 0.55 - 1.0)).abs() < 0.02);
-        // Consensus is unanimous (dispersion 0) so required edge == base 0.02.
-        assert!((home.required_edge - 0.02).abs() < 1e-6);
+        // Even unanimous sources retain the 1.5pp calibration floor.
+        assert!((home.required_edge - 0.035).abs() < 1e-6);
         assert!(home.kelly_fraction > 0.0 && home.kelly_fraction < 0.25);
         assert_eq!(home.fillable_size, Some(1234.0));
         assert_eq!(home.action, "PAPER_BET");

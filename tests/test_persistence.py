@@ -140,10 +140,12 @@ def test_account_book_places_dedupes_settles_and_lists_every_account(tmp_path):
         book.close()
 
 
-def test_history_sqlite_roundtrip_and_quote_throttle(tmp_path):
+def test_history_sqlite_roundtrip_is_lossless(tmp_path):
     history = HistoryDB(str(tmp_path / "history.db"))
     event = Event(name="Celtics at Knicks", sport="basketball", home="Knicks", away="Celtics")
-    quote = Quote(event.id, "moneyline", "Knicks", 0.55, "Pinnacle")
+    quote = Quote(event.id, "moneyline", "Knicks", 0.55, "Pinnacle",
+                  provider_event_id="provider-game", provider_market_id="main",
+                  condition_id="condition", outcome_id="home")
     state = GameState(event.id, 60, 55, "3", "08:00", "test", status="in_progress")
     try:
         history.log_quotes([quote])
@@ -153,7 +155,7 @@ def test_history_sqlite_roundtrip_and_quote_throttle(tmp_path):
         history.log_outcome(event, -3.0, 221.5, state)
 
         rows = history.get_event_history(event.id)
-        assert len(rows["quotes"]) == 1
+        assert len(rows["quotes"]) == 2
         assert rows["quotes"][0]["probability"] == pytest.approx(0.55)
         assert len(rows["states"]) == 1
         assert rows["states"][0]["home_score"] == pytest.approx(60)

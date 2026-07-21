@@ -7,6 +7,7 @@ from app.models import Quote
 def login(client):
     response = client.post("/api/login", data={"username": "admin", "password": "admin"})
     assert response.status_code == 200
+    client.headers.update({"X-CSRF-Token": response.json()["csrf_token"]})
 
 
 def create_manual_event(client):
@@ -33,12 +34,13 @@ def test_registered_event_can_be_removed():
 def test_dashboard_contains_merged_ui_behaviors():
     with TestClient(app) as client:
         html = client.get("/").text
-        assert "data-remove-event" in html
-        assert "details[open][data-detail-key]" in html
+        javascript = client.get("/static/index.js").text
+        assert "data-remove-event" in javascript
+        assert "details[open][data-detail-key]" in javascript
         assert "Paste Polymarket link" in html
-        assert "data-save-position" in html
-        assert "Signal quality" in html
-        assert "Edge buffer" in html or "edge_buffer" in html
+        assert "data-save-position" in javascript
+        assert "Signal quality" in javascript
+        assert "Edge buffer" in javascript or "edge_buffer" in javascript
 
 
 def test_position_can_be_saved_and_removed_for_a_visible_selection():

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import threading
 import time
+import hashlib
 from typing import Iterable
 
 from .database import Database
@@ -65,6 +66,64 @@ CREATE TABLE IF NOT EXISTS positions (
 );
 """
 
+_SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS decision_marks (
+    decision_hash TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    market TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    as_of DOUBLE PRECISION NOT NULL,
+    consensus_probability DOUBLE PRECISION,
+    executable_probability DOUBLE PRECISION,
+    gross_edge DOUBLE PRECISION,
+    net_ev_per_stake DOUBLE PRECISION,
+    policy_action TEXT NOT NULL,
+    reasons TEXT NOT NULL,
+    PRIMARY KEY(decision_hash, market, outcome)
+);
+CREATE TABLE IF NOT EXISTS paper_orders (
+    order_id TEXT PRIMARY KEY,
+    decision_hash TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    market TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    requested_cash DOUBLE PRECISION NOT NULL,
+    status TEXT NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL,
+    updated_at DOUBLE PRECISION NOT NULL,
+    UNIQUE(event_id, market, outcome)
+);
+CREATE TABLE IF NOT EXISTS paper_fills (
+    fill_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL,
+    filled_cash DOUBLE PRECISION NOT NULL,
+    filled_shares DOUBLE PRECISION NOT NULL,
+    effective_price DOUBLE PRECISION NOT NULL,
+    fee DOUBLE PRECISION NOT NULL,
+    filled_at DOUBLE PRECISION NOT NULL
+);
+CREATE TABLE IF NOT EXISTS close_marks (
+    event_id TEXT NOT NULL,
+    market TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    executable_probability DOUBLE PRECISION NOT NULL,
+    consensus_probability DOUBLE PRECISION,
+    observed_at DOUBLE PRECISION NOT NULL,
+    decision_hash TEXT NOT NULL,
+    finalized_at DOUBLE PRECISION,
+    PRIMARY KEY(event_id, market, outcome)
+);
+CREATE TABLE IF NOT EXISTS settlement_marks (
+    event_id TEXT NOT NULL,
+    market TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    result DOUBLE PRECISION,
+    status TEXT NOT NULL,
+    settled_at DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY(event_id, market, outcome)
+);
+"""
+
 _MONEYLINE_MARKETS = {"moneyline", "h2h", "winner"}
 
 
@@ -84,7 +143,31 @@ class Ledger:
         self._conn = self._db.connection
         self._lock = threading.Lock()
         with self._lock:
-            self._db.initialize(_SCHEMA)
+            self._db.initialize(_SCHEMA, component="ledger", version=1)
+            self._db.initialize(_SCHEMA_V2, component="ledger", version=2)
+            self._db.migrate_columns("ledger", 3, {
+                "bets": {
+                    "decision_hash": "TEXT",
+                    "closing_executable": "DOUBLE PRECISION",
+                },
+            })
+            self._db.migrate_columns("ledger", 4, {
+                "decision_marks": {
+                    "decision_id": "TEXT",
+                    "engine_version": "TEXT",
+                    "configuration_hash": "TEXT",
+                    "source_mapping_version": "TEXT",
+                    "model_version": "TEXT",
+                    "calibration_version": "TEXT",
+                    "execution_policy_version": "TEXT",
+                    "input_snapshot_json": "TEXT",
+                    "token_id": "TEXT",
+                    "order_book_snapshot_id": "TEXT",
+                    "requested_cash": "DOUBLE PRECISION",
+                    "execution_vwap": "DOUBLE PRECISION",
+                    "execution_fee": "DOUBLE PRECISION",
+                },
+            })
 
     def close(self) -> None:
         with self._lock:
@@ -92,60 +175,146 @@ class Ledger:
 
     def record_signals(self, event: Event, signals: Iterable[Signal]) -> int:
         """Log the entry snapshot of every PAPER_BET, once per selection."""
-        now = _now()
+        signals = list(signals)
+        signal_by_selection = {(signal.market, signal.outcome): signal for signal in signals}
+        now = max((signal.observed_at.timestamp() for signal in signals), default=_now())
         rows = [
             (
                 event.id, event.name, event.sport, s.market, s.outcome, s.quote_source,
                 now, s.market_probability, s.market_fair_prob, s.edge, s.confidence,
-                s.devig_method, s.overround, s.n_reference_sources,
+                s.devig_method, s.overround, s.n_reference_sources, s.decision_hash,
             )
             for s in signals
             if s.action == "PAPER_BET"
+            and (s.requested_cash is None or s.requested_cash > 0)
+            and (s.filled_shares is None or s.filled_shares > 0)
         ]
-        if not rows:
-            return 0
         with self._lock:
             inserted = 0
             with self._db.transaction() as cur:
+                invalid_close_markers = (
+                    "stale", "untrusted", "future", "not accepting",
+                    "depth unavailable", "fee metadata unavailable",
+                )
+                for signal in signals:
+                    self._db.execute(
+                        cur,
+                        """INSERT INTO decision_marks
+                           (decision_hash, event_id, market, outcome, as_of,
+                            consensus_probability, executable_probability, gross_edge,
+                            net_ev_per_stake, policy_action, reasons, decision_id,
+                            engine_version, configuration_hash, source_mapping_version,
+                            model_version, calibration_version, execution_policy_version,
+                            input_snapshot_json, token_id, order_book_snapshot_id,
+                            requested_cash, execution_vwap, execution_fee)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                                   %s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT(decision_hash, market, outcome) DO NOTHING""",
+                        (signal.decision_hash, event.id, signal.market, signal.outcome,
+                         signal.observed_at.timestamp(), signal.consensus_probability,
+                         signal.market_probability, signal.edge, signal.ev_per_stake,
+                         signal.action, "\n".join(signal.reasons), signal.decision_id,
+                         signal.engine_version, signal.configuration_hash,
+                         signal.source_mapping_version, signal.model_version,
+                         signal.calibration_version, signal.execution_policy_version,
+                         signal.input_snapshot_json, signal.token_id,
+                         signal.order_book_snapshot_id, signal.requested_cash,
+                         signal.execution_vwap, signal.execution_fee),
+                    )
+                    reasons = " ".join(signal.reasons).casefold()
+                    if (signal.market_probability > 0
+                            and not any(marker in reasons for marker in invalid_close_markers)):
+                        self._db.execute(
+                            cur,
+                            """INSERT INTO close_marks
+                               (event_id, market, outcome, executable_probability,
+                                consensus_probability, observed_at, decision_hash)
+                               VALUES (%s,%s,%s,%s,%s,%s,%s)
+                               ON CONFLICT(event_id, market, outcome) DO UPDATE SET
+                                 executable_probability=EXCLUDED.executable_probability,
+                                 consensus_probability=EXCLUDED.consensus_probability,
+                                 observed_at=EXCLUDED.observed_at,
+                                 decision_hash=EXCLUDED.decision_hash
+                               WHERE EXCLUDED.observed_at >= close_marks.observed_at
+                                 AND close_marks.finalized_at IS NULL""",
+                            (event.id, signal.market, signal.outcome,
+                             signal.market_probability, signal.consensus_probability,
+                             signal.observed_at.timestamp(), signal.decision_hash),
+                        )
                 for row in rows:
                     self._db.execute(
                         cur,
                         """INSERT INTO bets
                            (event_id, event_name, sport, market, outcome, quote_source,
                             entry_ts, entry_executable, entry_fair_prob, entry_edge,
-                            confidence, devig_method, overround, n_reference_sources)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            confidence, devig_method, overround, n_reference_sources,
+                            decision_hash)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                            ON CONFLICT (event_id, market, outcome) DO NOTHING""",
                         row,
                     )
                     inserted += max(cur.rowcount, 0)
+                    if cur.rowcount:
+                        signal = signal_by_selection[(row[3], row[4])]
+                        order_id = hashlib.sha256(
+                            f"{row[14]}:{row[3]}:{row[4]}".encode("utf-8")
+                        ).hexdigest()
+                        requested_cash = signal.requested_cash or 100.0
+                        filled_cash = signal.filled_cash or requested_cash
+                        filled_shares = signal.filled_shares or (
+                            (filled_cash / row[7]) if row[7] else 0.0)
+                        self._db.execute(
+                            cur,
+                            """INSERT INTO paper_orders
+                               (order_id, decision_hash, event_id, market, outcome,
+                                requested_cash, status, created_at, updated_at)
+                               VALUES (%s,%s,%s,%s,%s,%s,'filled',%s,%s)
+                               ON CONFLICT(event_id, market, outcome) DO NOTHING""",
+                            (order_id, row[14], event.id, row[3], row[4],
+                             requested_cash, now, now),
+                        )
+                        self._db.execute(
+                            cur,
+                            """INSERT INTO paper_fills
+                               (fill_id, order_id, filled_cash, filled_shares,
+                                effective_price, fee, filled_at)
+                               VALUES (%s,%s,%s,%s,%s,%s,%s)
+                               ON CONFLICT(fill_id) DO NOTHING""",
+                            (hashlib.sha256(f"fill:{order_id}".encode()).hexdigest(),
+                             order_id, filled_cash, filled_shares,
+                             row[7], signal.execution_fee or 0.0, now),
+                        )
             return inserted
 
-    def snapshot_closing(self, event_id: str, fair_by_selection: dict[tuple[str, str], float]) -> None:
-        """Record the closing consensus fair and compute CLV for open bets."""
-        if not fair_by_selection:
-            return
+    def snapshot_closing(self, event_id: str,
+                         fair_by_selection: dict[tuple[str, str], float] | None = None) -> None:
+        """Freeze the last pre-suspension mark and compute executable-price CLV."""
         now = _now()
         with self._lock:
             with self._db.transaction() as cur:
-                for (market, outcome), fair in fair_by_selection.items():
-                    self._db.execute(
-                        cur,
-                        """INSERT INTO closing_lines (event_id, market, outcome, closing_fair_prob, closing_ts)
-                           VALUES (%s,%s,%s,%s,%s)
-                           ON CONFLICT(event_id, market, outcome)
-                           DO UPDATE SET closing_fair_prob=EXCLUDED.closing_fair_prob,
-                                         closing_ts=EXCLUDED.closing_ts""",
-                        (event_id, market, outcome, fair, now),
-                    )
-                    # CLV = closing fair prob - the price we entered at. Only set once.
-                    self._db.execute(
-                        cur,
-                        """UPDATE bets
-                           SET closing_fair_prob=%s, clv=%s - entry_executable, closing_ts=%s
-                           WHERE event_id=%s AND market=%s AND outcome=%s AND closing_fair_prob IS NULL""",
-                        (fair, fair, now, event_id, market, outcome),
-                    )
+                self._db.execute(
+                    cur, "UPDATE close_marks SET finalized_at=%s "
+                         "WHERE event_id=%s AND finalized_at IS NULL", (now, event_id))
+                self._db.execute(
+                    cur,
+                    """UPDATE bets SET
+                         closing_executable=(SELECT executable_probability FROM close_marks c
+                           WHERE c.event_id=bets.event_id AND c.market=bets.market
+                             AND c.outcome=bets.outcome),
+                         closing_fair_prob=(SELECT consensus_probability FROM close_marks c
+                           WHERE c.event_id=bets.event_id AND c.market=bets.market
+                             AND c.outcome=bets.outcome),
+                         clv=(SELECT executable_probability FROM close_marks c
+                           WHERE c.event_id=bets.event_id AND c.market=bets.market
+                             AND c.outcome=bets.outcome) - entry_executable,
+                         closing_ts=(SELECT observed_at FROM close_marks c
+                           WHERE c.event_id=bets.event_id AND c.market=bets.market
+                             AND c.outcome=bets.outcome)
+                       WHERE event_id=%s AND closing_ts IS NULL
+                         AND EXISTS (SELECT 1 FROM close_marks c WHERE c.event_id=bets.event_id
+                           AND c.market=bets.market AND c.outcome=bets.outcome)""",
+                    (event_id,),
+                )
 
     def settle_moneyline(self, event_id: str, winner_labels: set[str]) -> None:
         """Settle moneyline-style bets from the final result (win=1, loss=0)."""
@@ -171,6 +340,40 @@ class Ledger:
                         "UPDATE bets SET settled_result=%s, settled_ts=%s WHERE id=%s",
                         updates,
                     )
+                    for result, settled_at, bet_id in updates:
+                        self._db.execute(
+                            cur,
+                            """INSERT INTO settlement_marks
+                               (event_id, market, outcome, result, status, settled_at)
+                               SELECT event_id, market, outcome, %s, 'settled', %s
+                               FROM bets WHERE id=%s
+                               ON CONFLICT(event_id, market, outcome) DO NOTHING""",
+                            (result, settled_at, bet_id),
+                        )
+
+    def void_event(self, event_id: str, *, status: str = "void") -> None:
+        """Record an idempotent non-result settlement without inventing a loss."""
+        if status not in {"void", "canceled", "abandoned", "ungradeable"}:
+            raise ValueError("unsupported void status")
+        now = _now()
+        with self._lock:
+            with self._db.transaction() as cur:
+                self._db.execute(
+                    cur,
+                    """INSERT INTO settlement_marks
+                       (event_id, market, outcome, result, status, settled_at)
+                       SELECT event_id, market, outcome, NULL, %s, %s
+                       FROM bets WHERE event_id=%s
+                       ON CONFLICT(event_id, market, outcome) DO UPDATE SET
+                         result=NULL, status=EXCLUDED.status,
+                         settled_at=EXCLUDED.settled_at""",
+                    (status, now, event_id),
+                )
+                self._db.execute(
+                    cur,
+                    "UPDATE paper_orders SET status=%s, updated_at=%s WHERE event_id=%s",
+                    (status, now, event_id),
+                )
 
     def all_bets(self) -> list[dict]:
         with self._lock:

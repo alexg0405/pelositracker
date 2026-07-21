@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from app import actionnetwork
 from app.advice import market_views
 from app.engine import SignalEngine
@@ -6,28 +8,44 @@ from app.pinnacle import _parse_pinnacle_quotes
 from app.sources import _polymarket_token_meta, _quote_from_book, odds_api_quotes
 
 
+NOW = datetime.now(timezone.utc)
+
+
+_SignalEngine = SignalEngine
+
+
+class SignalEngine(_SignalEngine):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.calibrated_markets = {
+            "moneyline", "spread", "total",
+            "jalen brunson — points", "karl-anthony towns — rebounds",
+        }
+
+
 def event():
     return Event("Dodgers vs Yankees", "baseball", "New York Yankees", "Los Angeles Dodgers")
 
 
 def book(bid, ask):
     return {
+        "timestamp": str(int(NOW.timestamp() * 1000)),
         "bids": [{"price": str(bid), "size": "200"}],
-        "asks": [{"price": str(ask), "size": "150"}],
+        "asks": [{"price": str(ask), "size": "1000"}],
     }
 
 
 def reference_quotes(ev):
     actionnetwork._book_map.clear()
     actionnetwork._book_map[1] = "Bookmaker"
-    action = actionnetwork.parse_action_quotes(ev, {"odds": [{
+    action = actionnetwork.parse_action_quotes(ev, {"last_updated": NOW.isoformat(), "odds": [{
         "type": "game", "book_id": 1,
         "ml_home": -140, "ml_away": 120,
         "spread_home": -1.5, "spread_home_line": -140,
         "spread_away": 1.5, "spread_away_line": 120,
         "total": 8.5, "over": -135, "under": 115,
     }]})
-    pinnacle = _parse_pinnacle_quotes(ev, {}, [
+    pinnacle = _parse_pinnacle_quotes(ev, {"updatedAt": NOW.isoformat()}, [
         {"type": "spread", "key": "s;0;m", "prices": [
             {"designation": "home", "price": -145, "points": -1.5},
             {"designation": "away", "price": 125, "points": 1.5},
@@ -43,14 +61,14 @@ def reference_quotes(ev):
 def polymarket_quotes(ev):
     metadata = _polymarket_token_meta({"markets": [
         {
-            "active": True, "closed": False, "enableOrderBook": True,
+            "active": True, "closed": False, "enableOrderBook": True, "feesEnabled": False,
             "acceptingOrders": True, "sportsMarketType": "spreads", "line": -1.5,
             "question": "Spread: New York Yankees (-1.5)",
             "outcomes": '["New York Yankees", "Los Angeles Dodgers"]',
             "clobTokenIds": '["poly-spread-home", "poly-spread-away"]',
         },
         {
-            "active": True, "closed": False, "enableOrderBook": True,
+            "active": True, "closed": False, "enableOrderBook": True, "feesEnabled": False,
             "acceptingOrders": True, "sportsMarketType": "totals", "line": 8.5,
             "question": "Los Angeles Dodgers vs. New York Yankees: O/U 8.5",
             "outcomes": '["Over", "Under"]',
@@ -70,7 +88,8 @@ def test_cross_provider_spread_and_total_edges_reach_actionable_cards():
     poly = polymarket_quotes(ev)
     quotes = poly + reference_quotes(ev)
     signals = SignalEngine(confidence_threshold=0, edge_threshold=0, edge_z=0).evaluate(
-        ev.id, quotes, [], away_outcome=ev.away, home_outcome=ev.home, sport=ev.sport
+        ev.id, quotes, [], away_outcome=ev.away, home_outcome=ev.home, sport=ev.sport,
+        as_of=NOW
     )
 
     spread = next(signal for signal in signals if signal.outcome == "New York Yankees -1.5")
@@ -87,10 +106,10 @@ def test_cross_provider_spread_and_total_edges_reach_actionable_cards():
 
 def test_polymarket_alternate_lines_keep_distinct_selection_identities():
     meta = _polymarket_token_meta({"markets": [
-        {"active": True, "closed": False, "enableOrderBook": True, "acceptingOrders": True,
+        {"active": True, "closed": False, "enableOrderBook": True, "acceptingOrders": True, "feesEnabled": False,
          "sportsMarketType": "totals", "line": 7.5, "question": "O/U 7.5",
          "outcomes": '["Over", "Under"]', "clobTokenIds": '["o75", "u75"]'},
-        {"active": True, "closed": False, "enableOrderBook": True, "acceptingOrders": True,
+        {"active": True, "closed": False, "enableOrderBook": True, "acceptingOrders": True, "feesEnabled": False,
          "sportsMarketType": "totals", "line": 8.5, "question": "O/U 8.5",
          "outcomes": '["Over", "Under"]', "clobTokenIds": '["o85", "u85"]'},
     ]})
@@ -102,16 +121,16 @@ def test_polymarket_alternate_lines_keep_distinct_selection_identities():
 def test_gamma_three_condition_soccer_moneyline_joins_complete_three_way_books():
     ev = Event("AFC Bournemouth vs Arsenal FC", "soccer", "Arsenal FC", "AFC Bournemouth")
     metadata = _polymarket_token_meta({"markets": [
-        {"active": True, "closed": False, "enableOrderBook": True,
+        {"active": True, "closed": False, "enableOrderBook": True, "feesEnabled": False,
          "acceptingOrders": True, "sportsMarketType": "moneyline",
          "question": "Will AFC Bournemouth win?", "groupItemTitle": "AFC Bournemouth",
          "outcomes": '["Yes", "No"]', "clobTokenIds": '["bou-yes", "bou-no"]'},
-        {"active": True, "closed": False, "enableOrderBook": True,
+        {"active": True, "closed": False, "enableOrderBook": True, "feesEnabled": False,
          "acceptingOrders": True, "sportsMarketType": "moneyline",
          "question": "Will AFC Bournemouth vs. Arsenal FC end in a draw?",
          "groupItemTitle": "Draw (AFC Bournemouth vs. Arsenal FC)",
          "outcomes": '["Yes", "No"]', "clobTokenIds": '["draw-yes", "draw-no"]'},
-        {"active": True, "closed": False, "enableOrderBook": True,
+        {"active": True, "closed": False, "enableOrderBook": True, "feesEnabled": False,
          "acceptingOrders": True, "sportsMarketType": "moneyline",
          "question": "Will Arsenal FC win?", "groupItemTitle": "Arsenal FC",
          "outcomes": '["Yes", "No"]', "clobTokenIds": '["ars-yes", "ars-no"]'},
@@ -126,11 +145,11 @@ def test_gamma_three_condition_soccer_moneyline_joins_complete_three_way_books()
 
     actionnetwork._book_map.clear()
     actionnetwork._book_map[1] = "Bookmaker"
-    action = actionnetwork.parse_action_quotes(ev, {"odds": [{
+    action = actionnetwork.parse_action_quotes(ev, {"last_updated": NOW.isoformat(), "odds": [{
         "type": "game", "book_id": 1,
         "ml_home": -125, "ml_away": 300, "ml_draw": 300,
     }]})
-    pinnacle = _parse_pinnacle_quotes(ev, {}, [{
+    pinnacle = _parse_pinnacle_quotes(ev, {"updatedAt": NOW.isoformat()}, [{
         "type": "moneyline", "key": "s;0;m", "prices": [
             {"designation": "home", "price": -120},
             {"designation": "away", "price": 310},
@@ -138,7 +157,8 @@ def test_gamma_three_condition_soccer_moneyline_joins_complete_three_way_books()
         ],
     }])
     signals = SignalEngine(confidence_threshold=0, edge_threshold=0, edge_z=0).evaluate(
-        ev.id, poly + action + pinnacle, [], away_outcome=ev.away, home_outcome=ev.home
+        ev.id, poly + action + pinnacle, [], away_outcome=ev.away, home_outcome=ev.home,
+        as_of=NOW
     )
 
     affirmative = [signal for signal in signals
@@ -158,12 +178,12 @@ def test_gamma_player_props_join_odds_api_without_cross_player_or_line_collapse(
     ev = Event("Celtics vs Knicks", "basketball", "New York Knicks", "Boston Celtics",
                odds_api_event_id="game")
     metadata = _polymarket_token_meta({"markets": [
-        {"active": True, "closed": False, "enableOrderBook": True,
+        {"active": True, "closed": False, "enableOrderBook": True, "feesEnabled": False,
          "acceptingOrders": True, "sportsMarketType": "points", "line": 25.5,
          "question": "Jalen Brunson: Points O/U 25.5",
          "groupItemTitle": "Jalen Brunson: Points O/U 25.5",
          "outcomes": '["Yes", "No"]', "clobTokenIds": '["jb-o", "jb-u"]'},
-        {"active": True, "closed": False, "enableOrderBook": True,
+        {"active": True, "closed": False, "enableOrderBook": True, "feesEnabled": False,
          "acceptingOrders": True, "sportsMarketType": "rebounds", "line": 11.5,
          "question": "Karl-Anthony Towns: Rebounds O/U 11.5",
          "groupItemTitle": "Karl-Anthony Towns: Rebounds O/U 11.5",
@@ -188,12 +208,15 @@ def test_gamma_player_props_join_odds_api_without_cross_player_or_line_collapse(
     references = odds_api_quotes(ev, {
         "id": "game", "home_team": ev.home, "away_team": ev.away,
         "bookmakers": [
-            {"title": "Pinnacle", "markets": markets},
-            {"title": "Bookmaker", "markets": markets},
+            {"key": "pinnacle", "title": "Pinnacle", "last_update": NOW.isoformat(),
+             "markets": markets},
+            {"key": "bookmaker", "title": "Bookmaker", "last_update": NOW.isoformat(),
+             "markets": markets},
         ],
     })
     signals = SignalEngine(confidence_threshold=0, edge_threshold=0, edge_z=0).evaluate(
-        ev.id, poly + references, [], away_outcome=ev.away, home_outcome=ev.home
+        ev.id, poly + references, [], away_outcome=ev.away, home_outcome=ev.home,
+        as_of=NOW
     )
     matched = [signal for signal in signals if signal.quote_source == "Polymarket"
                and signal.n_reference_sources]

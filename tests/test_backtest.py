@@ -1,4 +1,5 @@
 import math
+from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -51,13 +52,18 @@ def test_ledger_roundtrip_clv_and_settlement(tmp_path):
         assert ledger.record_signals(event, [sig]) == 1
         assert ledger.record_signals(event, [sig]) == 0  # deduped per selection
 
-        ledger.snapshot_closing(event.id, {("moneyline", "home"): 0.62})
+        close = paper_signal("home", 0.63, 0.62, 0.01)
+        close.action = "WATCH"
+        close.observed_at = sig.observed_at + timedelta(seconds=1)
+        close.decision_hash = "close-mark"
+        ledger.record_signals(event, [close])
+        ledger.snapshot_closing(event.id)
         ledger.settle_moneyline(event.id, {"home", event.home})
 
         rows = ledger.all_bets()
         assert len(rows) == 1
         row = rows[0]
-        assert row["clv"] == pytest.approx(0.62 - 0.55)     # closing fair - entry price
+        assert row["clv"] == pytest.approx(0.62 - 0.55)     # close executable - entry
         assert row["settled_result"] == 1.0                 # Hawks (home) won
         assert row["devig_method"] == "shin"
 
@@ -101,6 +107,25 @@ def test_empty_winner_set_settles_nothing(tmp_path):
                    overround=1.05, n_reference_sources=2),
         ])
         ledger.settle_moneyline(event.id, set())  # unknown result must not mis-settle
+        assert ledger.all_bets()[0]["settled_result"] is None
+    finally:
+        ledger.close()
+
+
+def test_canceled_event_records_void_without_inventing_a_result(tmp_path):
+    ledger = Ledger(str(tmp_path / "void.db"))
+    try:
+        event = Event(name="A vs B", sport="basketball", home="A", away="B")
+        ledger.record_signals(event, [paper_signal("A", 0.55, 0.50, 0.05)])
+        ledger.void_event(event.id, status="canceled")
+        ledger.void_event(event.id, status="canceled")
+        with ledger._db.cursor(dict_rows=True) as cur:
+            ledger._db.execute(
+                cur, "SELECT result, status FROM settlement_marks WHERE event_id=%s",
+                (event.id,),
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+        assert rows == [{"result": None, "status": "canceled"}]
         assert ledger.all_bets()[0]["settled_result"] is None
     finally:
         ledger.close()

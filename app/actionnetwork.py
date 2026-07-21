@@ -1,12 +1,14 @@
 import asyncio
 import logging
 import re as _re
+from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 import httpx
 
 from .models import Event, Quote
 from .matching import best_team_pair_match
+from .domain.time import parse_provider_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +68,8 @@ def parse_action_quotes(event: Event, game: dict) -> list[Quote]:
 
         book_id = odds.get("book_id")
         book_name = _book_map.get(book_id)
-        if not book_name: continue
+        if not book_name:
+            continue
         
         source = _clean_book_name(book_name)
         if "consensus" in source or "open" in source:
@@ -149,6 +152,17 @@ def parse_action_quotes(event: Event, game: dict) -> list[Quote]:
                     probability=implied_probability(under_line),
                     source=source,
                 ))
+    raw_time = game.get("last_updated") or game.get("updated_at") or game.get("timestamp")
+    try:
+        provider_time = parse_provider_timestamp(raw_time)
+    except (TypeError, ValueError, OverflowError):
+        provider_time = None
+    processed_at = datetime.now(timezone.utc)
+    for quote in quotes:
+        quote.provider_timestamp = provider_time
+        quote.observed_at = provider_time or quote.received_at
+        quote.processed_at = processed_at
+        quote.timestamp_trusted = provider_time is not None
     return quotes
 
 def match_game(event: Event, games: list[dict]) -> dict | None:
@@ -185,7 +199,8 @@ async def _action_network_once(event: Event, client: httpx.AsyncClient,
             await emit(quotes)
 
 async def action_network_poll(event: Event, emit: Callable[[list[Quote]], Awaitable[None]]):
-    if not event.odds_api_sport: return
+    if not event.odds_api_sport:
+        return
 
     async with httpx.AsyncClient() as client:
         while True:
