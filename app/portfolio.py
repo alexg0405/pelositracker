@@ -30,7 +30,7 @@ class Candidate:
 def joint_kelly_stakes(
     candidates: list[Candidate], bankroll: float, *,
     kelly_multiplier: float = 1.0, max_total_fraction: float = 1.0,
-    draws: int = 2000, seed: int = 0, iterations: int = 600, learning_rate: float = 0.5,
+    draws: int = 1500, seed: int = 0, iterations: int = 400, learning_rate: float = 0.5,
 ) -> list[float]:
     """Return the per-candidate stake in dollars that (approximately) maximizes
     fractional expected log wealth over simulated joint outcomes.

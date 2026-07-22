@@ -46,9 +46,17 @@ def test_prematch_rates_round_trip():
     assert draw == pytest.approx(p_draw, abs=0.02)
 
 
-def test_prematch_rates_rejects_impossible_priors():
-    assert prematch_rates(0.6, 0.5) is None   # home + draw >= 1
+def test_prematch_rates_rejects_degenerate_probabilities():
     assert prematch_rates(0.0, 0.3) is None    # degenerate home prob
+    assert prematch_rates(0.6, 1.0) is None    # degenerate draw prob
+
+
+def test_prematch_rates_normalizes_incoherent_independent_legs():
+    # Independent 1X2 binaries can sum past 1; the model renormalizes instead of
+    # refusing to price the match.
+    rates = prematch_rates(0.6, 0.5)
+    assert rates is not None
+    assert all(rate > 0 for rate in rates)
 
 
 def test_band_is_ordered_and_collapses_at_full_time():

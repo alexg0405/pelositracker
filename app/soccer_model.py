@@ -62,8 +62,14 @@ def prematch_rates(p_home: float, p_draw: float) -> tuple[float, float] | None:
     rates ``(lam_home, lam_away)``. Returns None if the inputs are not a usable
     two-of-three 1X2 prior. A coarse grid then a local refine keeps it robust
     without an external solver; it runs once per match and is then cached."""
-    if not (0.0 < p_home < 1.0 and 0.0 < p_draw < 1.0) or p_home + p_draw >= 1.0:
+    if not (0.0 < p_home < 1.0 and 0.0 < p_draw < 1.0):
         return None
+    # Polymarket 1X2 legs are independent binaries and need not sum to 1. If the
+    # implied away probability is non-positive, renormalize home+draw so it has
+    # mass and the fit is well-posed (rather than refusing to price the match).
+    if p_home + p_draw >= 0.999:
+        scale = 0.98 / (p_home + p_draw)
+        p_home, p_draw = p_home * scale, p_draw * scale
 
     def error(lam_h: float, lam_a: float) -> float:
         home, draw, _ = result_probabilities(lam_h, lam_a, 0, 0, 1.0)
@@ -80,9 +86,9 @@ def prematch_rates(p_home: float, p_draw: float) -> tuple[float, float] | None:
                     best, best_err = (lam_h, lam_a), err
         return best
 
-    lam_h, lam_a = search(0.1, 4.5, 0.1, 4.5, 30)
-    lam_h, lam_a = search(max(0.05, lam_h - 0.2), lam_h + 0.2,
-                          max(0.05, lam_a - 0.2), lam_a + 0.2, 20)
+    lam_h, lam_a = search(0.1, 6.0, 0.1, 6.0, 32)
+    lam_h, lam_a = search(max(0.05, lam_h - 0.25), lam_h + 0.25,
+                          max(0.05, lam_a - 0.25), lam_a + 0.25, 20)
     return lam_h, lam_a
 
 
