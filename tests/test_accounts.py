@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from app.accounts import AccountBook, Strategy, qualification_failures, qualifies, stake_for
@@ -209,6 +211,45 @@ def test_portfolio_kelly_flag_places_and_respects_the_base_cap(tmp_path):
     # Joint-Kelly sizing never exceeds the strategy's base stake ($50 flat).
     assert 0.0 < rows[0]["stake"] <= 50.0 + 1e-6
     assert rows[0]["edge"] == pytest.approx(0.10, abs=1e-6)
+
+
+def _stale_quote(event, *, seconds_old):
+    ts = datetime.now(timezone.utc) - timedelta(seconds=seconds_old)
+    return Quote(event.id, "moneyline", "Alcaraz", 0.50, "Polymarket", token_id="token-home",
+                 ask=.50, bid=.48, ask_levels=((.50, 10_000.0),), bid_levels=((.48, 10_000.0),),
+                 depth_complete=True, fee_rate=0.0, provider_timestamp=ts)
+
+
+def test_model_bet_skips_a_provably_stale_quote(tmp_path):
+    book, event, signal, _ = _tennis_setup(tmp_path / "stale.db", "tennis-stale")
+    quote = _stale_quote(event, seconds_old=600)
+    now = datetime.now(timezone.utc)
+    try:
+        blocked = book.place(event, [signal], [quote], as_of=now,
+                             model_probabilities={"token-home": 0.60},
+                             max_quote_age_seconds=120)
+        allowed = book.place(event, [signal], [quote], as_of=now,
+                             model_probabilities={"token-home": 0.60},
+                             max_quote_age_seconds=0)
+    finally:
+        book.close()
+    assert blocked == []          # 600s-old quote rejected at a 120s limit
+    assert len(allowed) == 1      # same quote trades when the check is disabled
+
+
+def test_model_backed_tennis_bet_places_then_settles_as_a_win(tmp_path):
+    book, event, signal, quote = _tennis_setup(tmp_path / "life.db", "tennis-life")
+    try:
+        placed = book.place(event, [signal], [quote], model_probabilities={"token-home": 0.60})
+        assert len(placed) == 1
+        # Alcaraz (home) wins the match; settle by set count 2-0.
+        settled = book.settle(event, 2.0, 0.0)
+        rows = book.account_bets("tennis")
+    finally:
+        book.close()
+    assert settled == 1
+    assert rows[0]["status"] == "win"
+    assert rows[0]["pnl"] > 0
 
 
 def test_validated_polymarket_signal_qualifies_and_depth_caps_stake():

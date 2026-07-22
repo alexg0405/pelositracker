@@ -658,6 +658,7 @@ async def record(event_id: str, *, as_of: datetime | None = None) -> None:
                     model_uncertainty=model_uncertainty,
                     edge_uncertainty_z=settings.edge_uncertainty_z,
                     portfolio_kelly=settings.enable_portfolio_kelly,
+                    max_quote_age_seconds=settings.max_data_age_seconds,
                 )
                 for paper_event in placed_bets:
                     if paper_event.get("webhook_url"):

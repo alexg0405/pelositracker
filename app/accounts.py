@@ -325,6 +325,19 @@ def _book_levels(values: tuple[tuple[float, float], ...]) -> list[BookLevel]:
         return []
 
 
+def _quote_is_stale(quote: Quote, now: float, max_age_seconds: float) -> bool:
+    """True when a quote is provably older than ``max_age_seconds`` (0 disables).
+
+    The odds engine applies a max-age gate to consensus signals, but model-backed
+    bets bypass that gate, so this restores an explicit quote-freshness check for
+    them. Untrusted timestamps are not treated as stale (to avoid rejecting a
+    feed that omits provider time); the book-hash match still ties the simulated
+    fill to the live order book."""
+    if max_age_seconds <= 0 or not quote.timestamp_trusted or quote.provider_timestamp is None:
+        return False
+    return (now - quote.provider_timestamp.timestamp()) > max_age_seconds
+
+
 def _latest_quotes(quotes: list[Quote]) -> dict[str, Quote]:
     latest: dict[str, Quote] = {}
     for quote in quotes:
@@ -539,7 +552,8 @@ class AccountBook:
               model_probabilities: dict[str, float] | None = None,
               model_uncertainty: dict[str, float] | None = None,
               edge_uncertainty_z: float = 0.0,
-              portfolio_kelly: bool = False) -> list[dict]:
+              portfolio_kelly: bool = False,
+              max_quote_age_seconds: float = 0.0) -> list[dict]:
         """Open paper positions only after an exact full-depth simulated fill.
 
         ``allow_uncalibrated`` (opt-in, off by default) additionally admits
@@ -602,6 +616,8 @@ class AccountBook:
                         model_override = model_probabilities.get(signal.token_id)
                         if model_override is not None:
                             if model_backed_failures(strategy, signal):
+                                continue
+                            if _quote_is_stale(quote, now, max_quote_age_seconds):
                                 continue
                         elif not qualifies(strategy, signal,
                                            allow_uncalibrated=allow_uncalibrated):
