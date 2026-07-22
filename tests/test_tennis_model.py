@@ -3,6 +3,7 @@ import pytest
 from app.tennis_model import (
     game_prob_from_prematch,
     match_win_prob,
+    match_win_probability_band,
     parse_tennis_score,
     set_complete,
 )
@@ -79,3 +80,24 @@ def test_parse_tiebreak_pins_current_set_to_six_all():
 def test_parse_rejects_non_tennis_scores():
     assert parse_tennis_score("", "S1") is None
     assert parse_tennis_score("abc", "S1") is None
+
+
+def test_band_is_ordered_and_within_the_unit_interval():
+    low, mid, high = match_win_probability_band(0.6, 0, 0, 0, 0)
+    assert 0.0 < low <= mid <= high < 1.0
+
+
+def test_band_mid_matches_the_point_estimate():
+    low, mid, high = match_win_probability_band(0.62, 0, 0, 0, 0)
+    g = game_prob_from_prematch(0.62)
+    assert mid == pytest.approx(match_win_prob(0, 0, 0, 0, g), abs=1e-9)
+
+
+def test_band_narrows_as_the_match_resolves():
+    low0, _, high0 = match_win_probability_band(0.6, 0, 0, 0, 0)
+    low1, _, high1 = match_win_probability_band(0.6, 1, 0, 4, 2)
+    assert (high1 - low1) < (high0 - low0)
+
+
+def test_band_collapses_once_the_match_is_decided():
+    assert match_win_probability_band(0.6, 2, 0, 0, 0) == (1.0, 1.0, 1.0)

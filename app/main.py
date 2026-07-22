@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from .engine import SignalEngine
 from . import __version__, backtest, shadow_eval
 from .accounts import AccountBook, DEFAULT_STRATEGIES, line_type
-from .tennis_model import game_prob_from_prematch, match_win_prob, parse_tennis_score
+from .tennis_model import match_win_probability_band, parse_tennis_score
 from .diagnostics import edge_health
 from .advice import market_views, position_views
 from .history import HistoryDB
@@ -303,30 +303,39 @@ def _tennis_score_now(event: Event) -> tuple[int, int, int, int] | None:
     return parse_tennis_score(score, period)
 
 
-def _tennis_model_probabilities(event: Event, signals: list) -> dict[str, float]:
-    """Independent in-play win probabilities per Polymarket token for a tennis
-    match: pre-match anchor propagated through the live set/game score. Empty
-    unless the model is enabled, the event is tennis, we captured a clean
-    pre-match anchor, and a live score is available."""
+def _tennis_model_probabilities(
+    event: Event, signals: list
+) -> tuple[dict[str, float], dict[str, float]]:
+    """``(probabilities, uncertainties)`` per Polymarket token for a tennis match.
+
+    ``probabilities`` is the independent in-play win probability (pre-match
+    anchor propagated through the live set/game score). ``uncertainties`` is the
+    one-standard-deviation band half-width from pre-match-probability
+    uncertainty; it narrows as the match resolves and feeds the uncertainty-aware
+    trade gate. Both empty unless the model is enabled, the event is tennis, we
+    captured a clean pre-match anchor, and a live score is available."""
     if not settings.enable_tennis_model or not _is_tennis(event):
-        return {}
+        return {}, {}
     parsed = _tennis_score_now(event)
     if parsed is None:
-        return {}
+        return {}, {}
     p0 = _pregame.get(event.id, {}).get("tennis_p0")
     if p0 is None or not 0 < p0 < 1:
-        return {}
+        return {}, {}
     sets_home, sets_away, games_home, games_away = parsed
-    g = game_prob_from_prematch(p0)
-    pm_home = match_win_prob(sets_home, sets_away, games_home, games_away, g)
+    low, pm_home, high = match_win_probability_band(
+        p0, sets_home, sets_away, games_home, games_away)
+    sigma = max(0.0, (high - low) / 2.0)
     probabilities: dict[str, float] = {}
+    uncertainties: dict[str, float] = {}
     for signal in signals:
         if not signal.token_id or not _is_tennis_moneyline(signal.market):
             continue
         side = _tennis_side(signal.outcome, event)
         if side is not None:
             probabilities[signal.token_id] = pm_home if side == "home" else 1.0 - pm_home
-    return probabilities
+            uncertainties[signal.token_id] = sigma
+    return probabilities, uncertainties
 
 
 def recompute(event_id: str, *, as_of: datetime) -> list:
@@ -386,11 +395,14 @@ async def record(event_id: str, *, as_of: datetime | None = None) -> None:
                 if paper_event.get("webhook_url"):
                     _schedule_notification(paper_event)
             if signals:
-                model_probabilities = _tennis_model_probabilities(event, signals)
+                model_probabilities, model_uncertainty = _tennis_model_probabilities(
+                    event, signals)
                 placed_bets = await asyncio.to_thread(
                     account_book.place, event, signals, quotes, as_of=decision_at,
                     allow_uncalibrated=settings.allow_uncalibrated_paper,
                     model_probabilities=model_probabilities,
+                    model_uncertainty=model_uncertainty,
+                    edge_uncertainty_z=settings.edge_uncertainty_z,
                 )
                 for paper_event in placed_bets:
                     if paper_event.get("webhook_url"):

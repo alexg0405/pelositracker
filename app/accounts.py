@@ -488,7 +488,9 @@ class AccountBook:
     def place(self, event: Event, signals: list[Signal], quotes: list[Quote] | None = None,
               *, as_of: datetime | float | None = None,
               allow_uncalibrated: bool = False,
-              model_probabilities: dict[str, float] | None = None) -> list[dict]:
+              model_probabilities: dict[str, float] | None = None,
+              model_uncertainty: dict[str, float] | None = None,
+              edge_uncertainty_z: float = 0.0) -> list[dict]:
         """Open paper positions only after an exact full-depth simulated fill.
 
         ``allow_uncalibrated`` (opt-in, off by default) additionally admits
@@ -505,6 +507,7 @@ class AccountBook:
         """
         now = _timestamp(as_of)
         model_probabilities = model_probabilities or {}
+        model_uncertainty = model_uncertainty or {}
         quote_by_token = _latest_quotes(quotes or [])
         placed_bets = []
         with self._lock:
@@ -595,7 +598,15 @@ class AccountBook:
                         if model_probability is None or not 0 < model_probability < 1:
                             continue
                         actual_edge = model_probability - entry_price
-                        if actual_edge < max(signal.required_edge, strategy.edge_threshold):
+                        edge_floor = max(signal.required_edge, strategy.edge_threshold)
+                        # Uncertainty-aware gate: for a model-backed decision the
+                        # probability is a point estimate, so require the edge to
+                        # clear the floor at its lower confidence bound
+                        # (edge - z*sigma), not just on the mean. sigma is 0 for
+                        # non-model signals, so this is a no-op there.
+                        sigma = (model_uncertainty.get(signal.token_id, 0.0)
+                                 if model_override is not None else 0.0)
+                        if actual_edge - edge_uncertainty_z * sigma < edge_floor:
                             continue
                         self._db.execute(
                             cur,

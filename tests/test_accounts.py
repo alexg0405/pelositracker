@@ -143,6 +143,59 @@ def test_model_backed_bet_still_respects_the_edge_floor(tmp_path):
     assert placed == []
 
 
+def _tennis_setup(book_path, event_id):
+    book = AccountBook(str(book_path))
+    strategy = Strategy("tennis", sizing="flat", flat_stake=50.0, start_bankroll=1000.0,
+                        edge_threshold=0.0, max_stake_pct=1.0, max_event_exposure_pct=1.0,
+                        max_sport_exposure_pct=1.0, max_correlated_exposure_pct=1.0,
+                        max_total_exposure_pct=1.0)
+    book.seed([strategy])
+    event = Event("Alcaraz vs Sinner", "tennis", "Alcaraz", "Sinner", id=event_id)
+    signal = _single_source_watch_signal(event)
+    quote = executable_quote(event, "token-home", "moneyline", "Alcaraz", ask=.50, bid=.48)
+    return book, event, signal, quote
+
+
+def test_uncertainty_gate_rejects_when_lower_bound_falls_below_floor(tmp_path):
+    book, event, signal, quote = _tennis_setup(tmp_path / "u1.db", "tennis-u1")
+    try:
+        # Mean edge is 10% (60% model vs 50% ask), but the band is wide:
+        # lower bound 0.10 - 1.0*0.12 < 0 fails the floor, so nothing is placed.
+        placed = book.place(event, [signal], [quote],
+                            model_probabilities={"token-home": 0.60},
+                            model_uncertainty={"token-home": 0.12},
+                            edge_uncertainty_z=1.0)
+    finally:
+        book.close()
+    assert placed == []
+
+
+def test_uncertainty_gate_off_trades_on_the_mean_edge(tmp_path):
+    book, event, signal, quote = _tennis_setup(tmp_path / "u2.db", "tennis-u2")
+    try:
+        # Same wide band, but z=0 reduces the gate to the mean edge -> traded.
+        placed = book.place(event, [signal], [quote],
+                            model_probabilities={"token-home": 0.60},
+                            model_uncertainty={"token-home": 0.12},
+                            edge_uncertainty_z=0.0)
+    finally:
+        book.close()
+    assert len(placed) == 1
+
+
+def test_uncertainty_gate_allows_a_tight_band(tmp_path):
+    book, event, signal, quote = _tennis_setup(tmp_path / "u3.db", "tennis-u3")
+    try:
+        # Lower bound 0.10 - 1.0*0.03 = 0.07 clears the floor -> traded.
+        placed = book.place(event, [signal], [quote],
+                            model_probabilities={"token-home": 0.60},
+                            model_uncertainty={"token-home": 0.03},
+                            edge_uncertainty_z=1.0)
+    finally:
+        book.close()
+    assert len(placed) == 1
+
+
 def test_validated_polymarket_signal_qualifies_and_depth_caps_stake():
     strategy = Strategy("flat", edge_threshold=.05, sizing="flat", flat_stake=100)
     signal = valid_signal(fillable_size=40)  # 40 shares * $0.50 = $20 available

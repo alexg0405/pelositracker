@@ -57,6 +57,7 @@ class Settings:
     kelly_fraction: float
     allow_uncalibrated_paper: bool
     enable_tennis_model: bool
+    edge_uncertainty_z: float
     odds_api_key: str
     odds_regions: str
     odds_markets: str
@@ -89,6 +90,7 @@ class Settings:
             kelly_fraction=_float(values, "SIGNAL_KELLY_FRACTION", 0.25),
             allow_uncalibrated_paper=_bool(values, "PAPER_ALLOW_UNCALIBRATED", False),
             enable_tennis_model=_bool(values, "ENABLE_TENNIS_MODEL", False),
+            edge_uncertainty_z=_float(values, "PAPER_EDGE_UNCERTAINTY_Z", 1.0),
             odds_api_key=values.get("THE_ODDS_API_KEY", "").strip(),
             odds_regions=values.get("ODDS_REGIONS", "us").strip(),
             odds_markets=values.get("ODDS_MARKETS", "h2h,spreads,totals").strip(),

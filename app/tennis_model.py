@@ -109,6 +109,34 @@ def game_prob_from_prematch(p0: float, *, best_of: int = 3) -> float:
     return (low + high) / 2.0
 
 
+def match_win_probability_band(
+    p0: float, sets_home: int, sets_away: int, cur_home_games: int, cur_away_games: int,
+    *, best_of: int = 3, prematch_sd: float = 0.05,
+) -> tuple[float, float, float]:
+    """``(low, mid, high)`` home-win probability band from the live state.
+
+    The band propagates a pre-match probability uncertainty ``prematch_sd``
+    (roughly one standard deviation, in match-win-probability space) through the
+    current score: it re-anchors at ``p0 +/- prematch_sd``, inverts each to a
+    per-game ``g``, and evaluates the live match probability. Because match win
+    probability is pinned toward 0/1 as sets are decided, the band **narrows
+    automatically as the match resolves** -- more of the match observed means
+    less model uncertainty, which is exactly what an uncertainty-aware trade
+    gate should see. ``low <= mid <= high`` by monotonicity in ``g``.
+    """
+    p0 = min(max(p0, 1e-6), 1.0 - 1e-6)
+    sd = max(0.0, prematch_sd)
+    lo_anchor = max(1e-6, p0 - sd)
+    hi_anchor = min(1.0 - 1e-6, p0 + sd)
+
+    def at(anchor: float) -> float:
+        g = game_prob_from_prematch(anchor, best_of=best_of)
+        return match_win_prob(sets_home, sets_away, cur_home_games, cur_away_games,
+                              g, best_of=best_of)
+
+    return at(lo_anchor), at(p0), at(hi_anchor)
+
+
 def parse_tennis_score(score: str, period: str) -> tuple[int, int, int, int] | None:
     """Parse the feed's tennis score into ``(sets_home, sets_away, cur_home_games,
     cur_away_games)``.
