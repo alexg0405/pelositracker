@@ -196,6 +196,21 @@ def test_uncertainty_gate_allows_a_tight_band(tmp_path):
     assert len(placed) == 1
 
 
+def test_portfolio_kelly_flag_places_and_respects_the_base_cap(tmp_path):
+    book, event, signal, quote = _tennis_setup(tmp_path / "pk.db", "tennis-pk")
+    try:
+        placed = book.place(event, [signal], [quote],
+                            model_probabilities={"token-home": 0.60},
+                            portfolio_kelly=True)
+        rows = book.account_bets("tennis")
+    finally:
+        book.close()
+    assert len(placed) == 1
+    # Joint-Kelly sizing never exceeds the strategy's base stake ($50 flat).
+    assert 0.0 < rows[0]["stake"] <= 50.0 + 1e-6
+    assert rows[0]["edge"] == pytest.approx(0.10, abs=1e-6)
+
+
 def test_validated_polymarket_signal_qualifies_and_depth_caps_stake():
     strategy = Strategy("flat", edge_threshold=.05, sizing="flat", flat_stake=100)
     signal = valid_signal(fillable_size=40)  # 40 shares * $0.50 = $20 available

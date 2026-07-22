@@ -25,6 +25,7 @@ from .database import Database
 from .execution import BookLevel, simulate_buy, simulate_sell
 from .lines import is_spread_market, is_total_market, quote_line_side
 from .models import Event, Quote, Signal
+from .portfolio import Candidate, joint_kelly_stakes
 
 _MONEYLINE = {"moneyline", "h2h", "winner", "match_winner"}
 
@@ -396,6 +397,53 @@ def _cashout_decision(strategy: Strategy, row, *, net_value: float,
     return False, "cash-out thresholds not met after spread and fees"
 
 
+def _joint_stakes(strategy: Strategy, event: Event, signals: list[Signal],
+                  quote_by_token: dict[str, Quote],
+                  model_probabilities: dict[str, float], *,
+                  allow_uncalibrated: bool, bankroll: float,
+                  event_open: float, sport_open: float, total_open: float,
+                  equity_for_caps: float) -> dict[str, float]:
+    """Portfolio-Kelly stake per token: size all of this account's qualifying
+    candidates jointly over their correlation groups rather than independently.
+
+    Each candidate is capped at its own independent exposure limit
+    (event/sport/total), so the joint solution only ever reduces a correlated or
+    oversized book; the per-group correlated cap is re-applied in the placement
+    loop. Returns an empty mapping when nothing qualifies."""
+    candidates: list[Candidate] = []
+    tokens: list[str] = []
+    for signal in signals:
+        if not signal.token_id or not _gradeable(event, signal.market, signal.outcome):
+            continue
+        if quote_by_token.get(signal.token_id) is None or signal.market_probability <= 0:
+            continue
+        model_override = model_probabilities.get(signal.token_id)
+        if model_override is not None:
+            if model_backed_failures(strategy, signal):
+                continue
+        elif not qualifies(strategy, signal, allow_uncalibrated=allow_uncalibrated):
+            continue
+        prob = model_override if model_override is not None else _decision_probability(signal)
+        if prob is None or not 0 < prob < 1 or not 0 < signal.market_probability < 1:
+            continue
+        cap = min(
+            stake_for(strategy, signal, bankroll),
+            max(0.0, strategy.max_event_exposure_pct * equity_for_caps - event_open),
+            max(0.0, strategy.max_sport_exposure_pct * equity_for_caps - sport_open),
+            max(0.0, strategy.max_total_exposure_pct * equity_for_caps - total_open),
+        )
+        if cap <= 0:
+            continue
+        candidates.append(Candidate(
+            prob=float(prob), price=float(signal.market_probability),
+            group=_correlation_group(event, signal), cap=float(cap)))
+        tokens.append(signal.token_id)
+    stakes = joint_kelly_stakes(
+        candidates, bankroll, kelly_multiplier=strategy.kelly_multiplier,
+        max_total_fraction=strategy.max_total_exposure_pct)
+    return dict(zip(tokens, stakes))
+
+
 class AccountBook:
     """Thread-safe store for auditable, fake-money bot positions."""
 
@@ -490,7 +538,8 @@ class AccountBook:
               allow_uncalibrated: bool = False,
               model_probabilities: dict[str, float] | None = None,
               model_uncertainty: dict[str, float] | None = None,
-              edge_uncertainty_z: float = 0.0) -> list[dict]:
+              edge_uncertainty_z: float = 0.0,
+              portfolio_kelly: bool = False) -> list[dict]:
         """Open paper positions only after an exact full-depth simulated fill.
 
         ``allow_uncalibrated`` (opt-in, off by default) additionally admits
@@ -535,6 +584,14 @@ class AccountBook:
                     event_open = float(exposure["event_open"] or 0)
                     sport_open = float(exposure["sport_open"] or 0)
                     equity_for_caps = bankroll + total_open
+                    joint_overrides = (
+                        _joint_stakes(
+                            strategy, event, signals, quote_by_token, model_probabilities,
+                            allow_uncalibrated=allow_uncalibrated, bankroll=bankroll,
+                            event_open=event_open, sport_open=sport_open,
+                            total_open=total_open, equity_for_caps=equity_for_caps)
+                        if portfolio_kelly else None
+                    )
                     for signal in signals:
                         if not signal.token_id or not _gradeable(
                                 event, signal.market, signal.outcome):
@@ -561,9 +618,11 @@ class AccountBook:
                             (account["name"], correlation_group),
                         )
                         correlated_open = float(cur.fetchone()["correlated_open"] or 0)
-                        requested_stake = stake_for(strategy, signal, bankroll)
+                        base_stake = (joint_overrides.get(signal.token_id, 0.0)
+                                      if joint_overrides is not None
+                                      else stake_for(strategy, signal, bankroll))
                         requested_stake = min(
-                            requested_stake,
+                            base_stake,
                             max(0.0, strategy.max_event_exposure_pct * equity_for_caps
                                 - event_open),
                             max(0.0, strategy.max_sport_exposure_pct * equity_for_caps
