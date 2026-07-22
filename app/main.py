@@ -27,12 +27,13 @@ from .tennis_model import (
     next_game_swing,
     parse_tennis_score,
 )
+from .lead_model import LEAD_SPORT_PARAMS, score_swing, win_probability_band
 from .diagnostics import edge_health
 from .advice import market_views, position_views
 from .history import HistoryDB
 from .ledger import Ledger
 from .lines import pregame_priors
-from .gameclock import validate_state_transition
+from .gameclock import game_progress, league_rule, validate_state_transition
 from .models import Event, GameState, Quote, as_json
 from .monitor_state import MonitorState
 from .sources import (_odds_quota, extract_polymarket_slug, infer_polymarket_event,
@@ -267,11 +268,11 @@ def _is_tennis(event: Event) -> bool:
     return (event.sport or "").strip().casefold() == "tennis"
 
 
-def _tennis_side(outcome: str, event: Event) -> str | None:
-    """Map a moneyline outcome label to home/away for a tennis match.
+def _moneyline_side(outcome: str, event: Event) -> str | None:
+    """Map a moneyline outcome label to home/away for any two-sided match.
 
-    Handles Polymarket's binary shape where one side is the player name and the
-    other is the negated condition (``"Not <player>"``)."""
+    Handles Polymarket's binary shape where one side is the team/player name and
+    the other is the negated condition (``"Not <name>"``)."""
     label = (outcome or "").strip().casefold()
     home = (event.home or "").strip().casefold()
     away = (event.away or "").strip().casefold()
@@ -363,11 +364,90 @@ def _tennis_model_probabilities(
     for signal in signals:
         if not signal.token_id or not _is_tennis_moneyline(signal.market):
             continue
-        side = _tennis_side(signal.outcome, event)
+        side = _moneyline_side(signal.outcome, event)
         if side is not None:
             probabilities[signal.token_id] = pm_home if side == "home" else 1.0 - pm_home
             uncertainties[signal.token_id] = sigma
     return probabilities, uncertainties
+
+
+def _state_age_seconds(state: GameState, as_of: datetime) -> float | None:
+    """Seconds since a GameState was observed at the provider, or None."""
+    stamp = state.provider_timestamp or state.observed_at
+    if stamp is None:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return max(0.0, (as_of - stamp).total_seconds())
+
+
+def _at_game_start(event: Event) -> bool:
+    """True before meaningful play: no live state yet, or a level score at (near)
+    full regulation remaining. Used to capture the pre-match price anchor once."""
+    states = store.states.get(event.id) or []
+    if not states:
+        return True
+    state = states[-1]
+    _, fraction = game_progress(event.sport, state.period, state.clock, event.league)
+    lead = float(state.home_score) - float(state.away_score)
+    return lead == 0 and (fraction is None or fraction >= 0.99)
+
+
+def _lead_model_probabilities(
+    event: Event, signals: list, *, as_of: datetime
+) -> tuple[dict[str, float], dict[str, float]]:
+    """``(probabilities, uncertainties)`` per token for a lead/clock sport
+    (basketball, football, hockey): the pre-match price anchor propagated through
+    the live lead and game clock via the Brownian-margin model, with the band
+    widened for the execution window. Empty unless the model is on, the league is
+    supported, a live state with a known regulation fraction exists (overtime is
+    skipped), a clean pre-match anchor was captured, and the state is fresh enough
+    to represent a realistic fill."""
+    if not settings.enable_lead_model:
+        return {}, {}
+    rule = league_rule(event.sport, event.league)
+    params = LEAD_SPORT_PARAMS.get(rule.key) if rule is not None else None
+    if params is None:
+        return {}, {}
+    states = store.states.get(event.id) or []
+    if not states:
+        return {}, {}
+    state = states[-1]
+    _, fraction = game_progress(event.sport, state.period, state.clock, event.league)
+    if fraction is None:
+        return {}, {}
+    p0 = _pregame.get(event.id, {}).get("prematch_home_p")
+    if p0 is None or not 0 < p0 < 1:
+        return {}, {}
+    age = _state_age_seconds(state, as_of)
+    if age is not None and age > settings.max_state_age_seconds:
+        return {}, {}
+    window = (age or 0.0) + settings.latency_budget_seconds
+    lead = float(state.home_score) - float(state.away_score)
+    low, pm_home, high = win_probability_band(p0, lead, fraction, params.sigma)
+    model_sigma = max(0.0, (high - low) / 2.0)
+    swing = score_swing(p0, lead, fraction, params.sigma, params.score_unit)
+    sigma = execution_sigma(model_sigma, swing, window,
+                            seconds_per_game=params.seconds_per_score)
+    probabilities: dict[str, float] = {}
+    uncertainties: dict[str, float] = {}
+    for signal in signals:
+        if not signal.token_id or line_type(signal.market) != "moneyline":
+            continue
+        side = _moneyline_side(signal.outcome, event)
+        if side is not None:
+            probabilities[signal.token_id] = pm_home if side == "home" else 1.0 - pm_home
+            uncertainties[signal.token_id] = sigma
+    return probabilities, uncertainties
+
+
+def _model_probabilities(
+    event: Event, signals: list, *, as_of: datetime
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Dispatch to the sport's independent in-play model (tennis or lead/clock)."""
+    if _is_tennis(event):
+        return _tennis_model_probabilities(event, signals, as_of=as_of)
+    return _lead_model_probabilities(event, signals, as_of=as_of)
 
 
 def recompute(event_id: str, *, as_of: datetime) -> list:
@@ -386,20 +466,31 @@ def recompute(event_id: str, *, as_of: datetime) -> list:
                               pregame_spread=prior["spread"], pregame_total=prior["total"],
                               as_of=as_of, canonical_event_id=event.canonical_event_id)
     store.set_signals(event_id, signals)
-    # Anchor the tennis model to the market's pre-match view: capture the home
-    # win probability only while the match is at its start (score 0-0) or still
-    # pregame. Joining mid-match yields no anchor, so we never fabricate one.
+    # Anchor an in-play model to the market's pre-match view: capture the home
+    # win probability only at the start (or still pregame). Joining mid-match
+    # yields no anchor, so we never fabricate one.
+    def _home_anchor() -> float | None:
+        home_signal = next(
+            (signal for signal in signals
+             if _moneyline_side(signal.outcome, event) == "home"
+             and 0 < (signal.model_probability or 0) < 1),
+            None,
+        )
+        return float(home_signal.model_probability) if home_signal is not None else None
+
     if settings.enable_tennis_model and _is_tennis(event) and prior.get("tennis_p0") is None:
         parsed = _tennis_score_now(event)
         if parsed is None or parsed == (0, 0, 0, 0):
-            home_signal = next(
-                (signal for signal in signals
-                 if _tennis_side(signal.outcome, event) == "home"
-                 and 0 < (signal.model_probability or 0) < 1),
-                None,
-            )
-            if home_signal is not None:
-                prior["tennis_p0"] = float(home_signal.model_probability)
+            anchor = _home_anchor()
+            if anchor is not None:
+                prior["tennis_p0"] = anchor
+    if (settings.enable_lead_model and not _is_tennis(event)
+            and prior.get("prematch_home_p") is None):
+        rule = league_rule(event.sport, event.league)
+        if rule is not None and rule.key in LEAD_SPORT_PARAMS and _at_game_start(event):
+            anchor = _home_anchor()
+            if anchor is not None:
+                prior["prematch_home_p"] = anchor
     return signals
 
 
@@ -427,7 +518,7 @@ async def record(event_id: str, *, as_of: datetime | None = None) -> None:
                 if paper_event.get("webhook_url"):
                     _schedule_notification(paper_event)
             if signals:
-                model_probabilities, model_uncertainty = _tennis_model_probabilities(
+                model_probabilities, model_uncertainty = _model_probabilities(
                     event, signals, as_of=decision_at)
                 placed_bets = await asyncio.to_thread(
                     account_book.place, event, signals, quotes, as_of=decision_at,

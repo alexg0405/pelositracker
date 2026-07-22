@@ -80,3 +80,21 @@ the odds engine's honest `WATCH` verdict is unchanged. Documented
 simplifications: serve-neutral (the feed exposes no server), tiebreak
 approximated as one game, independent sets, best-of-three by default. It is a
 demonstration/strategy-exercise model, not validated calibration.
+
+## Paper-harness in-play lead/clock model (display-grade)
+
+`ENABLE_LEAD_MODEL` is the same opt-in paper-harness mechanism for lead/clock
+sports — basketball, football, and hockey (NBA, WNBA, NCAAB, NFL, NCAAF, NHL) —
+which likewise have no reference-book feed here. `app.lead_model` models the
+score margin as a drifting Brownian motion: the home win probability is
+`P(final_margin > 0)` where the final margin is Normal with mean
+`current_lead + pregame_margin * fraction_remaining` and standard deviation
+`sigma * sqrt(fraction_remaining)`. `sigma` is the sport's final-margin standard
+deviation; `pregame_margin` is inverted from the market's pre-match price
+(captured at tip-off), so the model reproduces the market at the start and
+diverges only as the live lead and clock move. Overtime and unsupported leagues
+are skipped (no comparable regulation fraction), and joining after tip-off gets
+no anchor. Both in-play models feed the shared uncertainty-aware
+(`PAPER_EDGE_UNCERTAINTY_Z`) and latency-aware (`PAPER_LATENCY_BUDGET_SECONDS`,
+`PAPER_MAX_STATE_AGE_SECONDS`) trade gates. Per-sport parameters are documented
+approximations; this is a strategy-exercise model, not validated calibration.
