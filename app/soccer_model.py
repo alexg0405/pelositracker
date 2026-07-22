@@ -58,11 +58,23 @@ def result_probabilities(lam_home: float, lam_away: float, home_now: int,
 
 
 def prematch_rates(p_home: float, p_draw: float) -> tuple[float, float] | None:
-    """Invert pre-match home-win and draw probabilities into full-match Poisson
-    rates ``(lam_home, lam_away)``. Returns None if the inputs are not a usable
-    two-of-three 1X2 prior. A coarse grid then a local refine keeps it robust
-    without an external solver; it runs once per match and is then cached."""
+    """Full-match Poisson rates from the pre-match 1X2 price (the 0-0 case of
+    :func:`rates_from_state`)."""
+    return rates_from_state(p_home, p_draw, 0, 0, 1.0)
+
+
+def rates_from_state(p_home: float, p_draw: float, home_now: int, away_now: int,
+                     fraction_remaining: float) -> tuple[float, float] | None:
+    """Invert live home-win and draw probabilities into full-match Poisson rates
+    ``(lam_home, lam_away)`` given the current score and remaining fraction, so
+    the model can anchor to the market at any point in the match. Returns None if
+    the inputs are not a usable 1X2 prior or there is no time left. A coarse grid
+    then a local refine keeps it robust without an external solver; it runs once
+    per match and is then cached."""
     if not (0.0 < p_home < 1.0 and 0.0 < p_draw < 1.0):
+        return None
+    f = min(max(fraction_remaining, 0.0), 1.0)
+    if f <= 1e-9:
         return None
     # Polymarket 1X2 legs are independent binaries and need not sum to 1. If the
     # implied away probability is non-positive, renormalize home+draw so it has
@@ -72,7 +84,7 @@ def prematch_rates(p_home: float, p_draw: float) -> tuple[float, float] | None:
         p_home, p_draw = p_home * scale, p_draw * scale
 
     def error(lam_h: float, lam_a: float) -> float:
-        home, draw, _ = result_probabilities(lam_h, lam_a, 0, 0, 1.0)
+        home, draw, _ = result_probabilities(lam_h, lam_a, home_now, away_now, f)
         return (home - p_home) ** 2 + (draw - p_draw) ** 2
 
     def search(h_lo: float, h_hi: float, a_lo: float, a_hi: float, steps: int):

@@ -24,11 +24,17 @@ from .accounts import AccountBook, DEFAULT_STRATEGIES, line_type
 from .tennis_model import (
     execution_sigma,
     game_prob_from_prematch,
+    implied_prematch_price as tennis_implied_prematch_price,
     match_win_probability_band,
     next_game_swing,
     parse_tennis_score,
 )
-from .lead_model import LEAD_SPORT_PARAMS, score_swing, win_probability_band
+from .lead_model import (
+    LEAD_SPORT_PARAMS,
+    implied_prematch_price as lead_implied_prematch_price,
+    score_swing,
+    win_probability_band,
+)
 from . import soccer_model
 from .diagnostics import edge_health
 from .advice import market_views, position_views
@@ -402,18 +408,6 @@ def _state_age_seconds(state: GameState, as_of: datetime) -> float | None:
     return max(0.0, (as_of - stamp).total_seconds())
 
 
-def _at_game_start(event: Event) -> bool:
-    """True before meaningful play: no live state yet, or a level score at (near)
-    full regulation remaining. Used to capture the pre-match price anchor once."""
-    states = store.states.get(event.id) or []
-    if not states:
-        return True
-    state = states[-1]
-    _, fraction = game_progress(event.sport, state.period, state.clock, event.league)
-    lead = float(state.home_score) - float(state.away_score)
-    return lead == 0 and (fraction is None or fraction >= 0.99)
-
-
 def _lead_model_probabilities(
     event: Event, signals: list, *, as_of: datetime
 ) -> tuple[dict[str, float], dict[str, float]]:
@@ -595,33 +589,47 @@ def recompute(event_id: str, *, as_of: datetime) -> list:
                               pregame_spread=prior["spread"], pregame_total=prior["total"],
                               as_of=as_of, canonical_event_id=event.canonical_event_id)
     store.set_signals(event_id, signals)
-    # Anchor an in-play model to the market's pre-match view: capture the home
-    # win probability only at the start (or still pregame). Joining mid-match
-    # yields no anchor, so we never fabricate one. The market guard keeps a
-    # spread/total price from being captured as the win-probability anchor.
+    # Anchor an in-play model to the market at the FIRST observation, whatever the
+    # game state: invert the model's strength parameter from the current price and
+    # live score so a game joined in progress is anchored (and can trade) rather
+    # than skipped. Captured once; at true kickoff this reduces to the pre-match
+    # anchor. The market guard keeps a spread/total price from being taken as the
+    # win-probability anchor.
     if settings.enable_tennis_model and _is_tennis(event) and prior.get("tennis_p0") is None:
         parsed = _tennis_score_now(event)
-        if parsed is None or parsed == (0, 0, 0, 0):
-            anchor = _prematch_anchor(signals, event, "home", _is_tennis_moneyline)
-            if anchor is not None:
-                prior["tennis_p0"] = anchor
+        p_now = _prematch_anchor(signals, event, "home", _is_tennis_moneyline)
+        if parsed is not None and p_now is not None:
+            p0 = tennis_implied_prematch_price(p_now, *parsed)
+            if p0 is not None:
+                prior["tennis_p0"] = p0
     if (settings.enable_lead_model and not _is_tennis(event)
             and prior.get("prematch_home_p") is None):
         rule = league_rule(event.sport, event.league)
-        if rule is not None and rule.key in LEAD_SPORT_PARAMS and _at_game_start(event):
-            anchor = _prematch_anchor(signals, event, "home", _is_moneyline_market)
-            if anchor is not None:
-                prior["prematch_home_p"] = anchor
-    if (settings.enable_soccer_model and _is_soccer(event)
-            and "soccer_rates" not in prior and _at_game_start(event)):
+        params = LEAD_SPORT_PARAMS.get(rule.key) if rule is not None else None
+        states = store.states.get(event_id) or []
+        p_now = _prematch_anchor(signals, event, "home", _is_moneyline_market)
+        if params is not None and states and p_now is not None:
+            state = states[-1]
+            _, fraction = game_progress(event.sport, state.period, state.clock, event.league)
+            if fraction is not None:
+                lead = float(state.home_score) - float(state.away_score)
+                p0 = lead_implied_prematch_price(p_now, lead, fraction, params.sigma)
+                if p0 is not None:
+                    prior["prematch_home_p"] = p0
+    if settings.enable_soccer_model and _is_soccer(event) and "soccer_rates" not in prior:
+        states = store.states.get(event_id) or []
         home_p = _prematch_anchor(signals, event, "home", _is_moneyline_market)
         # A 1X2 draw is a result in its own right, so it is not filtered by the
         # moneyline guard (its market label is the draw condition itself).
         draw_p = _prematch_anchor(signals, event, "draw", lambda _market: True)
-        if home_p is not None and draw_p is not None:
-            # Store the inverted rates (or None if the prior is unusable) so we
-            # neither re-invert every cycle nor retry a bad anchor forever.
-            prior["soccer_rates"] = soccer_model.prematch_rates(home_p, draw_p)
+        if states and home_p is not None and draw_p is not None:
+            state = states[-1]
+            _, fraction = game_progress(event.sport, state.period, state.clock, event.league)
+            if fraction is not None:
+                # Stored once (may be None if the prior is unusable) so we neither
+                # re-invert every cycle nor retry a bad anchor forever.
+                prior["soccer_rates"] = soccer_model.rates_from_state(
+                    home_p, draw_p, int(state.home_score), int(state.away_score), fraction)
     return signals
 
 

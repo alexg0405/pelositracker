@@ -5,6 +5,7 @@ import pytest
 
 from app.soccer_model import (
     prematch_rates,
+    rates_from_state,
     result_band,
     result_probabilities,
     result_swing,
@@ -69,3 +70,17 @@ def test_band_is_ordered_and_collapses_at_full_time():
 def test_swing_is_positive_mid_match_and_zero_at_full_time():
     assert result_swing(1.6, 1.1, 1, 1, 0.4, "home") > 0.0
     assert result_swing(1.6, 1.1, 1, 1, 0.0, "home") == 0.0
+
+
+def test_rates_from_state_recovers_a_midmatch_price():
+    # Fit rates to a live 1-0 at half time; re-derived result probabilities match.
+    p_home, p_draw, _ = result_probabilities(1.5, 1.0, 1, 0, 0.5)
+    rates = rates_from_state(p_home, p_draw, 1, 0, 0.5)
+    assert rates is not None
+    home, draw, _ = result_probabilities(*rates, 1, 0, 0.5)
+    assert home == pytest.approx(p_home, abs=0.02)
+    assert draw == pytest.approx(p_draw, abs=0.02)
+
+
+def test_rates_from_state_is_none_without_remaining_time():
+    assert rates_from_state(0.5, 0.3, 0, 0, 0.0) is None

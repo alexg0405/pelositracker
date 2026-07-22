@@ -72,9 +72,10 @@ exists because tennis has no reference-book feed here, so the odds engine can
 never estimate an edge and every tennis selection stays single-source `WATCH`.
 
 When enabled, `app.tennis_model` computes an independent in-play win
-probability from the live set/game score, anchored to the market's pre-match
-price captured at the start of the match (score 0-0; joining mid-match yields
-no anchor and no trades). Paper bots trade the edge of that model versus the
+probability from the live set/game score, anchored to the market price inverted
+from the current price and live score at the first observation (so a match
+joined in progress is anchored and can trade; at 0-0 this reduces to the
+pre-match price). Paper bots trade the edge of that model versus the
 executable Polymarket price via `AccountBook.place(model_probabilities=...)`;
 the odds engine's honest `WATCH` verdict is unchanged. Documented
 simplifications: serve-neutral (the feed exposes no server), tiebreak
@@ -90,11 +91,12 @@ score margin as a drifting Brownian motion: the home win probability is
 `P(final_margin > 0)` where the final margin is Normal with mean
 `current_lead + pregame_margin * fraction_remaining` and standard deviation
 `sigma * sqrt(fraction_remaining)`. `sigma` is the sport's final-margin standard
-deviation; `pregame_margin` is inverted from the market's pre-match price
-(captured at tip-off), so the model reproduces the market at the start and
-diverges only as the live lead and clock move. Overtime and unsupported leagues
-are skipped (no comparable regulation fraction), and joining after tip-off gets
-no anchor. Both in-play models feed the shared uncertainty-aware
+deviation; `pregame_margin` is inverted from the market price at the first
+observation (from the current price + live lead + clock), so the model
+reproduces the market when first seen and diverges only as the live lead and
+clock move -- a game joined in progress is anchored and can trade. Overtime and
+unsupported leagues are skipped (no comparable regulation fraction). Both
+in-play models feed the shared uncertainty-aware
 (`PAPER_EDGE_UNCERTAINTY_Z`) and latency-aware (`PAPER_LATENCY_BUDGET_SECONDS`,
 `PAPER_MAX_STATE_AGE_SECONDS`) trade gates. Per-sport parameters are documented
 approximations; this is a strategy-exercise model, not validated calibration.
@@ -105,9 +107,11 @@ approximations; this is a strategy-exercise model, not validated calibration.
 each side's remaining goals as independent Poisson arrivals over the remaining
 regulation fraction; the final joint score distribution gives home/draw/away
 result probabilities. The full-match scoring rates are **inverted from the
-market's pre-match 1X2 price** (home-win and draw), captured at kickoff and
-cached, so the model reproduces the market at the start and diverges only as the
-live score and clock move. Added time / extra time is skipped (no comparable
+market's 1X2 price** (home-win and draw) at the first observation, given the
+current score and remaining fraction, and cached -- so the model reproduces the
+market when first seen and diverges only as the live score and clock move (a
+match joined in progress is anchored and can trade). Added time / extra time is
+skipped (no comparable
 regulation fraction) and it is restricted to moneyline/1X2 selections so spreads
 and totals are never mispriced as a result bet. Simplifications: independent
 Poisson (no Dixon-Coles low-score correction), constant rates, regulation only.

@@ -171,6 +171,45 @@ def execution_sigma(model_sigma: float, game_swing: float, window_seconds: float
     return (max(0.0, model_sigma) ** 2 + move_sigma ** 2) ** 0.5
 
 
+def game_prob_from_state(p_now: float, sets_home: int, sets_away: int,
+                         cur_home_games: int, cur_away_games: int,
+                         *, best_of: int = 3) -> float | None:
+    """Per-game probability ``g`` reproducing a live home match-win probability
+    ``p_now`` at the current score, or None if the score already decides the
+    match (``g`` is then unidentifiable). Generalizes
+    :func:`game_prob_from_prematch` (the 0-0 case) to any live score."""
+    p = min(max(p_now, 1e-6), 1.0 - 1e-6)
+    lo = match_win_prob(sets_home, sets_away, cur_home_games, cur_away_games, 1e-6,
+                        best_of=best_of)
+    hi = match_win_prob(sets_home, sets_away, cur_home_games, cur_away_games, 1.0 - 1e-6,
+                        best_of=best_of)
+    if hi - lo < 1e-6:
+        return None
+    low, high = 0.0, 1.0
+    for _ in range(60):
+        mid = (low + high) / 2.0
+        value = match_win_prob(sets_home, sets_away, cur_home_games, cur_away_games,
+                               mid, best_of=best_of)
+        if value < p:
+            low = mid
+        else:
+            high = mid
+    return (low + high) / 2.0
+
+
+def implied_prematch_price(p_now: float, sets_home: int, sets_away: int,
+                           cur_home_games: int, cur_away_games: int,
+                           *, best_of: int = 3) -> float | None:
+    """The equivalent 0-0 home price for a market pricing the home player at
+    ``p_now`` given the current score, so the model can anchor to the market at
+    any point in the match. None if the score already decides it."""
+    g = game_prob_from_state(p_now, sets_home, sets_away, cur_home_games,
+                             cur_away_games, best_of=best_of)
+    if g is None:
+        return None
+    return match_win_prob(0, 0, 0, 0, g, best_of=best_of)
+
+
 def parse_tennis_score(score: str, period: str) -> tuple[int, int, int, int] | None:
     """Parse the feed's tennis score into ``(sets_home, sets_away, cur_home_games,
     cur_away_games)``.

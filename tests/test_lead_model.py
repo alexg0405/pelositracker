@@ -5,6 +5,7 @@ import pytest
 
 from app.lead_model import (
     LEAD_SPORT_PARAMS,
+    implied_prematch_price,
     live_win_probability,
     pregame_margin_from_price,
     score_swing,
@@ -65,3 +66,19 @@ def test_hockey_is_far_more_lead_sensitive_than_basketball():
 
 def test_supported_leagues_present():
     assert {"nba", "wnba", "ncaab", "nfl", "ncaaf", "nhl"} <= set(LEAD_SPORT_PARAMS)
+
+
+def test_implied_prematch_price_is_identity_at_tipoff():
+    assert implied_prematch_price(0.62, 0, 1.0, NBA_SIGMA) == pytest.approx(0.62, abs=1e-6)
+
+
+def test_implied_prematch_price_recovers_a_midgame_market():
+    p_now, lead, fraction = 0.70, 5, 0.5
+    p0 = implied_prematch_price(p_now, lead, fraction, NBA_SIGMA)
+    assert p0 is not None
+    margin = pregame_margin_from_price(p0, NBA_SIGMA)
+    assert live_win_probability(lead, margin, fraction, NBA_SIGMA) == pytest.approx(p_now, abs=1e-6)
+
+
+def test_implied_prematch_price_is_none_without_remaining_time():
+    assert implied_prematch_price(0.6, 3, 0.0, NBA_SIGMA) is None

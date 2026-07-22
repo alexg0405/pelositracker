@@ -3,6 +3,8 @@ import pytest
 from app.tennis_model import (
     execution_sigma,
     game_prob_from_prematch,
+    game_prob_from_state,
+    implied_prematch_price,
     match_win_prob,
     match_win_probability_band,
     next_game_swing,
@@ -128,6 +130,21 @@ def test_execution_sigma_grows_with_the_latency_window():
     near = execution_sigma(0.05, 0.20, 5.0)
     far = execution_sigma(0.05, 0.20, 90.0)
     assert far > near > 0.05
+
+
+def test_implied_prematch_price_is_identity_at_love_all():
+    assert implied_prematch_price(0.62, 0, 0, 0, 0) == pytest.approx(0.62, abs=2e-3)
+
+
+def test_game_prob_from_state_recovers_a_midmatch_price():
+    p_now = 0.70
+    g = game_prob_from_state(p_now, 1, 0, 3, 2)   # up a set and serving at 3-2
+    assert g is not None
+    assert match_win_prob(1, 0, 3, 2, g) == pytest.approx(p_now, abs=2e-3)
+
+
+def test_game_prob_from_state_is_none_once_the_match_is_decided():
+    assert game_prob_from_state(0.99, 2, 0, 0, 0) is None   # best-of-three clinched
 
 
 def test_execution_sigma_movement_term_is_capped_at_one_game():

@@ -71,6 +71,23 @@ def pregame_margin_from_price(p0: float, sigma: float) -> float:
     return sigma * _N.inv_cdf(p0)
 
 
+def implied_prematch_price(p_now: float, lead: float, fraction_remaining: float,
+                           sigma: float) -> float | None:
+    """The equivalent tip-off home price (lead 0, full time) for a market pricing
+    the home side at ``p_now`` given the current lead and fraction remaining.
+
+    This lets the model anchor to the market at ANY point in the game, not only
+    pre-match: invert the drift that reproduces ``p_now`` now, then express it as
+    the tip-off price the rest of the pipeline already propagates. Returns None
+    if there is no remaining time to invert against. Identity at (lead 0, f=1)."""
+    f = min(max(fraction_remaining, 0.0), 1.0)
+    if sigma <= 0 or f <= 1e-9:
+        return None
+    p = min(max(p_now, 1e-6), 1.0 - 1e-6)
+    margin = (_N.inv_cdf(p) * sigma * f ** 0.5 - lead) / f
+    return _N.cdf(margin / sigma)
+
+
 def win_probability_band(p0: float, lead: float, fraction_remaining: float,
                          sigma: float, *, prematch_sd: float = 0.05) -> tuple[float, float, float]:
     """``(low, mid, high)`` home-win band by propagating a pre-match-price
