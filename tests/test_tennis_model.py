@@ -1,9 +1,11 @@
 import pytest
 
 from app.tennis_model import (
+    execution_sigma,
     game_prob_from_prematch,
     match_win_prob,
     match_win_probability_band,
+    next_game_swing,
     parse_tennis_score,
     set_complete,
 )
@@ -101,3 +103,36 @@ def test_band_narrows_as_the_match_resolves():
 
 def test_band_collapses_once_the_match_is_decided():
     assert match_win_probability_band(0.6, 2, 0, 0, 0) == (1.0, 1.0, 1.0)
+
+
+def test_next_game_swing_is_positive_mid_match_and_bounded():
+    g = game_prob_from_prematch(0.5)
+    swing = next_game_swing(0, 0, 0, 0, g)
+    assert 0.0 < swing <= 0.5
+
+
+def test_next_game_swing_is_zero_once_decided():
+    g = game_prob_from_prematch(0.5)
+    assert next_game_swing(2, 0, 0, 0, g) == 0.0
+
+
+def test_execution_sigma_reduces_to_model_sigma_with_no_window():
+    assert execution_sigma(0.05, 0.20, 0.0) == pytest.approx(0.05)
+
+
+def test_execution_sigma_ignores_movement_when_swing_is_zero():
+    assert execution_sigma(0.05, 0.0, 600.0) == pytest.approx(0.05)
+
+
+def test_execution_sigma_grows_with_the_latency_window():
+    near = execution_sigma(0.05, 0.20, 5.0)
+    far = execution_sigma(0.05, 0.20, 90.0)
+    assert far > near > 0.05
+
+
+def test_execution_sigma_movement_term_is_capped_at_one_game():
+    # Beyond seconds_per_game the fraction saturates at 1, so sigma stops growing.
+    huge = execution_sigma(0.05, 0.20, 10_000.0)
+    one_game = execution_sigma(0.05, 0.20, 150.0)
+    assert huge == pytest.approx(one_game)
+    assert huge == pytest.approx((0.05 ** 2 + 0.20 ** 2) ** 0.5)

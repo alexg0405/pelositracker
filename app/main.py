@@ -20,7 +20,13 @@ from pydantic import BaseModel, Field
 from .engine import SignalEngine
 from . import __version__, backtest, shadow_eval
 from .accounts import AccountBook, DEFAULT_STRATEGIES, line_type
-from .tennis_model import match_win_probability_band, parse_tennis_score
+from .tennis_model import (
+    execution_sigma,
+    game_prob_from_prematch,
+    match_win_probability_band,
+    next_game_swing,
+    parse_tennis_score,
+)
 from .diagnostics import edge_health
 from .advice import market_views, position_views
 from .history import HistoryDB
@@ -303,17 +309,34 @@ def _tennis_score_now(event: Event) -> tuple[int, int, int, int] | None:
     return parse_tennis_score(score, period)
 
 
+def _tennis_state_age_seconds(event: Event, as_of: datetime) -> float | None:
+    """Seconds since the cached live tennis score was received, or None."""
+    status = _sports_status.get(event.polymarket_slug or "")
+    received = status.get("_received_at") if status else None
+    if not received:
+        return None
+    try:
+        stamp = datetime.fromisoformat(str(received))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return max(0.0, (as_of - stamp).total_seconds())
+
+
 def _tennis_model_probabilities(
-    event: Event, signals: list
+    event: Event, signals: list, *, as_of: datetime
 ) -> tuple[dict[str, float], dict[str, float]]:
     """``(probabilities, uncertainties)`` per Polymarket token for a tennis match.
 
     ``probabilities`` is the independent in-play win probability (pre-match
     anchor propagated through the live set/game score). ``uncertainties`` is the
-    one-standard-deviation band half-width from pre-match-probability
-    uncertainty; it narrows as the match resolves and feeds the uncertainty-aware
-    trade gate. Both empty unless the model is enabled, the event is tennis, we
-    captured a clean pre-match anchor, and a live score is available."""
+    model-band half-width, widened for the execution window (feed/compute/
+    network/venue latency plus how stale the score already is) so a stale or
+    fast-moving state raises the lower-bound edge gate. Both empty unless the
+    model is enabled, the event is tennis, we captured a clean pre-match anchor,
+    a live score is available, and that score is fresh enough to represent the
+    state at a realistic fill."""
     if not settings.enable_tennis_model or not _is_tennis(event):
         return {}, {}
     parsed = _tennis_score_now(event)
@@ -322,10 +345,19 @@ def _tennis_model_probabilities(
     p0 = _pregame.get(event.id, {}).get("tennis_p0")
     if p0 is None or not 0 < p0 < 1:
         return {}, {}
+    # Latency awareness: skip a score too stale to represent the execution-time
+    # state; otherwise fold its age into the movement window.
+    age = _tennis_state_age_seconds(event, as_of)
+    if age is not None and age > settings.max_state_age_seconds:
+        return {}, {}
+    window = (age or 0.0) + settings.latency_budget_seconds
     sets_home, sets_away, games_home, games_away = parsed
+    g = game_prob_from_prematch(p0)
     low, pm_home, high = match_win_probability_band(
         p0, sets_home, sets_away, games_home, games_away)
-    sigma = max(0.0, (high - low) / 2.0)
+    model_sigma = max(0.0, (high - low) / 2.0)
+    swing = next_game_swing(sets_home, sets_away, games_home, games_away, g)
+    sigma = execution_sigma(model_sigma, swing, window)
     probabilities: dict[str, float] = {}
     uncertainties: dict[str, float] = {}
     for signal in signals:
@@ -396,7 +428,7 @@ async def record(event_id: str, *, as_of: datetime | None = None) -> None:
                     _schedule_notification(paper_event)
             if signals:
                 model_probabilities, model_uncertainty = _tennis_model_probabilities(
-                    event, signals)
+                    event, signals, as_of=decision_at)
                 placed_bets = await asyncio.to_thread(
                     account_book.place, event, signals, quotes, as_of=decision_at,
                     allow_uncalibrated=settings.allow_uncalibrated_paper,

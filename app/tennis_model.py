@@ -137,6 +137,38 @@ def match_win_probability_band(
     return at(lo_anchor), at(p0), at(hi_anchor)
 
 
+def next_game_swing(sets_home: int, sets_away: int, cur_home_games: int,
+                    cur_away_games: int, g: float, *, best_of: int = 3) -> float:
+    """Half the home-win-probability swing from the current game resolving.
+
+    This is the local price-move scale for one game: it is small mid-set and
+    large at set/match point (where the next game can decide everything), which
+    is exactly where latency-driven adverse selection is worst. Used to size the
+    execution-window uncertainty for latency-aware gating."""
+    p_win = match_win_prob(sets_home, sets_away, cur_home_games + 1, cur_away_games,
+                           g, best_of=best_of)
+    p_lose = match_win_prob(sets_home, sets_away, cur_home_games, cur_away_games + 1,
+                            g, best_of=best_of)
+    return abs(p_win - p_lose) / 2.0
+
+
+def execution_sigma(model_sigma: float, game_swing: float, window_seconds: float,
+                    *, seconds_per_game: float = 150.0) -> float:
+    """Combine model uncertainty with expected in-window price movement.
+
+    ``window_seconds`` is the horizon between the observed state and a realistic
+    fill (feed + compute + network + venue delay, plus how stale the score
+    already is). Over that window a fraction of a game is expected to complete;
+    treating game completion as a Bernoulli step, the movement standard
+    deviation scales with ``sqrt`` of the expected games. The result is added in
+    quadrature to the model uncertainty, so a stale or high-latency read widens
+    the band and the lower-bound edge gate becomes more conservative.
+    """
+    fraction = max(0.0, window_seconds) / max(1e-6, seconds_per_game)
+    move_sigma = abs(game_swing) * min(1.0, fraction) ** 0.5
+    return (max(0.0, model_sigma) ** 2 + move_sigma ** 2) ** 0.5
+
+
 def parse_tennis_score(score: str, period: str) -> tuple[int, int, int, int] | None:
     """Parse the feed's tennis score into ``(sets_home, sets_away, cur_home_games,
     cur_away_games)``.
