@@ -352,6 +352,14 @@ def sports_game_status(payload) -> str | None:
     return None
 
 
+def exclude_restricted_games(games: list[dict]) -> list[dict]:
+    """Drop region-restricted games. Only useful from an *unrestricted* host
+    region where a subset of events is restricted; from a restricted region
+    Polymarket marks everything restricted, so the caller keeps this off by
+    default. Pure; the caller decides whether to apply it."""
+    return [game for game in games if not game.get("restricted")]
+
+
 def filter_sports_games(events: list[dict]) -> list[dict]:
     """Keep tradeable sports GAMES (team-vs-team matchups) that are accepting
     orders right now; drop futures, sub-events, and finished/idle markets. Pure

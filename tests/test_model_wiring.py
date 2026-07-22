@@ -5,8 +5,14 @@ from datetime import datetime, timedelta, timezone
 
 import app.main as main_module
 from app.accounts import grade
-from app.main import _is_moneyline_market, _prematch_anchor, _settle_scores, _state_age_seconds
-from app.models import Event, GameState, Signal
+from app.main import (
+    _is_moneyline_market,
+    _paper_tradeable_quotes,
+    _prematch_anchor,
+    _settle_scores,
+    _state_age_seconds,
+)
+from app.models import Event, GameState, Quote, Signal
 
 
 def _signal(outcome, market, prob):
@@ -87,3 +93,18 @@ def test_tennis_falls_back_to_the_live_state_when_no_score_is_cached():
 
 def test_non_tennis_settles_by_final_live_score():
     assert _settle_scores(_event(), [_state(home_score=101, away_score=99)]) == (101, 99)
+
+
+def _quote(restricted):
+    return Quote(event_id="e", market="moneyline", outcome="Home", probability=0.5,
+                 source="polymarket", restricted=restricted)
+
+
+def test_paper_tradeable_quotes_clears_region_restriction_when_ignored():
+    quotes = _paper_tradeable_quotes([_quote(True), _quote(False)], True)
+    assert all(q.restricted is False for q in quotes)
+
+
+def test_paper_tradeable_quotes_preserves_region_flag_when_honored():
+    quotes = _paper_tradeable_quotes([_quote(True)], False)
+    assert quotes[0].restricted is True

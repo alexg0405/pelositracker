@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from app.sources import _game_window, filter_sports_games
+from app.sources import _game_window, exclude_restricted_games, filter_sports_games
 
 
 def _ev(title, tags, orderbook=True, accepting=True, slug=None):
@@ -8,6 +8,15 @@ def _ev(title, tags, orderbook=True, accepting=True, slug=None):
             "enableOrderBook": orderbook, "tags": [{"label": t} for t in tags],
             "markets": [{"acceptingOrders": accepting, "gameStartTime": "2026-07-15T18:00:00Z",
                          "clobTokenIds": ["x"]}]}
+
+
+def test_exclude_restricted_games_drops_only_restricted():
+    games = [
+        {"slug": "a", "restricted": True},
+        {"slug": "b", "restricted": False},
+        {"slug": "c"},  # missing flag == not restricted
+    ]
+    assert [g["slug"] for g in exclude_restricted_games(games)] == ["b", "c"]
 
 
 def test_keeps_tradeable_sports_matchups():

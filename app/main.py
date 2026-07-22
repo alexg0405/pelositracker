@@ -44,8 +44,8 @@ from .lines import pregame_priors
 from .gameclock import game_progress, league_rule, validate_state_transition
 from .models import Event, GameState, Quote, as_json
 from .monitor_state import MonitorState
-from .sources import (_odds_quota, extract_polymarket_slug, infer_polymarket_event,
-                      odds_api_poll, polymarket_event,
+from .sources import (_odds_quota, exclude_restricted_games, extract_polymarket_slug,
+                      infer_polymarket_event, odds_api_poll, polymarket_event,
                       polymarket_market_stream, polymarket_sports_events,
                       polymarket_sports_stream, sports_game_status)
 from .actionnetwork import action_network_poll
@@ -234,8 +234,19 @@ async def on_sports_status(slug: str, payload: dict) -> None:
             game["status_source"] = "polymarket-live-feed"
 
 
+def _paper_tradeable_quotes(quotes: list[Quote], ignore_restriction: bool) -> list[Quote]:
+    """Clear the region-restriction flag for fake-money paper simulation. The flag
+    governs *real* order placement; a simulated fill is not a real order, so from
+    a restricted host region (where Polymarket marks every event restricted) this
+    is what lets any market trade on paper at all. No effect when disabled."""
+    if ignore_restriction:
+        for quote in quotes:
+            quote.restricted = False
+    return quotes
+
+
 async def on_quotes(quotes: list[Quote]):
-    store.add_quotes(quotes)
+    store.add_quotes(_paper_tradeable_quotes(quotes, settings.paper_ignore_region_restriction))
     event = store.events.get(quotes[0].event_id) if quotes else None
     if event is not None and monitor_state is not None and event.odds_api_event_id:
         # Background matching may resolve this ID after registration.
@@ -742,6 +753,8 @@ async def auto_monitor_loop():
         try:
             if _config_state["auto_monitor"]:
                 games = await polymarket_sports_events(live_statuses=_sports_status)
+                if settings.exclude_restricted_events:
+                    games = exclude_restricted_games(games)
                 for game in games:
                     if game.get("status") == "live":
                         slug = game.get("slug")
@@ -995,6 +1008,8 @@ async def discover():
         games = await polymarket_sports_events(live_statuses=_sports_status)
     except Exception as exc:
         raise HTTPException(502, f"Could not reach Polymarket: {exc}") from exc
+    if settings.exclude_restricted_events:
+        games = exclude_restricted_games(games)
     _discover_cache.update(at=now, data=games)
     return games
 
@@ -1085,6 +1100,10 @@ async def add_event(payload: EventIn):
             raise HTTPException(400, f"Could not resolve Polymarket link: {exc}") from exc
         if not poly.get("active") or poly.get("closed"):
             raise HTTPException(400, "Polymarket event is not active")
+        if settings.exclude_restricted_events and bool(poly.get("restricted", False)):
+            raise HTTPException(
+                400, "This event is region-restricted and can't be paper-traded; "
+                     "set EXCLUDE_RESTRICTED_EVENTS=false to monitor it anyway.")
         actionable = [market for market in poly.get("markets", [])
                       if market.get("active", True) and not market.get("closed", False)
                       and market.get("enableOrderBook", True) and market.get("acceptingOrders", False)

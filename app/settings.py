@@ -63,6 +63,8 @@ class Settings:
     latency_budget_seconds: float
     max_state_age_seconds: float
     enable_portfolio_kelly: bool
+    exclude_restricted_events: bool
+    paper_ignore_region_restriction: bool
     odds_api_key: str
     odds_regions: str
     odds_markets: str
@@ -101,6 +103,15 @@ class Settings:
             latency_budget_seconds=_float(values, "PAPER_LATENCY_BUDGET_SECONDS", 8.0),
             max_state_age_seconds=_float(values, "PAPER_MAX_STATE_AGE_SECONDS", 30.0, minimum=1.0),
             enable_portfolio_kelly=_bool(values, "PAPER_PORTFOLIO_KELLY", False),
+            # Off by default: Polymarket's region flag marks *every* event
+            # restricted from a restricted host region, so excluding would hide
+            # everything. Opt in only from an unrestricted region.
+            exclude_restricted_events=_bool(values, "EXCLUDE_RESTRICTED_EVENTS", False),
+            # Fake-money paper fills are not real orders, so by default the
+            # region-restriction flag does not block them (otherwise no market
+            # trades from a restricted host region).
+            paper_ignore_region_restriction=_bool(
+                values, "PAPER_IGNORE_REGION_RESTRICTION", True),
             odds_api_key=values.get("THE_ODDS_API_KEY", "").strip(),
             odds_regions=values.get("ODDS_REGIONS", "us").strip(),
             odds_markets=values.get("ODDS_MARKETS", "h2h,spreads,totals").strip(),
