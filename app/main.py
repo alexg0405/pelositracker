@@ -879,6 +879,8 @@ class StrategyIn(BaseModel):
     start_bankroll: float = 10000.0
     webhook_url: str = ""
     cash_out_enabled: bool = False
+    # Optional game allow-list (event ids). Empty = free bet (any qualifying game).
+    events: list[str] = Field(default_factory=list)
 
 
 class StrategyUpdateIn(BaseModel):
@@ -1206,9 +1208,19 @@ async def create_account(payload: StrategyIn):
         start_bankroll=payload.start_bankroll,
         webhook_url=payload.webhook_url,
         cash_out_enabled=payload.cash_out_enabled,
+        events=tuple(dict.fromkeys(e for e in payload.events if e)),
     )
     await asyncio.to_thread(account_book.seed, [strat])
     return {"status": "ok"}
+
+
+@app.get("/api/monitored-games", dependencies=[Depends(verify_auth)])
+async def monitored_games():
+    """Currently tracked games, for the per-bot allow-list picker."""
+    return [
+        {"id": event.id, "name": event.name, "sport": event.sport, "league": event.league}
+        for event in _sort_events_by_edge()
+    ]
 
 
 @app.get("/api/accounts/{name}/bets", dependencies=[Depends(verify_auth)])

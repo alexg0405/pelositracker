@@ -219,4 +219,8 @@ dialog::backdrop { background: rgba(0,0,0,0.7); }
 .cashout-create-row { padding:10px 12px; border:1px solid var(--line); background:var(--panel2); }
 .field-note { margin-top:7px; color:var(--faint); font:10px/1.45 var(--mono); }
 .bot-cashout-label { margin-top:9px; padding-top:7px; border-top:1px solid var(--line); }
+.bot-games { max-height:150px; overflow-y:auto; border:1px solid var(--line); background:rgba(0,0,0,.25); padding:6px 8px; display:flex; flex-direction:column; gap:4px; }
+.game-check { display:flex; align-items:center; gap:8px; font:12px var(--mono); color:var(--text); cursor:pointer; text-transform:none; letter-spacing:0; }
+.game-check input { width:auto; margin:0; }
+.game-check .g-league { margin-left:auto; color:var(--muted); font-size:11px; text-transform:uppercase; }
 .reliability-meter { width:100%; height:36px; writing-mode:vertical-lr; direction:rtl; }

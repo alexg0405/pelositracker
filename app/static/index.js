@@ -310,6 +310,18 @@
     try { source = new EventSource("/api/stream"); } catch { return; }
     source.onmessage = event => { if(!event.data) return; try { renderEvents(JSON.parse(event.data)); refreshMetrics(); } catch {} };
   }
+  async function refreshBotGames() {
+    const box = document.querySelector("#bot-games");
+    if (!box) return;
+    try {
+      const r = await fetch("/api/monitored-games");
+      if (!r.ok) throw new Error();
+      const games = await r.json();
+      const checked = new Set([...box.querySelectorAll("input:checked")].map(i => i.value));
+      if (!games.length) { box.innerHTML = `<div class="field-note">${box.dataset.empty}</div>`; return; }
+      box.innerHTML = games.map(g => `<label class="game-check"><input type="checkbox" value="${esc(g.id)}"${checked.has(g.id) ? " checked" : ""}><span>${esc(g.name)}</span><span class="g-league">${esc(String(g.league || g.sport || ""))}</span></label>`).join("");
+    } catch { box.innerHTML = '<div class="field-note">Could not load games.</div>'; }
+  }
 
   document.querySelector("#form").addEventListener("submit",async event=>{event.preventDefault();const form=event.currentTarget,button=document.querySelector("#submit-event"),box=document.querySelector("#form-error");
     const payload=Object.fromEntries(new FormData(form));Object.keys(payload).forEach(k=>{if(!payload[k])delete payload[k]});button.disabled=true;box.hidden=true;
@@ -332,7 +344,8 @@
       flat_stake: sizing === "flat" ? mult : 100.0,
       start_bankroll: 10000.0,
       webhook_url: form.querySelector("#bot-webhook").value || "",
-      cash_out_enabled: form.querySelector("#bot-cashout").checked
+      cash_out_enabled: form.querySelector("#bot-cashout").checked,
+      events: [...form.querySelectorAll("#bot-games input:checked")].map(i => i.value)
     };
     try {
       const r = await fetch("/api/accounts", { method: "POST", headers: {"content-type":"application/json"}, body: JSON.stringify(payload) });
@@ -477,12 +490,12 @@
       if(document.querySelector("#auto-monitor-toggle")) document.querySelector("#auto-monitor-toggle").checked = !!c.auto_monitor;
     }).catch(()=>document.querySelector("#config").textContent="Thresholds unavailable");
 
-    refresh();refreshMetrics();refreshLeaderboard();startStream();loadDiscover();
+    refresh();refreshMetrics();refreshLeaderboard();startStream();loadDiscover();refreshBotGames();
 
     // Set intervals
     if (!window.intervalsStarted) {
       window.intervalsStarted = true;
-      setInterval(refresh,10000);setInterval(refreshMetrics,5000);setInterval(refreshLeaderboard,5000);setInterval(loadDiscover,60000);
+      setInterval(refresh,10000);setInterval(refreshMetrics,5000);setInterval(refreshLeaderboard,5000);setInterval(loadDiscover,60000);setInterval(refreshBotGames,30000);
     }
   }
 

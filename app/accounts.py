@@ -97,6 +97,9 @@ class Strategy:
     confidence_threshold: float = 0.0
     min_sources: int = 2
     markets: tuple = ("all",)
+    # Optional per-bot game allow-list (event id / slug / name). Empty = free
+    # bet: the bot may take any qualifying game (the default behavior).
+    events: tuple = ()
     sizing: str = "kelly"            # kelly | flat | flat_pct
     kelly_multiplier: float = 1.0
     flat_stake: float = 100.0
@@ -129,6 +132,8 @@ class Strategy:
         data = {k: v for k, v in data.items() if k in known}
         if "markets" in data:
             data["markets"] = tuple(data["markets"])
+        if "events" in data:
+            data["events"] = tuple(data["events"])
         return Strategy(**data)
 
 
@@ -163,6 +168,15 @@ def line_type(market: str) -> str:
 
 def market_allowed(strategy: Strategy, market: str) -> bool:
     return "all" in strategy.markets or line_type(market) in strategy.markets
+
+
+def event_allowed(strategy: Strategy, event: Event) -> bool:
+    """True when a bot may bet this game. An empty allow-list means free bet (any
+    game); otherwise the event must match by id, Polymarket slug, or name."""
+    if not strategy.events:
+        return True
+    identifiers = {event.id, event.polymarket_slug, event.name}
+    return any(identifier in strategy.events for identifier in identifiers if identifier)
 
 
 def _correlation_group(event: Event, signal: Signal) -> str:
@@ -582,6 +596,8 @@ class AccountBook:
                 accounts = cur.fetchall()
                 for account in accounts:
                     strategy = Strategy.from_json(account["strategy"])
+                    if not event_allowed(strategy, event):
+                        continue  # bot is restricted to a game allow-list
                     bankroll = float(account["bankroll"])
                     self._db.execute(
                         cur,

@@ -2,7 +2,14 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.accounts import AccountBook, Strategy, qualification_failures, qualifies, stake_for
+from app.accounts import (
+    AccountBook,
+    Strategy,
+    event_allowed,
+    qualification_failures,
+    qualifies,
+    stake_for,
+)
 from app.models import Event, Quote, Signal
 
 
@@ -250,6 +257,51 @@ def test_model_backed_tennis_bet_places_then_settles_as_a_win(tmp_path):
     assert settled == 1
     assert rows[0]["status"] == "win"
     assert rows[0]["pnl"] > 0
+
+
+def test_strategy_serializes_the_game_allow_list():
+    restored = Strategy.from_json(Strategy("t", events=("game-1", "game-2")).to_json())
+    assert restored.events == ("game-1", "game-2")
+
+
+def test_event_allowed_matches_identifiers_and_free_bets_when_empty():
+    event = Event("Alcaraz vs Sinner", "tennis", "Alcaraz", "Sinner",
+                  id="ev1", polymarket_slug="alcaraz-sinner")
+    assert event_allowed(Strategy("free"), event) is True            # empty = free bet
+    assert event_allowed(Strategy("id", events=("ev1",)), event) is True
+    assert event_allowed(Strategy("slug", events=("alcaraz-sinner",)), event) is True
+    assert event_allowed(Strategy("miss", events=("another-game",)), event) is False
+
+
+def _allowlist_bot(book_path, event_id, allow):
+    book = AccountBook(str(book_path))
+    strategy = Strategy("Restricted", sizing="flat", flat_stake=50.0, start_bankroll=1000.0,
+                        edge_threshold=0.0, max_stake_pct=1.0, max_event_exposure_pct=1.0,
+                        max_sport_exposure_pct=1.0, max_correlated_exposure_pct=1.0,
+                        max_total_exposure_pct=1.0, events=allow)
+    book.seed([strategy])
+    event = Event("Alcaraz vs Sinner", "tennis", "Alcaraz", "Sinner", id=event_id)
+    signal = _single_source_watch_signal(event)
+    quote = executable_quote(event, "token-home", "moneyline", "Alcaraz", ask=.50, bid=.48)
+    return book, event, signal, quote
+
+
+def test_bot_skips_a_game_off_its_allow_list(tmp_path):
+    book, event, signal, quote = _allowlist_bot(tmp_path / "off.db", "other-game", ("allowed-game",))
+    try:
+        placed = book.place(event, [signal], [quote], model_probabilities={"token-home": 0.60})
+    finally:
+        book.close()
+    assert placed == []
+
+
+def test_bot_bets_a_game_on_its_allow_list(tmp_path):
+    book, event, signal, quote = _allowlist_bot(tmp_path / "on.db", "target", ("target",))
+    try:
+        placed = book.place(event, [signal], [quote], model_probabilities={"token-home": 0.60})
+    finally:
+        book.close()
+    assert len(placed) == 1
 
 
 def test_validated_polymarket_signal_qualifies_and_depth_caps_stake():
