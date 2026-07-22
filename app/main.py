@@ -28,6 +28,7 @@ from .tennis_model import (
     parse_tennis_score,
 )
 from .lead_model import LEAD_SPORT_PARAMS, score_swing, win_probability_band
+from . import soccer_model
 from .diagnostics import edge_health
 from .advice import market_views, position_views
 from .history import HistoryDB
@@ -268,6 +269,10 @@ def _is_tennis(event: Event) -> bool:
     return (event.sport or "").strip().casefold() == "tennis"
 
 
+def _is_soccer(event: Event) -> bool:
+    return (event.sport or "").strip().casefold() == "soccer"
+
+
 def _moneyline_side(outcome: str, event: Event) -> str | None:
     """Map a moneyline outcome label to home/away for any two-sided match.
 
@@ -287,6 +292,17 @@ def _moneyline_side(outcome: str, event: Event) -> str | None:
         if remainder in ("away", away):
             return "home"
     return None
+
+
+def _soccer_side(outcome: str, event: Event) -> str | None:
+    """Map a soccer 1X2 outcome label to home/draw/away, or None.
+
+    Polymarket represents 1X2 as three independent binary conditions, so the
+    positive side of each is one of the three results."""
+    label = (outcome or "").strip().casefold()
+    if label in ("draw", "tie", "x"):
+        return "draw"
+    return _moneyline_side(outcome, event)
 
 
 def _is_tennis_moneyline(market: str) -> bool:
@@ -441,12 +457,69 @@ def _lead_model_probabilities(
     return probabilities, uncertainties
 
 
+_SOCCER_SECONDS_PER_GOAL = 1800.0  # rough interval between goals, for the latency term
+
+
+def _soccer_model_probabilities(
+    event: Event, signals: list, *, as_of: datetime
+) -> tuple[dict[str, float], dict[str, float]]:
+    """``(probabilities, uncertainties)`` per token for a soccer 1X2 match: the
+    pre-match price inverted to Poisson scoring rates (cached at kickoff) and
+    propagated through the live score and clock. Empty unless enabled, a clean
+    pre-match anchor was inverted, a live state with a known regulation fraction
+    exists (added/extra time is skipped), and the state is fresh enough for a
+    realistic fill. Restricted to moneyline/1X2 selections so spreads and totals
+    are never mispriced as a result bet."""
+    if not settings.enable_soccer_model or not _is_soccer(event):
+        return {}, {}
+    rates = _pregame.get(event.id, {}).get("soccer_rates")
+    if not rates:
+        return {}, {}
+    states = store.states.get(event.id) or []
+    if not states:
+        return {}, {}
+    state = states[-1]
+    _, fraction = game_progress(event.sport, state.period, state.clock, event.league)
+    if fraction is None:
+        return {}, {}
+    age = _state_age_seconds(state, as_of)
+    if age is not None and age > settings.max_state_age_seconds:
+        return {}, {}
+    window = (age or 0.0) + settings.latency_budget_seconds
+    lam_home, lam_away = rates
+    home_now = int(state.home_score)
+    away_now = int(state.away_score)
+    probabilities: dict[str, float] = {}
+    uncertainties: dict[str, float] = {}
+    for signal in signals:
+        if not signal.token_id:
+            continue
+        side = _soccer_side(signal.outcome, event)
+        if side is None:
+            continue
+        # Home/away must be a moneyline/1X2 market; draw only exists in 1X2.
+        if side != "draw" and line_type(signal.market) != "moneyline":
+            continue
+        low, mid, high = soccer_model.result_band(
+            lam_home, lam_away, home_now, away_now, fraction, side)
+        model_sigma = max(0.0, (high - low) / 2.0)
+        swing = soccer_model.result_swing(
+            lam_home, lam_away, home_now, away_now, fraction, side)
+        sigma = execution_sigma(model_sigma, swing, window,
+                                seconds_per_game=_SOCCER_SECONDS_PER_GOAL)
+        probabilities[signal.token_id] = mid
+        uncertainties[signal.token_id] = sigma
+    return probabilities, uncertainties
+
+
 def _model_probabilities(
     event: Event, signals: list, *, as_of: datetime
 ) -> tuple[dict[str, float], dict[str, float]]:
-    """Dispatch to the sport's independent in-play model (tennis or lead/clock)."""
+    """Dispatch to the sport's independent in-play model (tennis, soccer, lead)."""
     if _is_tennis(event):
         return _tennis_model_probabilities(event, signals, as_of=as_of)
+    if _is_soccer(event):
+        return _soccer_model_probabilities(event, signals, as_of=as_of)
     return _lead_model_probabilities(event, signals, as_of=as_of)
 
 
@@ -491,6 +564,19 @@ def recompute(event_id: str, *, as_of: datetime) -> list:
             anchor = _home_anchor()
             if anchor is not None:
                 prior["prematch_home_p"] = anchor
+    if (settings.enable_soccer_model and _is_soccer(event)
+            and "soccer_rates" not in prior and _at_game_start(event)):
+        def _side_anchor(side: str) -> float | None:
+            sig = next((s for s in signals
+                        if _soccer_side(s.outcome, event) == side
+                        and 0 < (s.model_probability or 0) < 1), None)
+            return float(sig.model_probability) if sig is not None else None
+
+        home_p, draw_p = _side_anchor("home"), _side_anchor("draw")
+        if home_p is not None and draw_p is not None:
+            # Store the inverted rates (or None if the prior is unusable) so we
+            # neither re-invert every cycle nor retry a bad anchor forever.
+            prior["soccer_rates"] = soccer_model.prematch_rates(home_p, draw_p)
     return signals
 
 

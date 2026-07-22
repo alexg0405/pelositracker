@@ -98,3 +98,19 @@ no anchor. Both in-play models feed the shared uncertainty-aware
 (`PAPER_EDGE_UNCERTAINTY_Z`) and latency-aware (`PAPER_LATENCY_BUDGET_SECONDS`,
 `PAPER_MAX_STATE_AGE_SECONDS`) trade gates. Per-sport parameters are documented
 approximations; this is a strategy-exercise model, not validated calibration.
+
+## Paper-harness in-play soccer model (display-grade)
+
+`ENABLE_SOCCER_MODEL` covers soccer 1X2 (EPL, MLS). `app.soccer_model` treats
+each side's remaining goals as independent Poisson arrivals over the remaining
+regulation fraction; the final joint score distribution gives home/draw/away
+result probabilities. The full-match scoring rates are **inverted from the
+market's pre-match 1X2 price** (home-win and draw), captured at kickoff and
+cached, so the model reproduces the market at the start and diverges only as the
+live score and clock move. Added time / extra time is skipped (no comparable
+regulation fraction) and it is restricted to moneyline/1X2 selections so spreads
+and totals are never mispriced as a result bet. Simplifications: independent
+Poisson (no Dixon-Coles low-score correction), constant rates, regulation only.
+Note the exact Polymarket soccer market labels are unverified against live data
+and the outcome mapping may need adjustment once observed. Feeds the same §5/§7
+gates; strategy-exercise model, not validated calibration.

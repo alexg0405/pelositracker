@@ -58,6 +58,7 @@ class Settings:
     allow_uncalibrated_paper: bool
     enable_tennis_model: bool
     enable_lead_model: bool
+    enable_soccer_model: bool
     edge_uncertainty_z: float
     latency_budget_seconds: float
     max_state_age_seconds: float
@@ -95,6 +96,7 @@ class Settings:
             allow_uncalibrated_paper=_bool(values, "PAPER_ALLOW_UNCALIBRATED", False),
             enable_tennis_model=_bool(values, "ENABLE_TENNIS_MODEL", False),
             enable_lead_model=_bool(values, "ENABLE_LEAD_MODEL", False),
+            enable_soccer_model=_bool(values, "ENABLE_SOCCER_MODEL", False),
             edge_uncertainty_z=_float(values, "PAPER_EDGE_UNCERTAINTY_Z", 1.0),
             latency_budget_seconds=_float(values, "PAPER_LATENCY_BUDGET_SECONDS", 8.0),
             max_state_age_seconds=_float(values, "PAPER_MAX_STATE_AGE_SECONDS", 30.0, minimum=1.0),
