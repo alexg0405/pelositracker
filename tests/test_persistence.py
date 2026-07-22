@@ -64,14 +64,17 @@ def test_database_url_keeps_postgres_as_the_default(monkeypatch):
             pass
 
     connection = FakeConnection()
+    captured = {}
     monkeypatch.setenv("DATABASE_URL", "postgresql://example.invalid/app")
-    monkeypatch.setattr(database_module.psycopg2, "connect", lambda target: connection)
+    monkeypatch.setattr(database_module.psycopg2, "connect",
+                        lambda target, **kwargs: captured.update(kwargs) or connection)
 
     database = Database.open(None, sqlite_envs=("LEDGER_DB",), sqlite_default="ledger.db")
     try:
         assert database.backend == "postgres"
         assert database.target == "postgresql://example.invalid/app"
         assert connection.autocommit is False
+        assert captured.get("keepalives") == 1  # idle-drop protection is configured
     finally:
         database.close()
 

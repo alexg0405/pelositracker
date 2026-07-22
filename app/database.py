@@ -24,6 +24,22 @@ except ImportError:  # pragma: no cover - requirements include psycopg2 in CI
 
 _SERIAL_PRIMARY_KEY = re.compile(r"\bSERIAL\s+PRIMARY\s+KEY\b", re.IGNORECASE)
 
+# Postgres errors that mean the socket is dead -- typically a managed pooler
+# (e.g. Supabase) dropping an idle connection between polling cycles. We reconnect
+# on these so a long-lived, single-worker server heals without a manual restart.
+_CONNECTION_ERRORS: tuple = (
+    (psycopg2.OperationalError, psycopg2.InterfaceError) if psycopg2 is not None else ()
+)
+
+# TCP keepalives stop a managed pooler from silently dropping the app's idle
+# connection in the first place.
+_KEEPALIVES = {
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 5,
+}
+
 
 def _looks_postgres(value: str) -> bool:
     lowered = value.strip().lower()
@@ -41,8 +57,7 @@ class Database:
         if backend == "postgres":
             if psycopg2 is None:  # pragma: no cover - only on incomplete installs
                 raise RuntimeError("psycopg2 is required when DATABASE_URL is configured")
-            self.connection = psycopg2.connect(target)
-            self.connection.autocommit = False
+            self.connection = self._connect_postgres()
         else:
             if target != ":memory:" and not target.startswith("file:"):
                 parent = Path(target).expanduser().resolve().parent
@@ -217,10 +232,35 @@ class Database:
                 "VALUES (%s,%s,%s,%s)", (component, version, checksum, time.time()),
             )
 
+    def _connect_postgres(self):
+        connection = psycopg2.connect(self.target, **_KEEPALIVES)
+        connection.autocommit = False
+        return connection
+
+    def _reconnect(self) -> None:
+        """Drop and reopen a dead Postgres connection so the next call succeeds."""
+        if self.backend != "postgres":
+            return
+        try:
+            self.connection.close()
+        except Exception:
+            pass
+        self.connection = self._connect_postgres()
+
     def _cursor(self, dict_rows: bool = False):
+        # Reopen first if a managed pooler dropped the idle connection, so the app
+        # recovers without a restart.
+        if self.backend == "postgres" and self.connection.closed:
+            self._reconnect()
         if self.backend == "postgres" and dict_rows:
             return self.connection.cursor(cursor_factory=psycopg2.extras.DictCursor)
         return self.connection.cursor()
+
+    def _safe_rollback(self) -> None:
+        try:
+            self.connection.rollback()
+        except Exception:
+            self._reconnect()
 
     @contextmanager
     def cursor(self, *, dict_rows: bool = False) -> Iterator:
@@ -230,11 +270,17 @@ class Database:
             # psycopg starts a transaction for SELECTs too; end that snapshot
             # promptly so a long-lived app connection never sits idle in one.
             self.connection.commit()
+        except _CONNECTION_ERRORS:
+            self._reconnect()  # dead socket: heal for the next call, then surface
+            raise
         except BaseException:
-            self.connection.rollback()
+            self._safe_rollback()
             raise
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except Exception:
+                pass
 
     @contextmanager
     def transaction(self, *, dict_rows: bool = False) -> Iterator:
@@ -242,11 +288,17 @@ class Database:
         try:
             yield cur
             self.connection.commit()
+        except _CONNECTION_ERRORS:
+            self._reconnect()
+            raise
         except BaseException:
-            self.connection.rollback()
+            self._safe_rollback()
             raise
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except Exception:
+                pass
 
     def execute(self, cur, statement: str, params: Sequence | None = None):
         if params is None:
