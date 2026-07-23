@@ -917,15 +917,25 @@ fn log_pool_consensus(
     max_age: f64,
 ) -> Option<f64> {
     let current = log_pool_score_for(
-        outcome_key, same_market, expected_outcomes, target_source_key, policy,
-        now_seconds, max_age,
+        outcome_key,
+        same_market,
+        expected_outcomes,
+        target_source_key,
+        policy,
+        now_seconds,
+        max_age,
     )?;
     let denominator: f64 = expected_outcomes
         .iter()
         .filter_map(|other| {
             log_pool_score_for(
-                other, same_market, expected_outcomes, target_source_key, policy,
-                now_seconds, max_age,
+                other,
+                same_market,
+                expected_outcomes,
+                target_source_key,
+                policy,
+                now_seconds,
+                max_age,
             )
         })
         .sum();
@@ -1352,8 +1362,13 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
             // weights. Weights come from family_coefficients (clamped non-negative);
             // an absent family defaults to weight 1.
             log_pool_consensus(
-                &outcome_key, &same_market, &expected_outcomes, &target_source_key,
-                policy, now_seconds, max_age,
+                &outcome_key,
+                &same_market,
+                &expected_outcomes,
+                &target_source_key,
+                policy,
+                now_seconds,
+                max_age,
             )
         } else {
             policy.and_then(|model| {
@@ -1375,23 +1390,27 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         // coherent by logit symmetry (home + away == 1), so it is left untouched.
         // log_pool is already coherent across outcomes, so the post-hoc
         // renormalization only applies to the per-outcome logit pooling methods.
-        let coherence_sum: Option<f64> = if consensus_method != "log_pool"
-            && expected_outcomes.len() >= 3
-        {
-            Some(
-                expected_outcomes
-                    .iter()
-                    .filter_map(|other| {
-                        pooled_consensus_for(
-                            other, &same_market, &expected_outcomes, &target_source_key,
-                            policy, now_seconds, max_age,
-                        )
-                    })
-                    .sum(),
-            )
-        } else {
-            None
-        };
+        let coherence_sum: Option<f64> =
+            if consensus_method != "log_pool" && expected_outcomes.len() >= 3 {
+                Some(
+                    expected_outcomes
+                        .iter()
+                        .filter_map(|other| {
+                            pooled_consensus_for(
+                                other,
+                                &same_market,
+                                &expected_outcomes,
+                                &target_source_key,
+                                policy,
+                                now_seconds,
+                                max_age,
+                            )
+                        })
+                        .sum(),
+                )
+            } else {
+                None
+            };
         let fair = match coherence_sum {
             Some(sum) if sum > 1e-9 => clamp(fair / sum, 0.001, 0.999),
             _ => fair,
@@ -1427,8 +1446,13 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
                     .iter()
                     .filter_map(|other| {
                         pooled_consensus_for(
-                            other, &same_market, &expected_outcomes, &target_source_key,
-                            policy, now_seconds, max_age,
+                            other,
+                            &same_market,
+                            &expected_outcomes,
+                            &target_source_key,
+                            policy,
+                            now_seconds,
+                            max_age,
                         )
                         .and_then(|other_fair| {
                             beta_calibrate(
@@ -2134,7 +2158,10 @@ mod tests {
             .sum();
         // Independent logit pools do not sum to one; the renormalization makes the
         // three-way consensus coherent.
-        assert!((sum - 1.0).abs() < 1e-9, "three-way consensus summed to {sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-9,
+            "three-way consensus summed to {sum}"
+        );
     }
 
     #[test]
@@ -2197,15 +2224,23 @@ mod tests {
             quotes
         };
         let logit_home = evaluate(request(make()), now)
-            .iter().find(|s| s.outcome == "home").unwrap().consensus_probability;
+            .iter()
+            .find(|s| s.outcome == "home")
+            .unwrap()
+            .consensus_probability;
         let mut req = request(make());
         req.model_policies[0].consensus_method = "log_pool".to_string();
         let pool_home = evaluate(req, now)
-            .iter().find(|s| s.outcome == "home").unwrap().consensus_probability;
+            .iter()
+            .find(|s| s.outcome == "home")
+            .unwrap()
+            .consensus_probability;
         // At equal weights the log pool IS the logit average for a two-way market,
         // so the live moneyline consensus is provably unchanged.
-        assert!((logit_home - pool_home).abs() < 1e-9,
-                "log_pool {pool_home} != equal_family_logit {logit_home}");
+        assert!(
+            (logit_home - pool_home).abs() < 1e-9,
+            "log_pool {pool_home} != equal_family_logit {logit_home}"
+        );
     }
 
     #[test]
@@ -2229,9 +2264,18 @@ mod tests {
         let results = evaluate(req, now);
         let sum: f64 = ["home", "draw", "away"]
             .iter()
-            .map(|o| results.iter().find(|s| s.outcome == *o).unwrap().consensus_probability)
+            .map(|o| {
+                results
+                    .iter()
+                    .find(|s| s.outcome == *o)
+                    .unwrap()
+                    .consensus_probability
+            })
             .sum();
-        assert!((sum - 1.0).abs() < 1e-9, "log_pool three-way summed to {sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-9,
+            "log_pool three-way summed to {sum}"
+        );
     }
 
     #[test]
@@ -2259,17 +2303,30 @@ mod tests {
         let mut equal = request(make());
         equal.model_policies[0].consensus_method = "log_pool".to_string();
         let equal_home = evaluate(equal, now)
-            .iter().find(|s| s.outcome == "home").unwrap().consensus_probability;
+            .iter()
+            .find(|s| s.outcome == "home")
+            .unwrap()
+            .consensus_probability;
         let mut weighted = request(make());
         weighted.model_policies[0].consensus_method = "log_pool".to_string();
-        weighted.model_policies[0].family_coefficients =
-            BTreeMap::from([("c".to_string(), 10.0), ("a".to_string(), 1.0), ("b".to_string(), 1.0)]);
+        weighted.model_policies[0].family_coefficients = BTreeMap::from([
+            ("c".to_string(), 10.0),
+            ("a".to_string(), 1.0),
+            ("b".to_string(), 1.0),
+        ]);
         let weighted_home = evaluate(weighted, now)
-            .iter().find(|s| s.outcome == "home").unwrap().consensus_probability;
-        assert!(weighted_home > equal_home,
-                "weighting sharp C should raise home: {weighted_home} vs {equal_home}");
-        assert!(weighted_home > 0.6,
-                "heavy C weight should pull toward 0.70, got {weighted_home}");
+            .iter()
+            .find(|s| s.outcome == "home")
+            .unwrap()
+            .consensus_probability;
+        assert!(
+            weighted_home > equal_home,
+            "weighting sharp C should raise home: {weighted_home} vs {equal_home}"
+        );
+        assert!(
+            weighted_home > 0.6,
+            "heavy C weight should pull toward 0.70, got {weighted_home}"
+        );
     }
 
     #[test]
