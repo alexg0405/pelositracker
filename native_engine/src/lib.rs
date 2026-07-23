@@ -828,6 +828,113 @@ fn pooled_consensus_for(
     Some(selected.unwrap_or(equal_family))
 }
 
+/// Unnormalized log-pool score for one outcome: ``exp(sum_j w_j log p_jk)``, the
+/// weighted geometric mean of the reference sources' de-vigged fairs. Weights are
+/// non-negative per source family (an absent family defaults to 1.0) and are
+/// normalized to sum to one, so the score stays in (0, 1). Uses the same
+/// leave-one-out reference, de-vig, and complete-market filter as the main loop.
+#[allow(clippy::too_many_arguments)]
+fn log_pool_score_for(
+    outcome_key: &str,
+    same_market: &[&QuoteInput],
+    expected_outcomes: &BTreeSet<&str>,
+    target_source_key: &str,
+    policy: Option<&ModelPolicyInput>,
+    now_seconds: f64,
+    max_age: f64,
+) -> Option<f64> {
+    let sources: BTreeSet<String> = same_market.iter().map(|q| q.source_key()).collect();
+    let mut fairs: Vec<Fair> = Vec::new();
+    for source in &sources {
+        let source_quotes: Vec<&QuoteInput> = same_market
+            .iter()
+            .copied()
+            .filter(|q| q.source_key() == *source)
+            .collect();
+        let source_outcomes: BTreeSet<&str> =
+            source_quotes.iter().map(|q| q.outcome_key()).collect();
+        if !source_quotes.iter().any(|q| q.exchange()) && source_outcomes != *expected_outcomes {
+            continue;
+        }
+        if let Some(fair) = source_fair(
+            outcome_key,
+            &source_quotes,
+            policy.map(|value| value.devig_method.as_str()),
+        ) {
+            fairs.push(fair);
+        }
+    }
+    let reference: Vec<&Fair> = fairs
+        .iter()
+        .filter(|f| {
+            f.source_key != target_source_key
+                && f.timestamp_trusted
+                && now_seconds >= f.observed_at
+                && (now_seconds - f.observed_at) <= max_age
+        })
+        .collect();
+    if reference.is_empty() {
+        return None;
+    }
+    let weights: Vec<f64> = reference
+        .iter()
+        .map(|f| {
+            policy
+                .and_then(|model| {
+                    model
+                        .family_coefficients
+                        .iter()
+                        .find(|(family, _)| family.eq_ignore_ascii_case(&f.source_key))
+                        .map(|(_, weight)| weight.max(0.0))
+                })
+                .unwrap_or(1.0)
+        })
+        .collect();
+    let total: f64 = weights.iter().sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let log_score: f64 = reference
+        .iter()
+        .zip(&weights)
+        .map(|(f, weight)| (weight / total) * clamp(f.prob, 1e-9, 1.0).ln())
+        .sum();
+    Some(log_score.exp())
+}
+
+/// Normalized log-linear opinion pool for one outcome:
+/// ``q_k = exp(sum_j w_j log p_jk) / sum_l exp(sum_j w_j log p_jl)``. Coherent
+/// across the market's outcomes by construction (no post-hoc renormalization) and
+/// identical to `equal_family_logit` for a two-way market at equal weights.
+#[allow(clippy::too_many_arguments)]
+fn log_pool_consensus(
+    outcome_key: &str,
+    same_market: &[&QuoteInput],
+    expected_outcomes: &BTreeSet<&str>,
+    target_source_key: &str,
+    policy: Option<&ModelPolicyInput>,
+    now_seconds: f64,
+    max_age: f64,
+) -> Option<f64> {
+    let current = log_pool_score_for(
+        outcome_key, same_market, expected_outcomes, target_source_key, policy,
+        now_seconds, max_age,
+    )?;
+    let denominator: f64 = expected_outcomes
+        .iter()
+        .filter_map(|other| {
+            log_pool_score_for(
+                other, same_market, expected_outcomes, target_source_key, policy,
+                now_seconds, max_age,
+            )
+        })
+        .sum();
+    if denominator <= 1e-12 {
+        return None;
+    }
+    Some(clamp(current / denominator, 0.001, 0.999))
+}
+
 fn source_fair(
     outcome_key: &str,
     source_quotes: &[&QuoteInput],
@@ -1237,23 +1344,40 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         let consensus_method = policy
             .map(|value| value.consensus_method.as_str())
             .unwrap_or("equal_family_logit");
-        let selected_consensus = policy.and_then(|model| {
-            consensus_probability(
-                &reference,
-                &model.consensus_method,
-                model.sharp_source_family.as_deref(),
-                model.consensus_intercept,
-                &model.family_coefficients,
-                &model.missing_family_coefficients,
+        let selected_consensus = if consensus_method == "log_pool" {
+            // Genuine normalized log-linear opinion pool: a softmax over the
+            // market's outcomes of sum_j w_j log p_jk with non-negative weights.
+            // Coherent across outcomes by construction (no post-hoc renormalization)
+            // and identical to equal_family_logit for a two-way market at equal
+            // weights. Weights come from family_coefficients (clamped non-negative);
+            // an absent family defaults to weight 1.
+            log_pool_consensus(
+                &outcome_key, &same_market, &expected_outcomes, &target_source_key,
+                policy, now_seconds, max_age,
             )
-        });
+        } else {
+            policy.and_then(|model| {
+                consensus_probability(
+                    &reference,
+                    &model.consensus_method,
+                    model.sharp_source_family.as_deref(),
+                    model.consensus_intercept,
+                    &model.family_coefficients,
+                    &model.missing_family_coefficients,
+                )
+            })
+        };
         let consensus_supported = policy.is_none() || selected_consensus.is_some();
         let fair = selected_consensus.unwrap_or(equal_family_fair);
         // Probability coherence: pooling each outcome's logit independently does
         // not make a three-way (or larger) market sum to one. Renormalize across
         // the market's outcomes so the consensus is coherent. Two-way is already
         // coherent by logit symmetry (home + away == 1), so it is left untouched.
-        let coherence_sum: Option<f64> = if expected_outcomes.len() >= 3 {
+        // log_pool is already coherent across outcomes, so the post-hoc
+        // renormalization only applies to the per-outcome logit pooling methods.
+        let coherence_sum: Option<f64> = if consensus_method != "log_pool"
+            && expected_outcomes.len() >= 3
+        {
             Some(
                 expected_outcomes
                     .iter()
@@ -2051,6 +2175,101 @@ mod tests {
             (sum - 1.0).abs() < 1e-9,
             "three-way calibrated consensus summed to {sum}"
         );
+    }
+
+    #[test]
+    fn log_pool_two_way_matches_equal_family_logit_at_equal_weights() {
+        let now = 1_000.0;
+        let make = || {
+            let mut quotes = Vec::new();
+            for source in ["A", "B"] {
+                quotes.push(quote(source, "home", 0.60, now));
+                quotes.push(quote(source, "away", 0.40, now));
+            }
+            let mut c_home = quote("C", "home", 0.545, now);
+            c_home.bid = Some(0.54);
+            c_home.ask = Some(0.55);
+            let mut c_away = quote("C", "away", 0.455, now);
+            c_away.bid = Some(0.45);
+            c_away.ask = Some(0.46);
+            quotes.push(c_home);
+            quotes.push(c_away);
+            quotes
+        };
+        let logit_home = evaluate(request(make()), now)
+            .iter().find(|s| s.outcome == "home").unwrap().consensus_probability;
+        let mut req = request(make());
+        req.model_policies[0].consensus_method = "log_pool".to_string();
+        let pool_home = evaluate(req, now)
+            .iter().find(|s| s.outcome == "home").unwrap().consensus_probability;
+        // At equal weights the log pool IS the logit average for a two-way market,
+        // so the live moneyline consensus is provably unchanged.
+        assert!((logit_home - pool_home).abs() < 1e-9,
+                "log_pool {pool_home} != equal_family_logit {logit_home}");
+    }
+
+    #[test]
+    fn log_pool_three_way_consensus_is_coherent() {
+        let now = 1_000.0;
+        let mut quotes = Vec::new();
+        for (outcome, prob) in [("home", 0.55), ("draw", 0.25), ("away", 0.20)] {
+            quotes.push(quote("A", outcome, prob, now));
+        }
+        for (outcome, prob) in [("home", 0.45), ("draw", 0.30), ("away", 0.25)] {
+            quotes.push(quote("B", outcome, prob, now));
+        }
+        for outcome in ["home", "draw", "away"] {
+            let mut c = quote("C", outcome, 0.34, now);
+            c.bid = Some(0.04);
+            c.ask = Some(0.05);
+            quotes.push(c);
+        }
+        let mut req = request(quotes);
+        req.model_policies[0].consensus_method = "log_pool".to_string();
+        let results = evaluate(req, now);
+        let sum: f64 = ["home", "draw", "away"]
+            .iter()
+            .map(|o| results.iter().find(|s| s.outcome == *o).unwrap().consensus_probability)
+            .sum();
+        assert!((sum - 1.0).abs() < 1e-9, "log_pool three-way summed to {sum}");
+    }
+
+    #[test]
+    fn log_pool_weights_tilt_the_consensus_toward_the_weighted_family() {
+        let now = 1_000.0;
+        let make = || {
+            let mut quotes = Vec::new();
+            for source in ["A", "B"] {
+                quotes.push(quote(source, "home", 0.50, now));
+                quotes.push(quote(source, "away", 0.50, now));
+            }
+            quotes.push(quote("C", "home", 0.70, now)); // sharp family
+            quotes.push(quote("C", "away", 0.30, now));
+            // A separate exchange is the bet target, so A, B, C are all reference.
+            let mut p_home = quote("Polymarket", "home", 0.40, now);
+            p_home.bid = Some(0.39);
+            p_home.ask = Some(0.41);
+            let mut p_away = quote("Polymarket", "away", 0.60, now);
+            p_away.bid = Some(0.59);
+            p_away.ask = Some(0.61);
+            quotes.push(p_home);
+            quotes.push(p_away);
+            quotes
+        };
+        let mut equal = request(make());
+        equal.model_policies[0].consensus_method = "log_pool".to_string();
+        let equal_home = evaluate(equal, now)
+            .iter().find(|s| s.outcome == "home").unwrap().consensus_probability;
+        let mut weighted = request(make());
+        weighted.model_policies[0].consensus_method = "log_pool".to_string();
+        weighted.model_policies[0].family_coefficients =
+            BTreeMap::from([("c".to_string(), 10.0), ("a".to_string(), 1.0), ("b".to_string(), 1.0)]);
+        let weighted_home = evaluate(weighted, now)
+            .iter().find(|s| s.outcome == "home").unwrap().consensus_probability;
+        assert!(weighted_home > equal_home,
+                "weighting sharp C should raise home: {weighted_home} vs {equal_home}");
+        assert!(weighted_home > 0.6,
+                "heavy C weight should pull toward 0.70, got {weighted_home}");
     }
 
     #[test]
