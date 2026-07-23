@@ -147,7 +147,9 @@ def closest_start(candidates: Iterable[T], target_start,
         return None
     target = start_timestamp(target_start)
     if target is None:
-        return options[0]
+        # Team names alone cannot distinguish a rematch/doubleheader, so without a
+        # tracked start time only an unambiguous single match is safe to accept.
+        return options[0] if len(options) == 1 else None
     timed = [(abs(at - target), option) for option in options
              if (at := start_timestamp(get_start(option))) is not None]
     if not timed:

@@ -129,9 +129,10 @@ class MappingDecision:
 
 def resolve_event_mapping(provider: str, target: CanonicalEvent,
                           candidates: list[ProviderEventCandidate], *,
-                          tolerance_seconds: float = 4 * 3600) -> MappingDecision:
+                          tolerance_seconds: float = 4 * 3600,
+                          threshold: float = 0.70) -> MappingDecision:
     target_start = target.starts_at.timestamp() if target.starts_at else None
-    eligible: list[tuple[float, ProviderEventCandidate, str, dict[str, float]]] = []
+    eligible: list[tuple[float, ProviderEventCandidate, str, dict[str, float], bool]] = []
     for candidate in candidates:
         if canonical_text(candidate.sport) != target.sport:
             continue
@@ -150,6 +151,7 @@ def resolve_event_mapping(provider: str, target: CanonicalEvent,
             continue
         orientation, scores = max(valid, key=lambda item: sum(item[1]))
         candidate_start = start_timestamp(candidate.starts_at)
+        time_evidence = target_start is not None and candidate_start is not None
         if target_start is not None:
             if candidate_start is None:
                 continue
@@ -162,13 +164,13 @@ def resolve_event_mapping(provider: str, target: CanonicalEvent,
         time_score = 1.0 - min(delta / tolerance_seconds, 1.0)
         components = {"participant_score": name_score, "start_time_score": time_score}
         eligible.append((0.75 * name_score + 0.25 * time_score,
-                         candidate, orientation, components))
+                         candidate, orientation, components, time_evidence))
 
     if not eligible:
         return MappingDecision(provider, "", None, MappingStatus.QUARANTINED, 0.0,
                                "no candidate matched sport, both participants, and start time")
     eligible.sort(key=lambda item: (-item[0], item[1].provider_object_id))
-    best_score, best, orientation, components = eligible[0]
+    best_score, best, orientation, components, time_evidence = eligible[0]
     evidence = json.dumps({
         "candidate_ids": [item[1].provider_object_id for item in eligible],
         "best_components": components,
@@ -177,8 +179,18 @@ def resolve_event_mapping(provider: str, target: CanonicalEvent,
         return MappingDecision(provider, best.provider_object_id, None,
                                MappingStatus.AMBIGUOUS, best_score,
                                "multiple provider events have indistinguishable identity evidence",
-                               orientation=orientation, evidence_json=evidence)
+                               orientation=orientation, threshold=threshold, evidence_json=evidence)
+    if not time_evidence:
+        return MappingDecision(provider, best.provider_object_id, None,
+                               MappingStatus.AMBIGUOUS, best_score,
+                               "no start-time evidence to distinguish a possible rematch",
+                               orientation=orientation, threshold=threshold, evidence_json=evidence)
+    if best_score < threshold:
+        return MappingDecision(provider, best.provider_object_id, None,
+                               MappingStatus.QUARANTINED, best_score,
+                               f"match confidence {best_score:.2f} below threshold {threshold:.2f}",
+                               orientation=orientation, threshold=threshold, evidence_json=evidence)
     return MappingDecision(provider, best.provider_object_id, target.canonical_event_id,
                            MappingStatus.MAPPED, min(best_score, 1.0),
                            "matched sport, league, both participants, and start time",
-                           orientation=orientation, evidence_json=evidence)
+                           orientation=orientation, threshold=threshold, evidence_json=evidence)

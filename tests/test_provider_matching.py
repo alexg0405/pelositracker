@@ -5,7 +5,7 @@ import pytest
 from app import actionnetwork
 from app.actionnetwork import (_action_network_once, match_game, parse_action_quotes,
                                scoreboard_sport)
-from app.matching import team_match_score
+from app.matching import closest_start, team_match_score
 from app.models import Event
 from app.pinnacle import _match_pinnacle_game, _parse_pinnacle_quotes
 
@@ -13,6 +13,14 @@ from app.pinnacle import _match_pinnacle_game, _parse_pinnacle_quotes
 def event(start="2026-07-19T23:20:00Z"):
     return Event("Dodgers vs Yankees", "baseball", "New York Yankees",
                  "Los Angeles Dodgers", game_start=start)
+
+
+def test_no_start_time_rejects_an_ambiguous_rematch():
+    options = [{"id": "g1", "start": None}, {"id": "g2", "start": None}]
+    # Two same-name candidates and no tracked start: cannot disambiguate -> refuse.
+    assert closest_start(options, None, lambda o: o["start"]) is None
+    # A lone candidate with no start is still safe to accept.
+    assert closest_start(options[:1], None, lambda o: o["start"]) == options[0]
 
 
 def test_action_network_doubleheader_matches_by_start_time():

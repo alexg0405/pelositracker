@@ -64,6 +64,26 @@ def test_manchester_and_team_variants_do_not_cross_match():
     assert decision.status is MappingStatus.QUARANTINED
 
 
+def test_resolver_needs_start_time_evidence_to_map():
+    target = CanonicalEvent.create("basketball", "nba", None,
+                                   "New York Knicks", "Boston Celtics")
+    decision = resolve_event_mapping("fixture", target, [
+        ProviderEventCandidate("x", "New York Knicks", "Boston Celtics", None,
+                               "basketball", "nba")])
+    assert decision.status is MappingStatus.AMBIGUOUS   # name-only cannot rule out a rematch
+    assert decision.canonical_id is None
+
+
+def test_resolver_enforces_its_confidence_threshold():
+    target = CanonicalEvent.create("basketball", "nba", START,
+                                   "New York Knicks", "Boston Celtics")
+    decision = resolve_event_mapping("fixture", target, [
+        ProviderEventCandidate("x", "New York Knicks", "Boston Celtics", START,
+                               "basketball", "nba")], threshold=1.5)
+    assert decision.status is MappingStatus.QUARANTINED  # perfect match still below 1.5
+    assert decision.canonical_id is None
+
+
 def test_reversed_orientation_is_recorded_not_silently_relabelled():
     target = CanonicalEvent.create("basketball", "nba", START,
                                    "New York Knicks", "Boston Celtics")
