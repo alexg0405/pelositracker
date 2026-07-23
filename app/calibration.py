@@ -220,7 +220,7 @@ class CalibrationPolicy:
         if self.devig_method not in {"shin", "proportional"}:
             raise ValueError("unsupported selected de-vig method")
         if self.consensus_method not in {
-            "equal_family_logit", "sharp_source", "stacked_logit"
+            "equal_family_logit", "sharp_source", "stacked_logit", "log_pool"
         }:
             raise ValueError("unsupported selected consensus method")
         if self.calibration_method not in {"identity", "beta"}:
@@ -235,7 +235,7 @@ class CalibrationPolicy:
             if draw["devig_method"] not in {"shin", "proportional"}:
                 raise ValueError("uncertainty draw has unsupported de-vig method")
             if draw["consensus_method"] not in {
-                "equal_family_logit", "sharp_source", "stacked_logit"
+                "equal_family_logit", "sharp_source", "stacked_logit", "log_pool"
             }:
                 raise ValueError("uncertainty draw has unsupported consensus method")
             if (draw["consensus_method"] == "sharp_source"
@@ -244,6 +244,9 @@ class CalibrationPolicy:
             if (draw["consensus_method"] == "stacked_logit"
                     and not draw["family_coefficients"]):
                 raise ValueError("stacked uncertainty draw lacks coefficients")
+            if (draw["consensus_method"] == "log_pool"
+                    and any(weight < 0 for weight in draw["family_coefficients"].values())):
+                raise ValueError("log-pool uncertainty draw weights must be non-negative")
         if not 0.5 < self.min_probability_positive <= 1:
             raise ValueError("minimum positive-EV probability must be in (0.5, 1]")
         if self.min_expected_value_dollars < 0:
@@ -272,6 +275,12 @@ class CalibrationPolicy:
             raise ValueError("sharp-source consensus requires a declared source family")
         if self.consensus_method == "stacked_logit" and not self.family_coefficients:
             raise ValueError("stacked consensus requires fitted family coefficients")
+        # log_pool weights are optional (absent => equal weights) but, being a
+        # weighted geometric mean, they must be non-negative.
+        if self.consensus_method == "log_pool" and any(
+            value < 0 for _, value in self.family_coefficients
+        ):
+            raise ValueError("log-pool consensus weights must be non-negative")
 
     def matches(self, sport: str, league: str, market: str) -> bool:
         dimensions = (

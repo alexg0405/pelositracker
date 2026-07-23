@@ -10,6 +10,15 @@ def _draws(count: int = 200):
     return [[1.0, 1.0, 0.0] for _ in range(count)]
 
 
+def _log_pool_metrics():
+    return {
+        "devig": {"shin": {"sample_size": 1200, "brier_score": 0.21, "log_loss": 0.61}},
+        "consensus": {
+            "log_pool": {"sample_size": 1200, "brier_score": 0.20, "log_loss": 0.60}
+        },
+    }
+
+
 def artifact_v1(tmp_path, **overrides):
     payload = {
         "artifact_version": "1",
@@ -102,6 +111,32 @@ def test_actionable_v2_artifact_selects_policy_and_applies_beta_map(tmp_path):
     assert len(policy.uncertainty_draws) == 200
     assert policy.uncertainty_draws[0]["consensus_method"] == "equal_family_logit"
     assert policy.to_engine_dict()["min_probability_positive"] == 0.95
+
+
+def test_log_pool_consensus_artifact_loads_and_forwards_nonnegative_weights(tmp_path):
+    loaded = CalibrationArtifact.load(artifact_v2(
+        tmp_path,
+        consensus_method="log_pool",
+        candidate_metrics=_log_pool_metrics(),
+        family_coefficients={"pinnacle": 2.0, "circa": 1.0},
+    ))
+    policy = loaded.policy_for("basketball", "nba", "moneyline")
+    assert policy is not None
+    assert policy.consensus_method == "log_pool"
+    engine_dict = policy.to_engine_dict()
+    assert engine_dict["consensus_method"] == "log_pool"
+    # Non-negative weights reach the Rust engine's log-pool via family_coefficients.
+    assert engine_dict["family_coefficients"] == {"pinnacle": 2.0, "circa": 1.0}
+
+
+def test_log_pool_consensus_rejects_negative_weights(tmp_path):
+    with pytest.raises(ValueError, match="non-negative"):
+        CalibrationArtifact.load(artifact_v2(
+            tmp_path,
+            consensus_method="log_pool",
+            candidate_metrics=_log_pool_metrics(),
+            family_coefficients={"pinnacle": -0.5, "circa": 1.0},
+        ))
 
 
 def test_v2_hierarchical_policy_prefers_the_most_specific_segment(tmp_path):
