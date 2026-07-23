@@ -232,6 +232,30 @@ def test_ledger_never_invents_a_fill_when_execution_lineage_is_missing(tmp_path)
         ledger.close()
 
 
+def test_decision_coverage_is_lean_and_excludes_heavy_snapshot(tmp_path):
+    ledger = Ledger(str(tmp_path / "coverage.db"))
+    try:
+        event = Event(name="A vs B", sport="basketball", home="A", away="B")
+        signal = paper_signal("A", .6, .5, .1)
+        signal.input_snapshot_json = "x" * 100_000  # the heavy per-decision blob
+        assert ledger.record_signals(event, [signal]) == 1
+
+        full = ledger.all_decisions()
+        lean = ledger.decision_coverage()
+
+        # Same rows, but the lean projection drops the big snapshot column (and
+        # every other column the metrics summary never reads).
+        assert len(lean) == len(full) == 1
+        assert "input_snapshot_json" in full[0]
+        assert set(lean[0]) == {"policy_action", "gate_results_json", "as_of"}
+
+        # It must still drive eligibility_coverage identically.
+        assert (backtest.eligibility_coverage(lean, 1)
+                == backtest.eligibility_coverage(full, 1))
+    finally:
+        ledger.close()
+
+
 def test_ledger_roundtrip_clv_and_settlement(tmp_path):
     ledger = Ledger(str(tmp_path / "t.db"))
     try:

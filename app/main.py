@@ -1374,7 +1374,10 @@ async def metrics():
         return {"n_bets": 0, "n_settled": 0}
     bet_rows, decisions = await asyncio.gather(
         asyncio.to_thread(ledger.all_bets),
-        asyncio.to_thread(ledger.all_decisions),
+        # Lean projection: summary only counts these rows and reads two fields.
+        # all_decisions() SELECT * would load every input_snapshot_json blob into
+        # RAM, spiking on each metrics refresh (e.g. right after an event removal).
+        asyncio.to_thread(ledger.decision_coverage),
     )
     return await asyncio.to_thread(backtest.summary, bet_rows, decisions)
 

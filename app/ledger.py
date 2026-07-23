@@ -511,6 +511,22 @@ class Ledger:
             "SELECT * FROM decision_marks", "as_of", since_ts=since_ts, limit=limit
         )
 
+    def decision_coverage(self, *, since_ts: float | None = None,
+                          limit: int | None = None) -> list[dict]:
+        """Lean projection for eligibility coverage / the metrics endpoint.
+
+        ``backtest.summary`` only reads ``policy_action`` and ``gate_results_json``
+        (plus the row count) from decisions. ``all_decisions`` does ``SELECT *``,
+        which drags the full per-decision ``input_snapshot_json`` blob — the
+        entire evaluation request, every quote considered — for every row ever
+        recorded. On a long-running deployment that is a multi-hundred-MB read
+        the dashboard triggers on every metrics refresh (including after an event
+        removal). Select only the columns the summary consumes."""
+        return self._select_rows(
+            "SELECT policy_action, gate_results_json, as_of FROM decision_marks",
+            "as_of", since_ts=since_ts, limit=limit,
+        )
+
     def _select_rows(self, select: str, order_column: str, *,
                      since_ts: float | None, limit: int | None) -> list[dict]:
         clauses = ""
