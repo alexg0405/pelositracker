@@ -42,6 +42,41 @@ def observation(index: int, *, event_id: str | None = None, outcome: float | Non
     )
 
 
+def test_folds_use_label_availability_not_just_observation_time():
+    selection_through = START + timedelta(days=10)
+    calibration_through = START + timedelta(days=20)
+    validation_through = START + timedelta(days=30)
+
+    def _obs(event_id, observed_day, *, label_available_at=None):
+        return EvaluationObservation(
+            event_id=event_id, observed_at=START + timedelta(days=observed_day),
+            sport="basketball", league="nba", market="moneyline", outcome=1.0,
+            candidate_probabilities={"c": 0.6}, executable_cost=0.5,
+            execution_cost_error=0.0, label_available_at=label_available_at,
+        )
+
+    # One filler per fold so each is non-empty, plus a prediction observed before
+    # the selection cutoff whose label only settles inside the calibration window.
+    rows = [
+        _obs("sel", 3),
+        _obs("cal", 13),
+        _obs("val", 25),
+        _obs("test", 35),
+        _obs("late", 5, label_available_at=START + timedelta(days=15)),
+    ]
+    folds = chronological_folds(
+        rows, model_selection_through=selection_through,
+        calibration_through=calibration_through, validation_through=validation_through)
+
+    selection_ids = {row.event_id for row in folds.selection}
+    calibration_ids = {row.event_id for row in folds.calibration}
+    # The late label is NOT usable at the selection origin, so it is excluded from
+    # selection and only appears once its label is available (calibration window).
+    assert "late" not in selection_ids
+    assert "late" in calibration_ids
+    assert selection_ids == {"sel"}
+
+
 def test_multiplicity_report_flags_a_skilled_candidate_over_the_benchmark():
     from app.model_training import multiplicity_report
 

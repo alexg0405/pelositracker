@@ -36,9 +36,23 @@ class EvaluationObservation:
     candidate_probabilities: dict[str, float]
     executable_cost: float
     execution_cost_error: float
+    # When the features and the settled label became available. Default to
+    # observed_at (the legacy assumption) so existing rows behave unchanged; a
+    # label that settles later must carry its true availability so it cannot leak
+    # into an earlier fold.
+    feature_available_at: datetime | None = None
+    label_available_at: datetime | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "observed_at", ensure_utc(self.observed_at))
+        object.__setattr__(
+            self, "feature_available_at",
+            ensure_utc(self.feature_available_at)
+            if self.feature_available_at is not None else self.observed_at)
+        object.__setattr__(
+            self, "label_available_at",
+            ensure_utc(self.label_available_at)
+            if self.label_available_at is not None else self.observed_at)
         if not self.event_id:
             raise ValueError("event_id is required")
         if self.outcome not in {0.0, 1.0}:
@@ -56,6 +70,13 @@ class EvaluationObservation:
                 raise ValueError(f"{label} must be finite")
         if not 0 < self.executable_cost < 1:
             raise ValueError("executable cost must be strictly between zero and one")
+
+    @property
+    def usable_at(self) -> datetime:
+        """Earliest origin at which the row is usable to fit: both its features
+        and its settled label are known (the later of the two availabilities)."""
+        assert self.feature_available_at is not None and self.label_available_at is not None
+        return max(self.feature_available_at, self.label_available_at)
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,12 +165,15 @@ def chronological_folds(
     partitions: dict[str, list[EvaluationObservation]] = {
         "selection": [], "calibration": [], "validation": [], "test": []
     }
-    for row in sorted(observations, key=lambda value: (value.observed_at, value.event_id)):
-        if row.observed_at <= selection_end:
+    # Partition by usable_at (max of feature- and label-availability), NOT by the
+    # prediction-observation time, so a row whose label settles after a fold's
+    # origin cannot leak its outcome into that fold's fit/selection.
+    for row in sorted(observations, key=lambda value: (value.usable_at, value.event_id)):
+        if row.usable_at <= selection_end:
             fold = "selection"
-        elif row.observed_at <= calibration_end:
+        elif row.usable_at <= calibration_end:
             fold = "calibration"
-        elif row.observed_at <= validation_end:
+        elif row.usable_at <= validation_end:
             fold = "validation"
         else:
             fold = "test"
