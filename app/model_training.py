@@ -19,6 +19,7 @@ from typing import Any, Iterable
 
 from .calibration import BetaCoefficients
 from .domain.time import ensure_utc
+from .multiplicity import reality_check_pvalue, romano_wolf_pvalues
 
 
 _EPSILON = 1e-9
@@ -467,6 +468,52 @@ def _candidate_metrics(
             [row.candidate_probabilities[candidate] for row in observations], outcomes
         )
         for candidate in candidates
+    }
+
+
+def _observation_log_loss(probability: float, outcome: float) -> float:
+    clipped = min(max(probability, _EPSILON), 1.0 - _EPSILON)
+    return -(outcome * math.log(clipped) + (1.0 - outcome) * math.log(1.0 - clipped))
+
+
+def multiplicity_report(
+    observations: Iterable[EvaluationObservation], *, candidates: list[str],
+    benchmark: str, draws: int = 1000, seed: int = 0,
+) -> dict[str, Any]:
+    """Familywise-error-controlled evidence that a *searched* candidate beats
+    ``benchmark`` in out-of-sample log score, clustered by event.
+
+    Returns White's Reality Check p-value (does any searched candidate beat the
+    benchmark at all?) and the Romano-Wolf per-candidate adjusted p-values. Use
+    this whenever more than one candidate was searched, so a lucky winner is not
+    promoted as skill. Computes losses from the candidates' recorded
+    probabilities; it does not refit."""
+    rows = tuple(observations)
+    if not rows:
+        raise ValueError("at least one observation is required")
+    searched = [name for name in candidates if name != benchmark]
+    if not searched:
+        raise ValueError("at least one non-benchmark candidate is required")
+    event_ids = [row.event_id for row in rows]
+    benchmark_loss = [
+        _observation_log_loss(row.candidate_probabilities[benchmark], row.outcome)
+        for row in rows
+    ]
+    diffs_by_candidate = {
+        name: [
+            benchmark_loss[i]
+            - _observation_log_loss(rows[i].candidate_probabilities[name], rows[i].outcome)
+            for i in range(len(rows))
+        ]
+        for name in searched
+    }
+    return {
+        "benchmark": benchmark,
+        "candidates_searched": len(searched),
+        "reality_check_pvalue": reality_check_pvalue(
+            diffs_by_candidate, event_ids, draws=draws, seed=seed),
+        "romano_wolf_pvalues": romano_wolf_pvalues(
+            diffs_by_candidate, event_ids, draws=draws, seed=seed),
     }
 
 

@@ -42,6 +42,31 @@ def observation(index: int, *, event_id: str | None = None, outcome: float | Non
     )
 
 
+def test_multiplicity_report_flags_a_skilled_candidate_over_the_benchmark():
+    from app.model_training import multiplicity_report
+
+    rows = []
+    for index in range(40):
+        label = float(index % 2 == 0)
+        rows.append(EvaluationObservation(
+            event_id=f"m-{index}", observed_at=START + timedelta(days=index),
+            sport="basketball", league="nba", market="moneyline", outcome=label,
+            candidate_probabilities={
+                "benchmark": 0.5,                        # uninformative reference
+                "skilled": 0.85 if label == 1.0 else 0.15,  # tracks the outcome
+                "coinflip": 0.5,                          # same as benchmark
+            },
+            executable_cost=0.5, execution_cost_error=0.0,
+        ))
+    report = multiplicity_report(rows, candidates=["skilled", "coinflip"],
+                                 benchmark="benchmark", draws=400, seed=0)
+    assert report["candidates_searched"] == 2
+    assert report["reality_check_pvalue"] < 0.05
+    assert report["romano_wolf_pvalues"]["skilled"] < 0.05
+    assert (report["romano_wolf_pvalues"]["coinflip"]
+            > report["romano_wolf_pvalues"]["skilled"])
+
+
 def test_chronological_folds_are_event_grouped_and_future_safe():
     rows = [observation(i) for i in range(20)]
     folds = chronological_folds(
