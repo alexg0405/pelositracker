@@ -25,6 +25,15 @@ from .telemetry import runtime_telemetry
 logger = logging.getLogger(__name__)
 _odds_quota: dict[str, str] = {}
 
+# Bound the per-connection receive buffer. websockets otherwise inherits large
+# defaults (max_size=1 MiB, max_queue=32), and the decoded-text queue can grow to
+# ``4 * max_size * max_queue`` bytes (~128 MiB) per socket. This service opens one
+# market socket per tracked event plus the global sports socket in a single
+# worker, so we cap the queue depth explicitly. Our consumer drains each frame
+# immediately in the ``async for`` loop, so a shallow queue never drops messages
+# under normal load; 1 MiB stays well above any order-book/score frame we see.
+_WS_CONNECT_KW = {"max_size": 1_048_576, "max_queue": 8}
+
 
 def _provider_time(value: object) -> datetime | None:
     try:
@@ -729,7 +738,8 @@ async def polymarket_market_stream(event: Event, emit: Callable[[list[Quote]], A
             if initial:
                 await emit(initial)
                 runtime_telemetry.increment("polymarket_quotes", len(initial))
-            async with websockets.connect("wss://ws-subscriptions-clob.polymarket.com/ws/market") as ws:
+            async with websockets.connect("wss://ws-subscriptions-clob.polymarket.com/ws/market",
+                                          **_WS_CONNECT_KW) as ws:
                 backoff.reset()
                 await ws.send(json.dumps({"type": "market", "assets_ids": list(token_meta),
                                           "custom_feature_enabled": True}))
@@ -812,7 +822,8 @@ async def polymarket_sports_stream(events: Callable[[], list[Event]],
     backoff = RetryBackoff(base_seconds=1, cap_seconds=60)
     while True:
         try:
-            async with websockets.connect("wss://sports-api.polymarket.com/ws") as ws:
+            async with websockets.connect("wss://sports-api.polymarket.com/ws",
+                                          **_WS_CONNECT_KW) as ws:
                 backoff.reset()
                 async for raw in ws:
                     if raw == "ping":

@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import secrets
@@ -55,7 +56,7 @@ from .settings import Settings
 from .security import AuthManager, SlidingWindowLimiter
 from .calibration import load_calibration
 from .model_registry import load_independent_models
-from .telemetry import runtime_telemetry
+from .telemetry import memory_snapshot, runtime_telemetry, start_memory_trace
 from .identity import (CanonicalEvent, MappingDecision, MappingStatus)
 from .domain.time import parse_provider_timestamp
 from .notify import notify_webhook
@@ -83,12 +84,26 @@ if independent_model_artifact is not None:
     engine.install_independent_models(independent_model_artifact)
 tasks: dict[str, list[asyncio.Task]] = {}
 _finalized: set[str] = set()
+# Finalized event ids still resident in the live store, oldest first. `_finalized`
+# is the permanent idempotency guard (ids only, negligible); this is the subset
+# whose heavy buffers we keep for dashboard review until they age past the
+# retention cap. See _evict_finalized_overflow.
+_finalized_order: "OrderedDict[str, None]" = OrderedDict()
 _terminal_events: dict[str, str] = {}  # event_id -> final | canceled | deleted | shutdown
 _event_locks: dict[str, asyncio.Lock] = {}
 _pregame: dict[str, dict] = {}  # event_id -> {"spread": home point, "total": line}, captured near tip
 _subscribers: set[asyncio.Queue] = set()  # SSE clients for real-time dashboard pushes
 _notification_tasks: set[asyncio.Task] = set()
-_sports_status: dict[str, dict] = {}  # latest public Polymarket sport_result by event slug
+# The global sports feed emits a payload for *every* slug it sees, not just the
+# ones we track, so caching the full payload per slug forever is an unbounded
+# leak. Split by access pattern instead: discovery only needs a normalized
+# status + freshness (compact, every slug, TTL/LRU-bounded); the in-play models
+# need the score-rich payload but only for tracked events (detail, pruned with
+# its compact entry). See on_sports_status / _prune_sports_status.
+_sports_status_compact: "OrderedDict[str, dict]" = OrderedDict()
+_sports_status_detail: dict[str, dict] = {}
+_SPORTS_STATUS_TTL_SECONDS = 600.0  # drop slugs untouched for 10 min
+_SPORTS_STATUS_MAX = 512  # hard cap on compact entries (LRU eviction)
 _config_state = {"auto_monitor": False}
 
 _auth_users_env = os.getenv("AUTHORIZED_USERS")
@@ -203,14 +218,45 @@ async def on_state(state: GameState):
         await record(state.event_id, as_of=state.processed_at)
 
 
+def _tracked_slugs() -> set[str]:
+    return {event.polymarket_slug for event in store.events.values()
+            if event.polymarket_slug}
+
+
+def _prune_sports_status(now_epoch: float) -> None:
+    """Bound the sports-status caches by age then size, dropping each slug's
+    detail entry alongside its compact one so the two never diverge."""
+    stale = [slug for slug, snap in _sports_status_compact.items()
+             if now_epoch - snap.get("_received_epoch", 0.0) > _SPORTS_STATUS_TTL_SECONDS]
+    for slug in stale:
+        _sports_status_compact.pop(slug, None)
+        _sports_status_detail.pop(slug, None)
+    while len(_sports_status_compact) > _SPORTS_STATUS_MAX:
+        old_slug, _ = _sports_status_compact.popitem(last=False)  # oldest first
+        _sports_status_detail.pop(old_slug, None)
+
+
 async def on_sports_status(slug: str, payload: dict) -> None:
     """Cache authoritative live/final state for discovery without paid polling."""
-    snapshot = dict(payload)
-    snapshot["_received_at"] = datetime.now(timezone.utc).isoformat()
-    _sports_status[slug] = snapshot
-    raw_status = next((snapshot.get(key) for key in
+    now_epoch = time.time()
+    received_at = datetime.now(timezone.utc).isoformat()
+    raw_status = next((payload.get(key) for key in
                        ("status", "gameStatus", "game_status", "state")
-                       if snapshot.get(key)), None)
+                       if payload.get(key)), None)
+    # Compact snapshot for every slug: only what discovery's _game_window reads
+    # (normalized status via sports_game_status, the live flag, and freshness).
+    compact = {"status": raw_status, "live": payload.get("live"),
+               "_received_at": received_at, "_received_epoch": now_epoch}
+    _sports_status_compact[slug] = compact
+    _sports_status_compact.move_to_end(slug)
+    if slug in _tracked_slugs():
+        # Only a tracked event's rich payload is ever read (by the in-play models).
+        detail = dict(payload)
+        detail["_received_at"] = received_at
+        _sports_status_detail[slug] = detail
+    else:
+        _sports_status_detail.pop(slug, None)
+    _prune_sports_status(now_epoch)
     terminal = _terminal_kind(raw_status)
     matched = next((event for event in store.events.values()
                     if event.polymarket_slug == slug), None)
@@ -221,7 +267,7 @@ async def on_sports_status(slug: str, payload: dict) -> None:
         _terminal_events.setdefault(matched.id, terminal)
         if terminal == "canceled":
             await finalize_event(matched.id, canceled=True)
-    normalized = sports_game_status(snapshot)
+    normalized = sports_game_status(compact)
     if not _discover_cache.get("data") or normalized is None:
         return
     if normalized == "final":
@@ -332,7 +378,7 @@ def _is_tennis_moneyline(market: str) -> bool:
 
 def _tennis_score_now(event: Event) -> tuple[int, int, int, int] | None:
     """Parse the latest live tennis score cached from the sports feed."""
-    status = _sports_status.get(event.polymarket_slug or "")
+    status = _sports_status_detail.get(event.polymarket_slug or "")
     if not status:
         return None
     event_state = status.get("eventState")
@@ -346,7 +392,7 @@ def _tennis_score_now(event: Event) -> tuple[int, int, int, int] | None:
 
 def _tennis_state_age_seconds(event: Event, as_of: datetime) -> float | None:
     """Seconds since the cached live tennis score was received, or None."""
-    status = _sports_status.get(event.polymarket_slug or "")
+    status = _sports_status_detail.get(event.polymarket_slug or "")
     received = status.get("_received_at") if status else None
     if not received:
         return None
@@ -692,6 +738,37 @@ def _winner_labels(event: Event, home_score: float, away_score: float) -> set[st
     return {"draw", "Draw"}  # a tie settles the Draw outcome, not nothing
 
 
+def _evict_live_event_state(event_id: str) -> None:
+    """Drop a settled event's heavy live buffers. Keeps its permanent finalized
+    marker so a late duplicate terminal update stays idempotent; only the memory
+    (quotes/states/signals/pregame anchor) is released."""
+    _finalized_order.pop(event_id, None)
+    _pregame.pop(event_id, None)
+    _event_locks.pop(event_id, None)
+    with store.lock:
+        store.events.pop(event_id, None)
+        store.states.pop(event_id, None)
+        store.quotes.pop(event_id, None)
+        store.signals.pop(event_id, None)
+
+
+async def _evict_finalized_overflow() -> None:
+    """Evict the oldest resident finalized events beyond the retention cap. Skips
+    any that still carry open paper positions (as :func:`delete_event` does), so
+    a settled game is never dropped while a bot could still be marked against it;
+    such an event is simply retried after a later finalization."""
+    while len(_finalized_order) > settings.finalized_event_retention:
+        oldest = next(iter(_finalized_order))
+        if oldest not in store.events:  # already gone (e.g. manually deleted)
+            _finalized_order.pop(oldest, None)
+            continue
+        open_positions = (await asyncio.to_thread(account_book.open_count, oldest)
+                          if account_book is not None else 0)
+        if open_positions > 0:
+            break  # keep it monitored; a later finalize will reconsider
+        _evict_live_event_state(oldest)
+
+
 async def finalize_event(event_id: str, *, canceled: bool = False) -> None:
     """Stop entry, snapshot/settle a final, or void a provider cancellation.
 
@@ -746,13 +823,19 @@ async def finalize_event(event_id: str, *, canceled: bool = False) -> None:
             await asyncio.to_thread(monitor_state.delete_event, event_id)
         _finalized.add(event_id)
         _terminal_events[event_id] = "canceled" if canceled else "final"
+        if event_id in store.events:
+            _finalized_order[event_id] = None
+            _finalized_order.move_to_end(event_id)
+    # Trim after releasing the lock so evicting any candidate — including this
+    # event itself when retention is 0 — never contends the lock we just held.
+    await _evict_finalized_overflow()
 
 
 async def auto_monitor_loop():
     while True:
         try:
             if _config_state["auto_monitor"]:
-                games = await polymarket_sports_events(live_statuses=_sports_status)
+                games = await polymarket_sports_events(live_statuses=_sports_status_compact)
                 if settings.exclude_restricted_events:
                     games = exclude_restricted_games(games)
                 for game in games:
@@ -789,6 +872,8 @@ async def lifespan(_: FastAPI):
     global ledger, account_book, history_db, monitor_state
     sports_task: asyncio.Task | None = None
     auto_task: asyncio.Task | None = None
+    if settings.enable_memory_trace:
+        start_memory_trace()
     try:
         ledger = Ledger()
         account_book = AccountBook()
@@ -841,8 +926,11 @@ async def lifespan(_: FastAPI):
             store.signals.clear()
         _pregame.clear()
         _finalized.clear()
+        _finalized_order.clear()
         _terminal_events.clear()
         _event_locks.clear()
+        _sports_status_compact.clear()
+        _sports_status_detail.clear()
 
 
 app = FastAPI(title="Live Sports Signal Monitor", version=__version__, lifespan=lifespan)
@@ -945,12 +1033,23 @@ async def ready():
 
 @app.get("/api/runtime", dependencies=[Depends(verify_auth)])
 async def runtime_status():
+    with store.lock:
+        live_quotes = sum(len(buffer) for buffer in store.quotes.values())
+        live_states = sum(len(buffer) for buffer in store.states.values())
     return {
         "counters": runtime_telemetry.snapshot(),
         "odds_api_quota": dict(_odds_quota),
         "tracked_events": len(store.events),
         "feed_groups": {event_id: len(group) for event_id, group in tasks.items()},
         "notifications_in_flight": len(_notification_tasks),
+        "memory": memory_snapshot(),
+        "buffers": {
+            "sports_status_compact": len(_sports_status_compact),
+            "sports_status_detail": len(_sports_status_detail),
+            "live_quotes": live_quotes,
+            "live_states": live_states,
+            "finalized_events": len(_finalized),
+        },
     }
 
 
@@ -1005,7 +1104,7 @@ async def discover():
     if _discover_cache["data"] and now - _discover_cache["at"] < 45:
         return _discover_cache["data"]  # cache so browsing doesn't hammer Gamma
     try:
-        games = await polymarket_sports_events(live_statuses=_sports_status)
+        games = await polymarket_sports_events(live_statuses=_sports_status_compact)
     except Exception as exc:
         raise HTTPException(502, f"Could not reach Polymarket: {exc}") from exc
     if settings.exclude_restricted_events:
@@ -1022,14 +1121,30 @@ def _sort_events_by_edge():
     events.sort(key=max_edge, reverse=True)
     return events
 
+async def _event_view_or_none(event_id: str):
+    """``event_view`` that yields None instead of 404 when an event is evicted
+    between the snapshot and its render. Retention eviction (and manual deletion)
+    can drop an event mid-aggregate; a vanished row is simply omitted rather than
+    failing the whole list."""
+    try:
+        return await event_view(event_id)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return None
+        raise
+
+
 @app.get("/api/events", dependencies=[Depends(verify_auth)])
 async def list_events():
-    return await asyncio.gather(*(event_view(event.id) for event in _sort_events_by_edge()))
+    views = await asyncio.gather(
+        *(_event_view_or_none(event.id) for event in _sort_events_by_edge()))
+    return [view for view in views if view is not None]
 
 
 async def _events_snapshot_sse() -> str:
-    views = await asyncio.gather(*(event_view(event.id) for event in _sort_events_by_edge()))
-    payload = json.dumps(views, default=str)
+    views = await asyncio.gather(
+        *(_event_view_or_none(event.id) for event in _sort_events_by_edge()))
+    payload = json.dumps([view for view in views if view is not None], default=str)
     return f"data: {payload}\n\n"
 
 
@@ -1340,6 +1455,7 @@ async def delete_event(event_id: str):
         if monitor_state is not None:
             await asyncio.to_thread(monitor_state.delete_event, event_id)
         _finalized.discard(event_id)
+        _finalized_order.pop(event_id, None)
         _pregame.pop(event_id, None)
         with store.lock:
             store.events.pop(event_id, None)

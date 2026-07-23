@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 import threading
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -54,15 +55,16 @@ def runtime(tmp_path, monkeypatch):
         monitor.close()
 
 
-def _event() -> Event:
+def _event(suffix: str = "") -> Event:
+    tag = f"-{suffix}" if suffix else ""
     return Event(
-        id="runtime-event",
+        id=f"runtime-event{tag}",
         name="Celtics at Knicks",
         sport="basketball",
         home="Knicks",
         away="Celtics",
         league="NBA",
-        polymarket_slug="nba-runtime-event",
+        polymarket_slug=f"nba-runtime-event{tag}",
     )
 
 
@@ -201,6 +203,88 @@ def test_provider_cancellation_voids_instead_of_grading_score(runtime):
     assert runtime["ledger"].event_bets(event.id)[0]["settled_result"] is None
     assert _outcome_count(runtime["history"]) == 0
     assert event.id in main._finalized
+
+
+def test_finalized_events_evicted_beyond_retention(runtime, monkeypatch):
+    monkeypatch.setattr(main, "settings", replace(main.settings, finalized_event_retention=1))
+    monkeypatch.setattr(main, "_finalized_order", main.OrderedDict())
+    first = _event("a")
+    second = _event("b")
+    _register(runtime, first)
+    _register(runtime, second)
+
+    async def scenario():
+        for event in (first, second):
+            await main.on_quotes(_quotes(event))
+            await main.on_state(_state(event, "final"))
+
+    asyncio.run(scenario())
+
+    # Retention of 1: the newest settled game stays resident for review, the
+    # older one's heavy buffers are evicted once its positions have settled.
+    assert second.id in main.store.events
+    assert second.id in main._finalized_order
+    assert first.id not in main.store.events
+    assert first.id not in main.store.quotes
+    assert first.id not in main._finalized_order
+    # The permanent idempotency marker survives eviction for both.
+    assert {first.id, second.id} <= main._finalized
+
+
+def test_finalized_event_not_evicted_while_positions_open(runtime, monkeypatch):
+    # retention=0 would evict on settle, but an open position must block it
+    # (mirrors delete_event: a bot could still be marked against the event).
+    monkeypatch.setattr(main, "settings", replace(main.settings, finalized_event_retention=0))
+    monkeypatch.setattr(main, "_finalized_order", main.OrderedDict())
+    monkeypatch.setattr(runtime["accounts"], "open_count", lambda event_id: 1)
+    event = _event()
+    _register(runtime, event)
+
+    async def scenario():
+        await main.on_quotes(_quotes(event))
+        await main.on_state(_state(event, "final"))
+
+    asyncio.run(scenario())
+
+    assert event.id in main.store.events  # guarded from eviction
+    assert event.id in main._finalized
+
+
+def test_sports_status_detail_kept_only_for_tracked_events(runtime, monkeypatch):
+    monkeypatch.setattr(main, "_sports_status_compact", main.OrderedDict())
+    monkeypatch.setattr(main, "_sports_status_detail", {})
+    event = _event()
+    _register(runtime, event)
+
+    async def scenario():
+        await main.on_sports_status(event.polymarket_slug,
+                                    {"status": "in_progress", "score": "1-0", "live": True})
+        await main.on_sports_status("untracked-slug", {"status": "in_progress", "live": True})
+
+    asyncio.run(scenario())
+
+    # Only a tracked event's rich payload is retained; every slug gets a compact
+    # entry, but untracked slugs never carry the score-rich detail.
+    assert set(main._sports_status_detail) == {event.polymarket_slug}
+    assert main._sports_status_detail[event.polymarket_slug]["score"] == "1-0"
+    assert "untracked-slug" in main._sports_status_compact
+    assert "score" not in main._sports_status_compact["untracked-slug"]
+
+
+def test_sports_status_compact_cache_is_lru_bounded(monkeypatch):
+    monkeypatch.setattr(main, "store", Store())
+    monkeypatch.setattr(main, "_sports_status_compact", main.OrderedDict())
+    monkeypatch.setattr(main, "_sports_status_detail", {})
+    monkeypatch.setattr(main, "_SPORTS_STATUS_MAX", 3)
+
+    async def scenario():
+        for i in range(6):
+            await main.on_sports_status(f"slug-{i}", {"status": "in_progress"})
+
+    asyncio.run(scenario())
+
+    # Oldest entries are evicted; the most-recently-seen slugs survive.
+    assert set(main._sports_status_compact) == {"slug-3", "slug-4", "slug-5"}
 
 
 def test_lifespan_awaits_background_task_cancellation(monkeypatch):

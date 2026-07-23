@@ -76,12 +76,12 @@ def test_state_age_uses_the_provider_timestamp_when_trusted():
 def test_tennis_settles_by_set_count_and_grades_the_match_winner():
     event = Event("Alcaraz vs Sinner", "tennis", "Alcaraz", "Sinner",
                   league="atp", id="tn", polymarket_slug="alcaraz-sinner")
-    main_module._sports_status["alcaraz-sinner"] = {"score": "6-3, 6-4", "period": "S2"}
+    main_module._sports_status_detail["alcaraz-sinner"] = {"score": "6-3, 6-4", "period": "S2"}
     try:
         # A stale set-games GameState must NOT drive the grade; the set count does.
         home, away = _settle_scores(event, [_state(event_id="tn", home_score=3, away_score=4)])
     finally:
-        main_module._sports_status.pop("alcaraz-sinner", None)
+        main_module._sports_status_detail.pop("alcaraz-sinner", None)
     assert (home, away) == (2.0, 0.0)
     assert grade("moneyline", "Alcaraz", "Alcaraz", "Sinner", home, away) == "win"
 

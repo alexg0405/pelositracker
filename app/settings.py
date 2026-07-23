@@ -76,6 +76,8 @@ class Settings:
     calibration_artifact: Path | None
     independent_model_artifact: Path | None
     worker_count: int
+    enable_memory_trace: bool
+    finalized_event_retention: int
     authorized_users: str
     admin_username: str
     admin_password: str
@@ -125,6 +127,14 @@ class Settings:
                 values, "INDEPENDENT_MODEL_ARTIFACT"
             ),
             worker_count=_int(values, "WEB_CONCURRENCY", 1),
+            # Opt-in per-allocation tracing for /api/runtime; off by default to
+            # avoid tracemalloc's steady-state overhead.
+            enable_memory_trace=_bool(values, "ENABLE_MEMORY_TRACE", False),
+            # Keep the most recent N finalized events resident (visible on the
+            # dashboard) before evicting older settled events' live buffers.
+            # 0 evicts settled events as soon as their positions are gone.
+            finalized_event_retention=_int(
+                values, "FINALIZED_EVENT_RETENTION", 50, minimum=0),
             authorized_users=values.get("AUTHORIZED_USERS", "").strip(),
             admin_username=values.get("ADMIN_USERNAME", "admin").strip(),
             admin_password=values.get("ADMIN_PASSWORD", "admin"),
