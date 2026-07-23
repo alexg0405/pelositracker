@@ -1253,23 +1253,24 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         // not make a three-way (or larger) market sum to one. Renormalize across
         // the market's outcomes so the consensus is coherent. Two-way is already
         // coherent by logit symmetry (home + away == 1), so it is left untouched.
-        let fair = if expected_outcomes.len() >= 3 {
-            let coherence_sum: f64 = expected_outcomes
-                .iter()
-                .filter_map(|other| {
-                    pooled_consensus_for(
-                        other, &same_market, &expected_outcomes, &target_source_key,
-                        policy, now_seconds, max_age,
-                    )
-                })
-                .sum();
-            if coherence_sum > 1e-9 {
-                clamp(fair / coherence_sum, 0.001, 0.999)
-            } else {
-                fair
-            }
+        let coherence_sum: Option<f64> = if expected_outcomes.len() >= 3 {
+            Some(
+                expected_outcomes
+                    .iter()
+                    .filter_map(|other| {
+                        pooled_consensus_for(
+                            other, &same_market, &expected_outcomes, &target_source_key,
+                            policy, now_seconds, max_age,
+                        )
+                    })
+                    .sum(),
+            )
         } else {
-            fair
+            None
+        };
+        let fair = match coherence_sum {
+            Some(sum) if sum > 1e-9 => clamp(fair / sum, 0.001, 0.999),
+            _ => fair,
         };
 
         let dispersion = if ref_probs.len() > 1 {
@@ -1289,6 +1290,38 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
             "beta" => beta_calibrate(fair, &model.beta_coefficients),
             _ => None,
         });
+        // Calibrated coherence: beta is applied per outcome, so a three-way (or
+        // larger) calibrated market need not sum to one. Renormalize with the same
+        // beta map on each outcome's coherent fair, mirroring the fair
+        // renormalization above. Identity is already coherent (fair was
+        // renormalized); two-way is left to complement symmetry.
+        let calibrated = match (calibrated, policy, coherence_sum) {
+            (Some(value), Some(model), Some(sum))
+                if model.calibration_method == "beta" && sum > 1e-9 =>
+            {
+                let calibrated_sum: f64 = expected_outcomes
+                    .iter()
+                    .filter_map(|other| {
+                        pooled_consensus_for(
+                            other, &same_market, &expected_outcomes, &target_source_key,
+                            policy, now_seconds, max_age,
+                        )
+                        .and_then(|other_fair| {
+                            beta_calibrate(
+                                clamp(other_fair / sum, 0.001, 0.999),
+                                &model.beta_coefficients,
+                            )
+                        })
+                    })
+                    .sum();
+                if calibrated_sum > 1e-9 {
+                    Some(clamp(value / calibrated_sum, 0.001, 0.999))
+                } else {
+                    Some(value)
+                }
+            }
+            (other, _, _) => other,
+        };
         let mut probability_samples = Vec::new();
         let mut net_samples = Vec::new();
         let mut execution_cost_offsets = Vec::new();
@@ -1978,6 +2011,46 @@ mod tests {
         // Independent logit pools do not sum to one; the renormalization makes the
         // three-way consensus coherent.
         assert!((sum - 1.0).abs() < 1e-9, "three-way consensus summed to {sum}");
+    }
+
+    #[test]
+    fn three_way_calibrated_consensus_is_probability_coherent() {
+        let now = 1_000.0;
+        let mut quotes = Vec::new();
+        for (outcome, prob) in [("home", 0.55), ("draw", 0.25), ("away", 0.20)] {
+            quotes.push(quote("A", outcome, prob, now));
+        }
+        for (outcome, prob) in [("home", 0.45), ("draw", 0.30), ("away", 0.25)] {
+            quotes.push(quote("B", outcome, prob, now));
+        }
+        // Book C is uniformly cheapest, so all three outcomes share one
+        // leave-one-out basis (as in the uncalibrated coherence test).
+        for outcome in ["home", "draw", "away"] {
+            let mut c = quote("C", outcome, 0.34, now);
+            c.bid = Some(0.04);
+            c.ask = Some(0.05);
+            quotes.push(c);
+        }
+        // A non-identity beta map: applied per outcome it would NOT sum to one.
+        let mut req = request(quotes);
+        req.model_policies[0].calibration_method = "beta".to_string();
+        req.model_policies[0].beta_coefficients = vec![1.3, 0.8, 0.2];
+        let results = evaluate(req, now);
+        let sum: f64 = ["home", "draw", "away"]
+            .iter()
+            .map(|outcome| {
+                results
+                    .iter()
+                    .find(|signal| signal.outcome == *outcome)
+                    .unwrap()
+                    .calibrated_consensus_probability
+                    .expect("beta calibration present")
+            })
+            .sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-9,
+            "three-way calibrated consensus summed to {sum}"
+        );
     }
 
     #[test]
