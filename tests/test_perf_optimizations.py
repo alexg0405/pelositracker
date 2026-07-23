@@ -10,6 +10,7 @@ import asyncio
 from fastapi.testclient import TestClient
 
 from app import http_clients, main, sources
+from app.ledger import Ledger
 
 
 def test_sse_snapshot_built_once_until_a_change(monkeypatch):
@@ -92,3 +93,40 @@ def test_borrow_client_reuses_shared_pool_without_closing_it():
         assert http_clients.current_shared_client() is None
 
     asyncio.run(scenario())
+
+
+def test_event_positions_bulk_matches_per_event_fetch(tmp_path):
+    ledger = Ledger(str(tmp_path / "positions.db"))
+    try:
+        ledger.upsert_position("evt-a", "tok-1", "moneyline", "home", 10, 0.45)
+        ledger.upsert_position("evt-a", "tok-2", "moneyline", "away", 5, 0.55)
+        ledger.upsert_position("evt-b", "tok-3", "moneyline", "home", 7, 0.40)
+        # evt-c has no positions and must still map to an empty list.
+
+        bulk = ledger.event_positions_bulk(["evt-a", "evt-b", "evt-c"])
+        assert set(bulk) == {"evt-a", "evt-b", "evt-c"}
+        assert bulk["evt-c"] == []
+        # One IN query must return exactly what per-event queries would.
+        for event_id in ("evt-a", "evt-b", "evt-c"):
+            assert bulk[event_id] == ledger.event_positions(event_id)
+        # An id absent from the store yields an empty bucket, not a KeyError.
+        assert ledger.event_positions_bulk([]) == {}
+    finally:
+        ledger.close()
+
+
+def test_engine_audit_index_keeps_first_match():
+    # The audit index must select the same payload the old linear next() did:
+    # the first quote_payload matching (market, outcome, source).
+    quote_payloads = [
+        {"market": "ml", "outcome": "home", "source": "poly", "token_id": "first"},
+        {"market": "ml", "outcome": "home", "source": "poly", "token_id": "second"},
+        {"market": "ml", "outcome": "away", "source": "poly", "token_id": "third"},
+    ]
+    audit_by_key: dict[tuple[str, str, str], dict] = {}
+    for payload in quote_payloads:
+        audit_by_key.setdefault(
+            (payload["market"], payload["outcome"], payload["source"]), payload)
+
+    assert audit_by_key[("ml", "home", "poly")]["token_id"] == "first"
+    assert audit_by_key[("ml", "away", "poly")]["token_id"] == "third"

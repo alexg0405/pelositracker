@@ -1137,24 +1137,37 @@ def _sort_events_by_edge():
     events.sort(key=max_edge, reverse=True)
     return events
 
-async def _event_view_or_none(event_id: str):
+async def _event_view_or_none(event_id: str, positions: list[dict] | None = None):
     """``event_view`` that yields None instead of 404 when an event is evicted
     between the snapshot and its render. Retention eviction (and manual deletion)
     can drop an event mid-aggregate; a vanished row is simply omitted rather than
     failing the whole list."""
     try:
-        return await event_view(event_id)
+        return await event_view(event_id, positions)
     except HTTPException as exc:
         if exc.status_code == 404:
             return None
         raise
 
 
+async def _sorted_event_views() -> list[dict]:
+    """Render every tracked event, ordered by edge, sharing a single positions
+    query across the fan-out. Fetching positions per event was an N+1 that the
+    dashboard (``/api/events`` and every SSE push) paid on each render."""
+    events = _sort_events_by_edge()
+    positions_by_event: dict[str, list[dict]] = {}
+    if ledger is not None:
+        positions_by_event = await asyncio.to_thread(
+            ledger.event_positions_bulk, [event.id for event in events])
+    views = await asyncio.gather(
+        *(_event_view_or_none(event.id, positions_by_event.get(event.id, []))
+          for event in events))
+    return [view for view in views if view is not None]
+
+
 @app.get("/api/events", dependencies=[Depends(verify_auth)])
 async def list_events():
-    views = await asyncio.gather(
-        *(_event_view_or_none(event.id) for event in _sort_events_by_edge()))
-    return [view for view in views if view is not None]
+    return await _sorted_event_views()
 
 
 async def _events_snapshot_sse() -> str:
@@ -1169,9 +1182,7 @@ async def _events_snapshot_sse() -> str:
         return _snapshot_cache["payload"]
     async with _snapshot_lock:
         if _snapshot_cache["version"] != target:
-            views = await asyncio.gather(
-                *(_event_view_or_none(event.id) for event in _sort_events_by_edge()))
-            payload = json.dumps([view for view in views if view is not None], default=str)
+            payload = json.dumps(await _sorted_event_views(), default=str)
             _snapshot_cache["payload"] = f"data: {payload}\n\n"
             _snapshot_cache["version"] = target
         return _snapshot_cache["payload"]
@@ -1215,13 +1226,14 @@ def _signal_views(signals) -> list[dict]:
     ]
 
 
-async def event_view(event_id: str):
+async def event_view(event_id: str, positions: list[dict] | None = None):
     event = store.events.get(event_id)
     if not event:
         raise HTTPException(404, "event not found")
     signals = store.signals[event_id]
-    positions = (await asyncio.to_thread(ledger.event_positions, event_id)
-                 if ledger is not None else [])
+    if positions is None:
+        positions = (await asyncio.to_thread(ledger.event_positions, event_id)
+                     if ledger is not None else [])
     return {"event": as_json(event),
             "latest_state": as_json(store.states[event_id][-1]) if store.states[event_id] else None,
             "signals": _signal_views(signals),

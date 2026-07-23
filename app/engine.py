@@ -220,12 +220,17 @@ class SignalEngine:
                                        allow_nan=False)
         decision_hash = hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()
         results = json.loads(evaluate_json(canonical_request))
+        # Index the audit payloads once instead of re-scanning quote_payloads for
+        # every result (was O(results x quotes)). setdefault keeps the first
+        # match, preserving the previous next()-based selection exactly.
+        audit_by_key: dict[tuple[str, str, str], dict] = {}
+        for payload in quote_payloads:
+            audit_by_key.setdefault(
+                (payload["market"], payload["outcome"], payload["source"]), payload)
         signals = []
         for result in results:
-            audit = next((payload for payload in quote_payloads
-                          if payload["market"] == result["market"]
-                          and payload["outcome"] == result["outcome"]
-                          and payload["source"] == result["quote_source"]), {})
+            audit = audit_by_key.get(
+                (result["market"], result["outcome"], result["quote_source"]), {})
             decision_id = hashlib.sha256(
                 f"{decision_hash}:{result['market']}:{result['outcome']}".encode("utf-8")
             ).hexdigest()

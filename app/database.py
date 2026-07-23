@@ -71,6 +71,11 @@ class Database:
             self.connection.row_factory = sqlite3.Row
             self.connection.execute("PRAGMA foreign_keys = ON")
             self.connection.execute("PRAGMA busy_timeout = 10000")
+            # WAL lets readers (position/history lookups on the dashboard fan-out)
+            # proceed without blocking on the single writer thread. It's a
+            # persistent, per-file setting; skip in-memory DBs where it doesn't apply.
+            if target != ":memory:":
+                self.connection.execute("PRAGMA journal_mode = WAL")
 
     @classmethod
     def open(

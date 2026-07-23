@@ -18,7 +18,7 @@ import threading
 import time
 import hashlib
 import json
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from .database import Database
 from .models import Event, Signal
@@ -570,6 +570,31 @@ class Ledger:
                     "SELECT * FROM positions WHERE event_id=%s ORDER BY updated_ts DESC", (event_id,)
                 )
                 return [dict(row) for row in cur.fetchall()]
+
+    def event_positions_bulk(self, event_ids: Sequence[str]) -> dict[str, list[dict]]:
+        """Positions for many events in one query.
+
+        The dashboard fan-out (``/api/events`` and the SSE snapshot) renders
+        every tracked event; fetching positions per event issued one round-trip
+        each (an N+1). This collapses that into a single ``IN`` query and buckets
+        the rows by event, preserving the per-event ``updated_ts DESC`` ordering
+        that ``event_positions`` returns."""
+        ids = list(dict.fromkeys(event_ids))  # de-dup, keep order
+        out: dict[str, list[dict]] = {event_id: [] for event_id in ids}
+        if not ids:
+            return out
+        placeholders = ",".join(["%s"] * len(ids))
+        with self._lock:
+            with self._db.cursor(dict_rows=True) as cur:
+                self._db.execute(
+                    cur,
+                    f"SELECT * FROM positions WHERE event_id IN ({placeholders}) "
+                    "ORDER BY updated_ts DESC",
+                    tuple(ids),
+                )
+                for row in cur.fetchall():
+                    out.setdefault(row["event_id"], []).append(dict(row))
+        return out
 
     def delete_position(self, event_id: str, token_id: str) -> bool:
         with self._lock:
