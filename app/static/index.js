@@ -407,7 +407,7 @@
   }
 
   document.querySelector("#events").addEventListener("click",async event=>{const removeEvent=event.target.closest("[data-remove-event]"),removePosition=event.target.closest("[data-remove-position]"),chartBtn=event.target.closest("[data-chart-event]");
-    if(removeEvent){removeEvent.disabled=true;try{const response=await fetch(`/api/events/${encodeURIComponent(removeEvent.dataset.removeEvent)}`,{method:"DELETE"});if(response.ok){await refresh();await refreshMetrics()}}catch{}finally{removeEvent.disabled=false}}
+    if(removeEvent){removeEvent.disabled=true;document.querySelector("#action-error").hidden=true;try{const eventId=removeEvent.dataset.removeEvent,response=await fetch(`/api/events/${encodeURIComponent(eventId)}`,{method:"DELETE"});if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.detail||`Could not remove event (${response.status})`)}lastEvents=lastEvents.filter(view=>view.event.id!==eventId);renderEvents(lastEvents)}catch(error){showActionError(error.message)}finally{removeEvent.disabled=false}}
     if(removePosition){removePosition.disabled=true;try{const response=await fetch(`/api/events/${encodeURIComponent(removePosition.dataset.eventId)}/positions/${encodeURIComponent(removePosition.dataset.tokenId)}`,{method:"DELETE"});if(response.ok)await refresh()}catch{}finally{removePosition.disabled=false}}
     if(chartBtn){viewChart(chartBtn.dataset.chartEvent, chartBtn.dataset.chartTitle)}});
   let discoverGames = [];

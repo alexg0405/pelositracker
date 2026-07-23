@@ -1,9 +1,9 @@
-"""Ad-hoc RAM profiler for the memory-reduction changes.
+r"""Ad-hoc RAM profiler for the memory-reduction changes.
 
 Run: ``.\.venv\Scripts\python.exe -m tools.ram_profile``
 
 This is a developer measurement aid, not a test and not part of the service. It
-quantifies the three shipped live-memory reductions on synthetic workloads so
+quantifies the shipped live-memory reductions on synthetic workloads so
 the wins can be re-checked after future changes:
 
 1. bounded ``deque`` live buffers vs. the old ``list[-N:]`` trim (allocation
@@ -11,6 +11,8 @@ the wins can be re-checked after future changes:
 2. the engine's freshest-quote reduction (persisted request/snapshot size when
    the buffer holds a long tail of superseded quotes);
 3. streaming JSONL loading vs. materializing every parsed row.
+4. replacing an all-events SSE snapshot without retaining and reframing the
+   obsolete payload.
 
 Numbers are directional and depend on the synthetic sizes below; the point is
 the ratio between the "before" and "after" shapes, not absolute bytes.
@@ -136,7 +138,7 @@ def jsonl_streaming(rows: int = 200_000) -> None:
                 total += observation.outcome  # single pass, one row live at a time
 
         def materialized() -> None:
-            total = sum(o.outcome for o in load_observations_jsonl(path))
+            sum(o.outcome for o in load_observations_jsonl(path))
 
         stream_peak = _peak_mib(streamed)
         list_peak = _peak_mib(materialized)
@@ -147,10 +149,68 @@ def jsonl_streaming(rows: int = 200_000) -> None:
         print(f"   -> {list_peak / stream_peak:5.1f}x lower peak for a single pass\n")
 
 
+def event_snapshot_refresh(events: int = 12, selections: int = 300) -> None:
+    """Measure the transient allocation shape that event removal used to hit.
+
+    The legacy path retained the old framed SSE string while building a full
+    replacement JSON string and then copied that string again to add SSE
+    framing. The current path drops the obsolete cache first, uses compact JSON
+    bytes shared by GET and SSE, and sends SSE framing as separate chunks.
+    """
+    views = [
+        {
+            "event": {"id": f"event-{event}", "name": f"Synthetic event {event}"},
+            "actionable_markets": [
+                {
+                    "token_id": f"{event}-{selection}",
+                    "market": "moneyline",
+                    "outcome": f"selection-{selection}",
+                    "reasons": ["waiting for validated edge", "execution gate pending"],
+                    "gate_results": [
+                        {"code": "net_ev", "status": "fail", "value": 0.01,
+                         "threshold": 0.03, "explanation": "below required margin"}
+                    ],
+                }
+                for selection in range(selections)
+            ],
+        }
+        for event in range(events)
+    ]
+
+    def legacy() -> None:
+        cache = {"payload": f"data: {json.dumps(views)}\n\n"}
+        payload = json.dumps(views[1:])
+        cache["payload"] = f"data: {payload}\n\n"
+        # The Remove click handler also issued an immediate GET refresh while
+        # the SSE notification was rebuilding this same dashboard.
+        redundant_get = json.dumps(views[1:]).encode("utf-8")
+        assert redundant_get
+
+    def shared_bytes() -> None:
+        cache = {
+            "payload": json.dumps(
+                views, separators=(",", ":")
+            ).encode("utf-8")
+        }
+        cache["payload"] = b""  # notification invalidates before rebuilding
+        cache["payload"] = json.dumps(
+            views[1:], separators=(",", ":")
+        ).encode("utf-8")
+
+    legacy_peak = _peak_mib(legacy)
+    shared_peak = _peak_mib(shared_bytes)
+    print(f"4) All-events snapshot refresh ({events} events x {selections} selections)")
+    print(f"   old cache + SSE + duplicate GET peak: {legacy_peak:8.2f} MiB")
+    print(f"   invalidated shared JSON peak: {shared_peak:8.2f} MiB")
+    if shared_peak > 0:
+        print(f"   -> {legacy_peak / shared_peak:5.1f}x lower transient allocation peak\n")
+
+
 def main() -> int:
     bounded_buffer()
     snapshot_reduction()
     jsonl_streaming()
+    event_snapshot_refresh()
     return 0
 
 

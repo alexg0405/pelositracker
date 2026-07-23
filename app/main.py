@@ -102,7 +102,7 @@ _notification_tasks: set[asyncio.Task] = set()
 # forced N full recomputes + JSON serializations of the whole event list on
 # every push.
 _snapshot_version = 0
-_snapshot_cache: dict = {"version": -1, "payload": ""}
+_snapshot_cache: dict = {"version": -1, "payload": b""}
 _snapshot_lock = asyncio.Lock()
 # The global sports feed emits a payload for *every* slug it sees, not just the
 # ones we track, so caching the full payload per slug forever is an unbounded
@@ -151,7 +151,15 @@ async def verify_auth(request: Request):
 def _notify_subscribers() -> None:
     """Wake every SSE client that a snapshot changed (coalesced per client)."""
     global _snapshot_version
-    _snapshot_version += 1  # invalidate the cached payload; rebuilt lazily on demand
+    _snapshot_version += 1
+    # The old all-events payload can be one of the process's largest single
+    # objects. Once its version is obsolete it can never be served again, so
+    # release the cache reference before a subscriber starts constructing the
+    # replacement. Keeping old + Python view tree + replacement + SSE framing
+    # alive together caused sharp transient RAM spikes on changes such as an
+    # event removal.
+    _snapshot_cache["version"] = -1
+    _snapshot_cache["payload"] = b""
     for queue in list(_subscribers):
         if queue.empty():
             try:
@@ -1167,24 +1175,38 @@ async def _sorted_event_views() -> list[dict]:
 
 @app.get("/api/events", dependencies=[Depends(verify_auth)])
 async def list_events():
-    return await _sorted_event_views()
+    # GET refreshes and SSE notifications need the same representation. Sharing
+    # the already-encoded bytes prevents a browser refresh racing an SSE wake-up
+    # from independently materializing and serializing the complete dashboard.
+    return Response(content=await _events_snapshot_json(), media_type="application/json")
 
 
-async def _events_snapshot_sse() -> str:
-    """Build the events SSE frame, at most once per change across all subscribers.
+async def _events_snapshot_json() -> bytes:
+    """Build compact events JSON at most once per change across all consumers.
 
     The version captured on entry is the coalescing token: if the cache already
     holds it, return the shared payload; otherwise one coroutine rebuilds it
-    under the lock while the rest reuse the result. Each build still reads the
-    live store, so a payload is never staler than the notification that woke it."""
+    under the lock while the rest reuse it. The cache stores JSON bytes without
+    SSE framing so both ``/api/events`` and every stream subscriber share the
+    exact same immutable object."""
     target = _snapshot_version
     if _snapshot_cache["version"] == target:
         return _snapshot_cache["payload"]
     async with _snapshot_lock:
+        # A newer notification may have arrived while this coroutine waited.
+        target = _snapshot_version
         if _snapshot_cache["version"] != target:
-            payload = json.dumps(await _sorted_event_views(), default=str)
-            _snapshot_cache["payload"] = f"data: {payload}\n\n"
-            _snapshot_cache["version"] = target
+            views = await _sorted_event_views()
+            payload = json.dumps(
+                views, default=str, separators=(",", ":")
+            ).encode("utf-8")
+            # If state changed while rendering, callers may still use this
+            # internally consistent payload, but do not publish it as the cache
+            # for the newer version.
+            if target == _snapshot_version:
+                _snapshot_cache["payload"] = payload
+                _snapshot_cache["version"] = target
+            return payload
         return _snapshot_cache["payload"]
 
 
@@ -1195,13 +1217,20 @@ async def stream():
         queue: asyncio.Queue = asyncio.Queue(maxsize=1)
         _subscribers.add(queue)
         try:
-            yield await _events_snapshot_sse()  # initial state
+            # Keep framing as three transport chunks. Concatenating "data: " +
+            # a large JSON string would allocate another full-size object per
+            # push solely for SSE syntax.
+            yield b"data: "
+            yield await _events_snapshot_json()  # initial state
+            yield b"\n\n"
             while True:
                 try:
                     await asyncio.wait_for(queue.get(), timeout=15)
-                    yield await _events_snapshot_sse()
+                    yield b"data: "
+                    yield await _events_snapshot_json()
+                    yield b"\n\n"
                 except asyncio.TimeoutError:
-                    yield ": keepalive\n\n"  # keep the connection warm
+                    yield b": keepalive\n\n"  # keep the connection warm
         finally:
             _subscribers.discard(queue)
 
@@ -1227,22 +1256,35 @@ def _signal_views(signals) -> list[dict]:
 
 
 async def event_view(event_id: str, positions: list[dict] | None = None):
-    event = store.events.get(event_id)
-    if not event:
-        raise HTTPException(404, "event not found")
-    signals = store.signals[event_id]
+    # Manual deletion removes all four entries under this same lock. Capture
+    # references atomically so a concurrent all-events render either sees the
+    # complete event or a clean 404; indexing the defaultdicts after deletion
+    # used to recreate empty orphan buffers and could also raise midway through
+    # a snapshot.
+    with store.lock:
+        event = store.events.get(event_id)
+        if not event:
+            raise HTTPException(404, "event not found")
+        states = store.states.get(event_id)
+        quotes = store.quotes.get(event_id)
+        signals = store.signals.get(event_id)
+        latest_state = states[-1] if states else None
+        state_points = len(states) if states is not None else 0
+        quote_points = len(quotes) if quotes is not None else 0
+    quotes = quotes if quotes is not None else []
+    signals = signals if signals is not None else []
     if positions is None:
         positions = (await asyncio.to_thread(ledger.event_positions, event_id)
                      if ledger is not None else [])
     return {"event": as_json(event),
-            "latest_state": as_json(store.states[event_id][-1]) if store.states[event_id] else None,
+            "latest_state": as_json(latest_state),
             "signals": _signal_views(signals),
-            "edge_health": edge_health(store.quotes[event_id], signals, engine.max_age_seconds),
-            "actionable_markets": market_views(store.quotes[event_id], signals, engine.edge_threshold),
-            "positions": position_views(positions, store.quotes[event_id], signals,
+            "edge_health": edge_health(quotes, signals, engine.max_age_seconds),
+            "actionable_markets": market_views(quotes, signals, engine.edge_threshold),
+            "positions": position_views(positions, quotes, signals,
                                           engine.confidence_threshold),
-            "state_points": len(store.states[event_id]),
-            "quote_points": len(store.quotes[event_id])}
+            "state_points": state_points,
+            "quote_points": quote_points}
 
 
 @app.get("/api/events/{event_id}/history", dependencies=[Depends(verify_auth)])

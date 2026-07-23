@@ -22,19 +22,21 @@ def test_sse_snapshot_built_once_until_a_change(monkeypatch):
 
     monkeypatch.setattr(main, "_sort_events_by_edge", counting_sort)
     monkeypatch.setattr(main, "_snapshot_version", 0)
-    monkeypatch.setattr(main, "_snapshot_cache", {"version": -1, "payload": ""})
+    monkeypatch.setattr(main, "_snapshot_cache", {"version": -1, "payload": b""})
     monkeypatch.setattr(main, "_snapshot_lock", asyncio.Lock())
     monkeypatch.setattr(main, "_subscribers", set())
 
     async def scenario():
-        first = await main._events_snapshot_sse()
-        second = await main._events_snapshot_sse()  # served from cache
-        assert first == second == "data: []\n\n"
+        first = await main._events_snapshot_json()
+        second = await main._events_snapshot_json()  # served from cache
+        assert first is second
+        assert first == b"[]"
         assert builds["count"] == 1, "no change yet -> must not rebuild"
 
         main._notify_subscribers()  # a change invalidates the cached payload
-        await main._events_snapshot_sse()
-        await main._events_snapshot_sse()  # cached again
+        assert main._snapshot_cache == {"version": -1, "payload": b""}
+        await main._events_snapshot_json()
+        await main._events_snapshot_json()  # cached again
         assert builds["count"] == 2, "exactly one rebuild per change"
 
     asyncio.run(scenario())
@@ -49,17 +51,42 @@ def test_sse_snapshot_coalesced_across_concurrent_subscribers(monkeypatch):
 
     monkeypatch.setattr(main, "_sort_events_by_edge", counting_sort)
     monkeypatch.setattr(main, "_snapshot_version", 0)
-    monkeypatch.setattr(main, "_snapshot_cache", {"version": -1, "payload": ""})
+    monkeypatch.setattr(main, "_snapshot_cache", {"version": -1, "payload": b""})
     monkeypatch.setattr(main, "_snapshot_lock", asyncio.Lock())
 
     async def scenario():
         # Three subscribers waking on the same change build the snapshot once.
         results = await asyncio.gather(
-            main._events_snapshot_sse(),
-            main._events_snapshot_sse(),
-            main._events_snapshot_sse(),
+            main._events_snapshot_json(),
+            main._events_snapshot_json(),
+            main._events_snapshot_json(),
         )
-        assert results == ["data: []\n\n"] * 3
+        assert results == [b"[]"] * 3
+        assert results[0] is results[1] is results[2]
+        assert builds["count"] == 1
+
+    asyncio.run(scenario())
+
+
+def test_events_get_reuses_the_shared_serialized_snapshot(monkeypatch):
+    builds = {"count": 0}
+
+    async def event_views():
+        builds["count"] += 1
+        return [{"event": {"id": "shared"}}]
+
+    monkeypatch.setattr(main, "_sorted_event_views", event_views)
+    monkeypatch.setattr(main, "_snapshot_version", 0)
+    monkeypatch.setattr(main, "_snapshot_cache", {"version": -1, "payload": b""})
+    monkeypatch.setattr(main, "_snapshot_lock", asyncio.Lock())
+
+    async def scenario():
+        response, stream_payload = await asyncio.gather(
+            main.list_events(),
+            main._events_snapshot_json(),
+        )
+        assert response.body is stream_payload
+        assert response.body == b'[{"event":{"id":"shared"}}]'
         assert builds["count"] == 1
 
     asyncio.run(scenario())
