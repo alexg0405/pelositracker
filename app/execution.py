@@ -7,9 +7,25 @@ from typing import Iterable
 
 getcontext().prec = 28
 
+# Versioned fee-unit contract. Polymarket's fee formula (docs.polymarket.com/
+# trading/fees) is fee = shares * feeRate * p * (1-p), where feeRate is a DECIMAL
+# FRACTION (e.g. 0.05 = 5%) and the fee is rounded to 5 decimal places of USDC
+# (smallest fee 0.00001). NOTE: the /fee-rate/{token_id} endpoint returns
+# `base_fee` as an INTEGER IN BASIS POINTS (30 = 0.003) -- convert it with
+# fee_rate_from_basis_points before passing it here.
+FEE_SCHEDULE_VERSION = "polymarket-taker-v1"
+FEE_RATE_UNIT = "decimal_fraction"
+FEE_ROUNDING = Decimal("0.00001")  # 5 dp USDC, per current Polymarket docs
+
 
 def D(value: object) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+def fee_rate_from_basis_points(base_fee: object) -> Decimal:
+    """Convert the /fee-rate endpoint's integer basis-point `base_fee` (30 = 30
+    bps = 0.003) into the decimal fraction the fee formula expects."""
+    return D(base_fee) / Decimal("10000")
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,11 +74,18 @@ class SaleResult:
 
 
 def polymarket_fee(shares: Decimal, price: Decimal, fee_rate: Decimal) -> Decimal:
-    """Documented CLOB fee curve, rounded deterministically to 1e-8 USDC."""
+    """Documented CLOB fee curve ``shares * feeRate * p * (1-p)``, rounded to 5
+    decimal places of USDC per current Polymarket docs.
+
+    ``fee_rate`` is a decimal fraction (see FEE_RATE_UNIT); a value above 1 almost
+    certainly means basis points were passed by mistake, so it is rejected rather
+    than silently overcharging by 10,000x."""
     if fee_rate < 0:
         raise ValueError("fee rate cannot be negative")
+    if fee_rate > 1:
+        raise ValueError("fee rate must be a decimal fraction, not basis points")
     return (shares * fee_rate * price * (Decimal("1") - price)).quantize(
-        Decimal("0.00000001"), rounding=ROUND_HALF_EVEN)
+        FEE_ROUNDING, rounding=ROUND_HALF_EVEN)
 
 
 def simulate_buy(
@@ -96,6 +119,9 @@ def simulate_buy(
         return ExecutionResult(requested, D(0), D(0), None, D(0), None, False,
                                "fee metadata unavailable", 0)
     rate = D(fee_rate)
+    if rate < 0 or rate > 1:
+        return ExecutionResult(requested, D(0), D(0), None, D(0), None, False,
+                               "invalid fee rate (expected a decimal fraction)", 0)
     tick = D(tick_size) if tick_size is not None else None
     if tick is not None and (tick <= 0 or tick >= 1):
         return ExecutionResult(requested, D(0), D(0), None, D(0), None, False,
@@ -114,28 +140,28 @@ def simulate_buy(
         return ExecutionResult(requested, D(0), D(0), None, D(0), None, False,
                                "ask price is not aligned to tick size", 0)
     for level in ordered:
-        # Fee depends on shares at this level. Solve cash = shares*(p + fee/unit).
+        # Solve cash = shares*(p + feePerShare) with the EXACT fee curve so a full
+        # fill lands exactly on the requested cash; the reported fee is rounded to
+        # 5 dp once at the end. (Rounding per level left a sub-quantum cash residual
+        # that wrongly failed the full-fill check.)
         fee_per_share = rate * level.price * (D(1) - level.price)
         all_in_per_share = level.price + fee_per_share
         take = min(level.size, remaining / all_in_per_share)
         if take <= 0:
             continue
-        level_cost = take * level.price
-        level_fee = polymarket_fee(take, level.price, rate)
-        total = level_cost + level_fee
-        if total > remaining:  # rounding guard
+        total = take * all_in_per_share
+        if total > remaining:  # floating-point guard
             take = take * remaining / total
-            level_cost = take * level.price
-            level_fee = polymarket_fee(take, level.price, rate)
-            total = level_cost + level_fee
+            total = take * all_in_per_share
         shares += take
-        cost += level_cost
-        fee += level_fee
+        cost += take * level.price
+        fee += take * fee_per_share
         remaining -= total
         consumed += 1
         if remaining <= Decimal("0.00000001"):
             remaining = D(0)
             break
+    fee = fee.quantize(FEE_ROUNDING, rounding=ROUND_HALF_EVEN)
 
     complete = remaining == 0
     if not complete and partial_policy is PartialFillPolicy.REJECT:

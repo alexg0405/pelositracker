@@ -5,6 +5,7 @@ import pytest
 from app.execution import (
     BookLevel,
     PartialFillPolicy,
+    fee_rate_from_basis_points,
     polymarket_fee,
     simulate_buy,
     simulate_sell,
@@ -46,6 +47,20 @@ def test_partial_fill_requires_explicit_policy():
 def test_fee_curve_is_deterministic():
     assert polymarket_fee(Decimal("10"), Decimal("0.5"), Decimal("0.03")) \
         == Decimal("0.07500000")
+
+
+def test_fee_rounds_to_five_decimals_and_drops_a_sub_minimum_fee():
+    # 1 * 0.00001 * 0.5 * 0.5 = 0.0000025 USDC rounds to 0 at 5 dp (min fee 0.00001).
+    assert polymarket_fee(Decimal("1"), Decimal("0.5"), Decimal("0.00001")) == Decimal("0")
+
+
+def test_fee_rate_given_in_basis_points_is_rejected_not_overcharged():
+    with pytest.raises(ValueError):
+        polymarket_fee(Decimal("10"), Decimal("0.5"), Decimal("30"))
+
+
+def test_basis_points_convert_to_a_decimal_fraction():
+    assert fee_rate_from_basis_points(30) == Decimal("0.003")
 
 
 def test_orderbook_applies_zero_size_removal_and_detects_hash_gap():
