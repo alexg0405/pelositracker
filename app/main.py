@@ -1054,6 +1054,23 @@ async def stream():
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+# Internal reproducibility lineage the dashboard never renders. input_snapshot_json
+# embeds the full evaluation request (every quote considered) and is serialized once
+# per signal per event on every SSE push; left in, the all-events fan-out can allocate
+# hundreds of MB per notification and OOM the process (e.g. when a removal triggers a
+# rebuild while many events are monitored). It is still persisted to the ledger; it
+# just must not ride along in the client snapshot.
+_CLIENT_HIDDEN_SIGNAL_FIELDS = {"input_snapshot_json"}
+
+
+def _signal_views(signals) -> list[dict]:
+    return [
+        {key: value for key, value in row.items()
+         if key not in _CLIENT_HIDDEN_SIGNAL_FIELDS}
+        for row in as_json(signals)
+    ]
+
+
 async def event_view(event_id: str):
     event = store.events.get(event_id)
     if not event:
@@ -1063,7 +1080,7 @@ async def event_view(event_id: str):
                  if ledger is not None else [])
     return {"event": as_json(event),
             "latest_state": as_json(store.states[event_id][-1]) if store.states[event_id] else None,
-            "signals": as_json(signals),
+            "signals": _signal_views(signals),
             "edge_health": edge_health(store.quotes[event_id], signals, engine.max_age_seconds),
             "actionable_markets": market_views(store.quotes[event_id], signals, engine.edge_threshold),
             "positions": position_views(positions, store.quotes[event_id], signals,

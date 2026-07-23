@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
 from app.main import app, store
-from app.models import Quote
+from app.models import Quote, Signal
 
 
 def login(client):
@@ -29,6 +29,26 @@ def test_registered_event_can_be_removed():
         assert event_id not in store.states
         assert event_id not in store.quotes
         assert event_id not in store.signals
+
+
+def test_event_view_excludes_heavy_internal_snapshot_but_keeps_ui_fields():
+    """The per-signal input_snapshot_json embeds the whole evaluation request and
+    is re-serialized for every signal of every event on each SSE push; leaving it
+    in the client snapshot can OOM the fan-out. It must be dropped from the view
+    while the fields the dashboard renders survive."""
+    with TestClient(app) as client:
+        event_id = create_manual_event(client)["event"]["id"]
+        store.set_signals(event_id, [Signal(
+            event_id=event_id, market="moneyline", outcome="home",
+            model_probability=0.6, market_probability=0.55, edge=0.05,
+            confidence=0.9, action="WATCH", reasons=["r"],
+            input_snapshot_json="X" * 1_000_000,
+        )])
+        view = client.get(f"/api/events/{event_id}").json()
+        assert view["signals"], "signal should be present in the view"
+        signal = view["signals"][0]
+        assert "input_snapshot_json" not in signal
+        assert signal["market"] == "moneyline" and signal["edge"] == 0.05
 
 
 def test_dashboard_contains_merged_ui_behaviors():
