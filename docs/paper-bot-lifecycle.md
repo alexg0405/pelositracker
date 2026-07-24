@@ -12,6 +12,13 @@ entry. The requested stake is walked through complete ask depth using Decimal
 math. Tick size, minimum size, market status, depth completeness, and the
 recorded fee schedule are fail-closed gates.
 
+The fake-money research deployment may opt into
+`PAPER_ALLOW_UNCALIBRATED=true`. This admits a `WATCH` candidate only when the
+missing calibration artifact is the sole unresolved policy condition; every
+evaluated identity, source-count, freshness, signal-quality, edge, execution,
+fee, and exposure gate must still pass. The dashboard labels this mode and the
+decision ticker records the gate that accepted or rejected every candidate.
+
 `stake` is total fake cash consumed, including the entry fee. `entry_vwap` is
 the ask-depth VWAP and `entry_price` is the all-in cost per share. The order-book
 hash, provider identifiers, timestamps, fee, signal decision ID, and shares are
@@ -64,6 +71,12 @@ leaderboard reports realized P/L, executable open P/L,
 fees, cash-out counts, and average cash-out holding time. If any open position
 cannot be fully marked, total equity is `null` and the response reports known
 equity plus the count and stake of unpriced positions.
+
+`GET /api/bot-activity` returns the latest bounded cross-bot decision feed, and
+`GET /api/accounts/{name}/activity` filters it to one bot. Rows are deduplicated
+by bot and decision, retained for seven days with a 5,000-row cap, and include
+the decision stage, rejection or placement reason, observed price, probability,
+edge, quality, source count, exposure context, and planned/final paper stake.
 
 These observations are inputs for offline, event-grouped chronological
 research. They are not proof of predictive edge. Any future model trained from

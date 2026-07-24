@@ -212,16 +212,83 @@
     } catch {}
   }
 
+  function renderActivityRows(items, emptyMessage="No bot decisions have been recorded yet.") {
+    if (!items.length) return `<div class="metrics-empty">${esc(emptyMessage)}</div>`;
+    return items.map(item => {
+      const details = item.details || {};
+      const metrics = [];
+      const probability = details.model_probability ?? details.decision_probability;
+      const edge = details.actual_edge ?? details.quoted_edge;
+      const stake = details.filled_stake ?? details.requested_stake;
+      if (probability != null) metrics.push(`decision ${cents(probability)}`);
+      if (details.market_probability != null) metrics.push(`market ${cents(details.market_probability)}`);
+      if (edge != null) metrics.push(`edge ${signedCents(edge)}`);
+      if (stake != null) metrics.push(`plan $${Number(stake).toFixed(2)}`);
+      if (details.confidence != null) metrics.push(`quality ${Number(details.confidence).toFixed(0)}/100`);
+      if (details.reference_sources != null) metrics.push(`${details.reference_sources}/${details.minimum_sources ?? "?"} refs`);
+      const timestamp = new Date(Number(item.observed_ts) * 1000).toLocaleTimeString(
+        [], {hour:"numeric", minute:"2-digit", second:"2-digit"}
+      );
+      return `<div class="activity-row">
+        <div class="activity-who">
+          <div class="activity-bot">${esc(item.account)}</div>
+          <div class="activity-time">${esc(timestamp)} · ${esc(item.stage)}</div>
+        </div>
+        <div class="activity-selection">
+          <div class="activity-event">${esc(item.event_name)}</div>
+          <div class="activity-meta">${esc(item.market)} · ${esc(item.outcome)}</div>
+        </div>
+        <div class="activity-reason">
+          <span class="activity-status ${item.status === "placed" ? "placed" : "rejected"}">${esc(item.status)}</span>
+          <div>${esc(item.reason)}</div>
+          ${metrics.length ? `<div class="activity-meta">${metrics.join(" · ")}</div>` : ""}
+        </div>
+      </div>`;
+    }).join("");
+  }
+
+  let lastActivitySignature = "";
+  async function refreshBotActivity() {
+    const body = document.querySelector("#bot-activity");
+    const status = document.querySelector("#bot-activity-status");
+    if (!body || !status) return;
+    try {
+      const response = await fetch("/api/bot-activity?limit=80");
+      if (!response.ok) throw new Error();
+      const items = await response.json();
+      const signature = items.map(item => `${item.id}:${item.observed_ts}:${item.status}`).join("|");
+      if (signature !== lastActivitySignature) {
+        body.innerHTML = renderActivityRows(items);
+        lastActivitySignature = signature;
+      }
+      status.textContent = items.length
+        ? `${items.length} latest decision${items.length === 1 ? "" : "s"} · updates every 5s`
+        : "Waiting for the next monitored-game evaluation...";
+    } catch {
+      status.textContent = "Decision feed temporarily unavailable";
+      if (!body.children.length) {
+        body.innerHTML = '<div class="metrics-empty">Could not load bot decisions.</div>';
+      }
+    }
+  }
+
   async function viewBot(name) {
     const dialog = document.querySelector("#bot-modal");
     document.querySelector("#bot-modal-title").textContent = name + " Activity";
     document.querySelector("#bot-modal-content").innerHTML = "Loading...";
     dialog.showModal();
     try {
-      const r = await fetch(`/api/accounts/${encodeURIComponent(name)}/bets`);
-      if (!r.ok) throw new Error();
-      const bets = await r.json();
-      if (!bets.length) { document.querySelector("#bot-modal-content").innerHTML = '<div class="empty">No bets placed yet.</div>'; return; }
+      const [betsResponse, activityResponse] = await Promise.all([
+        fetch(`/api/accounts/${encodeURIComponent(name)}/bets`),
+        fetch(`/api/accounts/${encodeURIComponent(name)}/activity?limit=50`)
+      ]);
+      if (!betsResponse.ok || !activityResponse.ok) throw new Error();
+      const [bets, activity] = await Promise.all([
+        betsResponse.json(), activityResponse.json()
+      ]);
+      const activitySection = `<h3 class="activity-section-title">Latest decisions</h3>${renderActivityRows(
+        activity, "No evaluated trade candidates yet."
+      )}`;
       const rows = bets.map(b => {
         const displayedPnl = b.status === "open" ? b.last_mark_pnl : b.pnl;
         const mark = b.last_mark_value == null
@@ -243,7 +310,11 @@
           ${exit}
         </div>
       </div>`}).join("");
-      document.querySelector("#bot-modal-content").innerHTML = rows;
+      const positionsSection = `<h3 class="activity-section-title">Positions</h3>${
+        rows || '<div class="metrics-empty">No paper positions placed yet. The decision feed above shows what is blocking entry.</div>'
+      }`;
+      document.querySelector("#bot-modal-content").innerHTML =
+        activitySection + positionsSection;
     } catch { document.querySelector("#bot-modal-content").innerHTML = '<div class="error">Failed to load activity</div>'; }
   }
 
@@ -261,13 +332,19 @@
         const equity = account.equity == null ? `$${account.known_equity.toFixed(2)} known` : `$${account.equity.toFixed(2)} eq`;
         const roi = account.roi == null ? "UNPRICED" : pct(account.roi);
         const roiClass = account.roi == null ? "" : account.roi >= 0 ? "good" : "bad";
+        const removeButton = account.is_custom
+          ? `<button class="bot-remove" type="button" data-remove-bot data-account="${esc(account.name)}">Remove bot</button>`
+          : "";
         const unpriced = account.unpriced_open_positions ? ` · ${account.unpriced_open_positions} unpriced` : "";
         return `<div class="mtile" title="${esc(account.strategy)}" data-bot="${esc(account.name)}">
           <div class="k bot-name">${esc(account.name)}</div>
           <div class="v ${roiClass}">${roi}</div>
           <div class="sub2">${equity}${unpriced} · ${account.win_rate == null ? "—" : pct(account.win_rate)} WR</div>
           <div class="sub2 bot-count">${account.n_bets} positions · ${account.n_cashouts} cash-outs · fees $${account.execution_fees.toFixed(2)}</div>
-          <label class="cashout-label bot-cashout-label"><input type="checkbox" data-cashout-toggle data-account="${esc(account.name)}" ${account.cash_out_enabled ? "checked" : ""}> Auto cash-out</label>
+          <div class="bot-card-actions">
+            <label class="cashout-label bot-cashout-label"><input type="checkbox" data-cashout-toggle data-account="${esc(account.name)}" ${account.cash_out_enabled ? "checked" : ""}> Auto cash-out</label>
+            ${removeButton}
+          </div>
         </div>`;
       }).join("");
       body.innerHTML = `<div class="metric-tiles">${columns}</div>`;
@@ -407,6 +484,7 @@
       if (!r.ok) throw new Error(b.detail || "Failed to create bot");
       form.reset();
       await refreshLeaderboard();
+      await refreshBotActivity();
     } catch (er) { err.textContent = er.message; err.hidden = false; }
     finally { btn.disabled = false; }
   });
@@ -471,10 +549,51 @@
     const shown=discoverGames.filter(g=>!q||`${g.title} ${g.league||""}`.toLowerCase().includes(q));
     list.innerHTML=shown.length?shown.map(g=>`<div class="game" data-slug="${esc(g.slug)}" role="button" tabindex="0" title="${esc(g.title)}"><div><div class="g-title">${esc(g.title)}</div><div class="g-league">${discoverStatus(g)}${esc(g.league||"sports")}${g.reference_adapter===false?' · PRICE ONLY — NO REFERENCE ADAPTER':''}</div></div><span class="g-add">+ Monitor</span></div>`).join(""):'<div class="discover-empty">No games match.</div>';
   }
-  async function loadDiscover() {
+  let discoverRequest = null;
+  async function loadDiscover(manual=false) {
     const list=document.querySelector("#discover-list");
-    try{const r=await fetch("/api/discover");if(!r.ok)throw new Error();discoverGames=await r.json();renderDiscover()}
-    catch{if(!discoverGames.length)list.innerHTML='<div class="discover-empty">Could not load games.</div>'}
+    const button=document.querySelector("#discover-refresh");
+    const status=document.querySelector("#discover-refresh-status");
+    if(discoverRequest){
+      if(manual)status.textContent="A refresh is already running...";
+      return discoverRequest;
+    }
+    if(manual){
+      button.disabled=true;
+      button.classList.add("is-refreshing");
+      button.textContent="Refreshing...";
+      status.className="refresh-status";
+      status.textContent="Checking Polymarket for current games...";
+    }
+    discoverRequest=(async()=>{
+      try{
+        const r=await fetch(manual?"/api/discover?refresh=true":"/api/discover",{cache:"no-store"});
+        const body=await r.json().catch(()=>null);
+        if(!r.ok)throw new Error(body?.detail||`Refresh failed (${r.status})`);
+        discoverGames=body||[];
+        renderDiscover();
+        if(manual){
+          status.className="refresh-status is-success";
+          status.textContent=`Updated ${new Date().toLocaleTimeString()} · ${discoverGames.length} game${discoverGames.length===1?"":"s"} found`;
+        }
+      }
+      catch(error){
+        if(!discoverGames.length)list.innerHTML='<div class="discover-empty">Could not load games.</div>';
+        if(manual){
+          status.className="refresh-status is-error";
+          status.textContent=error.message||"Could not refresh the game list.";
+        }
+      }
+      finally{
+        if(manual){
+          button.disabled=false;
+          button.classList.remove("is-refreshing");
+          button.textContent="Refresh List";
+        }
+        discoverRequest=null;
+      }
+    })();
+    return discoverRequest;
   }
   async function monitorGame(slug,row) {
     const box=document.querySelector("#form-error");
@@ -499,12 +618,33 @@
   document.querySelector("#best-bets").addEventListener("click",e=>{const row=e.target.closest("[data-goto-event]");if(row)gotoEvent(row.dataset.gotoEvent)});
   document.querySelector("#best-bets").addEventListener("keydown",e=>{if(e.key!=="Enter"&&e.key!==" ")return;const row=e.target.closest("[data-goto-event]");if(row){e.preventDefault();gotoEvent(row.dataset.gotoEvent)}});
   document.querySelector("#discover-search").addEventListener("input",renderDiscover);
-  document.querySelector("#discover-refresh").addEventListener("click",loadDiscover);
+  document.querySelector("#discover-refresh").addEventListener("click",()=>loadDiscover(true));
   document.querySelector("#line-filter").addEventListener("click",e=>{const p=e.target.closest("[data-line]");if(!p)return;activeLine=p.dataset.line;renderEvents(lastEvents);});
 
-  document.addEventListener("click", event => {
+  document.addEventListener("click", async event => {
     const close = event.target.closest("[data-close-dialog]");
     if (close) document.getElementById(close.dataset.closeDialog)?.close();
+    const removeBot = event.target.closest("[data-remove-bot]");
+    if (removeBot) {
+      event.stopPropagation();
+      const name = removeBot.dataset.account;
+      if (!window.confirm(`Remove custom bot "${name}"? Its historical decisions and positions will be retained for analysis.`)) return;
+      removeBot.disabled = true;
+      try {
+        const response = await fetch(`/api/accounts/${encodeURIComponent(name)}`, {
+          method: "DELETE"
+        });
+        const body = await response.json().catch(()=>({}));
+        if (!response.ok) throw new Error(body.detail || "Could not remove bot");
+        await Promise.all([refreshLeaderboard(), refreshBotActivity()]);
+      } catch (error) {
+        const box = document.querySelector("#bot-error");
+        box.textContent = error.message;
+        box.hidden = false;
+        removeBot.disabled = false;
+      }
+      return;
+    }
     const cashout = event.target.closest("[data-cashout-toggle]");
     if (cashout) {
       event.stopPropagation();
@@ -544,14 +684,20 @@
     fetch("/api/config").then(r=>r.json()).then(c=>{
       document.querySelector("#config").textContent=`Quality ≥ ${c.confidence_threshold} · Base edge ≥ ${(c.edge_threshold*100).toFixed(1)}%`;
       if(document.querySelector("#auto-monitor-toggle")) document.querySelector("#auto-monitor-toggle").checked = !!c.auto_monitor;
+      const policy=document.querySelector("#bot-policy");
+      if(policy&&c.paper_bot_policy){
+        policy.textContent=c.paper_bot_policy.message;
+        const anyModel=Object.values(c.paper_bot_policy.models||{}).some(Boolean);
+        policy.classList.toggle("is-ready",!!c.paper_bot_policy.calibration_loaded||!!c.paper_bot_policy.allow_uncalibrated||anyModel);
+      }
     }).catch(()=>document.querySelector("#config").textContent="Thresholds unavailable");
 
-    refresh();refreshMetrics();refreshLeaderboard();startStream();loadDiscover();refreshBotGames();
+    refresh();refreshMetrics();refreshLeaderboard();refreshBotActivity();startStream();loadDiscover();refreshBotGames();
 
     // Set intervals
     if (!window.intervalsStarted) {
       window.intervalsStarted = true;
-      setInterval(refresh,10000);setInterval(refreshMetrics,5000);setInterval(refreshLeaderboard,5000);setInterval(loadDiscover,60000);setInterval(refreshBotGames,30000);
+      setInterval(refresh,10000);setInterval(refreshMetrics,5000);setInterval(refreshLeaderboard,5000);setInterval(refreshBotActivity,5000);setInterval(loadDiscover,60000);setInterval(refreshBotGames,30000);
     }
   }
 

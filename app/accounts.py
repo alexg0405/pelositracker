@@ -91,6 +91,32 @@ CREATE INDEX IF NOT EXISTS idx_account_bet_marks_event_time
     ON account_bet_marks(event_id, marked_ts);
 """
 
+_ACTIVITY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS account_activity (
+    id            SERIAL PRIMARY KEY,
+    activity_key  TEXT NOT NULL UNIQUE,
+    account       TEXT NOT NULL,
+    event_id      TEXT NOT NULL,
+    event_name    TEXT NOT NULL,
+    market        TEXT NOT NULL,
+    outcome       TEXT NOT NULL,
+    observed_ts   DOUBLE PRECISION NOT NULL,
+    status        TEXT NOT NULL,
+    stage         TEXT NOT NULL,
+    reason        TEXT NOT NULL,
+    details_json  TEXT NOT NULL,
+    decision_id   TEXT,
+    token_id      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_account_activity_time
+    ON account_activity(observed_ts);
+CREATE INDEX IF NOT EXISTS idx_account_activity_account_time
+    ON account_activity(account, observed_ts);
+"""
+
+_ACTIVITY_MAX_ROWS = 5_000
+_ACTIVITY_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+
 
 @dataclass
 class Strategy:
@@ -602,7 +628,23 @@ class AccountBook:
                     "exit_reason": "TEXT",
                 },
             })
+            self._db.migrate_columns("accounts", 4, {
+                "accounts": {
+                    "is_custom": "INTEGER NOT NULL DEFAULT 0",
+                    "active": "INTEGER NOT NULL DEFAULT 1",
+                },
+            })
             self._db.initialize(_MARKS_SCHEMA, component="account_marks", version=1)
+            self._db.initialize(_ACTIVITY_SCHEMA, component="account_activity", version=1)
+            # Preserve custom bots created before the explicit flag existed.
+            with self._db.transaction() as cur:
+                self._db.execute(
+                    cur,
+                    "UPDATE accounts SET is_custom=1 "
+                    "WHERE strategy LIKE %s AND is_custom=0",
+                    ("%Custom bot created via UI.%",),
+                )
+        self._last_activity_prune = 0.0
 
     def close(self) -> None:
         with self._lock:
@@ -618,18 +660,59 @@ class AccountBook:
                         cur,
                         """INSERT INTO accounts
                            (name, strategy, start_bankroll, bankroll, created_ts,
-                            cash_out_enabled)
-                           VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (name) DO UPDATE SET
-                           strategy=EXCLUDED.strategy""",
+                            cash_out_enabled, is_custom, active)
+                           VALUES (%s,%s,%s,%s,%s,%s,0,1)
+                           ON CONFLICT (name) DO UPDATE SET
+                           strategy=EXCLUDED.strategy, active=1""",
                         (strat.name, strat.to_json(), strat.start_bankroll,
                          strat.start_bankroll, now, int(strat.cash_out_enabled)),
                     )
+
+    def create_custom(self, strategy: Strategy) -> bool:
+        """Create a UI-owned bot without silently replacing an existing account."""
+        now = _now()
+        with self._lock:
+            with self._db.transaction() as cur:
+                self._db.execute(
+                    cur,
+                    """INSERT INTO accounts
+                       (name, strategy, start_bankroll, bankroll, created_ts,
+                        cash_out_enabled, is_custom, active)
+                       VALUES (%s,%s,%s,%s,%s,%s,1,1)
+                       ON CONFLICT (name) DO NOTHING""",
+                    (strategy.name, strategy.to_json(), strategy.start_bankroll,
+                     strategy.start_bankroll, now, int(strategy.cash_out_enabled)),
+                )
+                return bool(cur.rowcount)
+
+    def remove_custom(self, name: str) -> str:
+        """Soft-remove a custom bot while retaining its audit and position history."""
+        with self._lock:
+            with self._db.transaction(dict_rows=True) as cur:
+                self._db.execute(
+                    cur,
+                    "SELECT is_custom, active FROM accounts WHERE name=%s",
+                    (name,),
+                )
+                row = cur.fetchone()
+                if row is None or not bool(row["active"]):
+                    return "not_found"
+                if not bool(row["is_custom"]):
+                    return "preset"
+                self._db.execute(
+                    cur,
+                    "UPDATE accounts SET active=0 WHERE name=%s",
+                    (name,),
+                )
+                return "removed"
 
     def set_cash_out(self, name: str, enabled: bool) -> bool:
         with self._lock:
             with self._db.transaction() as cur:
                 self._db.execute(
-                    cur, "UPDATE accounts SET cash_out_enabled=%s WHERE name=%s",
+                    cur,
+                    "UPDATE accounts SET cash_out_enabled=%s "
+                    "WHERE name=%s AND active=1",
                     (int(enabled), name),
                 )
                 return bool(cur.rowcount)
@@ -643,6 +726,108 @@ class AccountBook:
                     (event_id,),
                 )
                 return int(cur.fetchone()[0])
+
+    def _record_activity(
+        self, cur, *, account: str, strategy: Strategy, event: Event,
+        signal: Signal, observed_ts: float, status: str, stage: str,
+        reason: str, details: dict | None = None,
+    ) -> None:
+        """Upsert one bounded, user-readable audit row per bot decision."""
+        decision_key = (
+            signal.decision_id
+            or signal.decision_hash
+            or f"{signal.market}:{signal.outcome}:{_timestamp(signal.observed_at):.6f}"
+        )
+        activity_key = "\x1f".join((
+            account, event.id, decision_key, signal.token_id or "",
+        ))
+        payload = {
+            "signal_action": signal.action,
+            "market_probability": signal.market_probability,
+            "decision_probability": _decision_probability(signal),
+            "quoted_edge": signal.edge,
+            "required_edge": signal.required_edge,
+            "strategy_edge_threshold": strategy.edge_threshold,
+            "confidence": signal.confidence,
+            "strategy_confidence_threshold": strategy.confidence_threshold,
+            "reference_sources": signal.n_reference_sources,
+            "minimum_sources": strategy.min_sources,
+            "sizing": strategy.sizing,
+        }
+        payload.update(details or {})
+        self._db.execute(
+            cur,
+            """INSERT INTO account_activity
+               (activity_key, account, event_id, event_name, market, outcome,
+                observed_ts, status, stage, reason, details_json, decision_id, token_id)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (activity_key) DO UPDATE SET
+                 observed_ts=EXCLUDED.observed_ts,
+                 status=EXCLUDED.status,
+                 stage=EXCLUDED.stage,
+                 reason=EXCLUDED.reason,
+                 details_json=EXCLUDED.details_json
+               WHERE account_activity.status<>'placed'""",
+            (
+                activity_key, account, event.id, event.name, signal.market,
+                signal.outcome, observed_ts, status, stage, reason,
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                signal.decision_id or None, signal.token_id,
+            ),
+        )
+
+    def _prune_activity(self, cur, now: float) -> None:
+        if now - self._last_activity_prune < 60:
+            return
+        self._db.execute(
+            cur,
+            "DELETE FROM account_activity WHERE observed_ts<%s",
+            (now - _ACTIVITY_MAX_AGE_SECONDS,),
+        )
+        while True:
+            self._db.execute(
+                cur,
+                """SELECT id FROM account_activity
+                   ORDER BY observed_ts DESC, id DESC LIMIT %s OFFSET %s""",
+                (_ACTIVITY_MAX_ROWS, _ACTIVITY_MAX_ROWS),
+            )
+            excess = [(row[0],) for row in cur.fetchall()]
+            if not excess:
+                break
+            self._db.execute_many(
+                cur, "DELETE FROM account_activity WHERE id=%s", excess
+            )
+        self._last_activity_prune = now
+
+    def activity(self, account: str | None = None, limit: int = 100) -> list[dict]:
+        limit = max(1, min(int(limit), 200))
+        with self._lock:
+            with self._db.cursor(dict_rows=True) as cur:
+                if account:
+                    self._db.execute(
+                        cur,
+                        """SELECT * FROM account_activity WHERE account=%s
+                           ORDER BY observed_ts DESC, id DESC LIMIT %s""",
+                        (account, limit),
+                    )
+                else:
+                    self._db.execute(
+                        cur,
+                        """SELECT * FROM account_activity
+                           ORDER BY observed_ts DESC, id DESC LIMIT %s""",
+                        (limit,),
+                    )
+                rows = []
+                for raw in cur.fetchall():
+                    row = dict(raw)
+                    try:
+                        row["details"] = json.loads(row.pop("details_json"))
+                    except (TypeError, ValueError):
+                        row["details"] = {}
+                        row.pop("details_json", None)
+                    row.pop("activity_key", None)
+                    rows.append(row)
+                return rows
 
     def place(self, event: Event, signals: list[Signal], quotes: list[Quote] | None = None,
               *, as_of: datetime | float | None = None,
@@ -675,7 +860,8 @@ class AccountBook:
             with self._db.transaction(dict_rows=True) as cur:
                 self._db.execute(
                     cur,
-                    "SELECT name, strategy, bankroll, start_bankroll FROM accounts",
+                    "SELECT name, strategy, bankroll, start_bankroll FROM accounts "
+                    "WHERE active=1",
                 )
                 accounts = cur.fetchall()
                 for account in accounts:
@@ -707,23 +893,85 @@ class AccountBook:
                         if portfolio_kelly else None
                     )
                     for signal in signals:
-                        if not signal.token_id or not _gradeable(
-                                event, signal.market, signal.outcome):
+                        activity_details = {
+                            "bankroll": bankroll,
+                            "event_open_exposure": event_open,
+                            "sport_open_exposure": sport_open,
+                            "total_open_exposure": total_open,
+                            "model_backed": signal.token_id in model_probabilities,
+                            "uncalibrated_paper_enabled": allow_uncalibrated,
+                        }
+
+                        def reject(stage: str, reason: str, **extra) -> None:
+                            self._record_activity(
+                                cur, account=account["name"], strategy=strategy,
+                                event=event, signal=signal, observed_ts=now,
+                                status="rejected", stage=stage, reason=reason,
+                                details={**activity_details, **extra},
+                            )
+
+                        if not signal.token_id:
+                            reject(
+                                "identity",
+                                "no executable Polymarket token is mapped to this selection",
+                            )
+                            continue
+                        if not _gradeable(event, signal.market, signal.outcome):
+                            reject(
+                                "settlement",
+                                "market cannot be graded safely from the final score",
+                            )
                             continue
                         quote = quote_by_token.get(signal.token_id)
-                        if quote is None or signal.market_probability <= 0:
+                        if quote is None:
+                            reject(
+                                "quote",
+                                "no current complete Polymarket order book is available",
+                            )
+                            continue
+                        if signal.market_probability <= 0:
+                            reject("quote", "the executable market price is invalid")
                             continue
                         model_override = model_probabilities.get(signal.token_id)
                         if model_override is not None:
-                            if model_backed_failures(strategy, signal):
+                            model_failures = model_backed_failures(strategy, signal)
+                            if model_failures:
+                                reject(
+                                    "qualification", "; ".join(model_failures),
+                                    model_probability=model_override,
+                                )
                                 continue
                             if _quote_is_stale(quote, now, max_quote_age_seconds):
+                                provider_ts = (
+                                    _timestamp(quote.provider_timestamp)
+                                    if quote.provider_timestamp is not None else None
+                                )
+                                reject(
+                                    "freshness",
+                                    "model-backed entry quote is stale or has no trusted timestamp",
+                                    model_probability=model_override,
+                                    provider_age_seconds=(
+                                        now - provider_ts if provider_ts is not None else None
+                                    ),
+                                    max_quote_age_seconds=max_quote_age_seconds,
+                                )
                                 continue
-                        elif not qualifies(strategy, signal,
-                                           allow_uncalibrated=allow_uncalibrated):
-                            continue
+                        else:
+                            failures = qualification_failures(
+                                strategy, signal,
+                                allow_uncalibrated=allow_uncalibrated,
+                            )
+                            if failures:
+                                reject("qualification", "; ".join(failures))
+                                continue
                         if (signal.order_book_snapshot_id
                                 and signal.order_book_snapshot_id != quote.book_hash):
+                            reject(
+                                "snapshot",
+                                "the live order book changed after this decision was calculated",
+                                decision_book_hash=signal.order_book_snapshot_id,
+                                current_book_hash=quote.book_hash,
+                            )
                             continue
                         correlation_group = _correlation_group(event, signal)
                         self._db.execute(
@@ -749,6 +997,13 @@ class AccountBook:
                                 - total_open),
                         )
                         if requested_stake < 1.0:
+                            reject(
+                                "sizing",
+                                "planned stake is below the $1 paper-order minimum",
+                                base_stake=base_stake,
+                                requested_stake=requested_stake,
+                                correlated_open_exposure=correlated_open,
+                            )
                             continue
                         execution = simulate_buy(
                             _book_levels(quote.ask_levels),
@@ -768,6 +1023,11 @@ class AccountBook:
                         )
                         if (not execution.complete or execution.effective_probability is None
                                 or execution.vwap is None):
+                            reject(
+                                "execution", execution.reason,
+                                requested_stake=requested_stake,
+                                levels_consumed=execution.levels_consumed,
+                            )
                             continue
                         stake = float(execution.filled_cash)
                         shares = float(execution.filled_shares)
@@ -775,6 +1035,12 @@ class AccountBook:
                         model_probability = (model_override if model_override is not None
                                              else _decision_probability(signal))
                         if model_probability is None or not 0 < model_probability < 1:
+                            reject(
+                                "probability",
+                                "no valid calibrated or independent decision probability exists",
+                                requested_stake=requested_stake,
+                                entry_price=entry_price,
+                            )
                             continue
                         actual_edge = model_probability - entry_price
                         edge_floor = max(signal.required_edge, strategy.edge_threshold)
@@ -786,6 +1052,17 @@ class AccountBook:
                         sigma = (model_uncertainty.get(signal.token_id, 0.0)
                                  if model_override is not None else 0.0)
                         if actual_edge - edge_uncertainty_z * sigma < edge_floor:
+                            reject(
+                                "edge",
+                                "the simulated all-in fill does not clear the required edge",
+                                requested_stake=requested_stake,
+                                entry_price=entry_price,
+                                model_probability=model_probability,
+                                actual_edge=actual_edge,
+                                edge_floor=edge_floor,
+                                probability_uncertainty=sigma,
+                                uncertainty_multiplier=edge_uncertainty_z,
+                            )
                             continue
                         self._db.execute(
                             cur,
@@ -809,6 +1086,13 @@ class AccountBook:
                              _timestamp(quote.received_at)),
                         )
                         if not cur.rowcount:
+                            reject(
+                                "duplicate",
+                                "this bot already has a position in the same event and line",
+                                requested_stake=requested_stake,
+                                entry_price=entry_price,
+                                actual_edge=actual_edge,
+                            )
                             continue
                         bankroll -= stake
                         total_open += stake
@@ -831,6 +1115,26 @@ class AccountBook:
                             cur, "UPDATE accounts SET bankroll=%s WHERE name=%s",
                             (bankroll, account["name"]),
                         )
+                        self._record_activity(
+                            cur, account=account["name"], strategy=strategy,
+                            event=event, signal=signal, observed_ts=now,
+                            status="placed", stage="placed",
+                            reason="paper trade placed after every gate cleared",
+                            details={
+                                **activity_details,
+                                "requested_stake": requested_stake,
+                                "filled_stake": stake,
+                                "shares": shares,
+                                "entry_price": entry_price,
+                                "entry_vwap": float(execution.vwap),
+                                "entry_fee": float(execution.fee),
+                                "model_probability": model_probability,
+                                "actual_edge": actual_edge,
+                                "edge_floor": edge_floor,
+                                "probability_uncertainty": sigma,
+                            },
+                        )
+                self._prune_activity(cur, now)
         return placed_bets
 
     def mark_and_cash_out(self, event: Event, quotes: list[Quote], signals: list[Signal],
@@ -1068,7 +1372,7 @@ class AccountBook:
     def leaderboard(self) -> list[dict]:
         with self._lock:
             with self._db.cursor(dict_rows=True) as cur:
-                self._db.execute(cur, "SELECT * FROM accounts")
+                self._db.execute(cur, "SELECT * FROM accounts WHERE active=1")
                 accounts = cur.fetchall()
                 board = []
                 for account in accounts:
@@ -1113,6 +1417,7 @@ class AccountBook:
                     board.append({
                         "name": account["name"],
                         "strategy": Strategy.from_json(account["strategy"]).blurb,
+                        "is_custom": bool(account["is_custom"]),
                         "cash_out_enabled": bool(account["cash_out_enabled"]),
                         "bankroll": float(account["bankroll"]),
                         "start_bankroll": start,

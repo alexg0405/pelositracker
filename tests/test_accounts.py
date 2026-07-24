@@ -38,6 +38,62 @@ def executable_quote(event: Event, token_id: str, market: str, outcome: str,
     )
 
 
+def test_custom_bot_removal_is_soft_and_presets_cannot_be_removed(tmp_path):
+    book = AccountBook(str(tmp_path / "accounts.db"))
+    preset = Strategy("preset")
+    custom = Strategy("custom", blurb="Custom bot created via UI.")
+    try:
+        book.seed([preset])
+        assert book.create_custom(custom) is True
+        assert book.create_custom(custom) is False
+        board = {row["name"]: row for row in book.leaderboard()}
+        assert board["preset"]["is_custom"] is False
+        assert board["custom"]["is_custom"] is True
+
+        assert book.remove_custom("preset") == "preset"
+        assert book.remove_custom("custom") == "removed"
+        assert book.remove_custom("custom") == "not_found"
+        assert [row["name"] for row in book.leaderboard()] == ["preset"]
+    finally:
+        book.close()
+
+
+def test_bot_activity_explains_rejection_then_preserves_placed_decision(tmp_path):
+    book = AccountBook(str(tmp_path / "accounts.db"))
+    event = Event("A vs B", "basketball", "A", "B", id="event")
+    strategy = Strategy(
+        "bot", sizing="flat", flat_stake=100, start_bankroll=1_000
+    )
+    signal = valid_signal(
+        event_id=event.id, outcome="A", action="WATCH",
+        decision_id="decision-1",
+    )
+    quote = executable_quote(event, "token-home", "moneyline", "A")
+    try:
+        book.seed([strategy])
+        assert book.place(event, [signal], [quote], as_of=1_000) == []
+        rejected = book.activity("bot")
+        assert len(rejected) == 1
+        assert rejected[0]["status"] == "rejected"
+        assert rejected[0]["stage"] == "qualification"
+        assert "engine gates did not clear" in rejected[0]["reason"]
+        assert rejected[0]["details"]["market_probability"] == pytest.approx(.50)
+        assert rejected[0]["details"]["confidence"] == 90
+
+        signal.action = "PAPER_BET"
+        assert len(book.place(event, [signal], [quote], as_of=1_001)) == 1
+        assert book.place(event, [signal], [quote], as_of=1_002) == []
+        activity = book.activity("bot")
+    finally:
+        book.close()
+
+    assert len(activity) == 1
+    assert activity[0]["status"] == "placed"
+    assert activity[0]["stage"] == "placed"
+    assert activity[0]["details"]["filled_stake"] == pytest.approx(100)
+    assert activity[0]["details"]["actual_edge"] == pytest.approx(.10)
+
+
 @pytest.mark.parametrize("changes, expected", [
     ({"action": "WATCH"}, "engine gates"),
     ({"quote_source": "Pinnacle"}, "Polymarket"),

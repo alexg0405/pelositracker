@@ -28,6 +28,11 @@ services:
         value: "0"
       - key: SIGNAL_EDGE_THRESHOLD
         value: "0"
+      # Fake-money research only: permit WATCH signals held back solely by the
+      # missing calibration artifact. Every identity, source, freshness, edge,
+      # quality, depth, fee, and exposure gate still fails closed.
+      - key: PAPER_ALLOW_UNCALIBRATED
+        value: "true"
       - key: ODDS_PLAYER_MARKETS  # e.g. player_points,player_rebounds (per sport)
         sync: false
       - key: DATABASE_URL       # optional PostgreSQL; takes priority over SQLite

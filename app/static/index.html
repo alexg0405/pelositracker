@@ -82,6 +82,7 @@
           <button class="ghost compact-button" id="discover-refresh" type="button">Refresh List</button>
         </div>
       </div>
+      <div id="discover-refresh-status" class="refresh-status" role="status" aria-live="polite"></div>
       <input class="search-gap" id="discover-search" placeholder="Filter games…" autocomplete="off">
       <div id="discover-list" class="discover-list" aria-live="polite"></div>
     </div>
@@ -134,6 +135,15 @@
         </div>
       </form>
     </div>
+
+    <section class="panel metrics-panel bot-activity-panel" aria-labelledby="bot-activity-heading">
+      <div class="metrics-head">
+        <h2 class="title glitch" data-text="Bot Decision Ticker" id="bot-activity-heading">Bot Decision Ticker</h2>
+        <span class="metrics-sub" id="bot-activity-status">Waiting for bot decisions...</span>
+      </div>
+      <div class="bot-policy" id="bot-policy" role="status"></div>
+      <div class="bot-activity" id="bot-activity" aria-live="polite" aria-atomic="false"></div>
+    </section>
 
     <section class="panel metrics-panel leaderboard-panel" aria-labelledby="leaderboard-heading">
       <div class="metrics-head"><h2 class="title glitch accent-text" data-text="Strategy Calibration · Dummy Accounts" id="leaderboard-heading">Strategy Calibration · Dummy Accounts</h2></div>

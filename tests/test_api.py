@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 
+import app.main as main_module
 from app.main import app, store
 from app.models import Quote, Signal
 
@@ -64,6 +65,10 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "Edge buffer" in javascript or "edge_buffer" in javascript
         assert "Allow logical automatic cash-out" in html
         assert "data-cashout-toggle" in javascript
+        assert 'id="discover-refresh-status"' in html
+        assert "/api/discover?refresh=true" in javascript
+        assert 'id="bot-activity"' in html
+        assert "data-remove-bot" in javascript
 
 
 def test_bot_cashout_toggle_and_mark_feed_are_authenticated_api_contracts():
@@ -84,6 +89,39 @@ def test_bot_cashout_toggle_and_mark_feed_are_authenticated_api_contracts():
             "/api/accounts/Engine%20Kelly", json={"cash_out_enabled": False}
         )
         assert restored.status_code == 200
+
+
+def test_custom_bot_can_be_removed_but_preset_bot_cannot():
+    with TestClient(app) as client:
+        login(client)
+        name = "Disposable custom bot"
+        created = client.post("/api/accounts", json={
+            "name": name,
+            "edge_threshold": .03,
+            "sizing": "flat",
+            "flat_stake": 25,
+        })
+        assert created.status_code == 201
+        duplicate = client.post("/api/accounts", json={
+            "name": name,
+            "edge_threshold": .03,
+            "sizing": "flat",
+            "flat_stake": 25,
+        })
+        assert duplicate.status_code == 409
+        account = next(
+            item for item in client.get("/api/leaderboard").json()
+            if item["name"] == name
+        )
+        assert account["is_custom"] is True
+
+        removed = client.delete("/api/accounts/Disposable%20custom%20bot")
+        assert removed.status_code == 204
+        assert all(
+            item["name"] != name for item in client.get("/api/leaderboard").json()
+        )
+        assert client.delete("/api/accounts/Engine%20Kelly").status_code == 409
+        assert client.get("/api/bot-activity").status_code == 200
 
 
 def test_position_can_be_saved_and_removed_for_a_visible_selection():
@@ -117,6 +155,30 @@ def test_add_event_requires_an_authenticated_session():
 def test_discover_requires_authentication():
     with TestClient(app) as client:
         assert client.get("/api/discover").status_code == 401
+
+
+def test_manual_discovery_refresh_bypasses_the_short_cache(monkeypatch):
+    calls = []
+
+    async def fake_discovery(**kwargs):
+        calls.append(kwargs)
+        return [{"slug": "fresh", "title": "Fresh game"}]
+
+    monkeypatch.setattr(main_module, "polymarket_sports_events", fake_discovery)
+    main_module._discover_cache.update(
+        at=main_module.time.monotonic(),
+        data=[{"slug": "cached", "title": "Cached game"}],
+    )
+    try:
+        with TestClient(app) as client:
+            login(client)
+            assert client.get("/api/discover").json()[0]["slug"] == "cached"
+            refreshed = client.get("/api/discover?refresh=true")
+            assert refreshed.status_code == 200
+            assert refreshed.json()[0]["slug"] == "fresh"
+            assert len(calls) == 1
+    finally:
+        main_module._discover_cache.update(at=0.0, data=[])
 
 
 def test_add_event_rejects_a_missing_csrf_header():

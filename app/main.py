@@ -1122,8 +1122,41 @@ async def logout(request: Request, response: Response):
 
 @app.get("/api/config", dependencies=[Depends(verify_auth)])
 async def config():
-    return {"confidence_threshold": engine.confidence_threshold, "edge_threshold": engine.edge_threshold,
-            "max_age_seconds": engine.max_age_seconds, "auto_monitor": _config_state["auto_monitor"]}
+    calibrated = calibration_artifact is not None
+    model_paths = {
+        "tennis": settings.enable_tennis_model,
+        "lead": settings.enable_lead_model,
+        "soccer": settings.enable_soccer_model,
+    }
+    if calibrated:
+        bot_mode = "Validated consensus calibration is loaded."
+    elif settings.allow_uncalibrated_paper:
+        bot_mode = (
+            "Research-mode uncalibrated paper entries are enabled; all other "
+            "quality and execution gates still apply."
+        )
+    elif any(model_paths.values()):
+        bot_mode = (
+            "Consensus entries wait for validated calibration; enabled independent "
+            "sport models may still place paper trades."
+        )
+    else:
+        bot_mode = (
+            "Bots are observing only: no calibration artifact or independent live "
+            "model is enabled, so consensus entries remain blocked."
+        )
+    return {
+        "confidence_threshold": engine.confidence_threshold,
+        "edge_threshold": engine.edge_threshold,
+        "max_age_seconds": engine.max_age_seconds,
+        "auto_monitor": _config_state["auto_monitor"],
+        "paper_bot_policy": {
+            "calibration_loaded": calibrated,
+            "allow_uncalibrated": settings.allow_uncalibrated_paper,
+            "models": model_paths,
+            "message": bot_mode,
+        },
+    }
 
 
 @app.post("/api/config", dependencies=[Depends(verify_auth)])
@@ -1138,10 +1171,10 @@ _discover_cache: dict = {"at": 0.0, "data": []}
 
 
 @app.get("/api/discover", dependencies=[Depends(verify_auth)])
-async def discover():
+async def discover(refresh: bool = False):
     """Browse live/upcoming Polymarket sports games to add without a link."""
     now = time.monotonic()
-    if _discover_cache["data"] and now - _discover_cache["at"] < 45:
+    if not refresh and _discover_cache["data"] and now - _discover_cache["at"] < 45:
         return _discover_cache["data"]  # cache so browsing doesn't hammer Gamma
     try:
         games = await polymarket_sports_events(live_statuses=_sports_status_compact)
@@ -1477,7 +1510,9 @@ async def create_account(payload: StrategyIn):
         cash_out_enabled=payload.cash_out_enabled,
         events=tuple(dict.fromkeys(e for e in payload.events if e)),
     )
-    await asyncio.to_thread(account_book.seed, [strat])
+    created = await asyncio.to_thread(account_book.create_custom, strat)
+    if not created:
+        raise HTTPException(409, "A bot with this name already exists")
     return {"status": "ok"}
 
 
@@ -1497,6 +1532,20 @@ async def get_account_bets(name: str):
     return await asyncio.to_thread(account_book.account_bets, name)
 
 
+@app.get("/api/bot-activity", dependencies=[Depends(verify_auth)])
+async def get_bot_activity(account: str | None = None, limit: int = 100):
+    if account_book is None:
+        return []
+    return await asyncio.to_thread(account_book.activity, account, limit)
+
+
+@app.get("/api/accounts/{name}/activity", dependencies=[Depends(verify_auth)])
+async def get_account_activity(name: str, limit: int = 100):
+    if account_book is None:
+        return []
+    return await asyncio.to_thread(account_book.activity, name, limit)
+
+
 @app.get("/api/accounts/{name}/marks", dependencies=[Depends(verify_auth)])
 async def get_account_marks(name: str):
     if account_book is None:
@@ -1514,6 +1563,18 @@ async def update_account(name: str, payload: StrategyUpdateIn):
     if not updated:
         raise HTTPException(404, "paper bot not found")
     return {"name": name, "cash_out_enabled": payload.cash_out_enabled}
+
+
+@app.delete("/api/accounts/{name}", status_code=204, dependencies=[Depends(verify_auth)])
+async def delete_account(name: str):
+    if account_book is None:
+        raise HTTPException(503, "Account book is not initialized")
+    result = await asyncio.to_thread(account_book.remove_custom, name)
+    if result == "not_found":
+        raise HTTPException(404, "paper bot not found")
+    if result == "preset":
+        raise HTTPException(409, "Preset calibration bots cannot be removed")
+    return Response(status_code=204)
 
 
 @app.get("/api/accounts/{name}/bets/{bet_id}/marks",
