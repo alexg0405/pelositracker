@@ -411,6 +411,50 @@ def eligibility_coverage(decisions: list[dict] | None, selected_bets: int) -> di
     }
 
 
+def _opportunity_proper_scores(rows: list[dict]) -> dict:
+    scored = []
+    for row in rows:
+        if row.get("settled_result") is None:
+            continue
+        probability = row.get("calibrated_probability")
+        if probability is None:
+            probability = row.get("consensus_probability")
+        if probability is None:
+            continue
+        clipped = min(max(float(probability), _EPS), 1 - _EPS)
+        scored.append((clipped, float(row["settled_result"])))
+    if not scored:
+        return {"sample_size": 0, "brier_score": None, "log_loss": None}
+    size = len(scored)
+    brier = sum((p - y) ** 2 for p, y in scored) / size
+    log_loss = -sum(y * math.log(p) + (1 - y) * math.log1p(-p)
+                    for p, y in scored) / size
+    return {"sample_size": size, "brier_score": brier, "log_loss": log_loss}
+
+
+def opportunity_scores(rows: list[dict]) -> dict:
+    """OBSERVATIONAL, off-policy proper scores over the full opportunity set
+    (placed plus WATCH/rejected), segmented by policy action.
+
+    This is deliberately NOT an unbiased model validation: the forecasts are
+    correlated within an event (each row is one decision tick) and the decision
+    policy is not randomized, so a favourable WATCH-vs-PAPER_BET gap is
+    observational only. ``statistical_claim_supported`` is always False; the
+    event-clustered treatment lives in the research/Phase-2 track.
+    """
+    placed = [row for row in rows if row.get("policy_action") == "PAPER_BET"]
+    watched = [row for row in rows if row.get("policy_action") != "PAPER_BET"]
+    return {
+        "observational": True,
+        "statistical_claim_supported": False,
+        "all_opportunities": _opportunity_proper_scores(rows),
+        "paper_bet": _opportunity_proper_scores(placed),
+        "watch_or_rejected": _opportunity_proper_scores(watched),
+        "note": ("off-policy; forecasts are correlated within an event and the "
+                 "policy is not randomized -- not an unbiased validation"),
+    }
+
+
 def summary(bets: list[dict], decisions: list[dict] | None = None) -> dict:
     """Execution-aware report with proper scores and event-block uncertainty."""
     settled = _settled(bets)

@@ -354,6 +354,48 @@ def test_close_mark_gated_by_typed_gates_not_reason_wording(tmp_path):
     assert row["clv"] == pytest.approx(0.62 - 0.55)
 
 
+def _placed_and_watched(event):
+    placed = paper_signal("Hawks", 0.60, 0.55, 0.05)
+    placed.consensus_probability = 0.58
+    watched = Signal(event.id, "moneyline", "Foxes", model_probability=0.40,
+                     market_probability=0.45, edge=-0.01, confidence=80.0,
+                     action="WATCH", reasons=[], quote_source="DraftKings",
+                     market_fair_prob=0.40, consensus_probability=0.42)
+    return placed, watched
+
+
+def test_scored_opportunities_labels_the_full_opportunity_set(tmp_path):
+    ledger = Ledger(str(tmp_path / "opp.db"))
+    try:
+        event = Event(name="Hawks vs Foxes", sport="basketball", home="Hawks", away="Foxes")
+        ledger.record_signals(event, list(_placed_and_watched(event)))
+        ledger.settle_moneyline(event.id, {"Hawks", "home"})
+        rows = ledger.scored_opportunities()
+    finally:
+        ledger.close()
+    by_outcome = {row["outcome"]: row for row in rows}
+    # The never-placed WATCH outcome is joined to a later label, just like the bet.
+    assert by_outcome["Hawks"]["settled_result"] == 1.0
+    assert by_outcome["Foxes"]["settled_result"] == 0.0
+    assert by_outcome["Foxes"]["policy_action"] == "WATCH"
+
+
+def test_opportunity_scores_are_flagged_observational(tmp_path):
+    ledger = Ledger(str(tmp_path / "opp2.db"))
+    try:
+        event = Event(name="Hawks vs Foxes", sport="basketball", home="Hawks", away="Foxes")
+        ledger.record_signals(event, list(_placed_and_watched(event)))
+        ledger.settle_moneyline(event.id, {"Hawks", "home"})
+        report = backtest.opportunity_scores(ledger.scored_opportunities())
+    finally:
+        ledger.close()
+    assert report["observational"] is True
+    assert report["statistical_claim_supported"] is False
+    assert report["all_opportunities"]["sample_size"] == 2
+    assert report["paper_bet"]["sample_size"] == 1        # the placed Hawks bet
+    assert report["watch_or_rejected"]["sample_size"] == 1  # the never-placed Foxes watch
+
+
 def test_draw_settles_the_draw_outcome_not_nothing(tmp_path):
     ledger = Ledger(str(tmp_path / "d.db"))
     try:

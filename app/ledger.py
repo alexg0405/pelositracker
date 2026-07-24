@@ -474,6 +474,31 @@ class Ledger:
                                ON CONFLICT(event_id, market, outcome) DO NOTHING""",
                             (result, settled_at, bet_id),
                         )
+                # Label the FULL opportunity set (WATCH/rejected outcomes too),
+                # not just placed bets, so shadow evaluation can score every
+                # decision without selection bias. Only moneyline outcomes get a
+                # win/loss label, and only now that the event has settled -- the
+                # label was not available at decision time.
+                self._db.execute(
+                    cur,
+                    "SELECT DISTINCT market, outcome FROM decision_marks WHERE event_id=%s",
+                    (event_id,),
+                )
+                opportunity_labels = [
+                    (event_id, row["market"], row["outcome"],
+                     1.0 if row["outcome"] in winner_labels else 0.0, now)
+                    for row in cur.fetchall()
+                    if row["market"].lower() in _MONEYLINE_MARKETS
+                ]
+                for ev, market, outcome, result, settled_at in opportunity_labels:
+                    self._db.execute(
+                        cur,
+                        """INSERT INTO settlement_marks
+                           (event_id, market, outcome, result, status, settled_at)
+                           VALUES (%s,%s,%s,%s,'settled',%s)
+                           ON CONFLICT(event_id, market, outcome) DO NOTHING""",
+                        (ev, market, outcome, result, settled_at),
+                    )
 
     def void_event(self, event_id: str, *, status: str = "void") -> None:
         """Record an idempotent non-result settlement without inventing a loss."""
@@ -520,6 +545,34 @@ class Ledger:
         return self._select_rows(
             "SELECT * FROM decision_marks", "as_of", since_ts=since_ts, limit=limit
         )
+
+    def scored_opportunities(self) -> list[dict]:
+        """Every evaluated opportunity (WATCH/rejected included) joined to its
+        later settled label, for *observational* shadow evaluation without the
+        selection bias of scoring only placed bets.
+
+        Only settled outcomes appear -- the win/loss label is not available until
+        the event resolves, so the join respects point-in-time availability. Each
+        row is one decision-time forecast; a long-lived event contributes many
+        correlated ticks, so downstream scoring must treat these as dependent
+        (event-clustered), not i.i.d.
+        """
+        with self._lock:
+            with self._db.cursor(dict_rows=True) as cur:
+                self._db.execute(
+                    cur,
+                    """SELECT d.event_id, d.market, d.outcome, d.as_of,
+                              d.policy_action, d.consensus_probability,
+                              d.calibrated_probability, d.executable_probability,
+                              s.result AS settled_result
+                       FROM decision_marks d
+                       JOIN settlement_marks s
+                         ON s.event_id=d.event_id AND s.market=d.market
+                            AND s.outcome=d.outcome
+                       WHERE s.status='settled' AND s.result IS NOT NULL
+                       ORDER BY d.as_of""",
+                )
+                return [dict(row) for row in cur.fetchall()]
 
     def decision_coverage(self, *, since_ts: float | None = None,
                           limit: int | None = None) -> list[dict]:
