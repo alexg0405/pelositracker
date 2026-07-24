@@ -13,6 +13,7 @@ need data the system does not yet ingest.
 """
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -23,6 +24,8 @@ from typing import Iterable, Sequence
 from .database import Database
 from .models import Event, Signal
 
+logger = logging.getLogger(__name__)
+
 
 def _retention_seconds() -> float:
     """Decision-audit retention window; keeps the ledger from exhausting a small
@@ -32,6 +35,18 @@ def _retention_seconds() -> float:
     except ValueError:
         days = 7.0
     return max(3600.0, days * 86400.0)
+
+
+def _max_decision_rows() -> int:
+    """Hard row cap on ``decision_marks``, a backstop when a burst of activity
+    fills the retention window faster than expected. The age-based prune alone
+    can't bound a small managed database (500 MB Supabase) if a busy day writes
+    millions of rows inside the window. ``0`` disables the cap."""
+    try:
+        rows = int(os.getenv("DECISION_MARKS_MAX_ROWS", "50000"))
+    except ValueError:
+        rows = 50000
+    return max(0, rows)
 
 
 # A CLV close mark may only be recorded (replacing the last valid one) when these
@@ -175,6 +190,7 @@ class Ledger:
         self._lock = threading.Lock()
         self._last_prune = 0.0
         self._retention_seconds = _retention_seconds()
+        self._max_decision_rows = _max_decision_rows()
         with self._lock:
             self._db.initialize(_SCHEMA, component="ledger", version=1)
             self._db.initialize(_SCHEMA_V2, component="ledger", version=2)
@@ -247,6 +263,54 @@ class Ledger:
                     "independent_model_event_count": "INTEGER",
                 },
             })
+            # Index the retention/metrics sort key. Without it, both the prune's
+            # `WHERE as_of < ...` and the metrics `ORDER BY as_of` do a full-table
+            # sort that spills to a temp file — the exact write that fails with
+            # DiskFull once the managed database is full.
+            self._db.initialize(
+                "CREATE INDEX IF NOT EXISTS idx_decision_marks_as_of "
+                "ON decision_marks(as_of);",
+                component="ledger", version=7,
+            )
+            # Bound the audit log at boot, not only while actively recording: a
+            # process that starts against an already-oversized table (e.g. after
+            # downtime, or right after an operator frees space) would otherwise
+            # wait for the next write to shrink it.
+            try:
+                boot_now = _now()
+                with self._db.transaction() as cur:
+                    self._prune_decision_marks(cur, boot_now)
+                self._last_prune = boot_now
+            except Exception:
+                # Never let retention housekeeping block startup — e.g. the disk
+                # is still full and the DELETE can't write WAL. Space is cleared
+                # out-of-band; steady-state pruning resumes once writes succeed.
+                logger.exception("startup decision_marks prune failed")
+
+    def _prune_decision_marks(self, cur, now: float) -> None:
+        """Age- and count-bound ``decision_marks``. The caller holds ``_lock``
+        and provides an open transaction cursor so this can run inside the write
+        path or standalone at boot."""
+        self._db.execute(
+            cur, "DELETE FROM decision_marks WHERE as_of < %s",
+            (now - self._retention_seconds,),
+        )
+        if self._max_decision_rows > 0:
+            # Keep only the newest N rows by as_of. The subquery rides the
+            # idx_decision_marks_as_of index (ORDER BY ... DESC LIMIT), so this
+            # stays cheap as the table grows. No-op when the table is under cap
+            # (the subquery's MIN is then the oldest row, and `< MIN` matches
+            # nothing).
+            self._db.execute(
+                cur,
+                """DELETE FROM decision_marks WHERE as_of < (
+                       SELECT MIN(as_of) FROM (
+                           SELECT as_of FROM decision_marks
+                           ORDER BY as_of DESC LIMIT %s
+                       ) AS keep
+                   )""",
+                (self._max_decision_rows,),
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -400,13 +464,10 @@ class Ledger:
                         )
                 # Bound the decision-audit log so it cannot exhaust a small
                 # managed database (the full input snapshot is already kept only
-                # for PAPER_BET rows). Pruned on a throttled cadence in the same
-                # transaction.
+                # for PAPER_BET rows). Age- and count-pruned on a throttled
+                # cadence in the same transaction.
                 if now - self._last_prune > _PRUNE_THROTTLE_SECONDS:
-                    self._db.execute(
-                        cur, "DELETE FROM decision_marks WHERE as_of < %s",
-                        (now - self._retention_seconds,),
-                    )
+                    self._prune_decision_marks(cur, now)
                     self._last_prune = now
             return inserted
 

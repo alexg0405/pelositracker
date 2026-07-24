@@ -1,5 +1,5 @@
 import math
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -266,6 +266,38 @@ def test_decision_coverage_is_lean_and_excludes_heavy_snapshot(tmp_path):
                 == backtest.eligibility_coverage(full, 1))
     finally:
         ledger.close()
+
+
+def test_startup_prune_enforces_decision_row_cap(tmp_path, monkeypatch):
+    # A busy window can write more decision rows than the age-based retention
+    # keeps small, so a hard row cap backstops a tiny managed database. It must
+    # also apply at boot, not only inside the write path — a process that starts
+    # against an already-oversized table should shrink it immediately.
+    db = str(tmp_path / "cap.db")
+    base = datetime.now(timezone.utc) - timedelta(minutes=10)
+    ledger = Ledger(db)
+    try:
+        event = Event(name="A vs B", sport="basketball", home="A", away="B")
+        signals = []
+        for i in range(6):
+            sig = paper_signal("home", .6, .5, .1)
+            sig.decision_hash = f"h{i}"  # PK is (decision_hash, market, outcome)
+            sig.observed_at = base + timedelta(seconds=i)  # distinct as_of order
+            signals.append(sig)
+        ledger.record_signals(event, signals)
+        assert len(ledger.all_decisions()) == 6
+    finally:
+        ledger.close()
+
+    # Reopen with a hard cap of 2; the boot prune keeps only the newest two.
+    monkeypatch.setenv("DECISION_MARKS_MAX_ROWS", "2")
+    ledger2 = Ledger(db)
+    try:
+        remaining = ledger2.all_decisions()
+        assert len(remaining) == 2
+        assert {row["decision_hash"] for row in remaining} == {"h4", "h5"}
+    finally:
+        ledger2.close()
 
 
 def test_ledger_roundtrip_clv_and_settlement(tmp_path):
