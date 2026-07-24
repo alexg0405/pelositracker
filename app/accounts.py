@@ -834,9 +834,22 @@ class AccountBook:
         return placed_bets
 
     def mark_and_cash_out(self, event: Event, quotes: list[Quote], signals: list[Signal],
-                          *, as_of: datetime | float | None = None) -> list[dict]:
-        """Persist executable marks and optionally close positions exactly once."""
+                          *, as_of: datetime | float | None = None,
+                          model_probabilities: dict[str, float] | None = None,
+                          max_quote_age_seconds: float = 0.0) -> list[dict]:
+        """Persist executable marks and optionally close positions exactly once.
+
+        ``model_probabilities`` (token_id -> independent-model win probability)
+        lets a harness-backed position be marked and cash-out-evaluated with the
+        same probability family that opened it, instead of the odds consensus.
+        The exit quote must clear the same freshness and identity gates as an
+        entry: a stale, future-dated, or untrusted book (``max_quote_age_seconds``
+        gate; an age of 0 disables it) or a quarantined book is recorded as
+        ``UNPRICED`` and never produces a mark or cash-out fill, so the last valid
+        CLV mark is left untouched.
+        """
         now = _timestamp(as_of)
+        model_probabilities = model_probabilities or {}
         quote_by_token = _latest_quotes(quotes)
         signal_by_token = {signal.token_id: signal for signal in signals if signal.token_id}
         exits: list[dict] = []
@@ -856,13 +869,23 @@ class AccountBook:
                         continue  # legacy rows remain settle-only; no identity is invented.
                     quote = quote_by_token.get(token_id)
                     signal = signal_by_token.get(token_id)
-                    model_prob = _decision_probability(signal)
+                    # Mark with the same probability family that opened the
+                    # position: an independent-model override if one applies,
+                    # otherwise the odds-consensus decision probability.
+                    model_override = model_probabilities.get(token_id)
+                    model_prob = (model_override if model_override is not None
+                                  else _decision_probability(signal))
                     strategy = Strategy.from_json(row["strategy"])
                     action = "UNPRICED"
                     reason = "exact current Polymarket order book unavailable"
                     execution_reason = reason
                     result = None
-                    if quote is not None:
+                    if quote is None:
+                        pass  # no current book -> UNPRICED, last valid mark stands
+                    elif _quote_is_stale(quote, now, max_quote_age_seconds):
+                        reason = "provider order book is stale, future-dated, or untrusted"
+                        execution_reason = reason
+                    else:
                         result = simulate_sell(
                             _book_levels(quote.bid_levels),
                             shares=row["shares"],
@@ -874,6 +897,9 @@ class AccountBook:
                             restricted=quote.paper_restricted,
                             accepting_orders=quote.accepting_orders,
                             depth_complete=quote.depth_complete,
+                            # Same identity guard as entry: a quarantined
+                            # (ambiguous-identity) book must not produce an exit.
+                            identity_ambiguous=quote.quarantined,
                         )
                         execution_reason = result.reason
 

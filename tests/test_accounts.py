@@ -385,6 +385,80 @@ def test_model_backed_tennis_bet_places_then_settles_as_a_win(tmp_path):
     assert rows[0]["pnl"] > 0
 
 
+def _fresh_home_quote(event, ts, *, quarantined=False):
+    return Quote(event.id, "moneyline", "Alcaraz", 0.50, "Polymarket", token_id="token-home",
+                 ask=.50, bid=.48, ask_levels=((.50, 10_000.0),), bid_levels=((.48, 10_000.0),),
+                 depth_complete=True, fee_rate=0.0, provider_timestamp=ts,
+                 quarantined=quarantined)
+
+
+def test_mark_uses_the_model_family_that_opened_the_position(tmp_path):
+    book, event, signal, _ = _tennis_setup(tmp_path / "markfam.db", "tennis-markfam")
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    fresh = _fresh_home_quote(event, t0)
+    try:
+        placed = book.place(event, [signal], [fresh], as_of=t0,
+                            model_probabilities={"token-home": 0.60}, max_quote_age_seconds=120)
+        assert len(placed) == 1
+        bet_id = book.account_bets("tennis")[0]["id"]
+        book.mark_and_cash_out(event, [fresh], [signal], as_of=t0,
+                               model_probabilities={"token-home": 0.60},
+                               max_quote_age_seconds=120)
+        marks = book.bet_marks("tennis", bet_id)
+    finally:
+        book.close()
+    # The mark carries the harness probability that opened the position (0.60),
+    # not the odds-consensus decision probability.
+    assert marks[0]["model_prob"] == pytest.approx(0.60)
+
+
+def test_stale_exit_book_is_unpriced_and_keeps_the_last_valid_mark(tmp_path):
+    book, event, signal, _ = _tennis_setup(tmp_path / "markstale.db", "tennis-markstale")
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    t1 = t0 + timedelta(seconds=10)
+    fresh = _fresh_home_quote(event, t0)
+    try:
+        book.place(event, [signal], [fresh], as_of=t0,
+                   model_probabilities={"token-home": 0.60}, max_quote_age_seconds=120)
+        bet_id = book.account_bets("tennis")[0]["id"]
+        book.mark_and_cash_out(event, [fresh], [signal], as_of=t0,
+                               model_probabilities={"token-home": 0.60},
+                               max_quote_age_seconds=120)
+        first_mark = book.account_bets("tennis")[0]["last_mark_price"]
+        # An untrusted (no provider timestamp) book with the freshness gate on.
+        stale = executable_quote(event, "token-home", "moneyline", "Alcaraz")
+        book.mark_and_cash_out(event, [stale], [signal], as_of=t1,
+                               model_probabilities={"token-home": 0.60},
+                               max_quote_age_seconds=120)
+        after = book.account_bets("tennis")[0]["last_mark_price"]
+        newest = book.bet_marks("tennis", bet_id)[0]
+    finally:
+        book.close()
+    assert first_mark is not None
+    assert after == first_mark                     # invalid later observation leaves it unchanged
+    assert newest["decision_action"] == "UNPRICED"
+
+
+def test_quarantined_exit_book_is_unpriced_and_makes_no_mark(tmp_path):
+    book, event, signal, _ = _tennis_setup(tmp_path / "markquar.db", "tennis-markquar")
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    fresh = _fresh_home_quote(event, t0)
+    quarantined = _fresh_home_quote(event, t0, quarantined=True)
+    try:
+        book.place(event, [signal], [fresh], as_of=t0,
+                   model_probabilities={"token-home": 0.60}, max_quote_age_seconds=120)
+        bet_id = book.account_bets("tennis")[0]["id"]
+        book.mark_and_cash_out(event, [quarantined], [signal], as_of=t0,
+                               model_probabilities={"token-home": 0.60},
+                               max_quote_age_seconds=120)
+        bet = book.account_bets("tennis")[0]
+        newest = book.bet_marks("tennis", bet_id)[0]
+    finally:
+        book.close()
+    assert bet["last_mark_price"] is None          # quarantined exit never produces a mark
+    assert newest["decision_action"] == "UNPRICED"
+
+
 def test_strategy_serializes_the_game_allow_list():
     restored = Strategy.from_json(Strategy("t", events=("game-1", "game-2")).to_json())
     assert restored.events == ("game-1", "game-2")

@@ -737,15 +737,21 @@ async def record(event_id: str, *, as_of: datetime | None = None) -> None:
             return
         if account_book is not None and event is not None:
             quotes = store.quotes[event_id]
+            # One current decision context, computed before mark/exit/entry, so a
+            # harness-backed position is managed with the same probability family
+            # that opened it (not the odds consensus).
+            model_probabilities, model_uncertainty = (
+                _model_probabilities(event, signals, as_of=decision_at)
+                if signals else ({}, {}))
             exited_bets = await asyncio.to_thread(
-                account_book.mark_and_cash_out, event, quotes, signals, as_of=decision_at
+                account_book.mark_and_cash_out, event, quotes, signals,
+                as_of=decision_at, model_probabilities=model_probabilities,
+                max_quote_age_seconds=settings.max_data_age_seconds,
             )
             for paper_event in exited_bets:
                 if paper_event.get("webhook_url"):
                     _schedule_notification(paper_event)
             if signals:
-                model_probabilities, model_uncertainty = _model_probabilities(
-                    event, signals, as_of=decision_at)
                 placed_bets = await asyncio.to_thread(
                     account_book.place, event, signals, quotes, as_of=decision_at,
                     allow_uncalibrated=settings.allow_uncalibrated_paper,
