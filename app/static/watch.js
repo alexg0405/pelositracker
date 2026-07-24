@@ -85,7 +85,10 @@ const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt
     try {
       const r = await fetch("/api/events", {method:"POST", headers:{"content-type":"application/json"},
         body: JSON.stringify({polymarket_url: `https://polymarket.com/event/${selected.slug}`})});
-      if (!r.ok){ const b = await r.json().catch(()=>({})); throw new Error(b.detail || "Could not add"); }
+      if (!r.ok){
+        if (r.status === 401 || r.status === 403) throw new Error("Log in on the dashboard first");
+        const b = await r.json().catch(()=>({})); throw new Error(b.detail || "Could not add");
+      }
       btn.textContent = "Tracking ✓ (see dashboard)";
     } catch (e){ btn.textContent = "Failed: " + e.message; btn.disabled = false; }
   }
@@ -107,7 +110,16 @@ const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt
   }
 
   async function load(){
-    try { const r = await fetch("/api/discover"); if (r.ok) games = await r.json(); } catch {}
+    try {
+      const r = await fetch("/api/discover");
+      if (r.ok){ games = await r.json(); }
+      else if (r.status === 401 || r.status === 403){
+        document.getElementById("games").innerHTML =
+          '<div class="muted">Please <a href="/">log in on the dashboard</a> to load games.</div>';
+        document.getElementById("league-filter").innerHTML = "";
+        return;  // do not fall through to render() with a stale/empty list
+      }
+    } catch {}
     render();
     const slug = new URLSearchParams(location.search).get("slug");
     if (slug){ const g = games.find(x => x.slug === slug); if (g) select(g); }

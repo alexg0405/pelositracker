@@ -101,3 +101,42 @@ def test_position_can_be_saved_and_removed_for_a_visible_selection():
         }
         removed = client.delete(f"/api/events/{event_id}/positions/token-1")
         assert removed.status_code == 204
+
+
+# --- Phase 0.7: watch-page / dashboard shared auth + CSRF contract -----------
+
+_EVENT_BODY = {"name": "Away at Home", "sport": "basketball", "home": "Home", "away": "Away"}
+
+
+def test_add_event_requires_an_authenticated_session():
+    with TestClient(app) as client:
+        assert client.post("/api/events", json=_EVENT_BODY).status_code == 401
+
+
+def test_discover_requires_authentication():
+    with TestClient(app) as client:
+        assert client.get("/api/discover").status_code == 401
+
+
+def test_add_event_rejects_a_missing_csrf_header():
+    # Exactly the watch.js defect: a logged-in session whose POST omits the CSRF
+    # header (as the un-wrapped watch page did) must be rejected with 403.
+    with TestClient(app) as client:
+        login(client)
+        client.headers.pop("X-CSRF-Token", None)
+        assert client.post("/api/events", json=_EVENT_BODY).status_code == 403
+
+
+def test_add_event_succeeds_with_session_and_csrf_header():
+    with TestClient(app) as client:
+        login(client)  # sets the X-CSRF-Token header, as the shared wrapper does
+        assert client.post("/api/events", json=_EVENT_BODY).status_code == 201
+
+
+def test_watch_and_dashboard_share_the_csrf_fetch_module():
+    with TestClient(app) as client:
+        assert 'src="/static/csrf.js"' in client.get("/").text
+        assert 'src="/static/csrf.js"' in client.get("/watch").text
+        module = client.get("/static/csrf.js")
+        assert module.status_code == 200
+        assert "X-CSRF-Token" in module.text

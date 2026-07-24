@@ -1,19 +1,6 @@
 // Tab Navigation Logic
-  const nativeFetch = window.fetch.bind(window);
-  window.fetch = (resource, options = {}) => {
-    const method = String(options.method || "GET").toUpperCase();
-    if (["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
-      const cookie = document.cookie.split("; ")
-        .find(value => value.startsWith("csrf_token=") || value.startsWith("__Host-csrf_token="));
-      if (cookie) {
-        const headers = new Headers(options.headers || {});
-        headers.set("X-CSRF-Token", decodeURIComponent(cookie.split("=").slice(1).join("=")));
-        options = {...options, headers};
-      }
-    }
-    return nativeFetch(resource, options);
-  };
-
+  // The CSRF-aware fetch wrapper now lives in the shared /static/csrf.js module,
+  // loaded before this script (and before watch.js) so both pages behave the same.
   document.querySelectorAll('.tab-carousel .pill').forEach(btn => {
     btn.addEventListener('click', e => {
       document.querySelectorAll('.tab-carousel .pill').forEach(b => b.classList.remove('active'));
