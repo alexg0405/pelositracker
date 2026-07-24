@@ -49,6 +49,15 @@
   <!-- TAB 2: DISCOVERY -->
   <div id="tab-discovery" class="tab-content is-hidden">
     <div class="panel pad section-gap">
+      <div class="browse-head">
+        <h2 class="title">Best current bets</h2>
+        <span class="metrics-sub" id="best-bets-sub"></span>
+      </div>
+      <div class="field-note">Highest-edge selections across every monitored game right now. Paper only — not advice. Tap one to jump to it on the Live Radar.</div>
+      <div id="best-bets" class="best-bets" aria-live="polite"></div>
+    </div>
+
+    <div class="panel pad section-gap">
       <h2 class="title">Paste Polymarket link</h2>
       <div class="error" id="form-error" role="alert" hidden></div>
       <form id="form">

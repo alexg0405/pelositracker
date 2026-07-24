@@ -179,6 +179,21 @@
     .game .g-add{color:var(--cyan);font-family:var(--mono);font-size:11px;white-space:nowrap;font-weight:bold}
     .discover-empty{color:var(--faint);font-size:12px;font-family:var(--mono)}
 
+    .best-bets{margin-top:12px;display:flex;flex-direction:column;gap:8px;max-height:520px;overflow-y:auto}
+    .best-bet{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 16px;border:1px solid var(--line);background:var(--panel2);cursor:pointer;transition:border-color .12s,background .12s}
+    .best-bet:hover{border-color:var(--cyan);background:rgba(41,231,214,.06)}
+    .best-bet:focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
+    .best-bet .bb-outcome{font:700 13px var(--mono);text-transform:uppercase;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+    .best-bet .bb-outcome .line-badge{margin-bottom:0}
+    .best-bet .bb-event{margin-top:4px;color:var(--muted);font:11px var(--mono);letter-spacing:.04em}
+    .best-bet .bb-figs{display:flex;align-items:center;gap:16px;white-space:nowrap}
+    .best-bet .bb-fig{text-align:right}
+    .best-bet .bb-fig .value{font:700 16px var(--mono);font-variant-numeric:tabular-nums}
+    .best-bet .bb-fig .hint{color:var(--faint);font-size:10px;text-transform:uppercase}
+    .event.flash{animation:flash 1.4s ease-out}
+    @keyframes flash{0%{box-shadow:0 0 0 2px var(--cyan)}100%{box-shadow:0 0 0 0 transparent}}
+    @media(max-width:560px){.best-bet{flex-direction:column;align-items:flex-start}.best-bet .bb-figs{width:100%;justify-content:space-between;gap:10px}.best-bet .bb-fig{text-align:left}}
+
     @media(max-width:560px){.wrap{padding:14px 10px 50px}header,.event-head{align-items:flex-start;flex-direction:column}.event-actions{width:100%;justify-content:space-between}.position-form{grid-template-columns:1fr}.market-top,.position-top{align-items:flex-start}.config{white-space:normal}}
     @media(prefers-reduced-motion:reduce){.dot{animation:none}}
 

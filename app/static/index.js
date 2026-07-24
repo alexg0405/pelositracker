@@ -273,6 +273,66 @@
       body.innerHTML = `<div class="metric-tiles">${columns}</div>`;
     } catch {}
   }
+  const BEST_BETS_LIMIT = 12;
+  function collectBestBets(events) {
+    const rows = [];
+    for (const v of events || []) {
+      for (const m of (v.actionable_markets || [])) {
+        // Show positive-edge selections plus anything the engine flags as a live
+        // entry window (which should already be positive, but never hide one).
+        if (m.edge == null) continue;
+        if (m.edge <= 0 && m.entry_action !== "ENTRY WINDOW") continue;
+        rows.push({ event: v.event, m });
+      }
+    }
+    rows.sort((a, b) => {
+      const ea = a.m.entry_action === "ENTRY WINDOW" ? 1 : 0;
+      const eb = b.m.entry_action === "ENTRY WINDOW" ? 1 : 0;
+      if (ea !== eb) return eb - ea;              // entry windows first
+      return (b.m.edge || 0) - (a.m.edge || 0);   // then by edge, strongest first
+    });
+    return rows.slice(0, BEST_BETS_LIMIT);
+  }
+  function gotoEvent(id) {
+    document.querySelector('[data-tab="tab-live"]').click();
+    requestAnimationFrame(() => {
+      const safe = (window.CSS && CSS.escape) ? CSS.escape(id) : id;
+      const card = document.querySelector(`.event[data-event-id="${safe}"]`);
+      if (card) {
+        card.scrollIntoView({ behavior: "smooth", block: "start" });
+        card.classList.add("flash");
+        setTimeout(() => card.classList.remove("flash"), 1400);
+      }
+    });
+  }
+  function renderBestBets() {
+    const box = document.querySelector("#best-bets");
+    if (!box) return;
+    const sub = document.querySelector("#best-bets-sub");
+    const rows = collectBestBets(lastEvents);
+    if (!rows.length) {
+      if (sub) sub.textContent = "";
+      box.innerHTML = '<div class="discover-empty">No positive-edge selections right now. Monitor games below to populate this list.</div>';
+      return;
+    }
+    const entries = rows.filter(r => r.m.entry_action === "ENTRY WINDOW").length;
+    if (sub) sub.textContent = `${rows.length} shown · ${entries} in entry window`;
+    box.innerHTML = rows.map(({ event, m }) => {
+      const basis = m.edge_basis === "gross" ? "gross edge" : "net edge";
+      const edgeCls = m.edge >= 0 ? "positive" : "negative";
+      return `<div class="best-bet" role="button" tabindex="0" data-goto-event="${esc(event.id)}" title="${esc(event.name)}">
+        <div class="bb-main">
+          <div class="bb-outcome">${lineBadge(m.market, m.outcome)}${esc(m.outcome)}</div>
+          <div class="bb-event">${esc(event.name)} · ${esc(event.sport)}</div>
+        </div>
+        <div class="bb-figs">
+          <div class="bb-fig"><div class="value ${edgeCls}">${signedCents(m.edge)}</div><div class="hint">${basis}</div></div>
+          <div class="bb-fig"><div class="value">${cents(m.buy_price)}</div><div class="hint">buy now</div></div>
+          <span class="tag ${tagClass(m.entry_action)}">${esc(m.entry_action)}</span>
+        </div>
+      </div>`;
+    }).join("");
+  }
   function renderEvents(events) {
     if (document.activeElement?.closest("[data-save-position]")) return;
     lastEvents = events;
@@ -290,6 +350,7 @@
       : (events.length && activeLine !== "all"
           ? `<div class="panel empty"><b>No ${LINE_META[activeLine].label} lines</b>Nothing matches this filter right now.</div>`
           : '<div class="panel empty"><b>No events yet</b>Go to the Discovery tab to begin.</div>');
+    renderBestBets();
   }
   async function refresh() {
     if (refreshInFlight || document.activeElement?.closest("[data-save-position]")) return;
@@ -435,6 +496,8 @@
     finally{if(row)row.removeAttribute("aria-disabled")}
   }
   document.querySelector("#discover-list").addEventListener("click",e=>{const row=e.target.closest("[data-slug]");if(row&&row.getAttribute("aria-disabled")!=="true")monitorGame(row.dataset.slug,row)});
+  document.querySelector("#best-bets").addEventListener("click",e=>{const row=e.target.closest("[data-goto-event]");if(row)gotoEvent(row.dataset.gotoEvent)});
+  document.querySelector("#best-bets").addEventListener("keydown",e=>{if(e.key!=="Enter"&&e.key!==" ")return;const row=e.target.closest("[data-goto-event]");if(row){e.preventDefault();gotoEvent(row.dataset.gotoEvent)}});
   document.querySelector("#discover-search").addEventListener("input",renderDiscover);
   document.querySelector("#discover-refresh").addEventListener("click",loadDiscover);
   document.querySelector("#line-filter").addEventListener("click",e=>{const p=e.target.closest("[data-line]");if(!p)return;activeLine=p.dataset.line;renderEvents(lastEvents);});
