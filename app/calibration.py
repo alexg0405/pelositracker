@@ -349,6 +349,10 @@ class CalibrationArtifact:
     validation_through: datetime | None = None
     uncertainty_method: str = "unavailable"
     policies: tuple[CalibrationPolicy, ...] = ()
+    # False when the artifact was built from legacy observations that lacked
+    # explicit point-in-time availability metadata (see model_training). Such an
+    # artifact stays display-only regardless of its metrics.
+    action_eligible: bool = True
 
     @classmethod
     def load(cls, path: str | Path) -> "CalibrationArtifact":
@@ -399,6 +403,7 @@ class CalibrationArtifact:
                 calibration_method="segmented",
                 uncertainty_method=_key(payload.get("uncertainty_method"), "unavailable"),
                 policies=policies,
+                action_eligible=bool(payload.get("action_eligible", True)),
             )
         else:
             raise ValueError("unsupported calibration artifact version")
@@ -407,7 +412,11 @@ class CalibrationArtifact:
 
     @property
     def eligible_for_action(self) -> bool:
-        return self.artifact_version == "2" and bool(self.policies)
+        return (
+            self.artifact_version == "2"
+            and bool(self.policies)
+            and self.action_eligible
+        )
 
     def policy_for(self, sport: str, league: str, market: str) -> CalibrationPolicy | None:
         if not self.eligible_for_action:

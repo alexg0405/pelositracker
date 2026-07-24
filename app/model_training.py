@@ -24,6 +24,13 @@ from .multiplicity import reality_check_pvalue, romano_wolf_pvalues
 
 _EPSILON = 1e-9
 
+# Version of the JSONL observation schema. Version 2 requires explicit
+# point-in-time availability metadata (``feature_available_at`` and
+# ``label_available_at``) on every row so a label that settles later cannot leak
+# into an earlier fold. Legacy version-1 rows omit it and may only be ingested
+# with an explicit opt-in that marks the resulting artifact ineligible for action.
+OBSERVATION_SCHEMA_VERSION = 2
+
 
 @dataclass(frozen=True, slots=True)
 class EvaluationObservation:
@@ -70,6 +77,9 @@ class EvaluationObservation:
                 raise ValueError(f"{label} must be finite")
         if not 0 < self.executable_cost < 1:
             raise ValueError("executable cost must be strictly between zero and one")
+        assert self.label_available_at is not None
+        if self.label_available_at < self.observed_at:
+            raise ValueError("label_available_at cannot precede observed_at")
 
     @property
     def usable_at(self) -> datetime:
@@ -567,12 +577,18 @@ def build_calibration_artifact(
     seed: int = 0,
     min_probability_positive: float = 0.95,
     min_expected_value_dollars: float = 1.0,
+    input_availability_declared: bool = True,
 ) -> dict[str, Any]:
     """Build one reviewable v2 segment from nested chronological folds.
 
     Candidate probabilities must already be point-in-time/out-of-fold. This
     builder will not infer them from post-event prices or refit a sport model.
     The returned payload is not installed or promoted automatically.
+
+    ``input_availability_declared`` records whether every input row carried
+    explicit point-in-time availability metadata. When ``False`` (a legacy
+    ingest that defaulted availability to ``observed_at``) the artifact is
+    stamped ``action_eligible=False`` so the runtime keeps it display-only.
     """
     rows = tuple(observations)
     expected_segment = tuple(
@@ -706,6 +722,8 @@ def build_calibration_artifact(
     }
     return {
         "artifact_version": "2",
+        "action_eligible": bool(input_availability_declared),
+        "observation_schema_version": OBSERVATION_SCHEMA_VERSION,
         "model_version": model_version,
         "model_hash": model_hash,
         "model_trained_through": max(row.observed_at for row in folds.selection).isoformat(),
@@ -741,7 +759,15 @@ def build_calibration_artifact(
     }
 
 
-def iter_observations_jsonl(path: str | Path) -> Iterable[EvaluationObservation]:
+def _parse_iso_timestamp(value: object) -> datetime:
+    """Parse an ISO-8601 string to a datetime; naive values are rejected downstream
+    by ``EvaluationObservation`` (via ``ensure_utc``)."""
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def iter_observations_jsonl(
+    path: str | Path, *, allow_legacy_availability: bool = False
+) -> Iterable[EvaluationObservation]:
     """Yield observations one line at a time.
 
     Streaming keeps peak memory close to a single parsed row rather than
@@ -750,6 +776,14 @@ def iter_observations_jsonl(path: str | Path) -> Iterable[EvaluationObservation]
     the whole set materialized can wrap this in ``tuple(...)`` (see
     ``load_observations_jsonl``); callers that only make a single pass should
     iterate directly.
+
+    Every row must carry point-in-time availability metadata
+    (``feature_available_at`` and ``label_available_at``, both timezone-aware) so
+    a label that settles later cannot silently leak into an earlier fold. The two
+    fields must be supplied together, and ``label_available_at`` may not precede
+    ``observed_at``. Passing ``allow_legacy_availability=True`` restores the
+    pre-schema behaviour of defaulting both to ``observed_at``; the CLI marks any
+    artifact built from such input ineligible for action.
     """
     with Path(path).open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, 1):
@@ -757,11 +791,40 @@ def iter_observations_jsonl(path: str | Path) -> Iterable[EvaluationObservation]
                 continue
             try:
                 payload = json.loads(line)
+                declared_version = payload.get("observation_schema_version")
+                if (
+                    declared_version is not None
+                    and int(declared_version) != OBSERVATION_SCHEMA_VERSION
+                ):
+                    raise ValueError(
+                        f"unsupported observation_schema_version {declared_version!r}"
+                    )
+                has_feature = payload.get("feature_available_at") not in (None, "")
+                has_label = payload.get("label_available_at") not in (None, "")
+                if has_feature != has_label:
+                    raise ValueError(
+                        "feature_available_at and label_available_at must be "
+                        "provided together"
+                    )
+                if not has_feature:
+                    if not allow_legacy_availability:
+                        raise ValueError(
+                            "missing feature_available_at/label_available_at; pass "
+                            "allow_legacy_availability=True to default them to "
+                            "observed_at (produces an artifact ineligible for action)"
+                        )
+                    feature_available_at: datetime | None = None
+                    label_available_at: datetime | None = None
+                else:
+                    feature_available_at = _parse_iso_timestamp(
+                        payload["feature_available_at"]
+                    )
+                    label_available_at = _parse_iso_timestamp(
+                        payload["label_available_at"]
+                    )
                 yield EvaluationObservation(
                     event_id=str(payload["event_id"]),
-                    observed_at=datetime.fromisoformat(
-                        str(payload["observed_at"]).replace("Z", "+00:00")
-                    ),
+                    observed_at=_parse_iso_timestamp(payload["observed_at"]),
                     sport=str(payload["sport"]),
                     league=str(payload["league"]),
                     market=str(payload["market"]),
@@ -772,13 +835,19 @@ def iter_observations_jsonl(path: str | Path) -> Iterable[EvaluationObservation]
                     },
                     executable_cost=float(payload["executable_cost"]),
                     execution_cost_error=float(payload["execution_cost_error"]),
+                    feature_available_at=feature_available_at,
+                    label_available_at=label_available_at,
                 )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise ValueError(f"invalid observation on JSONL line {line_number}") from exc
 
 
-def load_observations_jsonl(path: str | Path) -> list[EvaluationObservation]:
-    return list(iter_observations_jsonl(path))
+def load_observations_jsonl(
+    path: str | Path, *, allow_legacy_availability: bool = False
+) -> list[EvaluationObservation]:
+    return list(
+        iter_observations_jsonl(path, allow_legacy_availability=allow_legacy_availability)
+    )
 
 
 def write_artifact(payload: dict[str, Any], path: str | Path) -> None:
@@ -811,14 +880,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--min-probability-positive", type=float, default=0.95)
     parser.add_argument("--min-expected-value-dollars", type=float, default=1.0)
+    parser.add_argument(
+        "--allow-legacy-availability",
+        action="store_true",
+        help=(
+            "ingest legacy rows lacking feature_available_at/label_available_at "
+            "(defaults them to observed_at); the artifact is marked ineligible "
+            "for action"
+        ),
+    )
     arguments = parser.parse_args(argv)
     candidate_payload = json.loads(Path(arguments.candidates).read_text(encoding="utf-8"))
     specifications = {
         str(name): CandidateSpecification.from_payload(payload)
         for name, payload in dict(candidate_payload).items()
     }
+    allow_legacy = arguments.allow_legacy_availability
     artifact = build_calibration_artifact(
-        iter_observations_jsonl(arguments.observations),
+        iter_observations_jsonl(
+            arguments.observations, allow_legacy_availability=allow_legacy
+        ),
         specifications=specifications,
         model_selection_through=arguments.selection_through,
         calibration_through=arguments.calibration_through,
@@ -831,6 +912,7 @@ def main(argv: list[str] | None = None) -> int:
         seed=arguments.seed,
         min_probability_positive=arguments.min_probability_positive,
         min_expected_value_dollars=arguments.min_expected_value_dollars,
+        input_availability_declared=not allow_legacy,
     )
     write_artifact(artifact, arguments.output)
     return 0

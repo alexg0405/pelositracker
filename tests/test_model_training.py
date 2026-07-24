@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import json
 
 import pytest
 
@@ -9,6 +10,7 @@ from app.model_training import (
     chronological_folds,
     event_block_beta_bootstrap,
     fit_beta_calibration,
+    load_observations_jsonl,
     score_predictions,
     select_candidate,
     write_artifact,
@@ -220,3 +222,191 @@ def test_artifact_builder_preserves_nested_test_period_and_requires_review(
     policy = loaded.policy_for("basketball", "nba", "moneyline")
     assert policy is not None and len(policy.uncertainty_draws) == 200
     assert policy.uncertainty_draws[0]["pipeline"] == "simple"
+
+
+# --- Phase 0.1: JSONL delayed-label leakage protection -----------------------
+
+
+def _obs_payload(index, *, observed_day, feature_day=None, label_day=None,
+                 prob=0.6, outcome=1.0):
+    payload = {
+        "event_id": f"event-{index}",
+        "observed_at": (START + timedelta(days=observed_day)).isoformat(),
+        "sport": "basketball", "league": "nba", "market": "moneyline",
+        "outcome": outcome,
+        "candidate_probabilities": {"c": prob},
+        "executable_cost": 0.5, "execution_cost_error": 0.0,
+    }
+    if feature_day is not None:
+        payload["feature_available_at"] = (START + timedelta(days=feature_day)).isoformat()
+    if label_day is not None:
+        payload["label_available_at"] = (START + timedelta(days=label_day)).isoformat()
+    return payload
+
+
+def _write_jsonl(tmp_path, payloads):
+    path = tmp_path / "obs.jsonl"
+    path.write_text("\n".join(json.dumps(p) for p in payloads) + "\n", encoding="utf-8")
+    return path
+
+
+def test_jsonl_requires_availability_metadata_by_default(tmp_path):
+    # The exact leakage defect: a JSONL row without availability metadata must
+    # NOT be silently accepted (it previously defaulted to observed_at).
+    path = _write_jsonl(tmp_path, [_obs_payload(0, observed_day=0)])
+    with pytest.raises(ValueError, match="JSONL line 1"):
+        load_observations_jsonl(path)
+
+
+def test_jsonl_partial_availability_is_rejected(tmp_path):
+    path = _write_jsonl(tmp_path, [_obs_payload(0, observed_day=0, feature_day=0)])
+    with pytest.raises(ValueError, match="JSONL line 1"):
+        load_observations_jsonl(path)
+
+
+def test_jsonl_impossible_label_before_observation_is_rejected(tmp_path):
+    path = _write_jsonl(
+        tmp_path, [_obs_payload(0, observed_day=5, feature_day=5, label_day=3)]
+    )
+    with pytest.raises(ValueError, match="JSONL line 1"):
+        load_observations_jsonl(path)
+
+
+def test_jsonl_naive_timestamp_is_rejected(tmp_path):
+    payload = _obs_payload(0, observed_day=0, feature_day=0, label_day=1)
+    payload["label_available_at"] = "2025-01-05T00:00:00"  # no timezone offset
+    path = _write_jsonl(tmp_path, [payload])
+    with pytest.raises(ValueError, match="JSONL line 1"):
+        load_observations_jsonl(path)
+
+
+def test_jsonl_rejects_unsupported_schema_version(tmp_path):
+    payload = _obs_payload(0, observed_day=0, feature_day=0, label_day=1)
+    payload["observation_schema_version"] = 99
+    path = _write_jsonl(tmp_path, [payload])
+    with pytest.raises(ValueError, match="JSONL line 1"):
+        load_observations_jsonl(path)
+
+
+def test_jsonl_legacy_flag_defaults_availability_to_observed_at(tmp_path):
+    path = _write_jsonl(tmp_path, [_obs_payload(0, observed_day=7)])
+    [row] = load_observations_jsonl(path, allow_legacy_availability=True)
+    assert row.feature_available_at == row.observed_at
+    assert row.label_available_at == row.observed_at
+
+
+def test_jsonl_and_direct_object_paths_produce_identical_observations(tmp_path):
+    payloads = [
+        _obs_payload(0, observed_day=1, feature_day=1, label_day=3),
+        _obs_payload(1, observed_day=2, feature_day=2, label_day=9),
+    ]
+    from_jsonl = load_observations_jsonl(_write_jsonl(tmp_path, payloads))
+    direct = [
+        EvaluationObservation(
+            event_id=p["event_id"],
+            observed_at=datetime.fromisoformat(p["observed_at"]),
+            sport=p["sport"], league=p["league"], market=p["market"],
+            outcome=p["outcome"],
+            candidate_probabilities=p["candidate_probabilities"],
+            executable_cost=p["executable_cost"],
+            execution_cost_error=p["execution_cost_error"],
+            feature_available_at=datetime.fromisoformat(p["feature_available_at"]),
+            label_available_at=datetime.fromisoformat(p["label_available_at"]),
+        )
+        for p in payloads
+    ]
+    assert from_jsonl == direct
+
+
+def test_jsonl_late_label_is_excluded_from_the_selection_fold(tmp_path):
+    # A forecast observed before the selection cutoff whose label only settles in
+    # the calibration window must not enter the selection fit through the JSONL
+    # path — the leakage the availability fields exist to prevent.
+    payloads = [
+        _obs_payload(0, observed_day=3, feature_day=3, label_day=3),
+        _obs_payload(1, observed_day=13, feature_day=13, label_day=13),
+        _obs_payload(2, observed_day=25, feature_day=25, label_day=25),
+        _obs_payload(3, observed_day=35, feature_day=35, label_day=35),
+        _obs_payload(4, observed_day=5, feature_day=5, label_day=15),
+    ]
+    rows = load_observations_jsonl(_write_jsonl(tmp_path, payloads))
+    folds = chronological_folds(
+        rows,
+        model_selection_through=START + timedelta(days=10),
+        calibration_through=START + timedelta(days=20),
+        validation_through=START + timedelta(days=30),
+    )
+    selection_ids = {r.event_id for r in folds.selection}
+    calibration_ids = {r.event_id for r in folds.calibration}
+    assert "event-4" not in selection_ids
+    assert "event-4" in calibration_ids
+
+
+def _dense_artifact_rows():
+    def row(index, when):
+        cycle = index % 8
+        probability = .25 if cycle < 4 else .75
+        outcome = float(cycle == 0 or cycle in {5, 6, 7})
+        return EvaluationObservation(
+            event_id=f"{when.date()}-{index}",
+            observed_at=when + timedelta(seconds=index),
+            sport="basketball", league="nba", market="moneyline",
+            outcome=outcome,
+            candidate_probabilities={"simple": probability},
+            executable_cost=.5, execution_cost_error=(index % 3 - 1) * .001,
+        )
+
+    rows = []
+    for day in range(4):
+        rows += [row(i, START + timedelta(days=day)) for i in range(1000)]
+    return rows
+
+
+def _stub_uncertainty(monkeypatch):
+    monkeypatch.setattr(
+        "app.model_training.event_block_pipeline_uncertainty",
+        lambda *args, **kwargs: tuple({
+            "pipeline": "simple", "devig_method": "proportional",
+            "consensus_method": "equal_family_logit", "sharp_source_family": None,
+            "consensus_intercept": 0.0, "family_coefficients": {},
+            "missing_family_coefficients": {},
+            "beta_coefficients": BetaCoefficients(1, 1, 0).as_list(),
+            "execution_cost_offset": 0.0,
+        } for _ in range(200)),
+    )
+
+
+def _build_dense(monkeypatch, *, model_version, input_availability_declared):
+    _stub_uncertainty(monkeypatch)
+    return build_calibration_artifact(
+        _dense_artifact_rows(),
+        specifications={"simple": CandidateSpecification(
+            devig_method="proportional", consensus_method="equal_family_logit")},
+        model_selection_through=START + timedelta(hours=1),
+        calibration_through=START + timedelta(days=1, hours=1),
+        validation_through=START + timedelta(days=2, hours=1),
+        model_version=model_version,
+        sport="basketball", league="nba", market="moneyline",
+        bootstrap_draws=200,
+        input_availability_declared=input_availability_declared,
+    )
+
+
+def test_legacy_availability_marks_artifact_action_ineligible(tmp_path, monkeypatch):
+    legacy = _build_dense(
+        monkeypatch, model_version="legacy-test", input_availability_declared=False
+    )
+    assert legacy["action_eligible"] is False
+    legacy_path = tmp_path / "legacy.json"
+    write_artifact(legacy, legacy_path)
+    assert CalibrationArtifact.load(legacy_path).eligible_for_action is False
+
+
+def test_declared_availability_artifact_stays_action_eligible(tmp_path, monkeypatch):
+    declared = _build_dense(
+        monkeypatch, model_version="declared-test", input_availability_declared=True
+    )
+    assert declared["action_eligible"] is True
+    declared_path = tmp_path / "declared.json"
+    write_artifact(declared, declared_path)
+    assert CalibrationArtifact.load(declared_path).eligible_for_action is True
