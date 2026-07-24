@@ -56,6 +56,7 @@ def test_dashboard_contains_merged_ui_behaviors():
         html = client.get("/").text
         javascript = client.get("/static/index.js").text
         assert "data-remove-event" in javascript
+        assert "lastEvents=lastEvents.filter" in javascript
         assert "details[open][data-detail-key]" in javascript
         assert "Paste Polymarket link" in html
         assert "data-save-position" in javascript
