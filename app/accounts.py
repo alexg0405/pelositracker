@@ -286,24 +286,64 @@ def qualifies(strategy: Strategy, signal: Signal, *,
         strategy, signal, allow_uncalibrated=allow_uncalibrated)
 
 
-def model_backed_failures(strategy: Strategy, signal: Signal) -> list[str]:
-    """Gate a selection whose decision probability comes from an independent
-    model (e.g. the in-play tennis model) rather than an odds consensus.
+def gate_result(code: str, passed: bool | None, *, value: float | None = None,
+                threshold: float | None = None, explanation: str = "",
+                source: str | None = None) -> dict:
+    """Build a gate-result dict in the same schema the Rust engine emits for
+    consensus signals (``code``/``passed``/``status``/``value``/``threshold``/
+    ``explanation``). ``source`` optionally tags where a freshness signal came
+    from (e.g. ``"provider"`` vs ``"receipt"``) so a receipt-based check is never
+    read as a provider-verified one."""
+    status = "pass" if passed is True else "fail" if passed is False else "unknown"
+    result: dict = {"code": code, "passed": passed, "status": status,
+                    "value": value, "threshold": threshold, "explanation": explanation}
+    if source is not None:
+        result["source"] = source
+    return result
 
-    The model *is* the second opinion, so the engine action and reference-source
+
+# Failure wording kept identical to the pre-refactor string reasons so any caller
+# that only checks truthiness (or surfaces the strings) is unaffected.
+_MODEL_GATE_FAILURE = {
+    "quote_source": "not an executable Polymarket selection",
+    "executable_price": "invalid executable price",
+    "market_enabled": "market is disabled for this strategy",
+}
+
+
+def model_backed_gates(strategy: Strategy, signal: Signal) -> list[dict]:
+    """Structured gate results for a selection whose decision probability comes
+    from an independent model (e.g. the in-play tennis model) rather than an odds
+    consensus, in the same schema :func:`gate_result` / the Rust engine use.
+
+    The model *is* the second opinion, so the engine-action and reference-source
     gates do not apply. Everything else that protects execution still does: it
     must be an executable Polymarket price on a market the strategy allows. The
     actual edge (model probability minus the simulated fill) is enforced in
-    :meth:`AccountBook.place` against the strategy and engine floors.
+    :meth:`AccountBook.place` against the strategy and engine floors, and quote
+    freshness is enforced there too.
     """
-    failures = []
-    if signal.quote_source.casefold() != "polymarket":
-        failures.append("not an executable Polymarket selection")
-    if not 0 < signal.market_probability < 1:
-        failures.append("invalid executable price")
-    if not market_allowed(strategy, signal.market):
-        failures.append("market is disabled for this strategy")
-    return failures
+    return [
+        gate_result(
+            "quote_source", signal.quote_source.casefold() == "polymarket",
+            explanation="model-backed bet requires an executable Polymarket price"),
+        gate_result(
+            "executable_price", 0 < signal.market_probability < 1,
+            value=signal.market_probability,
+            explanation="executable price must be strictly between 0 and 1"),
+        gate_result(
+            "market_enabled", market_allowed(strategy, signal.market),
+            explanation="target market must be enabled for this strategy"),
+    ]
+
+
+def model_backed_failures(strategy: Strategy, signal: Signal) -> list[str]:
+    """Human-readable reasons a model-backed selection is not tradeable, derived
+    from :func:`model_backed_gates` so the structured and string views cannot
+    drift."""
+    return [_MODEL_GATE_FAILURE[gate["code"]]
+            for gate in model_backed_gates(strategy, signal)
+            if gate["passed"] is False]
 
 
 def stake_for(strategy: Strategy, signal: Signal, bankroll: float) -> float:

@@ -52,6 +52,44 @@ def test_bot_rejects_every_hard_engine_or_execution_failure(changes, expected):
     assert any(expected in reason for reason in qualification_failures(strategy, signal))
 
 
+def test_gate_result_status_and_optional_source_label():
+    from app.accounts import gate_result
+
+    assert gate_result("x", True)["status"] == "pass"
+    assert gate_result("x", False)["status"] == "fail"
+    assert gate_result("x", None)["status"] == "unknown"
+    assert "source" not in gate_result("x", True)
+    assert gate_result("fresh", True, source="receipt")["source"] == "receipt"
+
+
+def test_model_backed_gates_emit_the_shared_structured_schema():
+    from app.accounts import model_backed_failures, model_backed_gates
+
+    strategy = Strategy("test", edge_threshold=0)
+    gates = model_backed_gates(strategy, valid_signal())
+    assert [g["code"] for g in gates] == [
+        "quote_source", "executable_price", "market_enabled"]
+    for gate in gates:  # same field schema the Rust consensus gates carry
+        assert set(gate) >= {"code", "passed", "status", "value", "threshold",
+                             "explanation"}
+        assert gate["passed"] is True and gate["status"] == "pass"
+    assert model_backed_failures(strategy, valid_signal()) == []
+
+
+@pytest.mark.parametrize("code, changes, reason", [
+    ("quote_source", {"quote_source": "Pinnacle"}, "not an executable Polymarket selection"),
+    ("executable_price", {"market_probability": 0}, "invalid executable price"),
+])
+def test_model_backed_gate_fails_closed_and_matches_legacy_string(code, changes, reason):
+    from app.accounts import model_backed_failures, model_backed_gates
+
+    strategy = Strategy("test", edge_threshold=0)
+    signal = valid_signal(**changes)
+    gate = next(g for g in model_backed_gates(strategy, signal) if g["code"] == code)
+    assert gate["passed"] is False and gate["status"] == "fail"
+    assert reason in model_backed_failures(strategy, signal)
+
+
 def _uncalibrated_gates(reference_ok: bool = True):
     """Gate results the Rust engine emits with no calibration artifact: real
     gates evaluated, calibration/policy gates left ``unknown``."""
