@@ -10,7 +10,17 @@ from app.main import app
 from app.models import Event, Signal
 
 
-def paper_signal(outcome, model_p, exec_p, edge):
+# The typed execution-safety gates the engine emits as passing for a real
+# tradeable selection; a close mark is only recorded when these PASS.
+PASSING_EXECUTION_GATES = [
+    {"code": "provider_freshness", "passed": True, "status": "pass"},
+    {"code": "market_identity", "passed": True, "status": "pass"},
+    {"code": "market_status", "passed": True, "status": "pass"},
+    {"code": "executable_fill", "passed": True, "status": "pass"},
+]
+
+
+def paper_signal(outcome, model_p, exec_p, edge, *, gate_results=None):
     shares = 20.0
     cash = shares * exec_p
     return Signal("e", "moneyline", outcome, model_probability=model_p,
@@ -19,7 +29,9 @@ def paper_signal(outcome, model_p, exec_p, edge):
                   market_fair_prob=model_p, devig_method="shin", overround=1.05,
                   n_reference_sources=2, requested_cash=cash,
                   filled_cash=cash, filled_shares=shares,
-                  execution_fee=0.0, execution_complete=True)
+                  execution_fee=0.0, execution_complete=True,
+                  gate_results=(PASSING_EXECUTION_GATES if gate_results is None
+                                else gate_results))
 
 
 def test_pure_metrics_match_hand_computed_values():
@@ -302,6 +314,44 @@ def test_ledger_roundtrip_clv_and_settlement(tmp_path):
         assert summary["market_baseline"]["brier"] > summary["model"]["brier"]
     finally:
         ledger.close()
+
+
+def test_close_mark_gated_by_typed_gates_not_reason_wording(tmp_path):
+    ledger = Ledger(str(tmp_path / "cg.db"))
+    try:
+        event = Event(name="Hawks vs Foxes", sport="basketball", home="Hawks", away="Foxes")
+        entry = paper_signal("home", 0.60, 0.55, 0.05)   # entry + first valid close mark
+        ledger.record_signals(event, [entry])
+
+        # Reasons literally say "stale", but the typed gates all PASS -> wording
+        # has NO policy effect, so this DOES replace the close mark (0.62).
+        worded = paper_signal("home", 0.63, 0.62, 0.01)
+        worded.action = "WATCH"
+        worded.reasons = ["price looks stale to a human, but every gate passes"]
+        worded.observed_at = entry.observed_at + timedelta(seconds=1)
+        worded.decision_hash = "worded-close"
+        ledger.record_signals(event, [worded])
+
+        # Clean reasons, but provider_freshness FAILS -> must NOT replace the mark.
+        blocked = paper_signal("home", 0.70, 0.71, 0.01, gate_results=[
+            {"code": "provider_freshness", "passed": False, "status": "fail"},
+            {"code": "market_identity", "passed": True, "status": "pass"},
+            {"code": "market_status", "passed": True, "status": "pass"},
+            {"code": "executable_fill", "passed": True, "status": "pass"},
+        ])
+        blocked.action = "WATCH"
+        blocked.reasons = []
+        blocked.observed_at = entry.observed_at + timedelta(seconds=2)
+        blocked.decision_hash = "blocked-close"
+        ledger.record_signals(event, [blocked])
+
+        ledger.snapshot_closing(event.id)
+        ledger.settle_moneyline(event.id, {"home", event.home})
+        row = ledger.all_bets()[0]
+    finally:
+        ledger.close()
+    # CLV reflects the worded (0.62) mark: reason wording ignored, failing gate blocked.
+    assert row["clv"] == pytest.approx(0.62 - 0.55)
 
 
 def test_draw_settles_the_draw_outcome_not_nothing(tmp_path):

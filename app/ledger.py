@@ -34,6 +34,22 @@ def _retention_seconds() -> float:
     return max(3600.0, days * 86400.0)
 
 
+# A CLV close mark may only be recorded (replacing the last valid one) when these
+# typed execution-safety gates explicitly PASS. This replaces a fragile scan of
+# human-readable reason substrings: reason wording now has no policy effect, and a
+# gate that is missing, failing, or of unknown state fails closed.
+_REQUIRED_CLOSE_MARK_GATES = (
+    "provider_freshness", "market_identity", "market_status", "executable_fill",
+)
+
+
+def _close_mark_gates_pass(signal: Signal) -> bool:
+    passed_by_code = {
+        gate.get("code"): gate.get("passed") for gate in (signal.gate_results or [])
+    }
+    return all(passed_by_code.get(code) is True for code in _REQUIRED_CLOSE_MARK_GATES)
+
+
 _PRUNE_THROTTLE_SECONDS = 600.0
 
 _SCHEMA = """
@@ -268,10 +284,6 @@ class Ledger:
         with self._lock:
             inserted = 0
             with self._db.transaction() as cur:
-                invalid_close_markers = (
-                    "stale", "untrusted", "future", "not accepting",
-                    "depth unavailable", "fee metadata unavailable",
-                )
                 for signal in signals:
                     self._db.execute(
                         cur,
@@ -319,9 +331,7 @@ class Ledger:
                           signal.independent_model_event_count,
                           signal.independent_model_registry_version),
                     )
-                    reasons = " ".join(signal.reasons).casefold()
-                    if (signal.market_probability > 0
-                            and not any(marker in reasons for marker in invalid_close_markers)):
+                    if signal.market_probability > 0 and _close_mark_gates_pass(signal):
                         self._db.execute(
                             cur,
                             """INSERT INTO close_marks
