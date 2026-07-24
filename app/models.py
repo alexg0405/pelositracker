@@ -146,6 +146,10 @@ class Quote:
     active: bool = True
     resolved: bool = False
     restricted: bool = False
+    # Derived paper-policy waiver: set (never the raw ``restricted`` field) when a
+    # paper-only regional waiver applies, so the raw provider observation and its
+    # history row stay intact. Consumed only by simulated execution.
+    paper_restriction_waived: bool = False
     negative_risk: bool | None = None
     raw_payload_hash: str | None = None
     normalization_version: str = "quote-v2"
@@ -169,6 +173,16 @@ class Quote:
     @property
     def executable_probability(self) -> float:
         return self.ask if self.ask is not None else self.probability
+
+    @property
+    def paper_restricted(self) -> bool:
+        """Effective region-restriction for *simulated* paper execution only.
+
+        Equals the raw provider ``restricted`` fact unless a paper-only regional
+        waiver has been applied (see ``_paper_tradeable_quotes``). Real order
+        routing—which the paper system never performs—must consult the raw
+        ``restricted`` field, never this derived value."""
+        return self.restricted and not self.paper_restriction_waived
 
 
 @dataclass(slots=True)

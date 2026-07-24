@@ -62,6 +62,7 @@ class Settings:
     edge_uncertainty_z: float
     latency_budget_seconds: float
     max_state_age_seconds: float
+    provider_clock_skew_seconds: float
     enable_portfolio_kelly: bool
     exclude_restricted_events: bool
     paper_ignore_region_restriction: bool
@@ -104,6 +105,11 @@ class Settings:
             edge_uncertainty_z=_float(values, "PAPER_EDGE_UNCERTAINTY_Z", 1.0),
             latency_budget_seconds=_float(values, "PAPER_LATENCY_BUDGET_SECONDS", 8.0),
             max_state_age_seconds=_float(values, "PAPER_MAX_STATE_AGE_SECONDS", 30.0, minimum=1.0),
+            # Tolerance for a provider timestamp that reads slightly ahead of our
+            # clock. Beyond this the state is treated as future-dated and fails
+            # closed rather than being scored as maximally fresh.
+            provider_clock_skew_seconds=_float(
+                values, "PROVIDER_CLOCK_SKEW_SECONDS", 5.0, minimum=0.0),
             enable_portfolio_kelly=_bool(values, "PAPER_PORTFOLIO_KELLY", False),
             # Off by default: Polymarket's region flag marks *every* event
             # restricted from a restricted host region, so excluding would hide

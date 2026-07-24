@@ -210,23 +210,49 @@ def _correlation_group(event: Event, signal: Signal) -> str:
     return f"{event.id}:{group}"
 
 
+# The only engine gates that may legitimately report ``unknown`` (``passed`` is
+# None) when no versioned calibration policy is installed — exactly the Rust
+# ``policy.map``/``policy.and_then`` gates in native_engine. Any *other* unknown
+# gate, or an unrecognized gate code, must fail closed rather than be ignored, so
+# a future safety gate that starts emitting ``unknown`` can never silently admit
+# an uncalibrated bet.
+_ALLOWED_UNKNOWN_GATES = frozenset({
+    "consensus_policy",
+    "model_sample_support",
+    "calibration_support",
+    "uncertainty_support",
+    "probability_net_ev_positive",
+    "minimum_expected_value",
+})
+
+
 def _uncalibrated_eligible(signal: Signal) -> bool:
     """True when a WATCH signal is held back *only* by a missing calibration artifact.
 
     Every engine gate that was actually evaluated (``pass``/``fail``) must pass;
-    only the calibration/policy gates may be ``unknown`` (which is exactly what
-    the Rust engine reports when no versioned artifact is installed). This lets
-    an opt-in paper harness trade a fundamentally sound, uncalibrated gross-gap
-    edge without loosening any freshness, source-count, identity, execution, or
-    edge-floor requirement. It never fires once a real calibration policy is
-    installed, because such a signal would already carry action ``PAPER_BET``
-    (and a non-null calibrated probability).
+    only the named calibration/policy gates in ``_ALLOWED_UNKNOWN_GATES`` may be
+    ``unknown`` (which is exactly what the Rust engine reports when no versioned
+    artifact is installed). An unknown result from any other gate — or an
+    unrecognized gate code — fails closed. This lets an opt-in paper harness trade
+    a fundamentally sound, uncalibrated gross-gap edge without loosening any
+    freshness, source-count, identity, execution, or edge-floor requirement. It
+    never fires once a real calibration policy is installed, because such a signal
+    would already carry action ``PAPER_BET`` (and a non-null calibrated
+    probability).
     """
     if signal.calibrated_consensus_probability is not None:
         return False
-    evaluated = [gate for gate in (signal.gate_results or [])
-                 if gate.get("passed") is not None]
-    return bool(evaluated) and all(gate.get("passed") for gate in evaluated)
+    evaluated_any = False
+    for gate in signal.gate_results or []:
+        passed = gate.get("passed")
+        if passed is None:
+            if gate.get("code") not in _ALLOWED_UNKNOWN_GATES:
+                return False  # a non-whitelisted gate of unknown state: fail closed
+            continue
+        evaluated_any = True
+        if not passed:
+            return False
+    return evaluated_any
 
 
 def qualification_failures(strategy: Strategy, signal: Signal, *,
@@ -692,7 +718,7 @@ class AccountBook:
                             min_order_size=quote.min_order_size,
                             active=quote.active,
                             resolved=quote.resolved,
-                            restricted=quote.restricted,
+                            restricted=quote.paper_restricted,
                             accepting_orders=quote.accepting_orders,
                             depth_complete=quote.depth_complete,
                             # A quarantined (ambiguous-identity) quote must never
@@ -805,7 +831,7 @@ class AccountBook:
                             min_order_size=quote.min_order_size,
                             active=quote.active,
                             resolved=quote.resolved,
-                            restricted=quote.restricted,
+                            restricted=quote.paper_restricted,
                             accepting_orders=quote.accepting_orders,
                             depth_complete=quote.depth_complete,
                         )

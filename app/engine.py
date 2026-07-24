@@ -322,7 +322,7 @@ class SignalEngine:
             simulation = simulate_buy(
                 levels, cash=paper_notional, fee_rate=q.fee_rate,
                 tick_size=q.tick_size, min_order_size=q.min_order_size,
-                active=q.active, resolved=q.resolved, restricted=q.restricted,
+                active=q.active, resolved=q.resolved, restricted=q.paper_restricted,
                 accepting_orders=q.accepting_orders, depth_complete=q.depth_complete,
                 identity_ambiguous=q.quarantined,
             )
@@ -365,7 +365,7 @@ class SignalEngine:
             "depth_complete": q.depth_complete and execution_complete,
             "fee_metadata_known": fee_metadata_known,
             "accepting_orders": (q.accepting_orders and q.active
-                                 and not q.resolved and not q.restricted),
+                                 and not q.resolved and not q.paper_restricted),
             "requested_cash": requested_cash,
             "filled_cash": filled_cash,
             "filled_shares": filled_shares,

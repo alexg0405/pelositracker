@@ -73,6 +73,33 @@ def test_state_age_uses_the_provider_timestamp_when_trusted():
     assert _state_age_seconds(state, now) == 45.0
 
 
+def test_state_age_fails_closed_on_a_future_provider_timestamp():
+    # A provider timestamp ahead of us beyond the skew tolerance must not be
+    # scored as maximally fresh (the old max(0.0, ...) clamp did exactly that).
+    now = datetime.now(timezone.utc)
+    state = _state(provider_timestamp=now + timedelta(seconds=60))
+    assert state.timestamp_trusted is True
+    assert _state_age_seconds(state, now) is None
+
+
+def test_state_age_tolerates_small_forward_clock_skew():
+    now = datetime.now(timezone.utc)
+    state = _state(provider_timestamp=now + timedelta(seconds=1))
+    assert _state_age_seconds(state, now) == 0.0
+
+
+def test_tennis_state_age_fails_closed_on_a_future_receipt():
+    now = datetime.now(timezone.utc)
+    event = Event("A vs B", "tennis", "A", "B", id="e", polymarket_slug="slug-x")
+    main_module._sports_status_detail[event.polymarket_slug] = {
+        "_received_at": (now + timedelta(seconds=60)).isoformat()
+    }
+    try:
+        assert main_module._tennis_state_age_seconds(event, now) is None
+    finally:
+        main_module._sports_status_detail.pop(event.polymarket_slug, None)
+
+
 def test_tennis_settles_by_set_count_and_grades_the_match_winner():
     event = Event("Alcaraz vs Sinner", "tennis", "Alcaraz", "Sinner",
                   league="atp", id="tn", polymarket_slug="alcaraz-sinner")
@@ -100,11 +127,56 @@ def _quote(restricted):
                  source="polymarket", restricted=restricted)
 
 
-def test_paper_tradeable_quotes_clears_region_restriction_when_ignored():
-    quotes = _paper_tradeable_quotes([_quote(True), _quote(False)], True)
-    assert all(q.restricted is False for q in quotes)
+def test_paper_tradeable_quotes_waives_restriction_without_mutating_raw_flag():
+    restricted, unrestricted = _quote(True), _quote(False)
+    _paper_tradeable_quotes([restricted, unrestricted], True)
+    # Raw provider fact is preserved on both quotes...
+    assert restricted.restricted is True
+    assert unrestricted.restricted is False
+    # ...while the restricted quote is paper-waived, so simulated execution treats
+    # it as tradeable (paper_restricted is False) without touching the observation.
+    assert restricted.paper_restriction_waived is True
+    assert restricted.paper_restricted is False
+    assert unrestricted.paper_restriction_waived is False
+    assert unrestricted.paper_restricted is False
 
 
 def test_paper_tradeable_quotes_preserves_region_flag_when_honored():
-    quotes = _paper_tradeable_quotes([_quote(True)], False)
-    assert quotes[0].restricted is True
+    quote = _quote(True)
+    _paper_tradeable_quotes([quote], False)
+    assert quote.restricted is True
+    assert quote.paper_restriction_waived is False
+    assert quote.paper_restricted is True  # honored: still restricted for paper
+
+
+def test_waiver_preserves_raw_restricted_in_history_and_hash(tmp_path):
+    """Enabling the paper waiver must change only the paper-execution view, never
+    the persisted source observation or its hash."""
+    import sqlite3
+
+    from app.history import HistoryDB
+
+    quote = Quote(event_id="e", market="moneyline", outcome="Home", probability=0.5,
+                  source="polymarket", restricted=True, book_hash="abc123",
+                  condition_id="c", token_id="t")
+    original_hash = quote.raw_payload_hash
+    _paper_tradeable_quotes([quote], True)
+    assert quote.restricted is True
+    assert quote.raw_payload_hash == original_hash
+    assert quote.paper_restricted is False  # only the paper-exec view changed
+
+    db_path = tmp_path / "history.db"
+    history = HistoryDB(str(db_path))
+    try:
+        history.log_quotes([quote])
+    finally:
+        history.close()
+    conn = sqlite3.connect(str(db_path))
+    try:
+        stored = conn.execute(
+            "SELECT restricted, raw_payload_hash FROM quotes_history"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert stored[0] == 1  # raw restricted persisted, not the waived value
+    assert stored[1] == original_hash

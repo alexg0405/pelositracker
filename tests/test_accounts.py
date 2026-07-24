@@ -95,6 +95,33 @@ def test_uncalibrated_opt_in_never_admits_a_signal_with_no_gate_record():
     assert not qualifies(strategy, signal, allow_uncalibrated=True)
 
 
+def test_uncalibrated_opt_in_fails_closed_on_a_non_whitelisted_unknown_gate():
+    from app.accounts import _uncalibrated_eligible
+
+    strategy = Strategy("test", edge_threshold=0)
+    gates = _uncalibrated_gates()
+    # A safety gate (never legitimately unknown) reporting 'unknown' must fail
+    # closed, not be silently ignored the way the old blanket filter did.
+    for gate in gates:
+        if gate["code"] == "provider_freshness":
+            gate["passed"] = None
+            gate["status"] = "unknown"
+    signal = valid_signal(action="WATCH", calibrated_consensus_probability=None,
+                          gate_results=gates)
+    assert _uncalibrated_eligible(signal) is False
+    assert not qualifies(strategy, signal, allow_uncalibrated=True)
+
+
+def test_uncalibrated_opt_in_fails_closed_on_an_unrecognized_unknown_gate():
+    from app.accounts import _uncalibrated_eligible
+
+    gates = _uncalibrated_gates()
+    gates.append({"code": "some_future_gate", "passed": None, "status": "unknown"})
+    signal = valid_signal(action="WATCH", calibrated_consensus_probability=None,
+                          gate_results=gates)
+    assert _uncalibrated_eligible(signal) is False
+
+
 def _single_source_watch_signal(event, **overrides):
     """A tennis-style signal the engine could not price (no reference books)."""
     values = dict(

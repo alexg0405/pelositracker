@@ -293,13 +293,17 @@ async def on_sports_status(slug: str, payload: dict) -> None:
 
 
 def _paper_tradeable_quotes(quotes: list[Quote], ignore_restriction: bool) -> list[Quote]:
-    """Clear the region-restriction flag for fake-money paper simulation. The flag
-    governs *real* order placement; a simulated fill is not a real order, so from
-    a restricted host region (where Polymarket marks every event restricted) this
-    is what lets any market trade on paper at all. No effect when disabled."""
+    """Flag region-restricted quotes as paper-waived WITHOUT mutating the raw
+    ``restricted`` provider fact, so the stored and hashed observation—and its
+    history row—keep the original value. The waiver is derived metadata consumed
+    only by simulated execution (``Quote.paper_restricted``). The flag governs
+    *real* order placement; a simulated fill is not a real order, so from a
+    restricted host region (where Polymarket marks every event restricted) this is
+    what lets any market trade on paper at all. No effect when disabled."""
     if ignore_restriction:
         for quote in quotes:
-            quote.restricted = False
+            if quote.restricted:
+                quote.paper_restriction_waived = True
     return quotes
 
 
@@ -414,7 +418,10 @@ def _tennis_state_age_seconds(event: Event, as_of: datetime) -> float | None:
         return None
     if stamp.tzinfo is None:
         stamp = stamp.replace(tzinfo=timezone.utc)
-    return max(0.0, (as_of - stamp).total_seconds())
+    age = (as_of - stamp).total_seconds()
+    if age < -settings.provider_clock_skew_seconds:
+        return None  # future-dated: fail closed, never treat as fresh
+    return max(0.0, age)
 
 
 def _tennis_model_probabilities(
@@ -474,7 +481,10 @@ def _state_age_seconds(state: GameState, as_of: datetime) -> float | None:
     stamp = state.provider_timestamp
     if stamp.tzinfo is None:
         stamp = stamp.replace(tzinfo=timezone.utc)
-    return max(0.0, (as_of - stamp).total_seconds())
+    age = (as_of - stamp).total_seconds()
+    if age < -settings.provider_clock_skew_seconds:
+        return None  # future-dated provider timestamp: fail closed, never fresh
+    return max(0.0, age)
 
 
 def _lead_model_probabilities(
