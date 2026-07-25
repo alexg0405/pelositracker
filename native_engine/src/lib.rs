@@ -1368,7 +1368,7 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
                         "reference_source_support",
                         Some(false),
                         Some(0.0),
-                        Some(2.0),
+                        Some(1.0),
                         "no independent reference source family is available",
                     ),
                     gate(
@@ -1716,8 +1716,8 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         if best.observed_at > now_seconds + 5.0 {
             blockers.push("provider timestamp is in the future".to_string());
         }
-        if source_count < 2 {
-            blockers.push("fewer than 2 independent reference sources".to_string());
+        if source_count < 1 {
+            blockers.push("fewer than 1 independent reference source".to_string());
         }
         if !entry_price_allowed(executable) {
             blockers.push(
@@ -1824,10 +1824,10 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         ));
         gate_results.push(gate(
             "reference_source_support",
-            Some(source_count >= 2),
+            Some(source_count >= 1),
             Some(source_count as f64),
-            Some(2.0),
-            "at least two leave-one-out source families are required",
+            Some(1.0),
+            "at least one leave-one-out source family is required",
         ));
         gate_results.push(gate(
             "market_identity",

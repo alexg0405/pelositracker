@@ -125,7 +125,7 @@ class Strategy:
     blurb: str = ""
     edge_threshold: float = 0.03
     confidence_threshold: float = 0.0
-    min_sources: int = 2
+    min_sources: int = 1
     markets: tuple = ("all",)
     # Optional per-bot game allow-list (event id / slug / name). Empty = free
     # bet: the bot may take any qualifying game (the default behavior).
@@ -174,7 +174,7 @@ DEFAULT_STRATEGIES = [
     Strategy("Half Kelly", "Half-Kelly stakes — smoother equity curve.",
              edge_threshold=0.03, kelly_multiplier=0.5),
     Strategy("Quarter Kelly (safe)", "Quarter-Kelly and only well-anchored signals.",
-             edge_threshold=0.03, kelly_multiplier=0.25, confidence_threshold=70.0, min_sources=3),
+             edge_threshold=0.03, kelly_multiplier=0.25, confidence_threshold=70.0, min_sources=1),
     Strategy("Flat $100", "Fixed $100 a bet at a 3% edge floor.",
              edge_threshold=0.03, sizing="flat", flat_stake=100.0),
     Strategy("Aggressive (low bar)", "Lower 1.5% edge bar, full Kelly, bigger caps.",

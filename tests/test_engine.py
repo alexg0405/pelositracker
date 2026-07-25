@@ -185,8 +185,13 @@ def test_same_book_from_two_adapters_counts_as_one_reference():
     ]
     home = next(x for x in engine.evaluate("e", quotes, [], as_of=NOW) if x.outcome == "home")
     assert home.n_reference_sources == 1
+    # One de-duplicated reference now clears the reference-support gate...
+    assert next(
+        gate for gate in home.gate_results
+        if gate["code"] == "reference_source_support"
+    )["passed"] is True
+    # ...but execution still can't proceed without complete exchange depth.
     assert home.action == "WATCH"
-    assert any("fewer than 2 independent" in reason for reason in home.reasons)
 
 
 def test_incomplete_three_way_book_is_excluded_from_devig():

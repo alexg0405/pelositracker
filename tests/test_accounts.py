@@ -153,7 +153,7 @@ def test_bot_activity_report_balances_fast_and_slow_events(tmp_path):
     ({"market_probability": 0}, "invalid executable"),
     ({"market_probability": .05}, "above 5c and below 95c"),
     ({"market_probability": .95}, "above 5c and below 95c"),
-    ({"n_reference_sources": 1}, "too few"),
+    ({"n_reference_sources": 0}, "too few"),
     ({"edge": .03, "required_edge": .04}, "risk-adjusted"),
 ])
 def test_bot_rejects_every_hard_engine_or_execution_failure(changes, expected):
