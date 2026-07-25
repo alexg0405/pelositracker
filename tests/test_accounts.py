@@ -243,10 +243,37 @@ def test_bot_never_places_an_extreme_price_entry(tmp_path, price):
     try:
         book.seed([strategy])
         assert book.place(event, [value], [quote], as_of=1_000) == []
-        activity = book.activity("bot")
-        assert len(activity) == 1
-        assert activity[0]["stage"] == "price_range"
-        assert "above 5c and below 95c" in activity[0]["reason"]
+        # Impossible entry prices are discarded before bots iterate or log
+        # them, so the thinking ticker is reserved for plausible candidates.
+        assert book.activity("bot") == []
+        assert book.account_bets("bot") == []
+    finally:
+        book.close()
+
+
+@pytest.mark.parametrize("edge, required", [
+    (-.01, 0.0),
+    (0.0, 0.0),
+    (.01, .02),
+])
+def test_bot_prefilter_skips_nonpositive_or_below_required_edge(
+        tmp_path, edge, required):
+    book = AccountBook(str(tmp_path / f"accounts-{edge}-{required}.db"))
+    event = Event("A vs B", "basketball", "A", "B", id="event")
+    value = valid_signal(
+        event_id=event.id,
+        edge=edge,
+        required_edge=required,
+        decision_id=f"bad-edge-{edge}-{required}",
+    )
+    quote = executable_quote(event, "token-home", "moneyline", "A")
+    try:
+        book.seed([Strategy(
+            "bot", sizing="flat", flat_stake=100, start_bankroll=1_000,
+            edge_threshold=0.0,
+        )])
+        assert book.place(event, [value], [quote], as_of=1_000) == []
+        assert book.activity("bot") == []
         assert book.account_bets("bot") == []
     finally:
         book.close()

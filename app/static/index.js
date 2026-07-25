@@ -6,7 +6,19 @@
       document.querySelectorAll('.tab-carousel .pill').forEach(b => b.classList.remove('active'));
       e.target.classList.add('active');
       document.querySelectorAll('.tab-content').forEach(tc => tc.classList.add('is-hidden'));
-      document.getElementById(e.target.dataset.tab).classList.remove('is-hidden');
+      const tab = e.target.dataset.tab;
+      document.getElementById(tab).classList.remove('is-hidden');
+      if (tab === "tab-live") renderEvents(lastEvents);
+      if (tab === "tab-discovery") {
+        renderBestBets();
+        loadDiscover();
+      }
+      if (tab === "tab-bots") {
+        refreshMetrics();
+        refreshLeaderboard();
+        refreshBotActivity();
+        refreshBotGames();
+      }
     });
   });
 
@@ -44,8 +56,27 @@
   const money = value => value == null ? "—" : `${value >= 0 ? "+" : "-"}$${Math.abs(value).toFixed(2)}`;
   const keyFor = (...parts) => encodeURIComponent(parts.join("|"));
   let refreshInFlight = false;
+  const pendingEventRemovals = new Set();
   const pendingBotRemovals = new Set();
+  let eventActionStatusTimer = null;
   let botActionStatusTimer = null;
+
+  function showEventActionStatus(message, state = "pending", clearAfter = 0) {
+    const box = document.querySelector("#event-action-status");
+    if (!box) return;
+    if (eventActionStatusTimer) clearTimeout(eventActionStatusTimer);
+    box.textContent = message;
+    box.className = `event-action-status is-${state}`;
+    box.hidden = false;
+    eventActionStatusTimer = clearAfter ? setTimeout(() => {
+      box.hidden = true;
+      eventActionStatusTimer = null;
+    }, clearAfter) : null;
+  }
+
+  const botsTabVisible = () => !document.querySelector("#tab-bots").classList.contains("is-hidden");
+  const liveTabVisible = () => !document.querySelector("#tab-live").classList.contains("is-hidden");
+  const discoveryTabVisible = () => !document.querySelector("#tab-discovery").classList.contains("is-hidden");
 
   function showBotActionStatus(message, state = "pending", clearAfter = 0) {
     const box = document.querySelector("#bot-action-status");
@@ -187,6 +218,7 @@
 
   function eventCard(view, openDetails) {
     const {event,state_points,quote_points,latest_state:state,actionable_markets:markets,positions,signals} = view;
+    const removing = pendingEventRemovals.has(event.id);
     const health = view.edge_health;
     const usingFallback = !markets.length && !event.polymarket_slug;
     const anyReference = markets.some(m => (m.reference_sources||0) >= 1);
@@ -211,7 +243,7 @@
       : '<div class="pending">Waiting for a fresh executable ask and reference prices…</div>';
     const link = event.polymarket_url ? `<a href="${esc(event.polymarket_url)}" target="_blank" rel="noopener">Open event ↗</a>` : "manual event";
     const restriction = event.polymarket_restricted ? '<strong>Region notice:</strong> Polymarket marks this event restricted. The monitor shows public data only and does not bypass availability rules.' : 'Only selections accepting orders with a visible ask are listed.';
-    return `<article class="event" data-event-id="${esc(event.id)}"><div class="event-head"><div><div class="name">${esc(event.name)}</div><div class="meta">${esc(event.sport)} · ${link} · ${state_points} state / ${quote_points} updates</div></div><div class="event-actions"><button class="ghost chart-button" data-chart-event="${esc(event.id)}" data-chart-title="${esc(event.name)}">View Chart</button><div class="score">${score}</div><button class="remove" data-remove-event="${esc(event.id)}">Remove</button></div></div>
+    return `<article class="event${removing ? " is-removing" : ""}" data-event-id="${esc(event.id)}"${removing ? ' aria-busy="true"' : ""}><div class="event-head"><div><div class="name">${esc(event.name)}</div><div class="meta">${esc(event.sport)} · ${link} · ${state_points} state / ${quote_points} updates</div></div><div class="event-actions"><button class="ghost chart-button" data-chart-event="${esc(event.id)}" data-chart-title="${esc(event.name)}">View Chart</button><div class="score">${score}</div><button class="remove${removing ? " is-removing" : ""}" data-remove-event="${esc(event.id)}"${removing ? ' disabled aria-busy="true"' : ""}>${removing ? "Removing…" : "Remove"}</button></div></div>
       <div class="notice">${restriction}</div>${priceOnly}${portfolio}<div class="section-strip"><span>Actionable selections</span> · buy, sell, margin, and risk</div><div>${marketBody}</div></article>`;
   }
 
@@ -220,6 +252,7 @@
   function reliabilityView(bins) { if(!bins?.length)return "";const columns=bins.map(bin=>`<div class="rbin" title="predicted ${pct(bin.mean_predicted)} · actual ${pct(bin.empirical_rate)} · n=${bin.count}"><meter class="reliability-meter" min="0" max="1" value="${Number(bin.empirical_rate).toFixed(4)}">${pct(bin.empirical_rate)}</meter><div class="rlabel">${Math.round(bin.lo*100)} · p ${Math.round(bin.mean_predicted*100)}</div></div>`).join("");return `<div class="reliability">${columns}</div><div class="metrics-sub">Meter = actual win rate · label p = predicted probability</div>`; }
 
   async function refreshMetrics() {
+    if (!botsTabVisible()) return;
     const body=document.querySelector("#metrics-body"), sub=document.querySelector("#metrics-sub");
     try {
       const response=await fetch("/api/metrics");
@@ -303,6 +336,7 @@
 
   let lastActivitySignature = "";
   async function refreshBotActivity() {
+    if (!botsTabVisible()) return;
     const body = document.querySelector("#bot-activity");
     const status = document.querySelector("#bot-activity-status");
     if (!body || !status) return;
@@ -385,6 +419,7 @@
   }
 
   async function refreshLeaderboard() {
+    if (!botsTabVisible()) return [];
     const body = document.querySelector("#leaderboard-body");
     try {
       const response = await fetch("/api/leaderboard", {cache: "no-store"});
@@ -496,8 +531,12 @@
     }).join("");
   }
   function renderEvents(events) {
-    if (document.activeElement?.closest("[data-save-position]")) return;
+    events = (events || []).filter(view => !pendingEventRemovals.has(view.event.id));
     lastEvents = events;
+    renderBestBets();
+    // Keep the newest data for navigation/recommendations, but do not build and
+    // replace the heavy Live Radar DOM while another tab is visible.
+    if (!liveTabVisible() || document.activeElement?.closest("[data-save-position]")) return;
     const root=document.querySelector("#events");
     const openDetails=new Set([...root.querySelectorAll("details[open][data-detail-key]")].map(d=>d.dataset.detailKey));
     const present=new Set();
@@ -513,7 +552,6 @@
       : (events.length && activeLine !== "all"
           ? `<div class="panel empty"><b>No ${LINE_META[activeLine].label} lines</b>Nothing matches this filter right now.</div>`
           : '<div class="panel empty"><b>No events yet</b>Go to the Discovery tab to begin.</div>');
-    renderBestBets();
   }
   async function refresh() {
     if (refreshInFlight || document.activeElement?.closest("[data-save-position]")) return;
@@ -522,12 +560,30 @@
     catch { const root=document.querySelector("#events"); if(!root.children.length) root.innerHTML='<div class="panel empty"><b>Dashboard disconnected</b>Check your connection.</div>'; }
     finally { refreshInFlight=false; }
   }
+  let streamSource = null, streamConnected = false;
+  let pendingStreamEvents = null, streamRenderTimer = null;
+  function scheduleStreamRender(events) {
+    pendingStreamEvents = events;
+    if (streamRenderTimer) return;
+    streamRenderTimer = setTimeout(() => {
+      streamRenderTimer = null;
+      const newest = pendingStreamEvents;
+      pendingStreamEvents = null;
+      renderEvents(newest);
+    }, 100);
+  }
   function startStream() {
-    let source;
-    try { source = new EventSource("/api/stream"); } catch { return; }
-    source.onmessage = event => { if(!event.data) return; try { renderEvents(JSON.parse(event.data)); refreshMetrics(); } catch {} };
+    if (streamSource) return;
+    try { streamSource = new EventSource("/api/stream"); } catch { return; }
+    streamSource.onopen = () => { streamConnected = true; };
+    streamSource.onerror = () => { streamConnected = false; };
+    streamSource.onmessage = event => {
+      if(!event.data) return;
+      try { scheduleStreamRender(JSON.parse(event.data)); } catch {}
+    };
   }
   async function refreshBotGames() {
+    if (!botsTabVisible()) return;
     const box = document.querySelector("#bot-games");
     if (!box) return;
     try {
@@ -579,13 +635,29 @@
     const payload={token_id:form.dataset.tokenId,market:form.dataset.market,outcome:form.dataset.outcome,shares:Number(data.get("shares")),avg_entry_price:Number(data.get("entry_cents"))/100};
     try{const response=await fetch(`/api/events/${encodeURIComponent(form.dataset.eventId)}/positions`,{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify(payload)});const body=await response.json().catch(()=>({}));if(!response.ok)throw new Error(body.detail||"Could not save position");document.activeElement.blur();await refresh()}
     catch(error){showActionError(error.message)}finally{button.disabled=false}});
-  let currentChart = null;
+  let currentChart = null, chartLibraryPromise = null;
+  function loadChartLibrary() {
+    if (window.Chart) return Promise.resolve();
+    if (chartLibraryPromise) return chartLibraryPromise;
+    chartLibraryPromise = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "/static/vendor/chart.umd.min.js";
+      script.onload = resolve;
+      script.onerror = () => {
+        chartLibraryPromise = null;
+        reject(new Error("Chart library failed to load"));
+      };
+      document.head.appendChild(script);
+    });
+    return chartLibraryPromise;
+  }
   async function viewChart(eventId, eventName) {
     const dialog = document.querySelector("#chart-modal");
     document.querySelector("#chart-modal-title").textContent = eventName + " History";
     dialog.showModal();
     try {
-      const r = await fetch(`/api/events/${encodeURIComponent(eventId)}/history`);
+      await loadChartLibrary();
+      const r = await fetch(`/api/events/${encodeURIComponent(eventId)}/history?limit=1200`);
       if (!r.ok) throw new Error();
       const data = await r.json();
 
@@ -617,9 +689,36 @@
       console.error("Failed to load chart");
     }
   }
+  document.querySelector("#chart-modal").addEventListener("close", () => {
+    if (currentChart) {
+      currentChart.destroy();
+      currentChart = null;
+    }
+  });
 
   document.querySelector("#events").addEventListener("click",async event=>{const removeEvent=event.target.closest("[data-remove-event]"),removePosition=event.target.closest("[data-remove-position]"),chartBtn=event.target.closest("[data-chart-event]");
-    if(removeEvent){removeEvent.disabled=true;document.querySelector("#action-error").hidden=true;try{const eventId=removeEvent.dataset.removeEvent,response=await fetch(`/api/events/${encodeURIComponent(eventId)}`,{method:"DELETE"});if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.detail||`Could not remove event (${response.status})`)}lastEvents=lastEvents.filter(view=>view.event.id!==eventId);renderEvents(lastEvents)}catch(error){showActionError(error.message)}finally{removeEvent.disabled=false}}
+    if(removeEvent){
+      const eventId=removeEvent.dataset.removeEvent;
+      if(pendingEventRemovals.has(eventId))return;
+      const eventName=removeEvent.closest("[data-event-id]")?.querySelector(".name")?.textContent||"event";
+      pendingEventRemovals.add(eventId);
+      document.querySelector("#action-error").hidden=true;
+      showEventActionStatus(`Removing "${eventName}" and stopping its live feeds…`);
+      lastEvents=lastEvents.filter(view=>view.event.id!==eventId);
+      renderEvents(lastEvents);
+      try{
+        const response=await fetch(`/api/events/${encodeURIComponent(eventId)}`,{method:"DELETE"});
+        if(!response.ok){
+          const body=await response.json().catch(()=>({}));
+          throw new Error(body.detail||`Could not remove event (${response.status})`);
+        }
+        showEventActionStatus(`Removed "${eventName}". Its live buffers and feed tasks were released.`,"success",15000);
+      }catch(error){
+        pendingEventRemovals.delete(eventId);
+        showEventActionStatus(`${error.message||"Could not remove event"}. The event remains monitored.`,"error");
+        await refresh();
+      }
+    }
     if(removePosition){removePosition.disabled=true;try{const response=await fetch(`/api/events/${encodeURIComponent(removePosition.dataset.eventId)}/positions/${encodeURIComponent(removePosition.dataset.tokenId)}`,{method:"DELETE"});if(response.ok)await refresh()}catch{}finally{removePosition.disabled=false}}
     if(chartBtn){viewChart(chartBtn.dataset.chartEvent, chartBtn.dataset.chartTitle)}});
   let discoverGames = [];
@@ -637,6 +736,7 @@
   }
   let discoverRequest = null;
   async function loadDiscover(manual=false) {
+    if (!manual && !discoveryTabVisible()) return;
     const list=document.querySelector("#discover-list");
     const button=document.querySelector("#discover-refresh");
     const status=document.querySelector("#discover-refresh-status");
@@ -789,13 +889,19 @@
     try {
       const r = await fetch("/api/events");
       if (r.ok) {
+        const events = await r.json();
         document.querySelector("#login-overlay").hidden = true;
-        startApp();
+        startApp(events);
       }
     } catch {}
   }
 
-  function startApp() {
+  function startApp(initialEvents = null) {
+    if (window.appStarted) {
+      if (initialEvents) renderEvents(initialEvents);
+      return;
+    }
+    window.appStarted = true;
     fetch("/api/config").then(r=>r.json()).then(c=>{
       document.querySelector("#config").textContent=`Quality ≥ ${c.confidence_threshold} · Base edge ≥ ${(c.edge_threshold*100).toFixed(1)}%`;
       if(document.querySelector("#auto-monitor-toggle")) document.querySelector("#auto-monitor-toggle").checked = !!c.auto_monitor;
@@ -807,13 +913,33 @@
       }
     }).catch(()=>document.querySelector("#config").textContent="Thresholds unavailable");
 
-    refresh();refreshMetrics();refreshLeaderboard();refreshBotActivity();startStream();loadDiscover();refreshBotGames();
+    if (initialEvents) renderEvents(initialEvents); else refresh();
+    startStream();
 
     // Set intervals
     if (!window.intervalsStarted) {
       window.intervalsStarted = true;
-      setInterval(refresh,10000);setInterval(refreshMetrics,5000);setInterval(refreshLeaderboard,5000);setInterval(refreshBotActivity,5000);setInterval(loadDiscover,60000);setInterval(refreshBotGames,30000);
+      // SSE is the primary events transport. A full JSON poll is only a
+      // disconnected-stream fallback, avoiding duplicate parse/render cycles.
+      setInterval(()=>{if(!streamConnected)refresh()},30000);
+      setInterval(refreshMetrics,5000);
+      setInterval(refreshLeaderboard,5000);
+      setInterval(refreshBotActivity,5000);
+      setInterval(loadDiscover,60000);
+      setInterval(refreshBotGames,30000);
     }
   }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden || !window.appStarted) return;
+    if (liveTabVisible()) renderEvents(lastEvents);
+    if (!streamConnected) refresh();
+    if (botsTabVisible()) {
+      refreshMetrics();
+      refreshLeaderboard();
+      refreshBotActivity();
+      refreshBotGames();
+    }
+  });
 
   checkAuthAndStart();

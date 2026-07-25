@@ -282,6 +282,43 @@ def _uncalibrated_eligible(signal: Signal) -> bool:
     return evaluated_any
 
 
+def bot_entry_candidates(
+    signals: list[Signal],
+    *,
+    allow_uncalibrated: bool = False,
+    model_probabilities: dict[str, float] | None = None,
+) -> list[Signal]:
+    """Cheap, strategy-independent prefilter for the bot entry pipeline.
+
+    Position marking deliberately does not use this filter: an existing holding
+    still needs its 1c/99c bid and every current model update for hold/cash-out
+    decisions. New-entry bots, however, gain nothing by iterating or logging
+    lines that cannot possibly clear the shared safety policy.
+    """
+    model_probabilities = model_probabilities or {}
+    candidates: list[Signal] = []
+    for signal in signals:
+        if (
+            not signal.token_id
+            or signal.quote_source.casefold() != "polymarket"
+            or not entry_price_allowed(signal.market_probability)
+        ):
+            continue
+        model_probability = model_probabilities.get(signal.token_id)
+        if model_probability is not None:
+            edge = model_probability - signal.market_probability
+            if not 0.0 < model_probability < 1.0:
+                continue
+        else:
+            if (signal.confidence or 0.0) <= 0.0:
+                continue
+            edge = signal.edge
+        if edge <= 0.0 or edge < max(0.0, signal.required_edge):
+            continue
+        candidates.append(signal)
+    return candidates
+
+
 def qualification_failures(strategy: Strategy, signal: Signal, *,
                            allow_uncalibrated: bool = False) -> list[str]:
     """Explain why a strategy must not paper-buy a signal."""
@@ -915,6 +952,13 @@ class AccountBook:
         now = _timestamp(as_of)
         model_probabilities = model_probabilities or {}
         model_uncertainty = model_uncertainty or {}
+        signals = bot_entry_candidates(
+            signals,
+            allow_uncalibrated=allow_uncalibrated,
+            model_probabilities=model_probabilities,
+        )
+        if not signals:
+            return []
         quote_by_token = _latest_quotes(quotes or [])
         placed_bets = []
         with self._lock:

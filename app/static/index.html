@@ -6,7 +6,6 @@
   <meta name="description" content="Paper-only Polymarket entry and position monitor">
   <title>PelosiTracker Dashboard</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <script src="/static/vendor/chart.umd.min.js" defer></script>
   <link rel="stylesheet" href="/static/index.css">
 </head>
 <body>
@@ -42,6 +41,7 @@
   <div id="tab-live" class="tab-content">
     <h2 class="title glitch" data-text="Monitored events">Monitored events</h2>
     <div class="error" id="action-error" role="alert" hidden></div>
+    <div id="event-action-status" class="event-action-status" role="status" aria-live="polite" hidden></div>
     <nav id="event-navigator" class="event-navigator" aria-label="Jump to a monitored event" hidden>
       <div class="event-navigator-head">
         <span>Jump to event</span>

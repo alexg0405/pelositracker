@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 
 from .engine import SignalEngine
 from . import __version__, backtest, shadow_eval
-from .accounts import AccountBook, DEFAULT_STRATEGIES, line_type
+from .accounts import AccountBook, DEFAULT_STRATEGIES, bot_entry_candidates, line_type
 from .tennis_model import (
     execution_sigma,
     game_prob_from_prematch,
@@ -84,6 +84,7 @@ independent_model_artifact = load_independent_models(settings.independent_model_
 if independent_model_artifact is not None:
     engine.install_independent_models(independent_model_artifact)
 tasks: dict[str, list[asyncio.Task]] = {}
+_event_deletions: dict[str, asyncio.Task] = {}
 _finalized: set[str] = set()
 # Finalized event ids still resident in the live store, oldest first. `_finalized`
 # is the permanent idempotency guard (ids only, negligible); this is the subset
@@ -206,12 +207,14 @@ def _require_safe_id(value: str | None, field: str) -> None:
 
 
 async def on_state(state: GameState):
+    event = store.events.get(state.event_id)
+    if event is None or _terminal_events.get(state.event_id) == "deleted":
+        return
     terminal = _terminal_kind(state.status)
     if terminal is not None:
         # Close the entry gate synchronously, before history I/O yields control
         # to quote callbacks that might otherwise place a known-result bet.
         _terminal_events.setdefault(state.event_id, terminal)
-    event = store.events.get(state.event_id)
     previous_states = store.states.get(state.event_id)
     previous = previous_states[-1] if previous_states else None
     if terminal is None and event is not None and not state.quarantined:
@@ -316,9 +319,12 @@ def _paper_tradeable_quotes(quotes: list[Quote], ignore_restriction: bool) -> li
 
 
 async def on_quotes(quotes: list[Quote]):
-    store.add_quotes(_paper_tradeable_quotes(quotes, settings.paper_ignore_region_restriction))
     event = store.events.get(quotes[0].event_id) if quotes else None
-    if event is not None and monitor_state is not None and event.odds_api_event_id:
+    if event is None or event.id in _terminal_events:
+        return
+    store.add_quotes(_paper_tradeable_quotes(quotes, settings.paper_ignore_region_restriction))
+    if (event is not None and event.id not in _terminal_events
+            and monitor_state is not None and event.odds_api_event_id):
         # Background matching may resolve this ID after registration.
         await asyncio.to_thread(monitor_state.save_event, event)
     if history_db is not None and quotes:
@@ -664,13 +670,13 @@ def recompute(event_id: str, *, as_of: datetime) -> list:
     event = store.events.get(event_id)
     if event is None:  # event removed between emit and callback
         return []
-    quotes = store.quotes[event_id]
+    quotes = store.quote_values(event_id)
     prior = _pregame.setdefault(event_id, {"spread": None, "total": None})
     if prior["spread"] is None or prior["total"] is None:
         spread, total = pregame_priors(quotes, event.home, event.away)
         prior["spread"] = prior["spread"] if prior["spread"] is not None else spread
         prior["total"] = prior["total"] if prior["total"] is not None else total
-    signals = engine.evaluate(event_id, quotes, store.states[event_id], event.away,
+    signals = engine.evaluate(event_id, quotes, store.states.get(event_id, []), event.away,
                               sport=event.sport, league=event.league,
                               home_outcome=event.home,
                               pregame_spread=prior["spread"], pregame_total=prior["total"],
@@ -736,7 +742,7 @@ async def record(event_id: str, *, as_of: datetime | None = None) -> None:
         if event_id in _terminal_events or event_id in _finalized:
             return
         if account_book is not None and event is not None:
-            quotes = store.quotes[event_id]
+            quotes = store.quote_values(event_id)
             # One current decision context, computed before mark/exit/entry, so a
             # harness-backed position is managed with the same probability family
             # that opened it (not the odds consensus).
@@ -752,18 +758,31 @@ async def record(event_id: str, *, as_of: datetime | None = None) -> None:
                 if paper_event.get("webhook_url"):
                     _schedule_notification(paper_event)
             if signals:
-                placed_bets = await asyncio.to_thread(
-                    account_book.place, event, signals, quotes, as_of=decision_at,
+                entry_signals = bot_entry_candidates(
+                    signals,
                     allow_uncalibrated=settings.allow_uncalibrated_paper,
                     model_probabilities=model_probabilities,
-                    model_uncertainty=model_uncertainty,
-                    edge_uncertainty_z=settings.edge_uncertainty_z,
-                    portfolio_kelly=settings.enable_portfolio_kelly,
-                    max_quote_age_seconds=settings.max_data_age_seconds,
                 )
-                for paper_event in placed_bets:
-                    if paper_event.get("webhook_url"):
-                        _schedule_notification(paper_event)
+                skipped = len(signals) - len(entry_signals)
+                if skipped:
+                    runtime_telemetry.increment("bot_entry_prefiltered", skipped)
+                if entry_signals:
+                    runtime_telemetry.increment(
+                        "bot_entry_candidates", len(entry_signals)
+                    )
+                    placed_bets = await asyncio.to_thread(
+                        account_book.place, event, entry_signals, quotes,
+                        as_of=decision_at,
+                        allow_uncalibrated=settings.allow_uncalibrated_paper,
+                        model_probabilities=model_probabilities,
+                        model_uncertainty=model_uncertainty,
+                        edge_uncertainty_z=settings.edge_uncertainty_z,
+                        portfolio_kelly=settings.enable_portfolio_kelly,
+                        max_quote_age_seconds=settings.max_data_age_seconds,
+                    )
+                    for paper_event in placed_bets:
+                        if paper_event.get("webhook_url"):
+                            _schedule_notification(paper_event)
 
 
 def _winner_labels(event: Event, home_score: float, away_score: float) -> set[str]:
@@ -781,11 +800,10 @@ def _evict_live_event_state(event_id: str) -> None:
     _finalized_order.pop(event_id, None)
     _pregame.pop(event_id, None)
     _event_locks.pop(event_id, None)
-    with store.lock:
-        store.events.pop(event_id, None)
-        store.states.pop(event_id, None)
-        store.quotes.pop(event_id, None)
-        store.signals.pop(event_id, None)
+    event = store.events.get(event_id)
+    if event is not None and event.polymarket_slug:
+        _sports_status_detail.pop(event.polymarket_slug, None)
+    store.remove_event(event_id)
 
 
 async def _evict_finalized_overflow() -> None:
@@ -964,11 +982,14 @@ async def lifespan(_: FastAPI):
             store.states.clear()
             store.quotes.clear()
             store.signals.clear()
+            store.state_updates.clear()
+            store.quote_updates.clear()
         _pregame.clear()
         _finalized.clear()
         _finalized_order.clear()
         _terminal_events.clear()
         _event_locks.clear()
+        _event_deletions.clear()
         _sports_status_compact.clear()
         _sports_status_detail.clear()
 
@@ -1076,11 +1097,14 @@ async def runtime_status():
     with store.lock:
         live_quotes = sum(len(buffer) for buffer in store.quotes.values())
         live_states = sum(len(buffer) for buffer in store.states.values())
+        quote_updates = sum(store.quote_updates.values())
+        state_updates = sum(store.state_updates.values())
     return {
         "counters": runtime_telemetry.snapshot(),
         "odds_api_quota": dict(_odds_quota),
         "tracked_events": len(store.events),
         "feed_groups": {event_id: len(group) for event_id, group in tasks.items()},
+        "deletions_in_flight": len(_event_deletions),
         "notifications_in_flight": len(_notification_tasks),
         "memory": memory_snapshot(),
         "buffers": {
@@ -1088,6 +1112,8 @@ async def runtime_status():
             "sports_status_detail": len(_sports_status_detail),
             "live_quotes": live_quotes,
             "live_states": live_states,
+            "quote_updates": quote_updates,
+            "state_updates": state_updates,
             "finalized_events": len(_finalized),
         },
     }
@@ -1275,6 +1301,13 @@ async def stream():
             while True:
                 try:
                     await asyncio.wait_for(queue.get(), timeout=15)
+                    # Score and order-book bursts can wake this queue many times
+                    # in one browser frame. Coalesce them into one latest-state
+                    # snapshot instead of repeatedly allocating the full JSON
+                    # tree and replacing the whole dashboard DOM.
+                    await asyncio.sleep(0.15)
+                    while not queue.empty():
+                        queue.get_nowait()
                     yield b"data: "
                     yield await _events_snapshot_json()
                     yield b"\n\n"
@@ -1297,10 +1330,16 @@ _CLIENT_HIDDEN_SIGNAL_FIELDS = {"input_snapshot_json"}
 
 
 def _signal_views(signals) -> list[dict]:
+    # Filter before conversion. Building ``as_json(signal)`` first touched the
+    # large reproducibility snapshot solely to throw it away, multiplying peak
+    # RAM during every all-events render and especially during removals.
     return [
-        {key: value for key, value in row.items()
-         if key not in _CLIENT_HIDDEN_SIGNAL_FIELDS}
-        for row in as_json(signals)
+        {
+            key: as_json(getattr(signal, key))
+            for key in signal.__dataclass_fields__
+            if key not in _CLIENT_HIDDEN_SIGNAL_FIELDS
+        }
+        for signal in signals
     ]
 
 
@@ -1315,12 +1354,12 @@ async def event_view(event_id: str, positions: list[dict] | None = None):
         if not event:
             raise HTTPException(404, "event not found")
         states = store.states.get(event_id)
-        quotes = store.quotes.get(event_id)
+        quote_map = store.quotes.get(event_id)
+        quotes = list(quote_map.values()) if quote_map is not None else []
         signals = store.signals.get(event_id)
         latest_state = states[-1] if states else None
-        state_points = len(states) if states is not None else 0
-        quote_points = len(quotes) if quotes is not None else 0
-    quotes = quotes if quotes is not None else []
+        state_points = store.state_updates.get(event_id, 0)
+        quote_points = store.quote_updates.get(event_id, 0)
     signals = signals if signals is not None else []
     if positions is None:
         positions = (await asyncio.to_thread(ledger.event_positions, event_id)
@@ -1359,8 +1398,15 @@ async def get_event_history_api(
         raise HTTPException(503, "History database not available")
     if limit is not None and limit <= 0:
         raise HTTPException(400, "limit must be positive")
+    # Charting never needs an unbounded event history in one response. Bound
+    # both the default and caller-supplied value at the database query so long
+    # games cannot hydrate millions of rows into Python and the browser.
+    effective_limit = min(limit or 1200, 5000)
     return await asyncio.to_thread(
-        history_db.get_event_history, event_id, after_ts=after_ts, limit=limit
+        history_db.get_event_history,
+        event_id,
+        after_ts=after_ts,
+        limit=effective_limit,
     )
 
 
@@ -1453,7 +1499,7 @@ async def save_position(event_id: str, payload: PositionIn):
         raise HTTPException(404, "event not found")
     if ledger is None:
         raise HTTPException(503, "position ledger is not ready")
-    valid_tokens = {quote.token_id for quote in store.quotes[event_id]
+    valid_tokens = {quote.token_id for quote in store.quote_values(event_id)
                     if quote.source.casefold() == "polymarket" and quote.token_id}
     if payload.token_id not in valid_tokens:
         raise HTTPException(400, "That selection is not available for this event")
@@ -1623,13 +1669,43 @@ async def bets(event_id: str | None = None):
 
 @app.delete("/api/events/{event_id}", status_code=204, dependencies=[Depends(verify_auth)])
 async def delete_event(event_id: str):
-    if event_id not in store.events:
-        raise HTTPException(404, "event not found")
+    deletion = _event_deletions.get(event_id)
+    if deletion is None:
+        with store.lock:
+            if event_id not in store.events:
+                # DELETE is idempotent. A browser/network retry after the first
+                # request succeeded should not resurrect an error or trigger a
+                # new snapshot rebuild.
+                return Response(status_code=204)
+        deletion = asyncio.create_task(_delete_event_once(event_id))
+        _event_deletions[event_id] = deletion
+
+        def finished(task: asyncio.Task) -> None:
+            if _event_deletions.get(event_id) is task:
+                _event_deletions.pop(event_id, None)
+            # Retrieve failures even if the initiating HTTP request disconnected;
+            # active waiters still receive the same exception from the task.
+            if not task.cancelled():
+                task.exception()
+
+        deletion.add_done_callback(finished)
+
+    # A disconnected client must not cancel the shared cleanup. Repeated DELETEs
+    # await this same small task rather than queueing full cleanup operations.
+    await asyncio.shield(deletion)
+    return Response(status_code=204)
+
+
+async def _delete_event_once(event_id: str) -> None:
     # Manual removal is not evidence of a final result. Keep an event monitored
     # while any fake-money bot position is open so positions cannot disappear
     # into a misleading administrative void/refund.
     lock = _event_lock(event_id)
+    feed_tasks: list[asyncio.Task] = []
+    removed = False
     async with lock:
+        if event_id not in store.events:
+            return
         open_positions = (await asyncio.to_thread(account_book.open_count, event_id)
                           if account_book is not None else 0)
         if open_positions > 0:
@@ -1639,21 +1715,33 @@ async def delete_event(event_id: str):
                 "they settle or cash out; only a provider cancellation may void them.",
             )
         _terminal_events.setdefault(event_id, "deleted")
-        await _cancel_tasks(tasks.pop(event_id, []))
-        if ledger is not None:
-            await asyncio.to_thread(ledger.delete_event_positions, event_id)
-        if monitor_state is not None:
-            await asyncio.to_thread(monitor_state.delete_event, event_id)
-        _finalized.discard(event_id)
-        _finalized_order.pop(event_id, None)
-        _pregame.pop(event_id, None)
-        with store.lock:
-            store.events.pop(event_id, None)
-            store.states.pop(event_id, None)
-            store.quotes.pop(event_id, None)
-            store.signals.pop(event_id, None)
-        _notify_subscribers()
-    _terminal_events.pop(event_id, None)
-    _event_locks.pop(event_id, None)
+        try:
+            if ledger is not None:
+                await asyncio.to_thread(ledger.delete_event_positions, event_id)
+            if monitor_state is not None:
+                await asyncio.to_thread(monitor_state.delete_event, event_id)
+            feed_tasks = tasks.pop(event_id, [])
+            for task in feed_tasks:
+                if not task.done():
+                    task.cancel()
+            _finalized.discard(event_id)
+            _finalized_order.pop(event_id, None)
+            _pregame.pop(event_id, None)
+            event = store.events.get(event_id)
+            if event is not None and event.polymarket_slug:
+                _sports_status_detail.pop(event.polymarket_slug, None)
+            store.remove_event(event_id)
+            removed = True
+            _notify_subscribers()
+        except Exception:
+            # Persistence did not complete, so leave the event resident and let
+            # its feeds continue. The same first-click path can be retried.
+            _terminal_events.pop(event_id, None)
+            raise
+    if feed_tasks:
+        await asyncio.gather(*feed_tasks, return_exceptions=True)
+    if removed:
+        _terminal_events.pop(event_id, None)
+        _event_locks.pop(event_id, None)
 
 

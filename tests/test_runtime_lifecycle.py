@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 import threading
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -33,6 +34,7 @@ def runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "history_db", history)
     monkeypatch.setattr(main, "monitor_state", monitor)
     monkeypatch.setattr(main, "tasks", {})
+    monkeypatch.setattr(main, "_event_deletions", {})
     monkeypatch.setattr(main, "_finalized", set())
     monkeypatch.setattr(main, "_terminal_events", {})
     monkeypatch.setattr(main, "_event_locks", {})
@@ -185,6 +187,70 @@ def test_manual_delete_is_blocked_while_paper_bot_positions_are_open(runtime):
     assert _outcome_count(runtime["history"]) == 0
     assert [saved.id for saved in runtime["monitor"].events()] == [event.id]
     assert event.id in main.store.events
+
+
+def test_concurrent_manual_deletes_share_one_cleanup(runtime, monkeypatch):
+    event = _event("concurrent-delete")
+    _register(runtime, event)
+    main.store.add_quotes(_quotes(event))
+    monitor_deletes = 0
+    ledger_deletes = 0
+    notifications = 0
+    real_monitor_delete = runtime["monitor"].delete_event
+    real_ledger_delete = runtime["ledger"].delete_event_positions
+
+    def slow_monitor_delete(event_id):
+        nonlocal monitor_deletes
+        monitor_deletes += 1
+        time.sleep(.05)  # keep every simulated retry overlapping the leader
+        real_monitor_delete(event_id)
+
+    def count_ledger_delete(event_id):
+        nonlocal ledger_deletes
+        ledger_deletes += 1
+        real_ledger_delete(event_id)
+
+    def notify():
+        nonlocal notifications
+        notifications += 1
+
+    monkeypatch.setattr(runtime["monitor"], "delete_event", slow_monitor_delete)
+    monkeypatch.setattr(runtime["ledger"], "delete_event_positions", count_ledger_delete)
+    monkeypatch.setattr(main, "_notify_subscribers", notify)
+
+    async def scenario():
+        stopped = asyncio.Event()
+
+        async def feed():
+            try:
+                await asyncio.Future()
+            finally:
+                stopped.set()
+
+        feed_task = asyncio.create_task(feed())
+        main.tasks[event.id] = [feed_task]
+        await asyncio.sleep(0)
+        responses = await asyncio.gather(
+            *(main.delete_event(event.id) for _ in range(20))
+        )
+        await asyncio.sleep(0)  # run the deletion task's done callback
+        retry = await main.delete_event(event.id)
+        return responses, retry, stopped.is_set()
+
+    responses, retry, feed_stopped = asyncio.run(scenario())
+
+    assert all(response.status_code == 204 for response in responses)
+    assert retry.status_code == 204
+    assert monitor_deletes == 1
+    assert ledger_deletes == 1
+    assert notifications == 1
+    assert feed_stopped
+    assert event.id not in main.store.events
+    assert event.id not in main.store.quotes
+    assert event.id not in main.store.quote_updates
+    assert event.id not in main.tasks
+    assert event.id not in main._event_locks
+    assert event.id not in main._event_deletions
 
 
 def test_provider_cancellation_voids_instead_of_grading_score(runtime):

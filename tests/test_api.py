@@ -28,6 +28,7 @@ def test_registered_event_can_be_removed():
 
         removed = client.delete(f"/api/events/{event_id}")
         assert removed.status_code == 204
+        assert client.delete(f"/api/events/{event_id}").status_code == 204
         assert event_id not in store.events
         assert event_id not in store.states
         assert event_id not in store.quotes
@@ -85,10 +86,7 @@ def test_final_event_view_cannot_return_a_recommendation():
         assert "final or no longer active" in market["why_no_entry"]
     finally:
         main_module._terminal_events.pop(event_id, None)
-        with store.lock:
-            store.events.pop(event_id, None)
-            store.quotes.pop(event_id, None)
-            store.signals.pop(event_id, None)
+        store.remove_event(event_id)
 
 
 def test_dashboard_contains_merged_ui_behaviors():
@@ -110,6 +108,10 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "data-remove-bot" in javascript
         assert 'id="bot-action-status"' in html
         assert "pendingBotRemovals" in javascript
+        assert "pendingEventRemovals" in javascript
+        assert "streamConnected" in javascript
+        assert "loadChartLibrary" in javascript
+        assert 'id="event-action-status"' in html
         assert "Removing…" in javascript
         assert "It can no longer trade" in javascript
         assert "per_event_limit=4" in javascript
@@ -122,6 +124,27 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "recommendation_eligible" in javascript
         assert "recommendation_score" in javascript
         assert "at or below 5c or at or above 95c" in html
+
+
+def test_event_history_api_caps_default_and_requested_page_size(monkeypatch):
+    class HistoryStub:
+        def __init__(self):
+            self.limits = []
+
+        def get_event_history(self, event_id, *, after_ts=None, limit=None):
+            self.limits.append((event_id, after_ts, limit))
+            return {"quotes": [], "states": []}
+
+    stub = HistoryStub()
+    monkeypatch.setattr(main_module, "history_db", stub)
+    assert asyncio.run(main_module.get_event_history_api("event")) == {
+        "quotes": [], "states": []
+    }
+    assert asyncio.run(
+        main_module.get_event_history_api("event", limit=999999)
+    ) == {"quotes": [], "states": []}
+
+    assert [call[2] for call in stub.limits] == [1200, 5000]
 
 
 def test_bot_cashout_toggle_and_mark_feed_are_authenticated_api_contracts():

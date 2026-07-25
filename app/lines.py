@@ -49,6 +49,39 @@ def quote_line_side(market: str, outcome: str, home: str, away: str) -> tuple[fl
     return None, None
 
 
+def comparison_keys(
+    market: str,
+    outcome: str,
+    home: str,
+    away: str,
+    point: float | None,
+    side: str | None,
+) -> tuple[str, str]:
+    """Canonical selection identity shared by the engine and live quote store.
+
+    Keeping this in one place lets the in-memory store retain only the freshest
+    valid quote the engine could use for each source/selection. Full quote
+    history remains in ``HistoryDB``; the live process no longer holds thousands
+    of obsolete order-book snapshots per event.
+    """
+    market_key = (market or "market").strip().casefold()
+    outcome_key = (outcome or "").strip().casefold()
+    if is_spread_market(market_key) and point is not None and side in {"home", "away"}:
+        home_line = point if side == "home" else -point
+        if abs(home_line) < 1e-9:
+            home_line = 0.0
+        return f"spread:{home_line:g}", side
+    if is_total_market(market_key) and point is not None and side in {"over", "under"}:
+        return f"total:{point:g}", side
+    if point is not None and side in {"over", "under"}:
+        return f"{market_key}:{point:g}", side
+    if outcome_key in {"home", (home or "").strip().casefold()}:
+        outcome_key = "home"
+    elif outcome_key in {"away", (away or "").strip().casefold()}:
+        outcome_key = "away"
+    return market_key, outcome_key
+
+
 def pregame_priors(quotes, home: str, away: str) -> tuple[float | None, float | None]:
     """Best-effort pregame spread (home point) and game total line from quotes.
 

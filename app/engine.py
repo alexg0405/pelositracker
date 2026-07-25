@@ -12,7 +12,12 @@ from .calibration import CalibrationArtifact
 from .model_registry import IndependentModelArtifact
 from .gameclock import clock_seconds, game_progress
 from .domain.time import ensure_utc
-from .lines import is_spread_market, is_total_market, quote_line_side
+from .lines import (
+    comparison_keys,
+    is_spread_market,
+    is_total_market,
+    quote_line_side,
+)
 from .models import GameState, Quote, Signal, canonical_source, classify_source
 from .execution import BookLevel, simulate_buy
 
@@ -439,26 +444,5 @@ class SignalEngine:
     @staticmethod
     def _comparison_keys(market: str, outcome: str, home: str, away: str,
                          point: float | None, side: str | None) -> tuple[str, str]:
-        """Return stable cross-provider keys without changing display labels.
-
-        The line is part of the market identity. Grouping every alternate
-        spread/total together makes de-vigging treat many unrelated two-way
-        books as one giant market and can inflate overround above 500%.
-        """
-        market_key = (market or "market").strip().casefold()
-        outcome_key = (outcome or "").strip().casefold()
-        if is_spread_market(market_key) and point is not None and side in {"home", "away"}:
-            home_line = point if side == "home" else -point
-            if abs(home_line) < 1e-9:
-                home_line = 0.0
-            return f"spread:{home_line:g}", side
-        if is_total_market(market_key) and point is not None and side in {"over", "under"}:
-            return f"total:{point:g}", side
-        if point is not None and side in {"over", "under"}:
-            return f"{market_key}:{point:g}", side
-        if outcome_key in {"home", (home or "").strip().casefold()}:
-            outcome_key = "home"
-        elif outcome_key in {"away", (away or "").strip().casefold()}:
-            outcome_key = "away"
-        return market_key, outcome_key
+        return comparison_keys(market, outcome, home, away, point, side)
 
