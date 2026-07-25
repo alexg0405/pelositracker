@@ -472,21 +472,22 @@
     const rows = [];
     for (const v of events || []) {
       for (const m of (v.actionable_markets || [])) {
-        // Only rank selections that passed the server's final-game, executable
-        // 5c-95c price, reference-source, edge-floor, and signal-quality gates.
-        if (!m.recommendation_eligible) continue;
+        // The server limits this pool to active, order-taking 5c-95c Polymarket
+        // lines with a matched reference and positive displayed edge.
+        if (!m.best_bet_candidate) continue;
         rows.push({ event: v.event, m });
       }
     }
-    rows.sort((a, b) => {
-      const ea = a.m.entry_action === "ENTRY WINDOW" ? 1 : 0;
-      const eb = b.m.entry_action === "ENTRY WINDOW" ? 1 : 0;
-      if (ea !== eb) return eb - ea;              // entry windows first
-      const qualityEdge = (b.m.recommendation_score || 0) - (a.m.recommendation_score || 0);
-      if (qualityEdge !== 0) return qualityEdge;  // edge weighted by signal quality
+    // Prefer decent-quality signals. If none clear that modest bar, keep the
+    // best positive-edge choices visible instead of leaving the panel empty.
+    const preferred = rows.filter(row => row.m.best_bet_eligible);
+    const ranked = preferred.length ? preferred : rows;
+    ranked.sort((a, b) => {
+      const qualityEdge = (b.m.best_bet_score || 0) - (a.m.best_bet_score || 0);
+      if (qualityEdge !== 0) return qualityEdge;  // positive edge weighted by quality
       return (b.m.edge || 0) - (a.m.edge || 0);
     });
-    return rows.slice(0, BEST_BETS_LIMIT);
+    return ranked.slice(0, BEST_BETS_LIMIT);
   }
   function gotoEvent(id) {
     activeEventId=id;
@@ -515,14 +516,15 @@
     const rows = collectBestBets(lastEvents);
     if (!rows.length) {
       if (sub) sub.textContent = "";
-      box.innerHTML = '<div class="discover-empty">No qualifying recommendations right now. Final games, extreme prices, weak signals, and lines below their required edge are excluded.</div>';
+      box.innerHTML = '<div class="discover-empty">No monitored live Polymarket lines currently have a positive edge with a matched reference.</div>';
       return;
     }
     const entries = rows.filter(r => r.m.entry_action === "ENTRY WINDOW").length;
-    if (sub) sub.textContent = `${rows.length} shown · ${entries} in entry window`;
+    if (sub) sub.textContent = `${rows.length} positive-edge line${rows.length === 1 ? "" : "s"} shown · ${entries} full entry window${entries === 1 ? "" : "s"}`;
     box.innerHTML = rows.map(({ event, m }) => {
       const basis = m.edge_basis === "gross" ? "gross edge" : "net edge";
       const edgeCls = m.edge >= 0 ? "positive" : "negative";
+      const bestBetLabel = m.entry_action === "ENTRY WINDOW" ? "ENTRY WINDOW" : "POSITIVE EDGE";
       return `<div class="best-bet" role="button" tabindex="0" data-goto-event="${esc(event.id)}" title="${esc(event.name)}">
         <div class="bb-main">
           <div class="bb-outcome">${lineBadge(m.market, m.outcome)}${esc(m.outcome)}</div>
@@ -532,7 +534,7 @@
           <div class="bb-fig"><div class="value ${edgeCls}">${signedCents(m.edge)}</div><div class="hint">${basis}</div></div>
           <div class="bb-fig"><div class="value">${m.confidence == null ? "â€”" : Math.round(m.confidence)}</div><div class="hint">signal quality</div></div>
           <div class="bb-fig"><div class="value">${cents(m.buy_price)}</div><div class="hint">buy now</div></div>
-          <span class="tag ${tagClass(m.entry_action)}">${esc(m.entry_action)}</span>
+          <span class="tag ${tagClass(m.entry_action)}">${esc(bestBetLabel)}</span>
         </div>
       </div>`;
     }).join("");

@@ -122,8 +122,9 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "data-jump-event" in javascript
         assert 'activeLine="all"' in javascript
         assert "scrollIntoView" in javascript
-        assert "recommendation_eligible" in javascript
-        assert "recommendation_score" in javascript
+        assert "best_bet_candidate" in javascript
+        assert "best_bet_score" in javascript
+        assert "POSITIVE EDGE" in javascript
         assert "at or below 5c or at or above 95c" in html
         assert 'id="odds-api-toggle"' in html
         assert "odds_api_enabled" in javascript

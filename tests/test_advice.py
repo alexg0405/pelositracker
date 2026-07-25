@@ -60,7 +60,47 @@ def test_gross_edge_shown_when_calibrated_net_edge_is_unavailable():
     assert view["edge"] == pytest.approx(.06)
     assert view["entry_action"] == "WAIT"                # engine verdict unchanged
     assert view["recommendation_eligible"] is False
+    assert view["best_bet_candidate"] is True
+    assert view["best_bet_eligible"] is True
+    assert view["best_bet_score"] == pytest.approx(.06 * .80)
     assert "calibration" in view["why_no_entry"].lower()
+
+
+def test_positive_edge_is_a_best_bet_fallback_below_quality_preference():
+    value = uncalibrated_signal(consensus=.60)
+    value.confidence = 25
+
+    view = market_views([poly_quote()], [value], edge_threshold=.035)[0]
+
+    assert view["best_bet_candidate"] is True
+    assert view["best_bet_eligible"] is False
+    assert view["best_bet_score"] == pytest.approx(.04 * .25)
+
+
+def test_one_reference_can_reach_best_bets_without_changing_engine_verdict():
+    value = uncalibrated_signal(consensus=.58)
+    value.n_reference_sources = 1
+    value.confidence = 43
+
+    view = market_views([poly_quote()], [value], edge_threshold=.035)[0]
+
+    assert view["entry_action"] == "WAIT"
+    assert view["recommendation_eligible"] is False
+    assert view["best_bet_candidate"] is True
+    assert view["best_bet_eligible"] is True
+
+
+def test_negative_edge_is_not_a_best_bet_candidate():
+    view = market_views(
+        [poly_quote()],
+        [uncalibrated_signal(consensus=.54)],
+        edge_threshold=0.0,
+    )[0]
+
+    assert view["edge"] == pytest.approx(-.02)
+    assert view["best_bet_candidate"] is False
+    assert view["best_bet_eligible"] is False
+    assert view["best_bet_score"] is None
 
 
 def test_why_no_entry_flags_edge_below_the_required_floor():
@@ -131,6 +171,9 @@ def test_extreme_price_is_never_a_new_entry_or_recommendation(price):
     assert view["new_entry_eligible"] is False
     assert view["recommendation_eligible"] is False
     assert view["recommendation_score"] is None
+    assert view["best_bet_candidate"] is False
+    assert view["best_bet_eligible"] is False
+    assert view["best_bet_score"] is None
     assert "above 5c and below 95c" in view["why_no_entry"]
 
 
@@ -146,6 +189,9 @@ def test_final_game_is_never_a_new_entry_or_recommendation():
     assert view["entry_action"] == "WAIT"
     assert view["new_entry_eligible"] is False
     assert view["recommendation_eligible"] is False
+    assert view["best_bet_candidate"] is False
+    assert view["best_bet_eligible"] is False
+    assert view["best_bet_score"] is None
     assert view["why_no_entry"] == "New entry blocked: this game is final."
 
 
