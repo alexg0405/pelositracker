@@ -125,6 +125,7 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "if(button)gotoEvent(button.dataset.jumpEvent)" in javascript
         assert 'activeLine="all"' in javascript
         assert "scrollIntoView" in javascript
+        assert "if (!m.token_id || !m.market_slug) continue;" in javascript
         assert 'if (m.edge == null) continue;' in javascript
         assert 'if (m.edge <= 0 && m.entry_action !== "ENTRY WINDOW") continue;' in javascript
         assert "return rows.slice(0, BEST_BETS_LIMIT)" in javascript
@@ -135,6 +136,17 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "odds_api_enabled" in javascript
         assert 'fetch("/api/config", {' in javascript
         assert "backend pollers are paused" in javascript
+
+
+def test_best_current_bets_displays_existing_signal_quality():
+    with TestClient(app) as client:
+        javascript = client.get("/static/index.js").text
+
+    start = javascript.index("function renderBestBets")
+    end = javascript.index("function renderEvents", start)
+    renderer = javascript[start:end]
+    assert 'm.confidence == null ? "—" : Math.round(m.confidence)' in renderer
+    assert '<div class="hint">signal quality</div>' in renderer
 
 
 def test_odds_api_master_switch_updates_without_changing_auto_monitor(monkeypatch):

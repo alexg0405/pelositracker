@@ -472,6 +472,9 @@
     const rows = [];
     for (const v of events || []) {
       for (const m of (v.actionable_markets || [])) {
+        // A Best Bet must map back to a concrete, currently listed Polymarket
+        // contract—not a sportsbook-only or synthetic selection.
+        if (!m.token_id || !m.market_slug) continue;
         // Show positive-edge selections plus anything the engine flags as a live
         // entry window (which should already be positive, but never hide one).
         if (m.edge == null) continue;
@@ -529,6 +532,7 @@
         </div>
         <div class="bb-figs">
           <div class="bb-fig"><div class="value ${edgeCls}">${signedCents(m.edge)}</div><div class="hint">${basis}</div></div>
+          <div class="bb-fig"><div class="value">${m.confidence == null ? "—" : Math.round(m.confidence)}</div><div class="hint">signal quality</div></div>
           <div class="bb-fig"><div class="value">${cents(m.buy_price)}</div><div class="hint">buy now</div></div>
           <span class="tag ${tagClass(m.entry_action)}">${esc(m.entry_action)}</span>
         </div>

@@ -622,6 +622,7 @@ def _polymarket_token_meta(data: dict) -> dict[str, dict]:
     token_meta = {}
     for market in data.get("markets", []):
         if (not market.get("active", True) or market.get("closed", False) or
+                market.get("archived", False) or
                 not market.get("enableOrderBook", True) or
                 not market.get("acceptingOrders", False)):
             continue
@@ -796,7 +797,11 @@ async def _initial_polymarket_quotes(event: Event, token_meta: dict[str, dict]) 
     return quotes
 
 
-async def polymarket_market_stream(event: Event, emit: Callable[[list[Quote]], Awaitable[None]]):
+async def polymarket_market_stream(
+    event: Event,
+    emit: Callable[[list[Quote]], Awaitable[None]],
+    snapshot_emit: Callable[[Event, list[Quote]], Awaitable[None]] | None = None,
+):
     if not event.polymarket_slug:
         return
     backoff = RetryBackoff(base_seconds=1, cap_seconds=60)
@@ -805,6 +810,8 @@ async def polymarket_market_stream(event: Event, emit: Callable[[list[Quote]], A
             data = await polymarket_event(event.polymarket_slug)
             token_meta = _polymarket_token_meta(data)
             if not token_meta:
+                if snapshot_emit is not None:
+                    await snapshot_emit(event, [])
                 await asyncio.sleep(30)
                 continue
             initial = await _initial_polymarket_quotes(event, token_meta)
@@ -821,8 +828,11 @@ async def polymarket_market_stream(event: Event, emit: Callable[[list[Quote]], A
                                       if quote.provider_timestamp else None)
                 state.synchronized = bool(state.book_hash and state.timestamp_ms)
                 book_states[quote.token_id] = state
-            if initial:
+            if snapshot_emit is not None:
+                await snapshot_emit(event, initial)
+            elif initial:
                 await emit(initial)
+            if initial:
                 runtime_telemetry.increment("polymarket_quotes", len(initial))
             async with websockets.connect("wss://ws-subscriptions-clob.polymarket.com/ws/market",
                                           **_WS_CONNECT_KW) as ws:
@@ -841,12 +851,7 @@ async def polymarket_market_stream(event: Event, emit: Callable[[list[Quote]], A
                         if event_type == "new_market":
                             raise BookGapError("market universe changed; resnapshot required")
                         if event_type == "market_resolved":
-                            token = str(message.get("asset_id", ""))
-                            if token in token_meta:
-                                token_meta[token]["accepting_orders"] = False
-                                token_meta[token]["active"] = False
-                                token_meta[token]["resolved"] = True
-                            continue
+                            raise BookGapError("market resolved; resnapshot required")
                         if event_type == "tick_size_change":
                             token = str(message.get("asset_id", ""))
                             tick = _to_float(message.get("new_tick_size") or message.get("tick_size"))

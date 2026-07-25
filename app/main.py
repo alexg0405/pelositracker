@@ -359,6 +359,17 @@ async def on_quotes(quotes: list[Quote]):
         await record(quotes[0].event_id, as_of=max(quote.processed_at for quote in quotes))
 
 
+async def on_polymarket_snapshot(event: Event, quotes: list[Quote]) -> None:
+    """Replace the live Polymarket universe so removed/archived lines disappear."""
+    if event.id not in store.events or event.id in _terminal_events:
+        return
+    removed = store.remove_source_quotes(event.id, "Polymarket")
+    if quotes:
+        await on_quotes(quotes)
+    elif removed:
+        await record(event.id)
+
+
 def _is_tennis(event: Event) -> bool:
     return (event.sport or "").strip().casefold() == "tennis"
 
@@ -910,7 +921,9 @@ async def auto_monitor_loop():
 def _start_event_feeds(event: Event) -> None:
     group = []
     if event.polymarket_slug:
-        group.append(asyncio.create_task(polymarket_market_stream(event, on_quotes)))
+        group.append(asyncio.create_task(
+            polymarket_market_stream(event, on_quotes, on_polymarket_snapshot)
+        ))
     if event.odds_api_sport:
         group.append(asyncio.create_task(odds_api_poll(
             event,

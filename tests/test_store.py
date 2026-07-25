@@ -97,6 +97,24 @@ def test_live_store_keeps_new_receipt_when_unchanged_provider_time_ties():
     assert store.quote_values(event.id) == [confirmed]
 
 
+def test_live_store_can_replace_only_the_polymarket_universe():
+    store = Store()
+    event = Event("Away at Home", "basketball", "Home", "Away", id="event")
+    store.add_event(event)
+    polymarket = Quote(
+        event.id, "spread", "Home -1.5", .50, "Polymarket",
+        bid=.49, ask=.50, token_id="archived-token",
+    )
+    sportsbook = Quote(
+        event.id, "spread", "Home -1.5", .52, "Book A",
+        decimal_odds=1 / .52,
+    )
+    store.add_quotes([polymarket, sportsbook])
+
+    assert store.remove_source_quotes(event.id, "Polymarket") == 1
+    assert store.quote_values(event.id) == [sportsbook]
+
+
 def test_live_state_history_is_bounded_but_update_count_is_preserved():
     store = Store()
     event = Event("Away at Home", "basketball", "Home", "Away", id="event")

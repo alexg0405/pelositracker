@@ -78,6 +78,18 @@ class Store:
         with self.lock:
             return list(self.quotes.get(event_id, {}).values())
 
+    def remove_source_quotes(self, event_id: str, source: str) -> int:
+        """Remove one provider's current quote universe without touching others."""
+        source_key = canonical_source(source)
+        with self.lock:
+            bucket = self.quotes.get(event_id)
+            if not bucket:
+                return 0
+            stale = [key for key in bucket if key[2] == source_key]
+            for key in stale:
+                bucket.pop(key, None)
+            return len(stale)
+
     def remove_event(self, event_id: str) -> None:
         """Atomically release every live reference owned by an event."""
         with self.lock:

@@ -110,6 +110,23 @@ def test_polymarket_line_metadata_matches_sportsbook_selection_labels():
     assert meta["total-under"]["outcome"] == "Under 221.5"
 
 
+def test_archived_polymarket_lines_are_not_part_of_the_live_universe():
+    payload = {"markets": [{
+        "active": True,
+        "closed": False,
+        "archived": True,
+        "enableOrderBook": True,
+        "acceptingOrders": True,
+        "sportsMarketType": "totals",
+        "line": 221.5,
+        "question": "Archived O/U 221.5",
+        "outcomes": '["Over", "Under"]',
+        "clobTokenIds": '["archived-over", "archived-under"]',
+    }]}
+
+    assert _polymarket_token_meta(payload) == {}
+
+
 def test_polymarket_metadata_keeps_provider_game_start():
     inferred = infer_polymarket_event({
         "title": "Boston Celtics vs. New York Knicks", "seriesSlug": "nba",
