@@ -125,17 +125,12 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "if(button)gotoEvent(button.dataset.jumpEvent)" in javascript
         assert 'activeLine="all"' in javascript
         assert "scrollIntoView" in javascript
-        assert "bestBetExclusionReason" in javascript
-        assert "No Best Current Bets lines can be displayed yet." in javascript
-        assert "Best Current Bets exclusions" in javascript
-        assert "if (!m.best_bet_candidate)" not in javascript
-        assert "Number(b.m.edge) - Number(a.m.edge)" in javascript
-        assert "Number(b.m.confidence) - Number(a.m.confidence)" in javascript
-        assert "market.new_entry_eligible" not in javascript
-        assert "selectBestBetRows" in javascript
-        assert "representedEvents" in javascript
-        assert "POSITIVE EDGE" in javascript
-        assert "at or below 5c or at or above 95c" in html
+        assert 'if (m.edge == null) continue;' in javascript
+        assert 'if (m.edge <= 0 && m.entry_action !== "ENTRY WINDOW") continue;' in javascript
+        assert "return rows.slice(0, BEST_BETS_LIMIT)" in javascript
+        assert "No positive-edge selections right now." in javascript
+        assert "bestBetExclusionReason" not in javascript
+        assert "best_bet_candidate" not in javascript
         assert 'id="odds-api-toggle"' in html
         assert "odds_api_enabled" in javascript
         assert 'fetch("/api/config", {' in javascript

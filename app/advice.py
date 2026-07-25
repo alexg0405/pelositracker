@@ -8,9 +8,6 @@ from .entry_policy import entry_price_allowed, entry_price_blocker
 from .models import Quote, Signal
 
 
-BEST_BET_MIN_QUALITY = 40.0
-
-
 def _latest_polymarket_quotes(quotes: list[Quote]) -> dict[str, Quote]:
     latest: dict[str, Quote] = {}
     for quote in quotes:
@@ -166,30 +163,6 @@ def market_views(
             if recommendation_eligible and signal is not None and edge_buffer is not None
             else None
         )
-        # Best Current Bets is a discovery ranking, not a paper-trade verdict.
-        # Keep the strict engine recommendation above intact, but allow a live,
-        # order-taking Polymarket line with a positive displayed edge and at least
-        # one matched reference to appear even when calibration-only gates leave
-        # the engine action at WATCH.
-        best_bet_candidate = (
-            new_entries_allowed
-            and price_allowed
-            and signal is not None
-            and signal.n_reference_sources >= 1
-            and signal.confidence > 0
-            and edge is not None
-            and edge > 0
-        )
-        best_bet_eligible = (
-            best_bet_candidate
-            and signal is not None
-            and signal.confidence >= BEST_BET_MIN_QUALITY
-        )
-        best_bet_score = (
-            edge * min(100.0, max(0.0, signal.confidence)) / 100.0
-            if best_bet_candidate and signal is not None and edge is not None
-            else None
-        )
         why_no_entry = _entry_blocker(signal, entry_action, edge, required_edge,
                                       calibrated_probability,
                                       new_entries_allowed=new_entries_allowed,
@@ -219,9 +192,6 @@ def market_views(
             "new_entry_eligible": new_entries_allowed and price_allowed,
             "recommendation_eligible": recommendation_eligible,
             "recommendation_score": recommendation_score,
-            "best_bet_candidate": best_bet_candidate,
-            "best_bet_eligible": best_bet_eligible,
-            "best_bet_score": best_bet_score,
             "model_probability": consensus_probability,
             "consensus_probability": consensus_probability,
             "calibrated_consensus_probability": calibrated_probability,
