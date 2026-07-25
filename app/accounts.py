@@ -799,11 +799,63 @@ class AccountBook:
             )
         self._last_activity_prune = now
 
-    def activity(self, account: str | None = None, limit: int = 100) -> list[dict]:
+    def activity(
+        self,
+        account: str | None = None,
+        limit: int = 100,
+        per_event_limit: int | None = None,
+    ) -> list[dict]:
+        """Return recent bot decisions, optionally balanced across games.
+
+        Live games do not update at the same cadence. Without a per-event cap,
+        one high-frequency market can occupy the entire report window and make
+        it look as though bots ignored every other monitored event. The ranked
+        query keeps each game's freshest decisions while preserving the final
+        feed's chronological order.
+        """
         limit = max(1, min(int(limit), 200))
+        event_cap = (
+            max(1, min(int(per_event_limit), 50))
+            if per_event_limit is not None
+            else None
+        )
         with self._lock:
             with self._db.cursor(dict_rows=True) as cur:
-                if account:
+                if event_cap is not None:
+                    if account:
+                        self._db.execute(
+                            cur,
+                            """SELECT * FROM (
+                                   SELECT account_activity.*,
+                                          ROW_NUMBER() OVER (
+                                              PARTITION BY account, event_id
+                                              ORDER BY observed_ts DESC, id DESC
+                                          ) AS event_rank
+                                   FROM account_activity
+                                   WHERE account=%s
+                               ) AS ranked_activity
+                               WHERE event_rank<=%s
+                               ORDER BY observed_ts DESC, id DESC
+                               LIMIT %s""",
+                            (account, event_cap, limit),
+                        )
+                    else:
+                        self._db.execute(
+                            cur,
+                            """SELECT * FROM (
+                               SELECT account_activity.*,
+                                      ROW_NUMBER() OVER (
+                                          PARTITION BY account, event_id
+                                          ORDER BY observed_ts DESC, id DESC
+                                      ) AS event_rank
+                               FROM account_activity
+                           ) AS ranked_activity
+                           WHERE event_rank<=%s
+                           ORDER BY observed_ts DESC, id DESC
+                           LIMIT %s""",
+                            (event_cap, limit),
+                        )
+                elif account:
                     self._db.execute(
                         cur,
                         """SELECT * FROM account_activity WHERE account=%s
@@ -826,6 +878,7 @@ class AccountBook:
                         row["details"] = {}
                         row.pop("details_json", None)
                     row.pop("activity_key", None)
+                    row.pop("event_rank", None)
                     rows.append(row)
                 return rows
 
@@ -1414,9 +1467,11 @@ class AccountBook:
                         agg["marked_open_value"] or 0)
                     equity = known_equity if not unpriced else None
                     decided = int(agg["wins"] or 0) + int(agg["losses"] or 0)
+                    strategy = Strategy.from_json(account["strategy"])
                     board.append({
                         "name": account["name"],
-                        "strategy": Strategy.from_json(account["strategy"]).blurb,
+                        "strategy": strategy.blurb,
+                        "event_scope": list(strategy.events),
                         "is_custom": bool(account["is_custom"]),
                         "cash_out_enabled": bool(account["cash_out_enabled"]),
                         "bankroll": float(account["bankroll"]),

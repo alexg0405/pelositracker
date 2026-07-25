@@ -276,6 +276,9 @@ dialog::backdrop { background: rgba(0,0,0,0.7); }
 .activity-reason { color:var(--muted); font:11px/1.45 var(--mono); }
 .activity-section-title { margin:12px 0 2px; color:var(--muted); font:700 10px var(--mono); letter-spacing:.1em; text-transform:uppercase; }
 .activity-section-title:first-child { margin-top:0; }
+.activity-coverage { display:flex; gap:5px; overflow-x:auto; margin:7px 0 10px; padding-bottom:3px; }
+.activity-coverage span { flex:0 0 auto; max-width:230px; overflow:hidden; padding:3px 7px; color:var(--cyan); background:rgba(41,231,214,.06); border:1px solid rgba(41,231,214,.28); font:9px var(--mono); text-overflow:ellipsis; white-space:nowrap; }
+.bot-scope { color:var(--cyan); }
 @media(max-width:720px){.activity-row{grid-template-columns:1fr;gap:7px}.refresh-status{text-align:left}}
 @media(prefers-reduced-motion:reduce){#discover-refresh.is-refreshing::before,.bot-remove.is-removing::before{animation:none}}
 .bot-games { max-height:150px; overflow-y:auto; border:1px solid var(--line); background:rgba(0,0,0,.25); padding:6px 8px; display:flex; flex-direction:column; gap:4px; }

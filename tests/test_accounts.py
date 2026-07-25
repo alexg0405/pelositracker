@@ -94,6 +94,49 @@ def test_bot_activity_explains_rejection_then_preserves_placed_decision(tmp_path
     assert activity[0]["details"]["actual_edge"] == pytest.approx(.10)
 
 
+def test_bot_activity_report_balances_fast_and_slow_events(tmp_path):
+    book = AccountBook(str(tmp_path / "accounts.db"))
+    strategy = Strategy("multi-event bot")
+    noisy = Event("Fast game", "basketball", "A", "B", id="fast")
+    quiet = [
+        Event("Quiet game one", "basketball", "C", "D", id="quiet-1"),
+        Event("Quiet game two", "basketball", "E", "F", id="quiet-2"),
+    ]
+    try:
+        book.seed([strategy])
+        for index in range(8):
+            signal = valid_signal(
+                event_id=noisy.id,
+                decision_id=f"fast-{index}",
+                action="WATCH",
+            )
+            book.place(noisy, [signal], as_of=1_000 + index)
+        for index, event in enumerate(quiet):
+            signal = valid_signal(
+                event_id=event.id,
+                decision_id=f"quiet-{index}",
+                action="WATCH",
+            )
+            book.place(event, [signal], as_of=900 + index)
+
+        newest_only = book.activity("multi-event bot", limit=3)
+        assert {row["event_id"] for row in newest_only} == {"fast"}
+
+        balanced = book.activity(
+            "multi-event bot", limit=6, per_event_limit=2
+        )
+        assert {row["event_id"] for row in balanced} == {
+            "fast", "quiet-1", "quiet-2"
+        }
+        assert sum(row["event_id"] == "fast" for row in balanced) == 2
+        global_balanced = book.activity(limit=6, per_event_limit=2)
+        assert {row["event_id"] for row in global_balanced} == {
+            "fast", "quiet-1", "quiet-2"
+        }
+    finally:
+        book.close()
+
+
 @pytest.mark.parametrize("changes, expected", [
     ({"action": "WATCH"}, "engine gates"),
     ({"quote_source": "Pinnacle"}, "Polymarket"),

@@ -73,6 +73,9 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "pendingBotRemovals" in javascript
         assert "Removing…" in javascript
         assert "It can no longer trade" in javascript
+        assert "per_event_limit=4" in javascript
+        assert "activityCoverage" in javascript
+        assert "All monitored events" in javascript
         assert 'id="event-navigator"' in html
         assert "data-jump-event" in javascript
         assert 'activeLine="all"' in javascript
@@ -91,7 +94,14 @@ def test_bot_cashout_toggle_and_mark_feed_are_authenticated_api_contracts():
         board = client.get("/api/leaderboard").json()
         account = next(item for item in board if item["name"] == "Engine Kelly")
         assert account["cash_out_enabled"] is True
+        assert account["event_scope"] == []
         assert client.get("/api/accounts/Engine%20Kelly/marks").json() == []
+        assert client.get(
+            "/api/accounts/Engine%20Kelly/activity?limit=80&per_event_limit=8"
+        ).status_code == 200
+        assert client.get(
+            "/api/bot-activity?limit=80&per_event_limit=4"
+        ).status_code == 200
 
         restored = client.patch(
             "/api/accounts/Engine%20Kelly", json={"cash_out_enabled": False}

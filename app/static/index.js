@@ -290,22 +290,37 @@
     }).join("");
   }
 
+  function activityCoverage(items) {
+    const events = new Map();
+    for (const item of items || []) {
+      events.set(item.event_id, item.event_name);
+    }
+    return {
+      count: events.size,
+      names: [...events.values()],
+    };
+  }
+
   let lastActivitySignature = "";
   async function refreshBotActivity() {
     const body = document.querySelector("#bot-activity");
     const status = document.querySelector("#bot-activity-status");
     if (!body || !status) return;
     try {
-      const response = await fetch("/api/bot-activity?limit=80");
+      const response = await fetch(
+        "/api/bot-activity?limit=80&per_event_limit=4",
+        {cache: "no-store"}
+      );
       if (!response.ok) throw new Error();
       const items = await response.json();
+      const coverage = activityCoverage(items);
       const signature = items.map(item => `${item.id}:${item.observed_ts}:${item.status}`).join("|");
       if (signature !== lastActivitySignature) {
         body.innerHTML = renderActivityRows(items);
         lastActivitySignature = signature;
       }
       status.textContent = items.length
-        ? `${items.length} latest decision${items.length === 1 ? "" : "s"} · updates every 5s`
+        ? `${items.length} recent decision${items.length === 1 ? "" : "s"} across ${coverage.count} event${coverage.count === 1 ? "" : "s"} · balanced feed · updates every 5s`
         : "Waiting for the next monitored-game evaluation...";
     } catch {
       status.textContent = "Decision feed temporarily unavailable";
@@ -322,14 +337,22 @@
     dialog.showModal();
     try {
       const [betsResponse, activityResponse] = await Promise.all([
-        fetch(`/api/accounts/${encodeURIComponent(name)}/bets`),
-        fetch(`/api/accounts/${encodeURIComponent(name)}/activity?limit=50`)
+        fetch(`/api/accounts/${encodeURIComponent(name)}/bets`, {cache: "no-store"}),
+        fetch(
+          `/api/accounts/${encodeURIComponent(name)}/activity?limit=80&per_event_limit=8`,
+          {cache: "no-store"}
+        )
       ]);
       if (!betsResponse.ok || !activityResponse.ok) throw new Error();
       const [bets, activity] = await Promise.all([
         betsResponse.json(), activityResponse.json()
       ]);
-      const activitySection = `<h3 class="activity-section-title">Latest decisions</h3>${renderActivityRows(
+      const coverage = activityCoverage(activity);
+      const coverageNames = coverage.names.length
+        ? coverage.names.map(eventName => `<span>${esc(eventName)}</span>`).join("")
+        : "<span>Waiting for evaluated games</span>";
+      const activitySection = `<h3 class="activity-section-title">Latest decisions across ${coverage.count} event${coverage.count === 1 ? "" : "s"}</h3>
+        <div class="activity-coverage" aria-label="Events represented in this report">${coverageNames}</div>${renderActivityRows(
         activity, "No evaluated trade candidates yet."
       )}`;
       const rows = bets.map(b => {
@@ -376,6 +399,10 @@
         const roi = account.roi == null ? "UNPRICED" : pct(account.roi);
         const roiClass = account.roi == null ? "" : account.roi >= 0 ? "good" : "bad";
         const removing = pendingBotRemovals.has(account.name);
+        const scopeCount = (account.event_scope || []).length;
+        const scope = scopeCount
+          ? `${scopeCount} selected event${scopeCount === 1 ? "" : "s"} only`
+          : "All monitored events";
         const removeButton = account.is_custom
           ? `<button class="bot-remove${removing ? " is-removing" : ""}" type="button" data-remove-bot data-account="${esc(account.name)}"${removing ? ' disabled aria-busy="true"' : ""}>${removing ? "Removing…" : "Remove bot"}</button>`
           : "";
@@ -385,6 +412,7 @@
           <div class="v ${roiClass}">${roi}</div>
           <div class="sub2">${equity}${unpriced} · ${account.win_rate == null ? "—" : pct(account.win_rate)} WR</div>
           <div class="sub2 bot-count">${account.n_bets} positions · ${account.n_cashouts} cash-outs · fees $${account.execution_fees.toFixed(2)}</div>
+          <div class="sub2 bot-scope">Scope: ${scope}</div>
           <div class="bot-card-actions">
             <label class="cashout-label bot-cashout-label"><input type="checkbox" data-cashout-toggle data-account="${esc(account.name)}" ${account.cash_out_enabled ? "checked" : ""}> Auto cash-out</label>
             ${removeButton}

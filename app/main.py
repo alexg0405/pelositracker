@@ -1533,17 +1533,29 @@ async def get_account_bets(name: str):
 
 
 @app.get("/api/bot-activity", dependencies=[Depends(verify_auth)])
-async def get_bot_activity(account: str | None = None, limit: int = 100):
+async def get_bot_activity(
+    account: str | None = None,
+    limit: int = 100,
+    per_event_limit: int | None = None,
+):
     if account_book is None:
         return []
-    return await asyncio.to_thread(account_book.activity, account, limit)
+    return await asyncio.to_thread(
+        account_book.activity, account, limit, per_event_limit
+    )
 
 
 @app.get("/api/accounts/{name}/activity", dependencies=[Depends(verify_auth)])
-async def get_account_activity(name: str, limit: int = 100):
+async def get_account_activity(
+    name: str,
+    limit: int = 100,
+    per_event_limit: int | None = None,
+):
     if account_book is None:
         return []
-    return await asyncio.to_thread(account_book.activity, name, limit)
+    return await asyncio.to_thread(
+        account_book.activity, name, limit, per_event_limit
+    )
 
 
 @app.get("/api/accounts/{name}/marks", dependencies=[Depends(verify_auth)])
