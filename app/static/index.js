@@ -473,12 +473,18 @@
       && Number.isFinite(Number(value));
   }
   function bestBetExclusionReason(market) {
-    if (!market?.token_id || !hasFiniteBestBetMetric(market.buy_price)) {
+    // actionable_markets is already built exclusively from order-taking
+    // Polymarket token quotes. Do not add engine/recommendation gates here.
+    if (!hasFiniteBestBetMetric(market?.buy_price)) {
       return "No order-taking Polymarket ask is available.";
     }
-    if (market.new_entry_eligible === false) {
-      return market.why_no_entry
-        || "The event is final or inactive, or its price is outside 5–95¢.";
+    const buyPrice = Number(market.buy_price);
+    if (buyPrice <= 0.05 || buyPrice >= 0.95) {
+      return "The Polymarket ask is at or below 5¢ or at or above 95¢.";
+    }
+    if (String(market.why_no_entry || "").toLowerCase()
+      .includes("final or no longer active")) {
+      return "The event is final or no longer active.";
     }
     if (!hasFiniteBestBetMetric(market.edge)) {
       return market.why_no_entry || "No calculated edge is available.";
@@ -490,6 +496,29 @@
       return "Signal quality is unavailable or zero.";
     }
     return null;
+  }
+  function compareBestBetRows(a, b) {
+    const edgeDifference = Number(b.m.edge) - Number(a.m.edge);
+    if (edgeDifference !== 0) return edgeDifference;
+    return Number(b.m.confidence) - Number(a.m.confidence);
+  }
+  function selectBestBetRows(rankedRows) {
+    // Guarantee that every monitored event with a positive-edge Polymarket
+    // line contributes its best line. Then fill the normal top-12 panel with
+    // the strongest remaining selections.
+    const selected = [], representedEvents = new Set();
+    for (const row of rankedRows) {
+      const eventKey = row.event?.id || row.event?.name || "";
+      if (representedEvents.has(eventKey)) continue;
+      representedEvents.add(eventKey);
+      selected.push(row);
+    }
+    const targetCount = Math.max(BEST_BETS_LIMIT, selected.length);
+    for (const row of rankedRows) {
+      if (selected.length >= targetCount) break;
+      if (!selected.includes(row)) selected.push(row);
+    }
+    return selected.sort(compareBestBetRows);
   }
   function collectBestBets(events) {
     const rows = [], excluded = [];
@@ -510,13 +539,10 @@
         rows.push({ event: v.event, m });
       }
     }
-    rows.sort((a, b) => {
-      const edgeDifference = Number(b.m.edge) - Number(a.m.edge);
-      if (edgeDifference !== 0) return edgeDifference;
-      return Number(b.m.confidence) - Number(a.m.confidence);
-    });
+    rows.sort(compareBestBetRows);
     return {
-      rows: rows.slice(0, BEST_BETS_LIMIT),
+      rows: selectBestBetRows(rows),
+      qualifyingLines: rows.length,
       excluded,
       monitoredEvents: (events || []).length,
       polymarketLines: (events || []).reduce(
@@ -581,7 +607,7 @@
       return;
     }
     const entries = rows.filter(r => r.m.entry_action === "ENTRY WINDOW").length;
-    if (sub) sub.textContent = `${rows.length} positive-edge line${rows.length === 1 ? "" : "s"} shown · ${result.polymarketLines} Polymarket line${result.polymarketLines === 1 ? "" : "s"} scanned · ${entries} full entry window${entries === 1 ? "" : "s"}`;
+    if (sub) sub.textContent = `${rows.length} shown of ${result.qualifyingLines} positive-edge line${result.qualifyingLines === 1 ? "" : "s"} · ${result.polymarketLines} Polymarket line${result.polymarketLines === 1 ? "" : "s"} scanned · ${entries} full entry window${entries === 1 ? "" : "s"}`;
     box.innerHTML = rows.map(({ event, m }) => {
       const basis = m.edge_basis === "gross" ? "gross edge" : "net edge";
       const edgeCls = m.edge >= 0 ? "positive" : "negative";

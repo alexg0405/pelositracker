@@ -95,6 +95,7 @@ def test_dashboard_contains_merged_ui_behaviors():
         javascript = client.get("/static/index.js").text
         assert "data-remove-event" in javascript
         assert "lastEvents=lastEvents.filter" in javascript
+        assert 'fetch(`/api/events/${encodeURIComponent(eventId)}`,{method:"DELETE"})' in javascript
         assert "details[open][data-detail-key]" in javascript
         assert "Paste Polymarket link" in html
         assert "data-save-position" in javascript
@@ -106,6 +107,7 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "/api/discover?refresh=true" in javascript
         assert 'id="bot-activity"' in html
         assert "data-remove-bot" in javascript
+        assert 'fetch(`/api/accounts/${encodeURIComponent(name)}`' in javascript
         assert 'id="bot-action-status"' in html
         assert "pendingBotRemovals" in javascript
         assert "pendingEventRemovals" in javascript
@@ -120,6 +122,7 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "All monitored events" in javascript
         assert 'id="event-navigator"' in html
         assert "data-jump-event" in javascript
+        assert "if(button)gotoEvent(button.dataset.jumpEvent)" in javascript
         assert 'activeLine="all"' in javascript
         assert "scrollIntoView" in javascript
         assert "bestBetExclusionReason" in javascript
@@ -128,11 +131,14 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "if (!m.best_bet_candidate)" not in javascript
         assert "Number(b.m.edge) - Number(a.m.edge)" in javascript
         assert "Number(b.m.confidence) - Number(a.m.confidence)" in javascript
-        assert "market?.token_id" in javascript
+        assert "market.new_entry_eligible" not in javascript
+        assert "selectBestBetRows" in javascript
+        assert "representedEvents" in javascript
         assert "POSITIVE EDGE" in javascript
         assert "at or below 5c or at or above 95c" in html
         assert 'id="odds-api-toggle"' in html
         assert "odds_api_enabled" in javascript
+        assert 'fetch("/api/config", {' in javascript
         assert "backend pollers are paused" in javascript
 
 
