@@ -468,26 +468,81 @@
     }
   }
   const BEST_BETS_LIMIT = 12;
+  function hasFiniteBestBetMetric(value) {
+    return value !== null && value !== undefined && value !== ""
+      && Number.isFinite(Number(value));
+  }
+  function bestBetExclusionReason(market) {
+    if (!market?.token_id || !hasFiniteBestBetMetric(market.buy_price)) {
+      return "No order-taking Polymarket ask is available.";
+    }
+    if (market.new_entry_eligible === false) {
+      return market.why_no_entry
+        || "The event is final or inactive, or its price is outside 5–95¢.";
+    }
+    if (!hasFiniteBestBetMetric(market.edge)) {
+      return market.why_no_entry || "No calculated edge is available.";
+    }
+    if (Number(market.edge) <= 0) {
+      return "The calculated edge is not positive.";
+    }
+    if (!hasFiniteBestBetMetric(market.confidence) || Number(market.confidence) <= 0) {
+      return "Signal quality is unavailable or zero.";
+    }
+    return null;
+  }
   function collectBestBets(events) {
-    const rows = [];
+    const rows = [], excluded = [];
     for (const v of events || []) {
-      for (const m of (v.actionable_markets || [])) {
-        // The server limits this pool to active, order-taking 5c-95c Polymarket
-        // lines with a matched reference and positive displayed edge.
-        if (!m.best_bet_candidate) continue;
+      const markets = v.actionable_markets || [];
+      if (!markets.length) {
+        excluded.push({
+          event: v.event,
+          reason: "No order-taking Polymarket line was returned for this event."
+        });
+      }
+      for (const m of markets) {
+        const reason = bestBetExclusionReason(m);
+        if (reason) {
+          excluded.push({ event: v.event, m, reason });
+          continue;
+        }
         rows.push({ event: v.event, m });
       }
     }
-    // Prefer decent-quality signals. If none clear that modest bar, keep the
-    // best positive-edge choices visible instead of leaving the panel empty.
-    const preferred = rows.filter(row => row.m.best_bet_eligible);
-    const ranked = preferred.length ? preferred : rows;
-    ranked.sort((a, b) => {
-      const qualityEdge = (b.m.best_bet_score || 0) - (a.m.best_bet_score || 0);
-      if (qualityEdge !== 0) return qualityEdge;  // positive edge weighted by quality
-      return (b.m.edge || 0) - (a.m.edge || 0);
+    rows.sort((a, b) => {
+      const edgeDifference = Number(b.m.edge) - Number(a.m.edge);
+      if (edgeDifference !== 0) return edgeDifference;
+      return Number(b.m.confidence) - Number(a.m.confidence);
     });
-    return ranked.slice(0, BEST_BETS_LIMIT);
+    return {
+      rows: rows.slice(0, BEST_BETS_LIMIT),
+      excluded,
+      monitoredEvents: (events || []).length,
+      polymarketLines: (events || []).reduce(
+        (total, view) => total + (view.actionable_markets || []).length, 0
+      )
+    };
+  }
+  function summarizeBestBetExclusions(result) {
+    const reasonCounts = new Map();
+    for (const item of result.excluded) {
+      reasonCounts.set(item.reason, (reasonCounts.get(item.reason) || 0) + 1);
+    }
+    if (!result.monitoredEvents) {
+      reasonCounts.set("No monitored events are loaded.", 1);
+    }
+    return [...reasonCounts.entries()].sort((a, b) => b[1] - a[1]);
+  }
+  function renderBestBetDiagnostics(result) {
+    const reasons = summarizeBestBetExclusions(result)
+      .map(([reason, count]) => `<li>${count}× ${esc(reason)}</li>`)
+      .join("");
+    return `<div class="discover-empty">
+      <strong>No Best Current Bets lines can be displayed yet.</strong>
+      <div>Scanned ${result.monitoredEvents} monitored event${result.monitoredEvents === 1 ? "" : "s"} and ${result.polymarketLines} Polymarket line${result.polymarketLines === 1 ? "" : "s"}.</div>
+      <ul>${reasons}</ul>
+    </div>`;
   }
   function gotoEvent(id) {
     activeEventId=id;
@@ -513,14 +568,20 @@
     const box = document.querySelector("#best-bets");
     if (!box) return;
     const sub = document.querySelector("#best-bets-sub");
-    const rows = collectBestBets(lastEvents);
+    const result = collectBestBets(lastEvents);
+    const rows = result.rows;
     if (!rows.length) {
-      if (sub) sub.textContent = "";
-      box.innerHTML = '<div class="discover-empty">No monitored live Polymarket lines currently have a positive edge with a matched reference.</div>';
+      if (sub) sub.textContent = `${result.polymarketLines} Polymarket lines scanned`;
+      box.innerHTML = renderBestBetDiagnostics(result);
+      console.info("Best Current Bets exclusions", {
+        monitoredEvents: result.monitoredEvents,
+        polymarketLines: result.polymarketLines,
+        reasons: Object.fromEntries(summarizeBestBetExclusions(result))
+      });
       return;
     }
     const entries = rows.filter(r => r.m.entry_action === "ENTRY WINDOW").length;
-    if (sub) sub.textContent = `${rows.length} positive-edge line${rows.length === 1 ? "" : "s"} shown · ${entries} full entry window${entries === 1 ? "" : "s"}`;
+    if (sub) sub.textContent = `${rows.length} positive-edge line${rows.length === 1 ? "" : "s"} shown · ${result.polymarketLines} Polymarket line${result.polymarketLines === 1 ? "" : "s"} scanned · ${entries} full entry window${entries === 1 ? "" : "s"}`;
     box.innerHTML = rows.map(({ event, m }) => {
       const basis = m.edge_basis === "gross" ? "gross edge" : "net edge";
       const edgeCls = m.edge >= 0 ? "positive" : "negative";
