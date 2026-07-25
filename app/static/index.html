@@ -42,6 +42,13 @@
   <div id="tab-live" class="tab-content">
     <h2 class="title glitch" data-text="Monitored events">Monitored events</h2>
     <div class="error" id="action-error" role="alert" hidden></div>
+    <nav id="event-navigator" class="event-navigator" aria-label="Jump to a monitored event" hidden>
+      <div class="event-navigator-head">
+        <span>Jump to event</span>
+        <span id="event-navigator-count"></span>
+      </div>
+      <div id="event-jump-list" class="event-jump-list"></div>
+    </nav>
     <div id="line-filter" class="carousel" role="tablist" aria-label="Filter by line type"></div>
     <div id="events" aria-live="polite"></div>
   </div>

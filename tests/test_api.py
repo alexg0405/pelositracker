@@ -69,6 +69,10 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "/api/discover?refresh=true" in javascript
         assert 'id="bot-activity"' in html
         assert "data-remove-bot" in javascript
+        assert 'id="event-navigator"' in html
+        assert "data-jump-event" in javascript
+        assert 'activeLine="all"' in javascript
+        assert "scrollIntoView" in javascript
 
 
 def test_bot_cashout_toggle_and_mark_feed_are_authenticated_api_contracts():

@@ -54,7 +54,7 @@
     return "wait";
   }
 
-  let activeLine = "all", lastEvents = [];
+  let activeLine = "all", activeEventId = null, lastEvents = [];
   const LINE_META = { moneyline:{label:"Moneyline",cls:"lt-ml"}, spread:{label:"Spread",cls:"lt-sp"}, total:{label:"Over / Under",cls:"lt-ou"} };
   const LINE_ORDER = ["moneyline","spread","total"];
   function lineType(market, outcome){
@@ -70,6 +70,34 @@
     if(types.length<=1){ el.innerHTML=""; return; }
     const pill=(k,l)=>`<button class="pill${activeLine===k?" active":""}" data-line="${k}">${l}</button>`;
     el.innerHTML=pill("all","All")+types.map(t=>pill(t,LINE_META[t].label)).join("");
+  }
+  function renderEventNavigator(events) {
+    const nav=document.querySelector("#event-navigator");
+    const list=document.querySelector("#event-jump-list");
+    const count=document.querySelector("#event-navigator-count");
+    if(!events.length){
+      nav.hidden=true;
+      list.innerHTML="";
+      activeEventId=null;
+      return;
+    }
+    nav.hidden=false;
+    if(activeEventId&&!events.some(view=>view.event.id===activeEventId))activeEventId=null;
+    count.textContent=`${events.length} monitored`;
+    list.innerHTML=events.map(view=>{
+      const event=view.event,state=view.latest_state;
+      const live=!!state?.live&&!state?.ended;
+      const ended=!!state?.ended;
+      const score=state&&state.home_score!=null&&state.away_score!=null
+        ? `${state.home_score}-${state.away_score}`:"";
+      const stateLabel=ended?"FINAL":live?"LIVE":score?"UPDATED":"WATCHING";
+      const active=event.id===activeEventId;
+      return `<button class="event-jump${active?" active":""}" type="button" data-jump-event="${esc(event.id)}" title="Jump to ${esc(event.name)}"${active?' aria-current="true"':""}>
+        <span class="event-jump-state ${live?"is-live":ended?"is-final":""}">${stateLabel}</span>
+        <span class="event-jump-name">${esc(event.name)}</span>
+        <span class="event-jump-meta">${score?`${esc(score)} · `:""}${esc(event.league||event.sport||"sport")}</span>
+      </button>`;
+    }).join("");
   }
 
   function marketRow(eventId, market, openDetails) {
@@ -371,12 +399,20 @@
     return rows.slice(0, BEST_BETS_LIMIT);
   }
   function gotoEvent(id) {
+    activeEventId=id;
     document.querySelector('[data-tab="tab-live"]').click();
+    if(activeLine!=="all"){
+      activeLine="all";
+      renderEvents(lastEvents);
+    }else{
+      renderEventNavigator(lastEvents);
+    }
     requestAnimationFrame(() => {
       const safe = (window.CSS && CSS.escape) ? CSS.escape(id) : id;
       const card = document.querySelector(`.event[data-event-id="${safe}"]`);
       if (card) {
-        card.scrollIntoView({ behavior: "smooth", block: "start" });
+        const reduceMotion=window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+        card.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "start" });
         card.classList.add("flash");
         setTimeout(() => card.classList.remove("flash"), 1400);
       }
@@ -421,6 +457,7 @@
       else if (!v.event.polymarket_slug) (v.signals||[]).slice(0,3).forEach(s=>present.add(lineType(s.market,s.outcome)));
     }
     if (activeLine !== "all" && !present.has(activeLine)) activeLine = "all";
+    renderEventNavigator(events);
     renderCarousel(present);
     const cards = events.map(e=>eventCard(e,openDetails)).filter(Boolean).join("");
     root.innerHTML = cards ? `<div class="stack">${cards}</div>`
@@ -619,6 +656,7 @@
   document.querySelector("#best-bets").addEventListener("keydown",e=>{if(e.key!=="Enter"&&e.key!==" ")return;const row=e.target.closest("[data-goto-event]");if(row){e.preventDefault();gotoEvent(row.dataset.gotoEvent)}});
   document.querySelector("#discover-search").addEventListener("input",renderDiscover);
   document.querySelector("#discover-refresh").addEventListener("click",()=>loadDiscover(true));
+  document.querySelector("#event-jump-list").addEventListener("click",e=>{const button=e.target.closest("[data-jump-event]");if(button)gotoEvent(button.dataset.jumpEvent)});
   document.querySelector("#line-filter").addEventListener("click",e=>{const p=e.target.closest("[data-line]");if(!p)return;activeLine=p.dataset.line;renderEvents(lastEvents);});
 
   document.addEventListener("click", async event => {
