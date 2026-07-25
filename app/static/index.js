@@ -468,6 +468,14 @@
     }
   }
   const BEST_BETS_LIMIT = 12;
+  const BEST_BET_MIN_BUY_PRICE = 0.05;
+  const BEST_BET_MAX_BUY_PRICE = 0.95;
+  function bestBetBuyPriceAllowed(price) {
+    const value = Number(price);
+    return Number.isFinite(value)
+      && value > BEST_BET_MIN_BUY_PRICE
+      && value < BEST_BET_MAX_BUY_PRICE;
+  }
   function collectBestBets(events) {
     const rows = [];
     for (const v of events || []) {
@@ -475,6 +483,9 @@
         // A Best Bet must map back to a concrete, currently listed Polymarket
         // contract—not a sportsbook-only or synthetic selection.
         if (!m.token_id || !m.market_slug) continue;
+        // Display-only price bracket: terminal 1c/99c-style contracts can carry
+        // misleadingly large stale edges, but are not useful current entries.
+        if (!bestBetBuyPriceAllowed(m.buy_price)) continue;
         // Show positive-edge selections plus anything the engine flags as a live
         // entry window (which should already be positive, but never hide one).
         if (m.edge == null) continue;

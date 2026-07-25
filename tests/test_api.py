@@ -126,6 +126,9 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert 'activeLine="all"' in javascript
         assert "scrollIntoView" in javascript
         assert "if (!m.token_id || !m.market_slug) continue;" in javascript
+        assert "const BEST_BET_MIN_BUY_PRICE = 0.05;" in javascript
+        assert "const BEST_BET_MAX_BUY_PRICE = 0.95;" in javascript
+        assert "if (!bestBetBuyPriceAllowed(m.buy_price)) continue;" in javascript
         assert 'if (m.edge == null) continue;' in javascript
         assert 'if (m.edge <= 0 && m.entry_action !== "ENTRY WINDOW") continue;' in javascript
         assert "return rows.slice(0, BEST_BETS_LIMIT)" in javascript
