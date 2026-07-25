@@ -44,6 +44,21 @@
   const money = value => value == null ? "—" : `${value >= 0 ? "+" : "-"}$${Math.abs(value).toFixed(2)}`;
   const keyFor = (...parts) => encodeURIComponent(parts.join("|"));
   let refreshInFlight = false;
+  const pendingBotRemovals = new Set();
+  let botActionStatusTimer = null;
+
+  function showBotActionStatus(message, state = "pending", clearAfter = 0) {
+    const box = document.querySelector("#bot-action-status");
+    if (!box) return;
+    if (botActionStatusTimer) clearTimeout(botActionStatusTimer);
+    box.textContent = message;
+    box.className = `bot-action-status is-${state}`;
+    box.hidden = false;
+    botActionStatusTimer = clearAfter ? setTimeout(() => {
+      box.hidden = true;
+      botActionStatusTimer = null;
+    }, clearAfter) : null;
+  }
 
   function tagClass(action) {
     if (action === "ENTRY WINDOW") return "entry";
@@ -349,22 +364,23 @@
   async function refreshLeaderboard() {
     const body = document.querySelector("#leaderboard-body");
     try {
-      const response = await fetch("/api/leaderboard");
-      if (!response.ok) return;
+      const response = await fetch("/api/leaderboard", {cache: "no-store"});
+      if (!response.ok) throw new Error();
       const leaderboard = await response.json();
       if (!leaderboard.length) {
         body.innerHTML = '<div class="metrics-empty">No dummy accounts seeded.</div>';
-        return;
+        return leaderboard;
       }
       const columns = leaderboard.map(account => {
         const equity = account.equity == null ? `$${account.known_equity.toFixed(2)} known` : `$${account.equity.toFixed(2)} eq`;
         const roi = account.roi == null ? "UNPRICED" : pct(account.roi);
         const roiClass = account.roi == null ? "" : account.roi >= 0 ? "good" : "bad";
+        const removing = pendingBotRemovals.has(account.name);
         const removeButton = account.is_custom
-          ? `<button class="bot-remove" type="button" data-remove-bot data-account="${esc(account.name)}">Remove bot</button>`
+          ? `<button class="bot-remove${removing ? " is-removing" : ""}" type="button" data-remove-bot data-account="${esc(account.name)}"${removing ? ' disabled aria-busy="true"' : ""}>${removing ? "Removing…" : "Remove bot"}</button>`
           : "";
         const unpriced = account.unpriced_open_positions ? ` · ${account.unpriced_open_positions} unpriced` : "";
-        return `<div class="mtile" title="${esc(account.strategy)}" data-bot="${esc(account.name)}">
+        return `<div class="mtile${removing ? " is-removing" : ""}" title="${esc(account.strategy)}" data-bot="${esc(account.name)}"${removing ? ' aria-busy="true"' : ""}>
           <div class="k bot-name">${esc(account.name)}</div>
           <div class="v ${roiClass}">${roi}</div>
           <div class="sub2">${equity}${unpriced} · ${account.win_rate == null ? "—" : pct(account.win_rate)} WR</div>
@@ -376,7 +392,10 @@
         </div>`;
       }).join("");
       body.innerHTML = `<div class="metric-tiles">${columns}</div>`;
-    } catch {}
+      return leaderboard;
+    } catch {
+      return null;
+    }
   }
   const BEST_BETS_LIMIT = 12;
   function collectBestBets(events) {
@@ -667,19 +686,47 @@
       event.stopPropagation();
       const name = removeBot.dataset.account;
       if (!window.confirm(`Remove custom bot "${name}"? Its historical decisions and positions will be retained for analysis.`)) return;
+      const card = removeBot.closest("[data-bot]");
+      pendingBotRemovals.add(name);
       removeBot.disabled = true;
+      removeBot.setAttribute("aria-busy", "true");
+      removeBot.classList.add("is-removing");
+      removeBot.textContent = "Removing…";
+      card?.classList.add("is-removing");
+      card?.setAttribute("aria-busy", "true");
+      showBotActionStatus(`Removing "${name}" and stopping future paper trades…`);
       try {
         const response = await fetch(`/api/accounts/${encodeURIComponent(name)}`, {
           method: "DELETE"
         });
         const body = await response.json().catch(()=>({}));
         if (!response.ok) throw new Error(body.detail || "Could not remove bot");
-        await Promise.all([refreshLeaderboard(), refreshBotActivity()]);
+        card?.remove();
+        showBotActionStatus(
+          `Removed "${name}". It can no longer trade; its historical decisions and positions remain in the audit record.`,
+          "success",
+          30000
+        );
+        await refreshBotActivity();
       } catch (error) {
-        const box = document.querySelector("#bot-error");
-        box.textContent = error.message;
-        box.hidden = false;
-        removeBot.disabled = false;
+        showBotActionStatus(
+          `${error.message || "Could not remove bot"}. The bot is still active.`,
+          "error"
+        );
+      } finally {
+        pendingBotRemovals.delete(name);
+        await refreshLeaderboard();
+        const currentButton = [...document.querySelectorAll("[data-remove-bot]")]
+          .find(button => button.dataset.account === name) || removeBot;
+        const currentCard = currentButton.closest("[data-bot]") || card;
+        if (currentButton.isConnected) {
+          currentButton.disabled = false;
+          currentButton.removeAttribute("aria-busy");
+          currentButton.classList.remove("is-removing");
+          currentButton.textContent = "Remove bot";
+          currentCard?.classList.remove("is-removing");
+          currentCard?.removeAttribute("aria-busy");
+        }
       }
       return;
     }

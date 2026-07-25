@@ -69,6 +69,10 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "/api/discover?refresh=true" in javascript
         assert 'id="bot-activity"' in html
         assert "data-remove-bot" in javascript
+        assert 'id="bot-action-status"' in html
+        assert "pendingBotRemovals" in javascript
+        assert "Removing…" in javascript
+        assert "It can no longer trade" in javascript
         assert 'id="event-navigator"' in html
         assert "data-jump-event" in javascript
         assert 'activeLine="all"' in javascript

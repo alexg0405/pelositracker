@@ -254,6 +254,14 @@ dialog::backdrop { background: rgba(0,0,0,0.7); }
 .bot-card-actions .bot-cashout-label { margin:0; padding:0; border:0; }
 .bot-remove { width:auto; margin:0; padding:5px 8px; color:var(--red); background:transparent; border:1px solid rgba(255,77,46,.45); font-size:9px; }
 .bot-remove:hover { border-color:var(--red); }
+.mtile.is-removing { opacity:.62; pointer-events:none; }
+.bot-remove.is-removing { color:var(--yellow); border-color:rgba(255,207,63,.55); }
+.bot-remove.is-removing::before { content:""; display:inline-block; width:8px; height:8px; margin-right:6px; border:1px solid currentColor; border-right-color:transparent; border-radius:50%; animation:bot-remove-spin .7s linear infinite; vertical-align:-1px; }
+.bot-action-status { margin:10px 0 4px; padding:8px 10px; color:var(--yellow); background:rgba(255,207,63,.07); border-left:2px solid currentColor; font:11px/1.45 var(--mono); }
+.bot-action-status[hidden] { display:none; }
+.bot-action-status.is-success { color:var(--cyan); background:rgba(41,231,214,.07); }
+.bot-action-status.is-error { color:var(--red); background:rgba(255,107,95,.07); }
+@keyframes bot-remove-spin { to { transform:rotate(360deg); } }
 .bot-activity-panel { border-color:var(--bright); }
 .bot-policy { margin-top:12px; padding:9px 11px; color:var(--muted); background:var(--panel2); border-left:2px solid var(--yellow); font:11px/1.45 var(--mono); }
 .bot-policy.is-ready { border-left-color:var(--cyan); }
@@ -269,7 +277,7 @@ dialog::backdrop { background: rgba(0,0,0,0.7); }
 .activity-section-title { margin:12px 0 2px; color:var(--muted); font:700 10px var(--mono); letter-spacing:.1em; text-transform:uppercase; }
 .activity-section-title:first-child { margin-top:0; }
 @media(max-width:720px){.activity-row{grid-template-columns:1fr;gap:7px}.refresh-status{text-align:left}}
-@media(prefers-reduced-motion:reduce){#discover-refresh.is-refreshing::before{animation:none}}
+@media(prefers-reduced-motion:reduce){#discover-refresh.is-refreshing::before,.bot-remove.is-removing::before{animation:none}}
 .bot-games { max-height:150px; overflow-y:auto; border:1px solid var(--line); background:rgba(0,0,0,.25); padding:6px 8px; display:flex; flex-direction:column; gap:4px; }
 .game-check { display:flex; align-items:center; gap:8px; font:12px var(--mono); color:var(--text); cursor:pointer; text-transform:none; letter-spacing:0; }
 .game-check input { width:auto; margin:0; }
