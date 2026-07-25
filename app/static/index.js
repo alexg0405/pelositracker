@@ -170,7 +170,7 @@
     const independentModel = market.independent_model_probability == null
       ? "unavailable (no approved exact-segment artifact)"
       : `${pct(market.independent_model_probability)} · ${esc(market.independent_model_version||"unknown version")} · calibration ${esc(market.independent_calibration_version||"unknown")} · test n=${Number(market.independent_model_sample_size||0)} across ${Number(market.independent_model_event_count||0)} events`;
-    const executionAudit = `<li>Requested-size VWAP ${cents(market.requested_size_vwap)}; fee-adjusted requested cost ${cents(market.requested_effective_cost)}; simulated fee ${market.execution_fee == null ? "unknown" : "$"+market.execution_fee.toFixed(4)}; historical execution-cost adjustment ${signedCents(market.expected_execution_cost_offset)}; fillable ${market.paper_fillable_size == null ? "unknown" : market.paper_fillable_size.toFixed(2)+" shares"}.</li>`;
+    const executionAudit = `<li>Requested-size VWAP ${cents(market.requested_size_vwap)}; fee-adjusted requested cost ${cents(market.requested_effective_cost)}; simulated fee ${market.execution_fee == null ? "—" : "$"+market.execution_fee.toFixed(4)}; historical execution-cost adjustment ${signedCents(market.expected_execution_cost_offset)}; fillable ${market.paper_fillable_size == null ? "—" : market.paper_fillable_size.toFixed(2)+" shares"}.</li>`;
     const lineage = `<li>Engine ${esc(market.engine_version||"unavailable")} · consensus model ${esc(market.model_version||"unavailable")} (selection n=${Number(market.model_sample_size||0)}) · calibration ${esc(market.calibration_version||"unavailable")} (n=${Number(market.calibration_sample_size||0)}) · independent registry ${esc(market.independent_model_registry_version||"unavailable")} · independent model hash ${esc((market.independent_model_hash||"unavailable").slice(0,12))} · independent calibration hash ${esc((market.independent_calibration_hash||"unavailable").slice(0,12))} · execution ${esc(market.execution_policy_version||"unavailable")} · config ${esc((market.configuration_hash||"unavailable").slice(0,12))}.</li>`;
     const gates = (market.gate_results||[]).map(gate => `<li class="${gate.status === "fail" ? "risk" : ""}">Gate ${esc(gate.code)}: ${esc(gate.status)} · ${esc(gate.explanation||"")}${gate.value == null ? "" : ` · value ${Number(gate.value).toFixed(4)}`}${gate.threshold == null ? "" : ` · threshold ${Number(gate.threshold).toFixed(4)}`}</li>`).join("");
     return `<div class="market" data-line="${lineType(market.market,market.outcome)}" data-token-id="${esc(market.token_id)}">
@@ -302,6 +302,12 @@
       if (stake != null) metrics.push(`plan $${Number(stake).toFixed(2)}`);
       if (details.confidence != null) metrics.push(`quality ${Number(details.confidence).toFixed(0)}/100`);
       if (details.reference_sources != null) metrics.push(`${details.reference_sources}/${details.minimum_sources ?? "?"} refs`);
+      const failedGates = details.failed_engine_gates || [];
+      const failedCodes = failedGates.map(gate => gate.code).filter(Boolean);
+      const engineDetail = failedGates.length ? `<details class="activity-engine-detail">
+        <summary>Exact failed engine gate${failedGates.length === 1 ? "" : "s"}</summary>
+        <ul>${failedGates.map(gate => `<li><strong>${esc(gate.code||"unknown")}</strong> · ${esc(gate.explanation||"failed")}${gate.value == null ? "" : ` · value ${Number(gate.value).toFixed(4)}`}${gate.threshold == null ? "" : ` · threshold ${Number(gate.threshold).toFixed(4)}`}</li>`).join("")}</ul>
+      </details>` : "";
       const timestamp = new Date(Number(item.observed_ts) * 1000).toLocaleTimeString(
         [], {hour:"numeric", minute:"2-digit", second:"2-digit"}
       );
@@ -316,8 +322,9 @@
         </div>
         <div class="activity-reason">
           <span class="activity-status ${item.status === "placed" ? "placed" : "rejected"}">${esc(item.status)}</span>
-          <div>${esc(item.reason)}</div>
+          <div>${esc(item.reason)}${failedCodes.length ? ` · failed ${esc(failedCodes.join(", "))}` : ""}</div>
           ${metrics.length ? `<div class="activity-meta">${metrics.join(" · ")}</div>` : ""}
+          ${engineDetail}
         </div>
       </div>`;
     }).join("");

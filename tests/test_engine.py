@@ -28,6 +28,32 @@ def q(source, outcome, p, bid=None, ask=None):
                  ask=p + .01 if ask is None else ask)
 
 
+def test_complete_book_and_requested_fill_are_reported_as_separate_facts():
+    engine = _SignalEngine(confidence_threshold=0, edge_threshold=0)
+    quote = Quote(
+        "e", "moneyline", "home", .50, "Polymarket", NOW,
+        bid=.49, ask=.50, ask_size=1_000, depth_complete=True,
+        ask_levels=((.50, 1_000.0),), fee_rate=None,
+    )
+
+    missing_fee = engine._quote_payload(quote, "home", "away")
+    assert missing_fee["depth_complete"] is True
+    assert missing_fee["fee_metadata_known"] is False
+    assert missing_fee["execution_complete"] is False
+    assert missing_fee["execution_reason"] == "fee metadata unavailable"
+    assert missing_fee["ask_size"] is None
+    assert missing_fee["execution_fee"] is None
+
+    quote.fee_rate = .003
+    executable = engine._quote_payload(quote, "home", "away")
+    assert executable["depth_complete"] is True
+    assert executable["fee_metadata_known"] is True
+    assert executable["execution_complete"] is True
+    assert executable["execution_reason"] == "full fill"
+    assert executable["ask_size"] > 0
+    assert executable["execution_fee"] > 0
+
+
 def test_single_source_has_no_independent_reference():
     """One book cannot price against itself, so no edge is estimable."""
     engine = SignalEngine(confidence_threshold=0, edge_threshold=.03)

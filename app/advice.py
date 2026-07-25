@@ -219,7 +219,10 @@ def market_views(
             "net_ev_per_stake": signal.ev_per_stake if signal else None,
             "requested_cash": signal.requested_cash if signal else None,
             "requested_size_vwap": signal.execution_vwap if signal else None,
-            "requested_effective_cost": signal.market_probability if signal else None,
+            "requested_effective_cost": (
+                signal.market_probability
+                if signal and signal.execution_complete else None
+            ),
             "execution_fee": signal.execution_fee if signal else None,
             "expected_execution_cost_offset": expected_execution_cost_offset,
             "paper_fillable_size": signal.fillable_size if signal else None,

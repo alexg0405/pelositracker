@@ -116,6 +116,7 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "It can no longer trade" in javascript
         assert "per_event_limit=4" in javascript
         assert "activityCoverage" in javascript
+        assert "Exact failed engine gate" in javascript
         assert "All monitored events" in javascript
         assert 'id="event-navigator"' in html
         assert "data-jump-event" in javascript

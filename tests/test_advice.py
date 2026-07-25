@@ -36,6 +36,7 @@ def signal(model=.62, action="PAPER_BET", confidence=82, required_edge=0.0):
                   net_expected_value_total=80 * (model - .56),
                   consensus_method="equal_family_logit",
                   calibration_sample_size=1500,
+                  execution_complete=True,
                   gate_results=[{"code": "paper_policy", "status": "pass"}])
 
 

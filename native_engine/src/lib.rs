@@ -46,6 +46,10 @@ struct QuoteInput {
     depth_complete: bool,
     #[serde(default)]
     fee_metadata_known: bool,
+    #[serde(default)]
+    execution_complete: bool,
+    #[serde(default)]
+    execution_reason: String,
     #[serde(default = "default_true")]
     accepting_orders: bool,
     // Phase 2b: parsed spread/total line and normalized side
@@ -1716,8 +1720,20 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         let execution_ready = best.ask.is_some()
             && best.depth_complete
             && best.fee_metadata_known
+            && best.execution_complete
             && fillable_size.is_some_and(|size| size > 0.0)
             && best.accepting_orders;
+        if best.exchange()
+            && best.depth_complete
+            && best.fee_metadata_known
+            && !best.execution_complete
+        {
+            blockers.push(if best.execution_reason.is_empty() {
+                "requested paper order cannot be completely filled at current depth".to_string()
+            } else {
+                format!("paper fill unavailable: {}", best.execution_reason)
+            });
+        }
         if !execution_ready && !best.exchange() {
             blockers.push(
                 "sportsbook quote is reference-only; complete executable depth unavailable"
@@ -2015,6 +2031,8 @@ mod tests {
             ask_size: Some(100.0),
             depth_complete: true,
             fee_metadata_known: true,
+            execution_complete: true,
+            execution_reason: "filled".to_string(),
             accepting_orders: true,
         }
     }
@@ -2160,6 +2178,39 @@ mod tests {
             .find(|gate| gate.code == "entry_price_range")
             .unwrap();
         assert_eq!(price_gate.passed, Some(false));
+    }
+
+    #[test]
+    fn complete_depth_does_not_hide_a_failed_requested_size_fill() {
+        let now = 1_000.0;
+        let mut quotes = Vec::new();
+        for source in ["A", "B"] {
+            quotes.push(quote(source, "home", 0.60, now));
+            quotes.push(quote(source, "away", 0.40, now));
+        }
+        let mut poly_home = quote("Polymarket", "home", 0.49, now);
+        poly_home.ask = Some(0.50);
+        poly_home.depth_complete = true;
+        poly_home.fee_metadata_known = true;
+        poly_home.execution_complete = false;
+        poly_home.execution_reason = "insufficient depth for full-fill policy".to_string();
+        quotes.push(poly_home);
+
+        let home = evaluate(request(quotes), now)
+            .into_iter()
+            .find(|signal| signal.outcome == "home")
+            .unwrap();
+
+        assert_eq!(home.action, "WATCH");
+        assert!(home.reasons.iter().any(|reason| {
+            reason == "paper fill unavailable: insufficient depth for full-fill policy"
+        }));
+        let fill_gate = home
+            .gate_results
+            .iter()
+            .find(|gate| gate.code == "executable_fill")
+            .unwrap();
+        assert_eq!(fill_gate.passed, Some(false));
     }
 
     #[test]

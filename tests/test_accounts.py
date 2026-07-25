@@ -67,6 +67,11 @@ def test_bot_activity_explains_rejection_then_preserves_placed_decision(tmp_path
     signal = valid_signal(
         event_id=event.id, outcome="A", action="WATCH",
         decision_id="decision-1",
+        gate_results=[{
+            "code": "executable_fill", "passed": False, "status": "fail",
+            "value": None, "threshold": 0.0,
+            "explanation": "a complete fee-aware paper fill is required",
+        }],
     )
     quote = executable_quote(event, "token-home", "moneyline", "A")
     try:
@@ -79,6 +84,11 @@ def test_bot_activity_explains_rejection_then_preserves_placed_decision(tmp_path
         assert "engine gates did not clear" in rejected[0]["reason"]
         assert rejected[0]["details"]["market_probability"] == pytest.approx(.50)
         assert rejected[0]["details"]["confidence"] == 90
+        assert rejected[0]["details"]["failed_engine_gates"][0]["code"] == (
+            "executable_fill"
+        )
+        assert rejected[0]["details"]["engine_reasons"] == []
+        assert rejected[0]["details"]["execution_complete"] is False
 
         signal.action = "PAPER_BET"
         assert len(book.place(event, [signal], [quote], as_of=1_001)) == 1

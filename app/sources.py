@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import re
+import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import AsyncIterator, Awaitable, Callable
@@ -19,7 +21,7 @@ from .models import Event, GameState, Quote
 from .matching import closest_start, team_match_score
 from .domain.time import parse_provider_timestamp
 from .orderbook import BookGapError, OrderBookState
-from .execution import D
+from .execution import D, fee_rate_from_basis_points
 from .resilience import RetryBackoff
 from .telemetry import runtime_telemetry
 
@@ -35,6 +37,9 @@ _odds_quota: dict[str, str] = {}
 # immediately in the ``async for`` loop, so a shallow queue never drops messages
 # under normal load; 1 MiB stays well above any order-book/score frame we see.
 _WS_CONNECT_KW = {"max_size": 1_048_576, "max_queue": 8}
+_POLYMARKET_FEE_CACHE_TTL_SECONDS = 60 * 60
+_POLYMARKET_FEE_CACHE_MAX = 20_000
+_polymarket_fee_cache: OrderedDict[str, tuple[float, float, str]] = OrderedDict()
 
 
 def _provider_time(value: object) -> datetime | None:
@@ -302,6 +307,69 @@ async def _borrow_client(**kwargs) -> AsyncIterator[httpx.AsyncClient]:
         return
     async with httpx.AsyncClient(**kwargs) as owned:
         yield owned
+
+
+async def _polymarket_fee_rate(
+    client: httpx.AsyncClient,
+    token: str,
+) -> tuple[float, str] | None:
+    """Return the authoritative CLOB fee rate for one token, with a bounded TTL.
+
+    The bulk ``/books`` response contains complete depth but no fee field.
+    Gamma sometimes supplies one, but not consistently. A missing fee therefore
+    used to make every otherwise-valid paper fill fail closed. Resolve that
+    single missing fact through Polymarket's public ``/fee-rate/{token}``
+    endpoint and cache it independently of the 45-second sportsbook poll.
+    """
+    now = time.monotonic()
+    cached = _polymarket_fee_cache.get(token)
+    if cached is not None and now - cached[0] < _POLYMARKET_FEE_CACHE_TTL_SECONDS:
+        _polymarket_fee_cache.move_to_end(token)
+        runtime_telemetry.increment("polymarket_fee_cache_hits")
+        return cached[1], cached[2]
+
+    try:
+        response = await client.get(f"https://clob.polymarket.com/fee-rate/{token}")
+        response.raise_for_status()
+        base_fee = response.json()["base_fee"]
+        rate = float(fee_rate_from_basis_points(base_fee))
+    except Exception as exc:
+        runtime_telemetry.increment(f"polymarket_fee_error_{type(exc).__name__}")
+        return None
+
+    schedule_id = f"clob-base-fee-{float(base_fee):g}bps"
+    _polymarket_fee_cache[token] = (now, rate, schedule_id)
+    _polymarket_fee_cache.move_to_end(token)
+    while len(_polymarket_fee_cache) > _POLYMARKET_FEE_CACHE_MAX:
+        _polymarket_fee_cache.popitem(last=False)
+    runtime_telemetry.increment("polymarket_fee_lookups")
+    return rate, schedule_id
+
+
+async def _hydrate_polymarket_fee_rates(
+    client: httpx.AsyncClient,
+    token_meta: dict[str, dict],
+) -> None:
+    """Fill only missing fee facts without weakening the unknown-fee gate."""
+    missing = [
+        token for token, meta in token_meta.items()
+        if meta.get("fee_rate") is None
+    ]
+    if not missing:
+        return
+
+    semaphore = asyncio.Semaphore(16)
+
+    async def resolve(token: str) -> tuple[str, tuple[float, str] | None]:
+        async with semaphore:
+            return token, await _polymarket_fee_rate(client, token)
+
+    for token, result in await asyncio.gather(*(resolve(token) for token in missing)):
+        if result is None:
+            continue
+        rate, schedule_id = result
+        token_meta[token]["fee_rate"] = rate
+        token_meta[token]["fee_schedule_id"] = schedule_id
 
 
 async def polymarket_event(slug: str) -> dict:
@@ -708,6 +776,7 @@ async def _initial_polymarket_quotes(event: Event, token_meta: dict[str, dict]) 
     tokens = list(token_meta)
     quotes: list[Quote] = []
     async with _borrow_client(timeout=15) as client:
+        await _hydrate_polymarket_fee_rates(client, token_meta)
         for start in range(0, len(tokens), 500):
             batch = tokens[start:start + 500]
             response = await client.post(

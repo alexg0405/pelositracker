@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from app import sources
 from app.models import Event
 from app.sources import (_polymarket_token_meta, _quote_from_book, _quote_from_ws_change,
@@ -114,6 +116,49 @@ def test_polymarket_metadata_keeps_provider_game_start():
         "markets": [{"gameStartTime": "2026-07-19T23:20:00Z"}],
     })
     assert inferred["game_start"] == "2026-07-19T23:20:00Z"
+
+
+def test_missing_gamma_fee_uses_authoritative_clob_fee_and_cache():
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"base_fee": 30}
+
+    class Client:
+        def __init__(self):
+            self.calls = 0
+
+        async def get(self, url):
+            self.calls += 1
+            assert url.endswith("/fee-rate/official-fee-token")
+            return Response()
+
+    sources._polymarket_fee_cache.clear()
+    client = Client()
+    first = {"official-fee-token": {"fee_rate": None, "fee_schedule_id": None}}
+    second = {"official-fee-token": {"fee_rate": None, "fee_schedule_id": None}}
+
+    asyncio.run(sources._hydrate_polymarket_fee_rates(client, first))
+    asyncio.run(sources._hydrate_polymarket_fee_rates(client, second))
+
+    assert client.calls == 1
+    assert first["official-fee-token"]["fee_rate"] == pytest.approx(.003)
+    assert first["official-fee-token"]["fee_schedule_id"] == "clob-base-fee-30bps"
+    assert second == first
+    sources._polymarket_fee_cache.clear()
+
+
+def test_failed_clob_fee_lookup_remains_unknown_and_fails_closed():
+    class Client:
+        async def get(self, _url):
+            raise RuntimeError("unavailable")
+
+    sources._polymarket_fee_cache.clear()
+    metadata = {"fee-failure-token": {"fee_rate": None, "fee_schedule_id": None}}
+    asyncio.run(sources._hydrate_polymarket_fee_rates(Client(), metadata))
+    assert metadata["fee-failure-token"]["fee_rate"] is None
 
 
 def test_gamma_binary_soccer_moneylines_map_only_affirmative_contracts():

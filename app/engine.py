@@ -22,11 +22,11 @@ from .models import GameState, Quote, Signal, canonical_source, classify_source
 from .execution import BookLevel, simulate_buy
 
 
-ENGINE_VERSION = "live-edge-engine-0.6.1"
+ENGINE_VERSION = "live-edge-engine-0.6.2"
 REQUEST_SCHEMA_VERSION = "decision-request-v4"
 SOURCE_MAPPING_VERSION = "canonical-source-family-v1"
 DEFAULT_MODEL_VERSION = "equal-family-logit-consensus-v2-display-only"
-EXECUTION_POLICY_VERSION = "paper-depth-price-range-v2"
+EXECUTION_POLICY_VERSION = "paper-depth-fee-rate-v3"
 
 try:
     from ._native_engine import evaluate_json
@@ -314,9 +314,10 @@ class SignalEngine:
                        paper_notional: float = 100.0) -> dict:
         weight, is_exchange = classify_source(q.source)
         executable_ask = q.ask
-        executable_size = q.ask_size
+        executable_size = q.ask_size if not is_exchange else None
         execution_complete = not is_exchange
         fee_metadata_known = not is_exchange
+        execution_reason = ""
         requested_cash = None
         filled_cash = None
         filled_shares = None
@@ -333,12 +334,15 @@ class SignalEngine:
             )
             execution_complete = simulation.complete
             fee_metadata_known = q.fee_rate is not None
+            execution_reason = simulation.reason
             requested_cash = float(simulation.requested_cash)
-            filled_cash = float(simulation.filled_cash)
-            filled_shares = float(simulation.filled_shares)
-            execution_fee = float(simulation.fee)
-            execution_vwap = float(simulation.vwap) if simulation.vwap is not None else None
             if simulation.complete and simulation.effective_probability is not None:
+                filled_cash = float(simulation.filled_cash)
+                filled_shares = float(simulation.filled_shares)
+                execution_fee = float(simulation.fee)
+                execution_vwap = (
+                    float(simulation.vwap) if simulation.vwap is not None else None
+                )
                 executable_ask = float(simulation.effective_probability)
                 executable_size = float(simulation.filled_shares)
         point, side = quote_line_side(q.market, q.outcome, home_outcome, away_outcome)
@@ -367,7 +371,10 @@ class SignalEngine:
             "decimal_odds": q.decimal_odds,
             "liquidity": q.liquidity,
             "ask_size": executable_size,
-            "depth_complete": q.depth_complete and execution_complete,
+            # Raw provider-book completeness and the requested-size fill result
+            # are separate facts. Conflating them made a missing fee look like
+            # missing order-book depth and hid the actual ingestion defect.
+            "depth_complete": q.depth_complete,
             "fee_metadata_known": fee_metadata_known,
             "accepting_orders": (q.accepting_orders and q.active
                                  and not q.resolved and not q.paper_restricted),
@@ -377,6 +384,7 @@ class SignalEngine:
             "execution_fee": execution_fee,
             "execution_vwap": execution_vwap,
             "execution_complete": execution_complete,
+            "execution_reason": execution_reason,
             "token_id": q.token_id,
             "book_hash": q.book_hash,
             "point": point,

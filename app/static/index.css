@@ -276,6 +276,7 @@ dialog::backdrop { background: rgba(0,0,0,0.7); }
 .activity-status { display:inline-block; margin-bottom:4px; padding:2px 6px; border:1px solid currentColor; font:700 9px var(--mono); letter-spacing:.07em; text-transform:uppercase; }
 .activity-status.placed { color:var(--cyan); }.activity-status.rejected { color:var(--yellow); }
 .activity-reason { color:var(--muted); font:11px/1.45 var(--mono); }
+.activity-engine-detail{margin-top:6px;color:var(--faint)}.activity-engine-detail summary{cursor:pointer;color:var(--yellow)}.activity-engine-detail ul{margin:5px 0 0;padding-left:18px}.activity-engine-detail li{margin:3px 0}
 .activity-section-title { margin:12px 0 2px; color:var(--muted); font:700 10px var(--mono); letter-spacing:.1em; text-transform:uppercase; }
 .activity-section-title:first-child { margin-top:0; }
 .activity-coverage { display:flex; gap:5px; overflow-x:auto; margin:7px 0 10px; padding-bottom:3px; }

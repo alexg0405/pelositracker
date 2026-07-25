@@ -798,6 +798,20 @@ class AccountBook:
             "reference_sources": signal.n_reference_sources,
             "minimum_sources": strategy.min_sources,
             "sizing": strategy.sizing,
+            # Preserve the actual engine diagnosis with the bot attempt. The
+            # old activity report kept only "engine gates did not clear", which
+            # made a missing fee indistinguishable from freshness, identity, or
+            # edge failures after the live signal changed.
+            "failed_engine_gates": [
+                dict(gate) for gate in signal.gate_results
+                if gate.get("passed") is False
+            ],
+            "unknown_engine_gates": [
+                dict(gate) for gate in signal.gate_results
+                if gate.get("passed") is None
+            ],
+            "engine_reasons": list(signal.reasons),
+            "execution_complete": signal.execution_complete,
         }
         payload.update(details or {})
         self._db.execute(

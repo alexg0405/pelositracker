@@ -1,6 +1,9 @@
-from datetime import datetime, timezone
+import asyncio
+from datetime import datetime, timedelta, timezone
 
 from app import actionnetwork
+from app import sources
+from app.accounts import AccountBook, Strategy
 from app.advice import market_views
 from app.engine import SignalEngine
 from app.models import Event
@@ -103,6 +106,102 @@ def test_cross_provider_spread_and_total_edges_reach_actionable_cards():
     views = {view["token_id"]: view for view in market_views(poly, signals, 0)}
     assert views["poly-spread-home"]["entry_action"] == "ENTRY WINDOW"
     assert views["poly-over"]["entry_action"] == "ENTRY WINDOW"
+
+
+def test_authoritative_fee_allows_bot_entry_and_persistent_line_marks(tmp_path):
+    """Exercise the production paper path without installing a fake calibration.
+
+    The opt-in paper harness may trade an otherwise-valid uncalibrated signal,
+    then every later executable bid is retained as a valuation/decision mark.
+    Cash-out disabled means the position is measured, never silently closed.
+    """
+    ev = event()
+    metadata = _polymarket_token_meta({"markets": [{
+        "active": True,
+        "closed": False,
+        "enableOrderBook": True,
+        "acceptingOrders": True,
+        "sportsMarketType": "spreads",
+        "line": -1.5,
+        "question": "Spread: New York Yankees (-1.5)",
+        "outcomes": '["New York Yankees", "Los Angeles Dodgers"]',
+        "clobTokenIds": '["tracked-home", "tracked-away"]',
+    }]})
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"base_fee": 30}
+
+    class Client:
+        async def get(self, _url):
+            return Response()
+
+    sources._polymarket_fee_cache.clear()
+    asyncio.run(sources._hydrate_polymarket_fee_rates(Client(), metadata))
+    entry_quote = _quote_from_book(
+        ev, "tracked-home", metadata["tracked-home"], book(.48, .50)
+    )
+    references = reference_quotes(ev)
+    engine = _SignalEngine(confidence_threshold=0, edge_threshold=0, edge_z=0)
+    signals = engine.evaluate(
+        ev.id, [entry_quote] + references, [],
+        away_outcome=ev.away, home_outcome=ev.home, sport=ev.sport, as_of=NOW,
+    )
+    signal = next(item for item in signals if item.token_id == "tracked-home")
+    assert signal.action == "WATCH"
+    assert signal.execution_complete is True
+    assert any(gate["code"] == "executable_fill" and gate["passed"] is True
+               for gate in signal.gate_results)
+
+    account_book = AccountBook(str(tmp_path / "tracked-bot.db"))
+    strategy = Strategy(
+        "research bot",
+        edge_threshold=.01,
+        sizing="flat",
+        flat_stake=25,
+        start_bankroll=1_000,
+        cash_out_enabled=False,
+    )
+    later = NOW + timedelta(seconds=180)
+    later_book = {
+        "timestamp": str(int(later.timestamp() * 1000)),
+        "hash": "later-line-book",
+        "bids": [{"price": ".60", "size": "200"}],
+        "asks": [{"price": ".62", "size": "200"}],
+    }
+    mark_quote = _quote_from_book(
+        ev, "tracked-home", metadata["tracked-home"], later_book
+    )
+    try:
+        account_book.seed([strategy])
+        placed = account_book.place(
+            ev, [signal], [entry_quote], as_of=NOW,
+            allow_uncalibrated=True, max_quote_age_seconds=120,
+        )
+        assert len(placed) == 1
+        assert placed[0]["entry_fee"] > 0
+
+        exits = account_book.mark_and_cash_out(
+            ev, [mark_quote], [signal], as_of=later,
+            max_quote_age_seconds=120,
+        )
+        bet = account_book.account_bets("research bot")[0]
+        marks = account_book.bet_marks("research bot", bet["id"])
+    finally:
+        account_book.close()
+        sources._polymarket_fee_cache.clear()
+
+    assert exits == []
+    assert bet["status"] == "open"
+    assert bet["last_mark_price"] > bet["entry_price"]
+    assert bet["last_mark_value"] > bet["stake"]
+    assert bet["last_mark_pnl"] > 0
+    assert marks[0]["book_hash"] == "later-line-book"
+    assert marks[0]["decision_action"] == "MARK_ONLY"
+    assert marks[0]["decision_reason"] == "automatic cash-out is disabled for this bot"
 
 
 def test_polymarket_alternate_lines_keep_distinct_selection_identities():
