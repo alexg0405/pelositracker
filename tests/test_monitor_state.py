@@ -8,12 +8,14 @@ def test_monitor_state_restores_events_and_automation_setting(tmp_path):
                   polymarket_slug="game", game_start="2026-07-19T23:20:00Z")
     state = MonitorState(path)
     state.set_auto_monitor(True)
+    state.set_odds_api_enabled(False)
     state.save_event(event)
     state.close()
 
     restored = MonitorState(path)
     try:
         assert restored.auto_monitor() is True
+        assert restored.odds_api_enabled() is False
         assert restored.events() == [event]
         restored.delete_event(event.id)
         assert restored.events() == []

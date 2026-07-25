@@ -25,7 +25,8 @@ class SignalEngine(_SignalEngine):
 def q(source, outcome, p, bid=None, ask=None):
     return Quote("e", "moneyline", outcome, p, source, NOW,
                  bid=p - .01 if bid is None else bid,
-                 ask=p + .01 if ask is None else ask)
+                 ask=p + .01 if ask is None else ask,
+                 received_at=NOW)
 
 
 def test_complete_book_and_requested_fill_are_reported_as_separate_facts():
@@ -214,7 +215,10 @@ def test_stale_opposing_leg_makes_the_whole_book_stale():
     old = NOW - timedelta(seconds=121)
     quotes = [
         q("Pinnacle", "home", .60),
-        Quote("e", "moneyline", "away", .40, "Pinnacle", old),
+        Quote(
+            "e", "moneyline", "away", .40, "Pinnacle", old,
+            received_at=old,
+        ),
         q("Betfair", "home", .60), q("Betfair", "away", .40),
         Quote("e", "moneyline", "home", .54, "Polymarket", NOW,
               bid=.53, ask=.55, ask_size=100),
@@ -223,6 +227,59 @@ def test_stale_opposing_leg_makes_the_whole_book_stale():
     ]
     home = next(x for x in engine.evaluate("e", quotes, [], as_of=NOW) if x.outcome == "home")
     assert home.n_reference_sources == 1
+
+
+def test_recently_confirmed_unchanged_spread_books_remain_independent_references():
+    engine = SignalEngine(confidence_threshold=0, edge_threshold=0, edge_z=0)
+    old_provider_time = NOW - timedelta(seconds=180)
+    home = "San Francisco Giants"
+    away = "Los Angeles Angels"
+    quotes = []
+    for source in ("Book A", "Book B"):
+        quotes.extend([
+            Quote(
+                "e", "spread", f"{home} +1.5", .945, source,
+                observed_at=old_provider_time,
+                received_at=NOW,
+            ),
+            Quote(
+                "e", "spread", f"{away} -1.5", .075, source,
+                observed_at=old_provider_time,
+                received_at=NOW,
+            ),
+        ])
+    quotes.extend([
+        Quote(
+            "e", "spread", f"{home} +1.5", .91, "Polymarket", NOW,
+            bid=.90, ask=.913, ask_size=1_000, depth_complete=True,
+            ask_levels=((.913, 1_000.0),), fee_rate=0.0,
+        ),
+        Quote(
+            "e", "spread", f"{away} -1.5", .08, "Polymarket", NOW,
+            bid=.07, ask=.08, ask_size=1_000, depth_complete=True,
+            ask_levels=((.08, 1_000.0),), fee_rate=0.0,
+        ),
+    ])
+
+    signal = next(
+        item for item in engine.evaluate(
+            "e",
+            quotes,
+            [],
+            home_outcome=home,
+            away_outcome=away,
+            as_of=NOW,
+        )
+        if item.outcome == f"{home} +1.5"
+    )
+
+    assert signal.n_reference_sources == 2
+    assert signal.edge > .01
+    assert signal.action == "PAPER_BET"
+    assert next(
+        gate for gate in signal.gate_results
+        if gate["code"] == "reference_source_support"
+    )["passed"] is True
 
 
 def test_unknown_exchange_depth_blocks_paper_execution():

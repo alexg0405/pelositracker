@@ -58,6 +58,28 @@ class MonitorState:
                     ("auto_monitor", "true" if enabled else "false"),
                 )
 
+    def odds_api_enabled(self, default: bool = True) -> bool:
+        """Return the persisted master switch for paid Odds API polling."""
+        with self._lock:
+            with self._db.cursor() as cur:
+                self._db.execute(
+                    cur,
+                    "SELECT value FROM monitor_config WHERE key=%s",
+                    ("odds_api_enabled",),
+                )
+                row = cur.fetchone()
+        return default if row is None else str(row[0]).casefold() == "true"
+
+    def set_odds_api_enabled(self, enabled: bool) -> None:
+        with self._lock:
+            with self._db.transaction() as cur:
+                self._db.execute(
+                    cur,
+                    """INSERT INTO monitor_config (key, value) VALUES (%s,%s)
+                       ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value""",
+                    ("odds_api_enabled", "true" if enabled else "false"),
+                )
+
     def save_event(self, event: Event) -> None:
         payload = json.dumps(as_json(event), separators=(",", ":"))
         with self._lock:

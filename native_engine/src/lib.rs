@@ -24,6 +24,8 @@ struct QuoteInput {
     source: String,
     observed_at: f64,
     #[serde(default)]
+    received_at: Option<f64>,
+    #[serde(default)]
     timestamp_trusted: bool,
     #[serde(default = "default_true")]
     identity_valid: bool,
@@ -77,6 +79,9 @@ impl QuoteInput {
                 .flat_map(char::to_lowercase)
                 .collect()
         })
+    }
+    fn confirmed_at(&self) -> f64 {
+        self.received_at.unwrap_or(self.observed_at)
     }
 }
 
@@ -767,7 +772,24 @@ struct Fair {
     booksum: f64,
     method: &'static str,
     observed_at: f64,
+    confirmed_at: f64,
     timestamp_trusted: bool,
+}
+
+fn reference_is_current(fair: &Fair, now_seconds: f64, max_age: f64) -> bool {
+    // ``observed_at`` is the provider's last price-change time. A successful
+    // snapshot can legitimately re-confirm the same price without advancing
+    // that timestamp, so expiry follows the most recent receipt. We still
+    // require a trusted provider timestamp and retain its age for diagnostics.
+    // Historical replays and callers can evaluate before the stored receipt;
+    // that future information must not leak into the decision, so fall back to
+    // the provider timestamp in that case.
+    let confirmed_at = if fair.confirmed_at <= now_seconds {
+        fair.confirmed_at
+    } else {
+        fair.observed_at
+    };
+    fair.timestamp_trusted && now_seconds >= confirmed_at && (now_seconds - confirmed_at) <= max_age
 }
 
 /// Compute one source's fair value for `outcome` given all of its quotes in the
@@ -812,10 +834,7 @@ fn pooled_consensus_for(
     let reference: Vec<&Fair> = fairs
         .iter()
         .filter(|f| {
-            f.source_key != target_source_key
-                && f.timestamp_trusted
-                && now_seconds >= f.observed_at
-                && (now_seconds - f.observed_at) <= max_age
+            f.source_key != target_source_key && reference_is_current(f, now_seconds, max_age)
         })
         .collect();
     if reference.is_empty() {
@@ -878,10 +897,7 @@ fn log_pool_score_for(
     let reference: Vec<&Fair> = fairs
         .iter()
         .filter(|f| {
-            f.source_key != target_source_key
-                && f.timestamp_trusted
-                && now_seconds >= f.observed_at
-                && (now_seconds - f.observed_at) <= max_age
+            f.source_key != target_source_key && reference_is_current(f, now_seconds, max_age)
         })
         .collect();
     if reference.is_empty() {
@@ -1008,6 +1024,12 @@ fn source_fair(
             .iter()
             .map(|quote| quote.observed_at)
             .fold(f64::INFINITY, f64::min),
+        // Both legs must have been present in the confirming snapshot, so use
+        // the older receipt when deriving one complete-book fair.
+        confirmed_at: source_quotes
+            .iter()
+            .map(|quote| quote.confirmed_at())
+            .fold(f64::INFINITY, f64::min),
         timestamp_trusted: source_quotes.iter().all(|quote| quote.timestamp_trusted),
     })
 }
@@ -1066,7 +1088,11 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         );
         let replace = freshest
             .get(&key)
-            .map(|current| quote.observed_at > current.observed_at)
+            .map(|current| {
+                quote.observed_at > current.observed_at
+                    || (quote.observed_at == current.observed_at
+                        && quote.confirmed_at() > current.confirmed_at())
+            })
             .unwrap_or(true);
         if replace {
             freshest.insert(key, quote);
@@ -1229,10 +1255,7 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         let reference: Vec<&Fair> = fairs
             .iter()
             .filter(|f| {
-                f.source_key != target_source_key
-                    && f.timestamp_trusted
-                    && now_seconds >= f.observed_at
-                    && (now_seconds - f.observed_at) <= max_age
+                f.source_key != target_source_key && reference_is_current(f, now_seconds, max_age)
             })
             .collect();
 
@@ -1522,9 +1545,7 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
                         .iter()
                         .filter(|draw_fair| {
                             draw_fair.source_key != target_source_key
-                                && draw_fair.timestamp_trusted
-                                && now_seconds >= draw_fair.observed_at
-                                && (now_seconds - draw_fair.observed_at) <= max_age
+                                && reference_is_current(draw_fair, now_seconds, max_age)
                         })
                         .collect();
                     let draw_consensus = consensus_probability(
@@ -2020,6 +2041,7 @@ mod tests {
             probability,
             source: source.to_string(),
             observed_at: now,
+            received_at: Some(now),
             timestamp_trusted: true,
             identity_valid: true,
             bid: Some(probability - 0.01),
@@ -2211,6 +2233,41 @@ mod tests {
             .find(|gate| gate.code == "executable_fill")
             .unwrap();
         assert_eq!(fill_gate.passed, Some(false));
+    }
+
+    #[test]
+    fn recent_confirmation_keeps_unchanged_reference_books_current() {
+        let now = 1_000.0;
+        let provider_time = now - 60.0;
+        let mut quotes = Vec::new();
+        for source in ["A", "B"] {
+            let mut home = quote(source, "home", 0.60, provider_time);
+            home.received_at = Some(now);
+            home.is_exchange = Some(false);
+            let mut away = quote(source, "away", 0.40, provider_time);
+            away.received_at = Some(now);
+            away.is_exchange = Some(false);
+            quotes.push(home);
+            quotes.push(away);
+        }
+        let mut poly_home = quote("Polymarket", "home", 0.50, now);
+        poly_home.ask = Some(0.51);
+        quotes.push(poly_home);
+        quotes.push(quote("Polymarket", "away", 0.49, now));
+
+        let home = evaluate(request(quotes), now)
+            .into_iter()
+            .find(|signal| signal.outcome == "home")
+            .unwrap();
+
+        assert_eq!(home.n_reference_sources, 2);
+        assert_eq!(home.action, "PAPER_BET");
+        let support = home
+            .gate_results
+            .iter()
+            .find(|gate| gate.code == "reference_source_support")
+            .unwrap();
+        assert_eq!(support.passed, Some(true));
     }
 
     #[test]

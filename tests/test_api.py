@@ -125,6 +125,34 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "recommendation_eligible" in javascript
         assert "recommendation_score" in javascript
         assert "at or below 5c or at or above 95c" in html
+        assert 'id="odds-api-toggle"' in html
+        assert "odds_api_enabled" in javascript
+        assert "backend pollers are paused" in javascript
+
+
+def test_odds_api_master_switch_updates_without_changing_auto_monitor(monkeypatch):
+    class MonitorStub:
+        def __init__(self):
+            self.values = []
+
+        def set_odds_api_enabled(self, value):
+            self.values.append(value)
+
+    monitor = MonitorStub()
+    monkeypatch.setattr(
+        main_module,
+        "_config_state",
+        {"auto_monitor": True, "odds_api_enabled": True},
+    )
+    monkeypatch.setattr(main_module, "monitor_state", monitor)
+
+    response = asyncio.run(main_module.update_config(
+        main_module.ConfigIn(odds_api_enabled=False)
+    ))
+
+    assert response["odds_api_enabled"] is False
+    assert response["auto_monitor"] is True
+    assert monitor.values == [False]
 
 
 def test_event_history_api_caps_default_and_requested_page_size(monkeypatch):

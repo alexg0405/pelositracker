@@ -65,6 +65,38 @@ def test_live_store_ignores_invalid_or_late_updates_and_removed_event_writes():
     assert event.id not in store.state_updates
 
 
+def test_live_store_keeps_new_receipt_when_unchanged_provider_time_ties():
+    store = Store()
+    event = Event("Angels at Giants", "baseball", "Giants", "Angels", id="event")
+    store.add_event(event)
+    provider_time = datetime.now(timezone.utc) - timedelta(minutes=3)
+    first_receipt = provider_time + timedelta(seconds=1)
+    latest_receipt = provider_time + timedelta(minutes=3)
+    first = Quote(
+        event.id,
+        "spread",
+        "Giants +1.5",
+        .92,
+        "Book A",
+        observed_at=provider_time,
+        received_at=first_receipt,
+    )
+    confirmed = Quote(
+        event.id,
+        "spread",
+        "Giants +1.5",
+        .92,
+        "Book A",
+        observed_at=provider_time,
+        received_at=latest_receipt,
+    )
+
+    store.add_quotes([first])
+    store.add_quotes([confirmed])
+
+    assert store.quote_values(event.id) == [confirmed]
+
+
 def test_live_state_history_is_bounded_but_update_count_is_preserved():
     store = Store()
     event = Event("Away at Home", "basketball", "Home", "Away", id="event")

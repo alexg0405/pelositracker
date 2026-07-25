@@ -890,6 +890,49 @@
     try { await fetch("/api/config", { method: "POST", headers: {"content-type":"application/json"}, body: JSON.stringify({ auto_monitor: e.target.checked }) }); } catch {}
   });
 
+  function showOddsApiStatus(enabled, pollSeconds, message = "") {
+    const status = document.querySelector("#odds-api-status");
+    if (!status) return;
+    status.className = `odds-api-status ${enabled ? "is-enabled" : "is-disabled"}`;
+    status.textContent = message || (enabled
+      ? `Odds API calls are ON · backend polling every ${Number(pollSeconds||45).toFixed(0)} seconds per eligible monitored event.`
+      : "Odds API calls are OFF · backend pollers are paused even when no browser is open.");
+  }
+
+  document.querySelector("#odds-api-toggle")?.addEventListener("change", async event => {
+    const toggle = event.currentTarget;
+    const requested = toggle.checked;
+    const status = document.querySelector("#odds-api-status");
+    toggle.disabled = true;
+    if (status) {
+      status.className = "odds-api-status";
+      status.textContent = requested
+        ? "Starting Odds API polling…"
+        : "Stopping new Odds API calls…";
+    }
+    try {
+      const response = await fetch("/api/config", {
+        method: "POST",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify({odds_api_enabled: requested})
+      });
+      const config = await response.json().catch(()=>({}));
+      if (!response.ok) throw new Error(
+        config.detail||`Could not update (${response.status})`
+      );
+      toggle.checked = !!config.odds_api_enabled;
+      showOddsApiStatus(config.odds_api_enabled, config.odds_api_poll_seconds);
+    } catch (error) {
+      toggle.checked = !requested;
+      if (status) {
+        status.className = "odds-api-status is-error";
+        status.textContent = `${error.message||"Could not update Odds API polling"}. Setting was not changed.`;
+      }
+    } finally {
+      toggle.disabled = false;
+    }
+  });
+
   // Only start the app data fetching after successful login or if already authenticated.
   // We check if the events endpoint succeeds. If so, we are logged in, hide overlay immediately.
   async function checkAuthAndStart() {
@@ -912,6 +955,8 @@
     fetch("/api/config").then(r=>r.json()).then(c=>{
       document.querySelector("#config").textContent=`Quality ≥ ${c.confidence_threshold} · Base edge ≥ ${(c.edge_threshold*100).toFixed(1)}%`;
       if(document.querySelector("#auto-monitor-toggle")) document.querySelector("#auto-monitor-toggle").checked = !!c.auto_monitor;
+      if(document.querySelector("#odds-api-toggle")) document.querySelector("#odds-api-toggle").checked = !!c.odds_api_enabled;
+      showOddsApiStatus(c.odds_api_enabled, c.odds_api_poll_seconds);
       const policy=document.querySelector("#bot-policy");
       if(policy&&c.paper_bot_policy){
         policy.textContent=c.paper_bot_policy.message;

@@ -115,7 +115,7 @@ _sports_status_compact: "OrderedDict[str, dict]" = OrderedDict()
 _sports_status_detail: dict[str, dict] = {}
 _SPORTS_STATUS_TTL_SECONDS = 600.0  # drop slugs untouched for 10 min
 _SPORTS_STATUS_MAX = 512  # hard cap on compact entries (LRU eviction)
-_config_state = {"auto_monitor": False}
+_config_state = {"auto_monitor": False, "odds_api_enabled": True}
 
 _auth_users_env = os.getenv("AUTHORIZED_USERS")
 if _auth_users_env:
@@ -912,7 +912,11 @@ def _start_event_feeds(event: Event) -> None:
     if event.polymarket_slug:
         group.append(asyncio.create_task(polymarket_market_stream(event, on_quotes)))
     if event.odds_api_sport:
-        group.append(asyncio.create_task(odds_api_poll(event, on_quotes)))
+        group.append(asyncio.create_task(odds_api_poll(
+            event,
+            on_quotes,
+            enabled=lambda: _config_state["odds_api_enabled"],
+        )))
         if settings.enable_action_network:
             group.append(asyncio.create_task(action_network_poll(event, on_quotes)))
         if settings.enable_pinnacle_guest:
@@ -936,6 +940,7 @@ async def lifespan(_: FastAPI):
         monitor_state = MonitorState()
         account_book.seed(DEFAULT_STRATEGIES)
         _config_state["auto_monitor"] = monitor_state.auto_monitor(False)
+        _config_state["odds_api_enabled"] = monitor_state.odds_api_enabled(True)
         for event in monitor_state.events():
             store.add_event(event)
             _finalized.discard(event.id)
@@ -1058,7 +1063,8 @@ class StrategyUpdateIn(BaseModel):
 
 
 class ConfigIn(BaseModel):
-    auto_monitor: bool
+    auto_monitor: bool | None = None
+    odds_api_enabled: bool | None = None
 
 
 @app.get("/")
@@ -1104,6 +1110,7 @@ async def runtime_status():
         "odds_api_quota": dict(_odds_quota),
         "tracked_events": len(store.events),
         "feed_groups": {event_id: len(group) for event_id, group in tasks.items()},
+        "odds_api_enabled": _config_state["odds_api_enabled"],
         "deletions_in_flight": len(_event_deletions),
         "notifications_in_flight": len(_notification_tasks),
         "memory": memory_snapshot(),
@@ -1176,6 +1183,8 @@ async def config():
         "edge_threshold": engine.edge_threshold,
         "max_age_seconds": engine.max_age_seconds,
         "auto_monitor": _config_state["auto_monitor"],
+        "odds_api_enabled": _config_state["odds_api_enabled"],
+        "odds_api_poll_seconds": settings.odds_poll_seconds,
         "paper_bot_policy": {
             "calibration_loaded": calibrated,
             "allow_uncalibrated": settings.allow_uncalibrated_paper,
@@ -1187,9 +1196,17 @@ async def config():
 
 @app.post("/api/config", dependencies=[Depends(verify_auth)])
 async def update_config(payload: ConfigIn):
-    _config_state["auto_monitor"] = payload.auto_monitor
-    if monitor_state is not None:
-        await asyncio.to_thread(monitor_state.set_auto_monitor, payload.auto_monitor)
+    if payload.auto_monitor is not None:
+        _config_state["auto_monitor"] = payload.auto_monitor
+        if monitor_state is not None:
+            await asyncio.to_thread(monitor_state.set_auto_monitor, payload.auto_monitor)
+    if payload.odds_api_enabled is not None:
+        _config_state["odds_api_enabled"] = payload.odds_api_enabled
+        if monitor_state is not None:
+            await asyncio.to_thread(
+                monitor_state.set_odds_api_enabled,
+                payload.odds_api_enabled,
+            )
     return await config()
 
 

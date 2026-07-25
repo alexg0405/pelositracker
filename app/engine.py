@@ -22,7 +22,7 @@ from .models import GameState, Quote, Signal, canonical_source, classify_source
 from .execution import BookLevel, simulate_buy
 
 
-ENGINE_VERSION = "live-edge-engine-0.6.2"
+ENGINE_VERSION = "live-edge-engine-0.6.3"
 REQUEST_SCHEMA_VERSION = "decision-request-v4"
 SOURCE_MAPPING_VERSION = "canonical-source-family-v1"
 DEFAULT_MODEL_VERSION = "equal-family-logit-consensus-v2-display-only"
@@ -398,8 +398,9 @@ class SignalEngine:
 
         The native engine drops quotes with an out-of-range probability/size and
         then keeps, per (comparison_market, comparison_outcome,
-        comparison_source), the one with the greatest ``observed_at`` (ties keep
-        the first seen). Reducing to that exact set before serialization is
+        comparison_source), the one with the greatest ``observed_at`` and then
+        the newest ``received_at`` when provider times tie. Reducing to that
+        exact set before serialization is
         idempotent through the engine — it re-runs the same reduction — so the
         decisions are unchanged, but a stale quote's book depth is no longer
         carried through the request, the decision hash input, or the persisted
@@ -440,7 +441,16 @@ class SignalEngine:
             key = (payload["comparison_market"], payload["comparison_outcome"],
                    payload["comparison_source"])
             current = freshest.get(key)
-            if current is None or payload["observed_at"] > current["observed_at"]:
+            # Equal provider times are common when a book re-confirms an
+            # unchanged line. Preserve the newest receipt in that tie so the
+            # native reference-freshness check sees the current confirmation.
+            if current is None or (
+                payload["observed_at"],
+                payload["received_at"],
+            ) > (
+                current["observed_at"],
+                current["received_at"],
+            ):
                 freshest[key] = payload
         return list(freshest.values())
 

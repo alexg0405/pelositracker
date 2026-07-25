@@ -85,10 +85,12 @@
       <div class="browse-head">
         <h2 class="title">Live Polymarket games</h2>
         <div class="inline-controls">
+          <label class="auto-monitor-label" title="Master switch for paid sportsbook polling"><input class="compact-input" type="checkbox" id="odds-api-toggle"> Odds API polling</label>
           <label class="auto-monitor-label"><input class="compact-input" type="checkbox" id="auto-monitor-toggle"> Auto-Monitor</label>
           <button class="ghost compact-button" id="discover-refresh" type="button">Refresh List</button>
         </div>
       </div>
+      <div id="odds-api-status" class="odds-api-status" role="status" aria-live="polite">Loading Odds API status…</div>
       <div id="discover-refresh-status" class="refresh-status" role="status" aria-live="polite"></div>
       <input class="search-gap" id="discover-search" placeholder="Filter games…" autocomplete="off">
       <div id="discover-list" class="discover-list" aria-live="polite"></div>

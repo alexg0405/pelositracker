@@ -1118,7 +1118,12 @@ def odds_api_quotes(event: Event, payload: dict | list[dict]) -> list[Quote]:
     return quotes
 
 
-async def odds_api_poll(event: Event, emit: Callable[[list[Quote]], Awaitable[None]]):
+async def odds_api_poll(
+    event: Event,
+    emit: Callable[[list[Quote]], Awaitable[None]],
+    *,
+    enabled: Callable[[], bool] | None = None,
+):
     key = os.getenv("THE_ODDS_API_KEY")
     if not key or not event.odds_api_sport:
         return
@@ -1129,6 +1134,12 @@ async def odds_api_poll(event: Event, emit: Callable[[list[Quote]], Awaitable[No
     backoff = RetryBackoff(base_seconds=5, cap_seconds=180)
     async with httpx.AsyncClient(timeout=15) as client:
         while True:
+            # Check the master switch before event matching and before every
+            # paid odds request. The idle task makes re-enabling immediate and
+            # leaves Polymarket and the other event feeds untouched.
+            if enabled is not None and not enabled():
+                await asyncio.sleep(1.0)
+                continue
             failed = False
             try:
                 if not event.odds_api_event_id:
@@ -1142,6 +1153,11 @@ async def odds_api_poll(event: Event, emit: Callable[[list[Quote]], Awaitable[No
                                        event.name)
                         await asyncio.sleep(interval)
                         continue
+                # Event-ID resolution yields to the event loop. Recheck so a
+                # switch flipped while that lookup was in flight cannot be
+                # followed by a new paid odds request.
+                if enabled is not None and not enabled():
+                    continue
                 url, params = odds_api_request(event, key)
                 response = await client.get(url, params=params)
                 response.raise_for_status()

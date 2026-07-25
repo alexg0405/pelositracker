@@ -285,3 +285,109 @@ def test_odds_event_resolution_retries_instead_of_disabling_feed(monkeypatch):
         pass
     assert attempts == 2
     assert target.odds_api_event_id == "resolved"
+
+
+def test_odds_poll_master_switch_prevents_calls_until_enabled(monkeypatch):
+    target = event(odds_api_event_id="game")
+    enabled = False
+    calls = 0
+    sleeps = 0
+
+    class Response:
+        headers = {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "id": "game",
+                "home_team": target.home,
+                "away_team": target.away,
+                "bookmakers": [],
+            }
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return Response()
+
+    async def sleep(_seconds):
+        nonlocal enabled, sleeps
+        sleeps += 1
+        if sleeps == 1:
+            assert calls == 0
+            enabled = True
+            return
+        raise asyncio.CancelledError
+
+    async def emit(_quotes):
+        return None
+
+    monkeypatch.setenv("THE_ODDS_API_KEY", "test")
+    monkeypatch.setattr(sources.httpx, "AsyncClient", lambda **_kwargs: Client())
+    monkeypatch.setattr(sources.asyncio, "sleep", sleep)
+
+    try:
+        asyncio.run(sources.odds_api_poll(
+            target,
+            emit,
+            enabled=lambda: enabled,
+        ))
+    except asyncio.CancelledError:
+        pass
+
+    assert calls == 1
+
+
+def test_odds_poll_rechecks_switch_after_event_id_resolution(monkeypatch):
+    target = event(odds_api_event_id=None)
+    enabled = True
+    calls = 0
+
+    async def match(*_args):
+        nonlocal enabled
+        enabled = False
+        return {"id": "resolved"}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise AssertionError("paid odds request ran after switch was disabled")
+
+    async def sleep(_seconds):
+        raise asyncio.CancelledError
+
+    async def emit(_quotes):
+        return None
+
+    monkeypatch.setenv("THE_ODDS_API_KEY", "test")
+    monkeypatch.setattr(sources, "match_odds_api_event", match)
+    monkeypatch.setattr(sources.httpx, "AsyncClient", lambda **_kwargs: Client())
+    monkeypatch.setattr(sources.asyncio, "sleep", sleep)
+
+    try:
+        asyncio.run(sources.odds_api_poll(
+            target,
+            emit,
+            enabled=lambda: enabled,
+        ))
+    except asyncio.CancelledError:
+        pass
+
+    assert target.odds_api_event_id == "resolved"
+    assert calls == 0

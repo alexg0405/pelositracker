@@ -55,7 +55,17 @@ class Store:
                 )
                 key = (market_key, outcome_key, canonical_source(value.source))
                 current = self.quotes[value.event_id].get(key)
-                if current is None or value.observed_at > current.observed_at:
+                # A provider's ``last_update`` describes when its price changed,
+                # not when the aggregator most recently confirmed that unchanged
+                # price. Keep a newly received confirmation when provider times
+                # tie so an actively polled book does not falsely expire.
+                if current is None or (
+                    value.observed_at,
+                    value.received_at,
+                ) > (
+                    current.observed_at,
+                    current.received_at,
+                ):
                     self.quotes[value.event_id][key] = value
 
     def set_signals(self, event_id: str, values: list[Signal]) -> None:
