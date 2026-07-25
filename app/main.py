@@ -1009,6 +1009,13 @@ async def security_headers(request: Request, call_next):
     if request.url.path.startswith("/api/") and not api_limiter.allow(client):
         return Response(status_code=429, content="rate limit exceeded")
     response = await call_next(request)
+    # Deploys replace these files in place while keeping the same public URLs.
+    # Browsers may otherwise reuse a heuristically fresh copy of index.js and keep
+    # running an older recommendation collector after the backend has changed.
+    if request.url.path in {"/", "/watch"} or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"

@@ -113,6 +113,22 @@ def test_mutation_requires_csrf_and_security_headers_are_strict():
         assert headers["x-content-type-options"] == "nosniff"
 
 
+def test_deployed_dashboard_cannot_reuse_stale_javascript():
+    with TestClient(app) as client:
+        page = client.get("/")
+        script = client.get("/static/index.js?v=best-bets-0e7dcb4")
+
+        assert page.status_code == 200
+        assert script.status_code == 200
+        assert "/static/index.js?v=best-bets-0e7dcb4" in page.text
+        for response in (page, script):
+            assert response.headers["cache-control"] == (
+                "no-store, no-cache, must-revalidate, max-age=0"
+            )
+            assert response.headers["pragma"] == "no-cache"
+            assert response.headers["expires"] == "0"
+
+
 def test_static_pages_have_no_inline_code_handlers_styles_or_duplicate_ids():
     with TestClient(app) as client:
         for path in ("/", "/watch"):
