@@ -1,8 +1,10 @@
+import asyncio
+
 from fastapi.testclient import TestClient
 
 import app.main as main_module
 from app.main import app, store
-from app.models import Quote, Signal
+from app.models import Event, Quote, Signal
 
 
 def login(client):
@@ -52,6 +54,43 @@ def test_event_view_excludes_heavy_internal_snapshot_but_keeps_ui_fields():
         assert signal["market"] == "moneyline" and signal["edge"] == 0.05
 
 
+def test_final_event_view_cannot_return_a_recommendation():
+    event_id = "final-recommendation-fixture"
+    store.add_event(Event(
+        id=event_id, name="Away at Home", sport="basketball",
+        home="Home", away="Away",
+    ))
+    try:
+        store.add_quotes([Quote(
+            event_id, "moneyline", "Home", .55, "Polymarket",
+            bid=.54, ask=.55, token_id="final-token",
+        )])
+        store.set_signals(event_id, [Signal(
+            event_id=event_id, market="moneyline", outcome="Home",
+            model_probability=.65, market_probability=.55, edge=.10,
+            confidence=90, action="PAPER_BET", reasons=["qualified before final"],
+            quote_source="Polymarket", n_reference_sources=2,
+            required_edge=.03, token_id="final-token",
+            consensus_probability=.65, calibrated_consensus_probability=.65,
+            net_expected_value_per_share=.10,
+        )])
+        main_module._terminal_events[event_id] = "final"
+
+        view = asyncio.run(main_module.event_view(event_id, positions=[]))
+        market = view["actionable_markets"][0]
+
+        assert market["entry_action"] == "WAIT"
+        assert market["new_entry_eligible"] is False
+        assert market["recommendation_eligible"] is False
+        assert "final or no longer active" in market["why_no_entry"]
+    finally:
+        main_module._terminal_events.pop(event_id, None)
+        with store.lock:
+            store.events.pop(event_id, None)
+            store.quotes.pop(event_id, None)
+            store.signals.pop(event_id, None)
+
+
 def test_dashboard_contains_merged_ui_behaviors():
     with TestClient(app) as client:
         html = client.get("/").text
@@ -80,6 +119,9 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "data-jump-event" in javascript
         assert 'activeLine="all"' in javascript
         assert "scrollIntoView" in javascript
+        assert "recommendation_eligible" in javascript
+        assert "recommendation_score" in javascript
+        assert "at or below 5c or at or above 95c" in html
 
 
 def test_bot_cashout_toggle_and_mark_feed_are_authenticated_api_contracts():

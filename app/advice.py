@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from .entry_policy import entry_price_allowed, entry_price_blocker
 from .models import Quote, Signal
 
 
@@ -58,12 +59,18 @@ def _risk_flags(quote: Quote, signal: Signal | None,
 
 
 def _entry_blocker(signal: Signal | None, entry_action: str, edge: float | None,
-                   required_edge: float | None, calibrated: float | None) -> str | None:
+                   required_edge: float | None, calibrated: float | None, *,
+                   new_entries_allowed: bool, price_allowed: bool,
+                   new_entries_blocker: str | None) -> str | None:
     """One-line, human reason this selection is not an entry (None when it is).
 
     Turns "why isn't the bot betting this?" from a mystery into a visible,
     ranked reason: no reference, edge below the floor, or display-only because no
     validated calibration artifact is installed."""
+    if not new_entries_allowed:
+        return new_entries_blocker or "New entry blocked: this event is no longer active."
+    if not price_allowed:
+        return entry_price_blocker()
     if entry_action == "ENTRY WINDOW":
         return None
     if signal is None:
@@ -77,7 +84,14 @@ def _entry_blocker(signal: Signal | None, entry_action: str, edge: float | None,
     return "Engine gates not cleared — expand details."
 
 
-def market_views(quotes: list[Quote], signals: list[Signal], edge_threshold: float) -> list[dict]:
+def market_views(
+    quotes: list[Quote],
+    signals: list[Signal],
+    edge_threshold: float,
+    *,
+    new_entries_allowed: bool = True,
+    new_entries_blocker: str | None = None,
+) -> list[dict]:
     """Return only selections with an executable Polymarket ask."""
     now = datetime.now(timezone.utc)
     signal_by_selection = _signal_map(signals)
@@ -124,15 +138,36 @@ def market_views(quotes: list[Quote], signals: list[Signal], edge_threshold: flo
         net_edge_buffer = (entry_margin - required_edge
                            if entry_margin is not None and required_edge is not None else None)
         edge_buffer = edge - required_edge if edge is not None and required_edge is not None else None
-        if (signal and signal.action == "PAPER_BET"
+        price_allowed = (
+            entry_price_allowed(quote.ask)
+            and (signal is None or entry_price_allowed(signal.market_probability))
+        )
+        if (new_entries_allowed and price_allowed
+                and signal and signal.action == "PAPER_BET"
                 and net_edge_buffer is not None and net_edge_buffer >= 0):
             entry_action = "ENTRY WINDOW"
         elif signal:
             entry_action = "WAIT"
         else:
             entry_action = "MARKET ONLY"
+        recommendation_eligible = (
+            entry_action == "ENTRY WINDOW"
+            and signal is not None
+            and signal.n_reference_sources >= 2
+            and signal.confidence > 0
+            and edge_buffer is not None
+            and edge_buffer >= 0
+        )
+        recommendation_score = (
+            max(0.0, edge_buffer) * min(100.0, max(0.0, signal.confidence)) / 100.0
+            if recommendation_eligible and signal is not None and edge_buffer is not None
+            else None
+        )
         why_no_entry = _entry_blocker(signal, entry_action, edge, required_edge,
-                                      calibrated_probability)
+                                      calibrated_probability,
+                                      new_entries_allowed=new_entries_allowed,
+                                      price_allowed=price_allowed,
+                                      new_entries_blocker=new_entries_blocker)
         risks = _risk_flags(quote, signal, provider_age_seconds)
         uncertainty_low = signal.uncertainty_low if signal else None
         uncertainty_high = signal.uncertainty_high if signal else None
@@ -154,6 +189,9 @@ def market_views(quotes: list[Quote], signals: list[Signal], edge_threshold: flo
             "provider_age_seconds": provider_age_seconds,
             "receipt_age_seconds": receipt_age_seconds,
             "entry_action": entry_action,
+            "new_entry_eligible": new_entries_allowed and price_allowed,
+            "recommendation_eligible": recommendation_eligible,
+            "recommendation_score": recommendation_score,
             "model_probability": consensus_probability,
             "consensus_probability": consensus_probability,
             "calibrated_consensus_probability": calibrated_probability,
@@ -220,7 +258,9 @@ def market_views(quotes: list[Quote], signals: list[Signal], edge_threshold: flo
             "risk_flags": risks,
         })
     priority = {"ENTRY WINDOW": 0, "WAIT": 1, "MARKET ONLY": 2}
-    return sorted(views, key=lambda view: (priority[view["entry_action"]],
+    return sorted(views, key=lambda view: (not view["recommendation_eligible"],
+                                           priority[view["entry_action"]],
+                                           -(view["recommendation_score"] or -1),
                                            -(view["entry_margin"] or -1), view["question"], view["outcome"]))
 
 

@@ -430,10 +430,9 @@
     const rows = [];
     for (const v of events || []) {
       for (const m of (v.actionable_markets || [])) {
-        // Show positive-edge selections plus anything the engine flags as a live
-        // entry window (which should already be positive, but never hide one).
-        if (m.edge == null) continue;
-        if (m.edge <= 0 && m.entry_action !== "ENTRY WINDOW") continue;
+        // Only rank selections that passed the server's final-game, executable
+        // 5c-95c price, reference-source, edge-floor, and signal-quality gates.
+        if (!m.recommendation_eligible) continue;
         rows.push({ event: v.event, m });
       }
     }
@@ -441,7 +440,9 @@
       const ea = a.m.entry_action === "ENTRY WINDOW" ? 1 : 0;
       const eb = b.m.entry_action === "ENTRY WINDOW" ? 1 : 0;
       if (ea !== eb) return eb - ea;              // entry windows first
-      return (b.m.edge || 0) - (a.m.edge || 0);   // then by edge, strongest first
+      const qualityEdge = (b.m.recommendation_score || 0) - (a.m.recommendation_score || 0);
+      if (qualityEdge !== 0) return qualityEdge;  // edge weighted by signal quality
+      return (b.m.edge || 0) - (a.m.edge || 0);
     });
     return rows.slice(0, BEST_BETS_LIMIT);
   }
@@ -472,7 +473,7 @@
     const rows = collectBestBets(lastEvents);
     if (!rows.length) {
       if (sub) sub.textContent = "";
-      box.innerHTML = '<div class="discover-empty">No positive-edge selections right now. Monitor games below to populate this list.</div>';
+      box.innerHTML = '<div class="discover-empty">No qualifying recommendations right now. Final games, extreme prices, weak signals, and lines below their required edge are excluded.</div>';
       return;
     }
     const entries = rows.filter(r => r.m.entry_action === "ENTRY WINDOW").length;
@@ -487,6 +488,7 @@
         </div>
         <div class="bb-figs">
           <div class="bb-fig"><div class="value ${edgeCls}">${signedCents(m.edge)}</div><div class="hint">${basis}</div></div>
+          <div class="bb-fig"><div class="value">${m.confidence == null ? "â€”" : Math.round(m.confidence)}</div><div class="hint">signal quality</div></div>
           <div class="bb-fig"><div class="value">${cents(m.buy_price)}</div><div class="hint">buy now</div></div>
           <span class="tag ${tagClass(m.entry_action)}">${esc(m.entry_action)}</span>
         </div>

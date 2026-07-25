@@ -3,6 +3,13 @@ use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+const MIN_ENTRY_PRICE: f64 = 0.05;
+const MAX_ENTRY_PRICE: f64 = 0.95;
+
+fn entry_price_allowed(price: f64) -> bool {
+    price.is_finite() && price > MIN_ENTRY_PRICE && price < MAX_ENTRY_PRICE
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct QuoteInput {
     market: String,
@@ -1329,13 +1336,22 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
                     .map(|value| value.model_sample_size.unwrap_or(value.sample_size))
                     .unwrap_or(0),
                 calibration_sample_size: policy.map(|value| value.sample_size).unwrap_or(0),
-                gate_results: vec![gate(
-                    "reference_source_support",
-                    Some(false),
-                    Some(0.0),
-                    Some(2.0),
-                    "no independent reference source family is available",
-                )],
+                gate_results: vec![
+                    gate(
+                        "reference_source_support",
+                        Some(false),
+                        Some(0.0),
+                        Some(2.0),
+                        "no independent reference source family is available",
+                    ),
+                    gate(
+                        "entry_price_range",
+                        Some(entry_price_allowed(executable)),
+                        Some(executable),
+                        None,
+                        "new entries require an executable price above 5c and below 95c",
+                    ),
+                ],
             });
             continue;
         }
@@ -1678,6 +1694,11 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
         if source_count < 2 {
             blockers.push("fewer than 2 independent reference sources".to_string());
         }
+        if !entry_price_allowed(executable) {
+            blockers.push(
+                "executable price must be above 5c and below 95c for a new entry".to_string(),
+            );
+        }
         if let Some(s) = spread {
             if s > 0.08 {
                 blockers.push(format!("wide executable spread ({:.1}%)", s * 100.0));
@@ -1784,6 +1805,13 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
             None,
             None,
             "target market must be active, unresolved, unrestricted, and accepting orders",
+        ));
+        gate_results.push(gate(
+            "entry_price_range",
+            Some(entry_price_allowed(executable)),
+            Some(executable),
+            None,
+            "new entries require an executable price above 5c and below 95c",
         ));
         gate_results.push(gate(
             "executable_fill",
@@ -2093,6 +2121,45 @@ mod tests {
             state_valid: true,
             possession_home: Some(1.0),
         }
+    }
+
+    #[test]
+    fn recommendation_price_range_is_strict() {
+        for price in [0.01, 0.05, 0.95, 0.99] {
+            assert!(!entry_price_allowed(price));
+        }
+        for price in [0.051, 0.50, 0.949] {
+            assert!(entry_price_allowed(price));
+        }
+    }
+
+    #[test]
+    fn extreme_executable_price_cannot_produce_a_paper_bet() {
+        let now = 1_000.0;
+        let mut quotes = Vec::new();
+        for source in ["A", "B"] {
+            quotes.push(quote(source, "home", 0.60, now));
+            quotes.push(quote(source, "away", 0.40, now));
+        }
+        let mut poly_home = quote("Polymarket", "home", 0.04, now);
+        poly_home.bid = Some(0.03);
+        poly_home.ask = Some(0.04);
+        quotes.push(poly_home);
+        quotes.push(quote("Polymarket", "away", 0.96, now));
+
+        let home = evaluate(request(quotes), now)
+            .into_iter()
+            .find(|signal| signal.outcome == "home")
+            .unwrap();
+
+        assert!(home.edge > 0.02);
+        assert_eq!(home.action, "WATCH");
+        let price_gate = home
+            .gate_results
+            .iter()
+            .find(|gate| gate.code == "entry_price_range")
+            .unwrap();
+        assert_eq!(price_gate.passed, Some(false));
     }
 
     #[test]

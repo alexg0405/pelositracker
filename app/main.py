@@ -1325,11 +1325,26 @@ async def event_view(event_id: str, positions: list[dict] | None = None):
     if positions is None:
         positions = (await asyncio.to_thread(ledger.event_positions, event_id)
                      if ledger is not None else [])
+    terminal = (
+        _terminal_events.get(event_id)
+        or ("final" if latest_state is not None and latest_state.ended else None)
+        or (_terminal_kind(latest_state.status) if latest_state is not None else None)
+    )
+    new_entries_allowed = terminal is None and event_id not in _finalized
     return {"event": as_json(event),
             "latest_state": as_json(latest_state),
             "signals": _signal_views(signals),
             "edge_health": edge_health(quotes, signals, engine.max_age_seconds),
-            "actionable_markets": market_views(quotes, signals, engine.edge_threshold),
+            "actionable_markets": market_views(
+                quotes,
+                signals,
+                engine.edge_threshold,
+                new_entries_allowed=new_entries_allowed,
+                new_entries_blocker=(
+                    "New entry blocked: this game is final or no longer active."
+                    if not new_entries_allowed else None
+                ),
+            ),
             "positions": position_views(positions, quotes, signals,
                                           engine.confidence_threshold),
             "state_points": state_points,

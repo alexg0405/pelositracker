@@ -17,11 +17,11 @@ from .models import GameState, Quote, Signal, canonical_source, classify_source
 from .execution import BookLevel, simulate_buy
 
 
-ENGINE_VERSION = "live-edge-engine-0.6.0"
+ENGINE_VERSION = "live-edge-engine-0.6.1"
 REQUEST_SCHEMA_VERSION = "decision-request-v4"
 SOURCE_MAPPING_VERSION = "canonical-source-family-v1"
 DEFAULT_MODEL_VERSION = "equal-family-logit-consensus-v2-display-only"
-EXECUTION_POLICY_VERSION = "paper-depth-v1"
+EXECUTION_POLICY_VERSION = "paper-depth-price-range-v2"
 
 try:
     from ._native_engine import evaluate_json

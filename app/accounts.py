@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 
 from .database import Database
+from .entry_policy import entry_price_allowed, entry_price_blocker
 from .execution import BookLevel, simulate_buy, simulate_sell
 from .lines import is_spread_market, is_total_market, quote_line_side
 from .models import Event, Quote, Signal
@@ -293,6 +294,8 @@ def qualification_failures(strategy: Strategy, signal: Signal, *,
         failures.append("not an executable Polymarket selection")
     if not 0 < signal.market_probability < 1:
         failures.append("invalid executable price")
+    elif not entry_price_allowed(signal.market_probability):
+        failures.append(entry_price_blocker())
     if signal.n_reference_sources < strategy.min_sources:
         failures.append("too few independent references")
     if signal.edge < signal.required_edge:
@@ -333,6 +336,7 @@ def gate_result(code: str, passed: bool | None, *, value: float | None = None,
 _MODEL_GATE_FAILURE = {
     "quote_source": "not an executable Polymarket selection",
     "executable_price": "invalid executable price",
+    "entry_price_range": entry_price_blocker(),
     "market_enabled": "market is disabled for this strategy",
 }
 
@@ -357,6 +361,10 @@ def model_backed_gates(strategy: Strategy, signal: Signal) -> list[dict]:
             "executable_price", 0 < signal.market_probability < 1,
             value=signal.market_probability,
             explanation="executable price must be strictly between 0 and 1"),
+        gate_result(
+            "entry_price_range", entry_price_allowed(signal.market_probability),
+            value=signal.market_probability,
+            explanation="new entries require an executable price above 5c and below 95c"),
         gate_result(
             "market_enabled", market_allowed(strategy, signal.market),
             explanation="target market must be enabled for this strategy"),
@@ -982,8 +990,15 @@ class AccountBook:
                                 "no current complete Polymarket order book is available",
                             )
                             continue
-                        if signal.market_probability <= 0:
+                        if not 0 < signal.market_probability < 1:
                             reject("quote", "the executable market price is invalid")
+                            continue
+                        if not entry_price_allowed(signal.market_probability):
+                            reject(
+                                "price_range",
+                                entry_price_blocker(),
+                                market_probability=signal.market_probability,
+                            )
                             continue
                         model_override = model_probabilities.get(signal.token_id)
                         if model_override is not None:
@@ -1085,6 +1100,14 @@ class AccountBook:
                         stake = float(execution.filled_cash)
                         shares = float(execution.filled_shares)
                         entry_price = float(execution.effective_probability)
+                        if not entry_price_allowed(entry_price):
+                            reject(
+                                "price_range",
+                                entry_price_blocker(),
+                                requested_stake=requested_stake,
+                                entry_price=entry_price,
+                            )
+                            continue
                         model_probability = (model_override if model_override is not None
                                              else _decision_probability(signal))
                         if model_probability is None or not 0 < model_probability < 1:

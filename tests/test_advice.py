@@ -58,6 +58,7 @@ def test_gross_edge_shown_when_calibrated_net_edge_is_unavailable():
     assert view["gross_edge"] == pytest.approx(.06)      # consensus .62 - ask .56
     assert view["edge"] == pytest.approx(.06)
     assert view["entry_action"] == "WAIT"                # engine verdict unchanged
+    assert view["recommendation_eligible"] is False
     assert "calibration" in view["why_no_entry"].lower()
 
 
@@ -78,6 +79,8 @@ def test_actionable_market_has_executable_prices_and_entry_ceiling():
     views = market_views([poly_quote()], [signal()], edge_threshold=.035)
     assert len(views) == 1
     assert views[0]["entry_action"] == "ENTRY WINDOW"
+    assert views[0]["recommendation_eligible"] is True
+    assert views[0]["recommendation_score"] == pytest.approx(.025 * .82)
     assert views[0]["buy_price"] == .56
     assert views[0]["sell_price"] == .54
     assert abs(views[0]["price_ceiling"] - .585) < 1e-9
@@ -110,6 +113,39 @@ def test_market_without_an_ask_is_not_shown_as_placeable():
     quote = poly_quote()
     quote.ask = None
     assert market_views([quote], [signal()], edge_threshold=.035) == []
+
+
+@pytest.mark.parametrize("price", [.01, .05, .95, .99])
+def test_extreme_price_is_never_a_new_entry_or_recommendation(price):
+    quote = poly_quote()
+    quote.ask = price
+    value = signal(model=.99)
+    value.market_probability = price
+    value.edge = .20
+    value.net_expected_value_per_share = .20
+
+    view = market_views([quote], [value], edge_threshold=.035)[0]
+
+    assert view["entry_action"] == "WAIT"
+    assert view["new_entry_eligible"] is False
+    assert view["recommendation_eligible"] is False
+    assert view["recommendation_score"] is None
+    assert "above 5c and below 95c" in view["why_no_entry"]
+
+
+def test_final_game_is_never_a_new_entry_or_recommendation():
+    view = market_views(
+        [poly_quote()],
+        [signal()],
+        edge_threshold=.035,
+        new_entries_allowed=False,
+        new_entries_blocker="New entry blocked: this game is final.",
+    )[0]
+
+    assert view["entry_action"] == "WAIT"
+    assert view["new_entry_eligible"] is False
+    assert view["recommendation_eligible"] is False
+    assert view["why_no_entry"] == "New entry blocked: this game is final."
 
 
 def test_position_advice_can_hold_or_consider_cash():

@@ -22,6 +22,7 @@ import json
 from typing import Iterable, Sequence
 
 from .database import Database
+from .entry_policy import entry_price_allowed
 from .models import Event, Signal
 
 logger = logging.getLogger(__name__)
@@ -339,6 +340,7 @@ class Ledger:
             )
             for s in signals
             if s.action == "PAPER_BET"
+            and entry_price_allowed(s.market_probability)
             and s.execution_complete
             and s.requested_cash is not None and s.requested_cash > 0
             and s.filled_cash is not None and s.filled_cash > 0

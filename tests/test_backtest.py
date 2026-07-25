@@ -244,6 +244,21 @@ def test_ledger_never_invents_a_fill_when_execution_lineage_is_missing(tmp_path)
         ledger.close()
 
 
+@pytest.mark.parametrize("price", [.01, .05, .95, .99])
+def test_ledger_never_records_an_extreme_price_entry(tmp_path, price):
+    ledger = Ledger(str(tmp_path / f"extreme-{price}.db"))
+    event = Event("A at B", "basketball", "B", "A", id="e")
+    value = paper_signal("A", .99, price, .20)
+    try:
+        assert ledger.record_signals(event, [value]) == 0
+        assert ledger.all_bets() == []
+        decisions = ledger.all_decisions()
+        assert len(decisions) == 1
+        assert decisions[0]["policy_action"] == "PAPER_BET"
+    finally:
+        ledger.close()
+
+
 def test_decision_coverage_is_lean_and_excludes_heavy_snapshot(tmp_path):
     ledger = Ledger(str(tmp_path / "coverage.db"))
     try:

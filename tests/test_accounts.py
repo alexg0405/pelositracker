@@ -141,6 +141,8 @@ def test_bot_activity_report_balances_fast_and_slow_events(tmp_path):
     ({"action": "WATCH"}, "engine gates"),
     ({"quote_source": "Pinnacle"}, "Polymarket"),
     ({"market_probability": 0}, "invalid executable"),
+    ({"market_probability": .05}, "above 5c and below 95c"),
+    ({"market_probability": .95}, "above 5c and below 95c"),
     ({"n_reference_sources": 1}, "too few"),
     ({"edge": .03, "required_edge": .04}, "risk-adjusted"),
 ])
@@ -167,7 +169,7 @@ def test_model_backed_gates_emit_the_shared_structured_schema():
     strategy = Strategy("test", edge_threshold=0)
     gates = model_backed_gates(strategy, valid_signal())
     assert [g["code"] for g in gates] == [
-        "quote_source", "executable_price", "market_enabled"]
+        "quote_source", "executable_price", "entry_price_range", "market_enabled"]
     for gate in gates:  # same field schema the Rust consensus gates carry
         assert set(gate) >= {"code", "passed", "status", "value", "threshold",
                              "explanation"}
@@ -178,6 +180,8 @@ def test_model_backed_gates_emit_the_shared_structured_schema():
 @pytest.mark.parametrize("code, changes, reason", [
     ("quote_source", {"quote_source": "Pinnacle"}, "not an executable Polymarket selection"),
     ("executable_price", {"market_probability": 0}, "invalid executable price"),
+    ("entry_price_range", {"market_probability": .05},
+     "New entry blocked: executable price must be above 5c and below 95c."),
 ])
 def test_model_backed_gate_fails_closed_and_matches_legacy_string(code, changes, reason):
     from app.accounts import model_backed_failures, model_backed_gates
@@ -216,6 +220,36 @@ def test_uncalibrated_watch_signal_trades_only_with_opt_in():
                for reason in qualification_failures(strategy, signal))
     # Opt-in: a fundamentally sound, uncalibrated gross-gap edge is tradeable.
     assert qualifies(strategy, signal, allow_uncalibrated=True)
+
+
+@pytest.mark.parametrize("price", [.01, .05, .95, .99])
+def test_bot_never_places_an_extreme_price_entry(tmp_path, price):
+    book = AccountBook(str(tmp_path / f"accounts-{price}.db"))
+    event = Event("A vs B", "basketball", "A", "B", id=f"event-{price}")
+    strategy = Strategy(
+        "bot", sizing="flat", flat_stake=100, start_bankroll=1_000,
+        edge_threshold=0.0, min_sources=2,
+    )
+    value = valid_signal(
+        event_id=event.id,
+        market_probability=price,
+        edge=.20,
+        decision_id=f"extreme-{price}",
+    )
+    quote = executable_quote(
+        event, "token-home", "moneyline", "A",
+        ask=price, bid=max(.001, price - .01),
+    )
+    try:
+        book.seed([strategy])
+        assert book.place(event, [value], [quote], as_of=1_000) == []
+        activity = book.activity("bot")
+        assert len(activity) == 1
+        assert activity[0]["stage"] == "price_range"
+        assert "above 5c and below 95c" in activity[0]["reason"]
+        assert book.account_bets("bot") == []
+    finally:
+        book.close()
 
 
 def test_uncalibrated_opt_in_still_blocks_a_real_gate_failure():
