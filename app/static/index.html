@@ -3,12 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Paper-only Polymarket entry and position monitor">
+  <meta name="description" content="Auditable live sports-market research and controlled Polymarket US execution">
   <title>PelosiTracker Dashboard</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <link rel="stylesheet" href="/static/index.css">
+  <link rel="stylesheet" href="/static/index.css?v=us-hosted-execution-1">
 </head>
-<body>
+<body class="research-workstation">
 <div id="login-overlay">
   <div class="login-box">
     <h1 class="glitch" data-text="PelosiAlpha">Pelosi<span>Alpha</span></h1>
@@ -25,8 +25,9 @@
 
 <main class="wrap">
   <header>
-    <div class="brand"><span class="dot" aria-hidden="true"></span><div><h1 class="glitch" data-text="PelosiTracker">PelosiTracker</h1><small>Paper-only entry and position guidance</small></div></div>
+    <div class="brand"><span class="dot" aria-hidden="true"></span><div><h1 class="glitch" data-text="PelosiTracker">PelosiTracker</h1><small>Auditable research, paper tracking, and controlled US execution</small></div></div>
     <div class="header-brand">
+      <div class="workstation-chip">CONTROLLED POLYMARKET US EXECUTION</div>
       <div class="config" id="config">Loading thresholds…</div>
     </div>
   </header>
@@ -34,7 +35,8 @@
   <nav class="tab-carousel">
     <button class="pill active" data-tab="tab-live">Live Radar</button>
     <button class="pill" data-tab="tab-discovery">Discovery</button>
-    <button class="pill" data-tab="tab-bots">Custom Bots & Metrics</button>
+    <button class="pill" data-tab="tab-us-research">Polymarket US Research</button>
+    <button class="pill" id="bots-tab-button" data-tab="tab-bots">Custom Bots & Metrics</button>
   </nav>
 
   <!-- TAB 1: LIVE RADAR -->
@@ -60,7 +62,7 @@
         <h2 class="title">Best current bets</h2>
         <span class="metrics-sub" id="best-bets-sub"></span>
       </div>
-      <div class="field-note">Highest-edge selections across every monitored game right now. Paper only — not advice. Tap one to jump to it on the Live Radar.</div>
+      <div class="field-note">Positive research edges across monitored games. Each row shows whether an exact Polymarket US contract is qualified, queued, open, or research-only. Tap one to jump to the Live Radar.</div>
       <div id="best-bets" class="best-bets" aria-live="polite"></div>
     </div>
 
@@ -97,7 +99,223 @@
     </div>
   </div>
 
-  <!-- TAB 3: CUSTOM BOTS & METRICS -->
+  <!-- TAB 3: POLYMARKET US RESEARCH SIDECAR -->
+  <div id="tab-us-research" class="tab-content is-hidden">
+    <section class="panel pad section-gap us-research-hero">
+      <div class="browse-head">
+        <div>
+          <h2 class="title">Polymarket US research & execution</h2>
+          <div class="field-note">The established engine remains unchanged. A separate, auditable execution policy maps its signals to exact US/mobile contracts and enforces your bankroll limits.</div>
+        </div>
+        <span class="us-venue-badge">POLYMARKET US</span>
+      </div>
+      <div id="us-key-status" class="us-status-grid" role="status" aria-live="polite">
+        <div class="us-status-card"><span>Deployment</span><strong>Loading…</strong></div>
+        <div class="us-status-card"><span>API key</span><strong>Loading…</strong></div>
+        <div class="us-status-card"><span>Trading</span><strong>Loading…</strong></div>
+      </div>
+      <div class="notice us-safety-note"><strong>Safety boundary:</strong> live entries and live cash-outs are disarmed after every restart and after 30 minutes. Dry-run is the default. Orders are bounded fill-or-kill limits, every live order is previewed, and the emergency stop touches only orders created here.</div>
+    </section>
+
+    <div class="us-overview-grid section-gap">
+      <section class="panel pad us-performance-panel">
+        <div class="browse-head">
+          <div>
+            <h2 class="title">Trading performance</h2>
+            <div class="field-note">Running execution results for positions managed by this execution service. W–L–P counts closed trades by realized profit, loss, or push; open trades affect marked net but do not enter the record until they close.</div>
+          </div>
+          <button class="ghost compact-button" id="us-performance-refresh" type="button">Refresh tallies</button>
+        </div>
+        <div id="us-performance-summary" class="us-performance-summary" aria-live="polite">
+          <div class="metrics-empty">No managed trade results yet.</div>
+        </div>
+        <div class="us-performance-footnote">Total net = realized net + current executable cash-out value minus entry cost on priced open positions. Future live exit fees are unknown until an exit is previewed or filled.</div>
+      </section>
+
+      <section class="panel pad us-account-panel">
+        <div class="browse-head">
+          <div>
+            <h2 class="title">Account connection</h2>
+            <div class="field-note">After adding the Key ID and one-time Secret Key to the server environment, test authentication here. Credentials never leave the backend or appear in the journal.</div>
+          </div>
+          <button class="ghost compact-button" id="us-account-refresh" type="button">Test account key</button>
+        </div>
+        <div id="us-account-status" class="refresh-status" role="status" aria-live="polite"></div>
+        <div id="us-account" class="us-account-view">
+          <div class="metrics-empty">No account request has been made. Public US market data below does not require a key.</div>
+        </div>
+      </section>
+    </div>
+
+    <section class="panel pad section-gap us-trading-panel">
+      <div class="browse-head">
+        <div>
+          <h2 class="title">Automatic trade controls</h2>
+          <div class="field-note">These are execution limits around the existing model—not new probability, edge, quality, or calibration formulas.</div>
+        </div>
+        <span id="us-trading-mode-badge" class="us-venue-badge">DISARMED</span>
+      </div>
+      <div id="us-trading-status" class="us-trading-status" role="status" aria-live="polite">Loading execution policy…</div>
+      <form id="us-trading-form" class="us-trading-form">
+        <label>Execution mode
+          <select id="us-trading-mode">
+            <option value="dry_run">Dry run / simulated fills</option>
+            <option value="live">Live Polymarket US orders</option>
+          </select>
+        </label>
+        <label>Maximum total exposure ($)
+          <input id="us-max-exposure" type="number" min="0.01" step="0.01" required>
+        </label>
+        <label>Minimum cash reserve ($)
+          <input id="us-cash-reserve" type="number" min="0" step="0.01" required>
+        </label>
+        <label>Maximum per position ($)
+          <input id="us-max-position" type="number" min="0.01" step="0.01" required>
+        </label>
+        <label>Maximum per event ($)
+          <input id="us-max-event" type="number" min="0.01" step="0.01" required>
+        </label>
+        <label>Daily realized-loss stop ($)
+          <input id="us-daily-loss" type="number" min="0" step="0.01" required>
+        </label>
+        <label>Minimum edge (%)
+          <input id="us-min-edge" type="number" min="0" max="99" step="0.1" required>
+        </label>
+        <label>Minimum signal quality (0–100)
+          <input id="us-min-quality" type="number" min="0" max="100" step="1" required>
+        </label>
+        <label>Entry price floor (¢)
+          <input id="us-min-price" type="number" min="5.1" max="94.8" step="0.1" required>
+        </label>
+        <label>Entry price ceiling (¢)
+          <input id="us-max-price" type="number" min="5.2" max="94.9" step="0.1" required>
+        </label>
+        <label>Minimum hold before auto-exit (minutes)
+          <input id="us-min-hold" type="number" min="0" step="1" required>
+        </label>
+        <label>Meaningful profit target (%)
+          <input id="us-profit-target" type="number" min="1" max="99" step="1" required>
+        </label>
+        <label class="us-check"><input id="us-automation-enabled" type="checkbox"> Run automatic analysis cycles</label>
+        <label class="us-check"><input id="us-auto-cashout" type="checkbox"> Allow logical automatic cash-out</label>
+        <label class="us-check us-check-wide"><input id="us-require-engine" type="checkbox"> Require the existing engine to clear every entry gate (recommended)</label>
+        <div class="field-note us-check-wide">An exit needs the minimum hold plus either a meaningful gain with edge decay/trailing pullback, a stop with model invalidation, or a material model reversal. A one-cent gain alone never triggers an exit.</div>
+        <details class="advanced us-check-wide us-policy-advanced">
+          <summary>Advanced risk and exit limits</summary>
+          <div class="us-advanced-grid">
+            <label>Maximum open positions
+              <input id="us-max-open" type="number" min="1" step="1" required>
+            </label>
+            <label>Maximum live entries / hour
+              <input id="us-max-orders-hour" type="number" min="1" step="1" required>
+            </label>
+            <label>Minimum independent references
+              <input id="us-min-refs" type="number" min="1" step="1" required>
+            </label>
+            <label>Maximum bid/ask spread (¢)
+              <input id="us-max-spread" type="number" min="0.1" max="99" step="0.1" required>
+            </label>
+            <label>Minimum top-of-book shares
+              <input id="us-min-depth" type="number" min="1" step="1" required>
+            </label>
+            <label>Trailing pullback after profit (%)
+              <input id="us-trailing-drawdown" type="number" min="1" max="99" step="1" required>
+            </label>
+            <label>Stop loss with model invalidation (%)
+              <input id="us-stop-loss" type="number" min="1" max="99" step="1" required>
+            </label>
+            <label>Exit when current edge falls to (%)
+              <input id="us-exit-edge" type="number" min="-99" max="99" step="0.1" required>
+            </label>
+            <label>Analysis cycle (seconds)
+              <input id="us-cycle-seconds" type="number" min="10" max="300" step="1" required>
+            </label>
+          </div>
+        </details>
+        <div class="us-trading-actions us-check-wide">
+          <button class="primary" id="us-policy-save" type="submit">Save execution policy</button>
+          <button class="ghost" id="us-run-now" type="button">Run one cycle now</button>
+          <button class="ghost" id="us-disarm" type="button">Disarm live orders</button>
+          <button class="danger" id="us-emergency-stop" type="button">Emergency stop</button>
+        </div>
+      </form>
+      <div class="us-arm-row">
+        <label>To arm live mode, type <code>ARM LIVE TRADING</code>
+          <input id="us-arm-confirmation" autocomplete="off" placeholder="ARM LIVE TRADING">
+        </label>
+        <button class="danger" id="us-arm" type="button">Arm for 30 minutes</button>
+      </div>
+      <div class="notice us-safety-note"><strong>Recommended rollout:</strong> leave “Require every engine gate” on and run dry-run until the journal shows exact event/line mappings and exits you agree with. In dry-run only, unchecking it lets the execution layer judge WATCH signals by the current authenticated US executable edge even when the separate global display edge is negative. It does not change either calculation, and live mode retains the positive source-signal gate.</div>
+    </section>
+
+    <div class="us-activity-grid section-gap">
+      <section class="panel pad us-positions-panel">
+        <div class="browse-head">
+          <div>
+            <h2 class="title">Managed positions</h2>
+            <div class="field-note">Only positions created by this execution service appear here. Manual Polymarket positions are never auto-managed.</div>
+          </div>
+        </div>
+        <form id="us-liquidate-form" class="us-liquidate-controls">
+          <div class="us-liquidate-copy">
+            <strong>Clear trades</strong>
+            <span>Dry run is an executive reset: it switches automation off, force-clears every simulated position, and resets dry-run history without consulting a market. Live submits real sell attempts and never erases trade history.</span>
+          </div>
+          <fieldset class="us-mode-switch">
+            <legend>Action target</legend>
+            <label>
+              <input type="radio" name="liquidate-mode" value="dry_run" checked>
+              <span>Dry run <b id="us-liquidate-dry-count">0 trades</b></span>
+            </label>
+            <label>
+              <input type="radio" name="liquidate-mode" value="live">
+              <span>Live <b id="us-liquidate-live-count">0 open</b></span>
+            </label>
+          </fieldset>
+          <label id="us-liquidate-confirm-row" class="us-liquidate-confirm" hidden>
+            Confirm live bulk sale
+            <input id="us-liquidate-confirmation" autocomplete="off" placeholder="SELL ALL LIVE POSITIONS">
+          </label>
+          <button class="danger" id="us-liquidate-submit" type="submit">Stop automation + wipe dry-run trades</button>
+          <div id="us-liquidate-status" class="us-liquidate-status" role="status" aria-live="polite"></div>
+        </form>
+        <div class="us-position-toolbar">
+          <div class="us-position-filter" role="group" aria-label="Filter managed positions">
+            <button class="is-active" type="button" data-position-mode="all">All</button>
+            <button type="button" data-position-mode="dry_run">Dry run</button>
+            <button type="button" data-position-mode="live">Live</button>
+          </div>
+          <button class="ghost compact-button" id="us-trading-refresh" type="button">Refresh activity</button>
+        </div>
+        <div id="us-managed-positions" class="us-managed-positions"><div class="metrics-empty">No managed positions.</div></div>
+      </section>
+
+      <section class="panel pad us-journal-panel">
+        <div class="browse-head">
+          <div>
+            <h2 class="title">Execution journal</h2>
+            <div class="field-note">A running window into candidates, gate rejections, mapping decisions, previews, fills, marks, and cash-outs. Rejections include the observed value and configured threshold so you can see exactly which check failed.</div>
+          </div>
+        </div>
+        <div id="us-trading-journal" class="us-trading-journal"><div class="metrics-empty">No automation decisions yet.</div></div>
+      </section>
+    </div>
+
+    <section class="panel pad">
+      <div class="browse-head">
+        <div>
+          <h2 class="title">US/mobile sports inventory</h2>
+          <div class="field-note">Raw Polymarket US long-side bid/ask and listed outcomes. The execution layer may map established signals to these contracts; it never feeds these prices back into or changes the calculation engine.</div>
+        </div>
+        <button class="ghost compact-button" id="us-events-refresh" type="button">Refresh US markets</button>
+      </div>
+      <div id="us-events-status" class="refresh-status" role="status" aria-live="polite"></div>
+      <input class="search-gap" id="us-events-search" placeholder="Filter US games or lines…" autocomplete="off">
+      <div id="us-events" class="us-event-list" aria-live="polite"></div>
+    </section>
+  </div>
+
+  <!-- CUSTOM BOTS & METRICS (hidden at runtime when paper bots are disabled) -->
   <div id="tab-bots" class="tab-content is-hidden">
     <div class="panel pad section-gap accent-border">
       <h2 class="title accent-text">Create Custom Bot</h2>
@@ -189,6 +407,6 @@
 
 
 <script src="/static/csrf.js" defer></script>
-<script src="/static/index.js?v=best-bets-0e7dcb4" defer></script>
+<script src="/static/index.js?v=us-hosted-execution-1" defer></script>
 </body>
 </html>

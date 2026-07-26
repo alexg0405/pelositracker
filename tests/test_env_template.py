@@ -55,4 +55,7 @@ def test_env_template_loads_into_settings():
     # The template ships APP_ENV=development, so this must construct cleanly.
     settings = Settings.from_env(values)
     assert settings.environment == "development"
+    assert settings.workstation_mode is False
+    assert settings.enable_paper_bots is True
+    assert settings.enable_polymarket_us_trading is False
     assert settings.provider_clock_skew_seconds == 5.0

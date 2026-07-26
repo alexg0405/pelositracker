@@ -46,6 +46,9 @@ def _optional_path(env: Mapping[str, str], name: str) -> Path | None:
 @dataclass(frozen=True, slots=True)
 class Settings:
     environment: str
+    workstation_mode: bool
+    enable_paper_bots: bool
+    enable_polymarket_us_trading: bool
     database_url: str
     ledger_db: Path
     history_db: Path
@@ -66,6 +69,9 @@ class Settings:
     enable_portfolio_kelly: bool
     exclude_restricted_events: bool
     paper_ignore_region_restriction: bool
+    polymarket_us_key_id: str
+    polymarket_us_secret_key: str
+    polymarket_us_trading_db: Path
     odds_api_key: str
     odds_regions: str
     odds_markets: str
@@ -89,6 +95,11 @@ class Settings:
         environment = values.get("APP_ENV", "development").strip().casefold()
         settings = cls(
             environment=environment,
+            workstation_mode=_bool(values, "WORKSTATION_MODE", False),
+            enable_paper_bots=_bool(values, "ENABLE_PAPER_BOTS", True),
+            enable_polymarket_us_trading=_bool(
+                values, "ENABLE_POLYMARKET_US_TRADING", False
+            ),
             database_url=values.get("DATABASE_URL", "").strip(),
             ledger_db=Path(values.get("LEDGER_DB", "ledger.db")),
             history_db=Path(values.get("HISTORY_DB", "history.db")),
@@ -120,6 +131,16 @@ class Settings:
             # trades from a restricted host region).
             paper_ignore_region_restriction=_bool(
                 values, "PAPER_IGNORE_REGION_RESTRICTION", True),
+            polymarket_us_key_id=values.get("POLYMARKET_US_KEY_ID", "").strip(),
+            polymarket_us_secret_key=values.get(
+                "POLYMARKET_US_SECRET_KEY", ""
+            ).strip(),
+            polymarket_us_trading_db=Path(
+                values.get(
+                    "POLYMARKET_US_TRADING_DB",
+                    "polymarket-us-trading.db",
+                )
+            ),
             odds_api_key=values.get("THE_ODDS_API_KEY", "").strip(),
             odds_regions=values.get("ODDS_REGIONS", "us").strip(),
             odds_markets=values.get("ODDS_MARKETS", "h2h,spreads,totals").strip(),
@@ -156,3 +177,7 @@ class Settings:
             raise ValueError("production requires non-default authentication credentials")
         if self.enable_pinnacle_guest and not self.pinnacle_guest_api_key:
             raise ValueError("ENABLE_PINNACLE_GUEST requires PINNACLE_GUEST_API_KEY")
+        if bool(self.polymarket_us_key_id) != bool(self.polymarket_us_secret_key):
+            raise ValueError(
+                "POLYMARKET_US_KEY_ID and POLYMARKET_US_SECRET_KEY must be set together"
+            )

@@ -21,6 +21,21 @@ services:
         value: production
       - key: WEB_CONCURRENCY
         value: "1"
+      - key: WORKSTATION_MODE
+        value: "false"
+      - key: ENABLE_PAPER_BOTS
+        value: "true"
+      # The execution service still starts with automation off, dry-run mode,
+      # and a closed live-order latch. API credentials remain private Render
+      # variables and are never supplied by this blueprint.
+      - key: ENABLE_POLYMARKET_US_TRADING
+        value: "true"
+      - key: POLYMARKET_US_KEY_ID
+        sync: false
+      - key: POLYMARKET_US_SECRET_KEY
+        sync: false
+      - key: POLYMARKET_US_TRADING_DB
+        value: /app/data/polymarket-us-trading.db
       - key: MAX_DATA_AGE_SECONDS
         value: "120"
       # Keep global floors neutral so custom bots apply their own thresholds.

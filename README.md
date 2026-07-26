@@ -1,12 +1,18 @@
 # Live Edge Monitor
 
-An auditable, paper-only sports-market research system. It records Polymarket
+The application includes a separately gated, default-dry-run Polymarket US
+execution sidecar without changing the established calculation engine. For an
+isolated Windows installation, start with [WORKSTATION.md](WORKSTATION.md).
+
+An auditable sports-market research system. It records Polymarket
 books, independent sportsbook source-family prices, and provider game state;
 then produces reproducible `WATCH` or `PAPER_BET` policy output through a Rust
 engine and FastAPI dashboard.
 
-> The project cannot connect a wallet, sign an order, deposit funds, or place a
-> real wager. Signal quality is data reliability—not win probability or advice.
+> The original engine remains research/paper oriented. The optional Polymarket
+> US order layer has explicit bankroll limits, previewed fill-or-kill orders,
+> expiring arming, and a kill switch. Signal quality is data reliability—not win
+> probability or a guarantee of profit.
 
 ## Safety behavior
 
@@ -55,6 +61,11 @@ Open [http://127.0.0.1:8765](http://127.0.0.1:8765). Local development defaults
 to `admin` / `admin`; production startup rejects those credentials. `start.cmd`
 creates `.env` from `env.example` and runs one feed-owning worker.
 
+For the isolated Polymarket US workstation, run `setup-workstation.cmd` once,
+then `start-workstation.cmd`. It binds to `127.0.0.1:8775`, disables the
+separate paper-bot subsystem, and keeps its SQLite data under
+`workstation-data/`.
+
 ## Core configuration
 
 ```env
@@ -63,6 +74,13 @@ ODDS_POLL_SECONDS=45
 ODDS_REGIONS=us
 ODDS_MARKETS=h2h,spreads,totals
 ODDS_BOOKMAKERS=
+
+WORKSTATION_MODE=false
+ENABLE_PAPER_BOTS=true
+ENABLE_POLYMARKET_US_TRADING=false
+POLYMARKET_US_KEY_ID=
+POLYMARKET_US_SECRET_KEY=
+POLYMARKET_US_TRADING_DB=polymarket-us-trading.db
 
 MAX_DATA_AGE_SECONDS=120
 SIGNAL_CONFIDENCE_THRESHOLD=0
@@ -100,6 +118,14 @@ expiring sessions. State-changing requests require a double-submit CSRF token.
 Production requires non-default credentials and one worker until distributed
 feed ownership is implemented. Webhooks require HTTPS, an explicit host
 allowlist, public DNS results, and no redirects.
+
+Hosted Polymarket US execution is opt-in. Set
+`ENABLE_POLYMARKET_US_TRADING=true` plus both API credential variables in the
+hosting provider's private environment. Keep `WORKSTATION_MODE=false`, use the
+existing `DATABASE_URL` for persistent execution history, and retain
+`WEB_CONCURRENCY=1`. Source deployment alone cannot arm live orders: automation
+defaults off, execution defaults to dry-run, every restart disarms the
+process-local live latch, and live arming requires the exact confirmation phrase.
 
 ## Registering an event
 
