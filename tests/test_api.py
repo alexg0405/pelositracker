@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 
 from fastapi.testclient import TestClient
 import pytest
@@ -21,6 +22,21 @@ def create_manual_event(client):
     })
     assert response.status_code == 201
     return response.json()
+
+
+@pytest.fixture
+def enabled_live_trading(monkeypatch, tmp_path):
+    trading_db = tmp_path / "polymarket-us-trading.db"
+    monkeypatch.setenv("POLYMARKET_US_TRADING_DB", str(trading_db))
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        replace(
+            main_module.settings,
+            enable_polymarket_us_trading=True,
+            polymarket_us_trading_db=trading_db,
+        ),
+    )
 
 
 def test_registered_event_can_be_removed():
@@ -215,7 +231,9 @@ def test_workstation_exposes_only_bounded_polymarket_us_trading_routes():
     )
 
 
-def test_live_trading_api_defaults_disarmed_and_rejects_unsafe_policy():
+def test_live_trading_api_defaults_disarmed_and_rejects_unsafe_policy(
+    enabled_live_trading,
+):
     with TestClient(app) as client:
         # Authenticate directly so this route test does not consume a shared
         # login-throttle slot and make the later rate-limit test order-dependent.
@@ -259,7 +277,10 @@ def test_live_trading_api_defaults_disarmed_and_rejects_unsafe_policy():
             main_module.auth_manager.revoke(token)
 
 
-def test_empty_mode_liquidation_returns_without_fetching_market_inventory(monkeypatch):
+def test_empty_mode_liquidation_returns_without_fetching_market_inventory(
+    monkeypatch,
+    enabled_live_trading,
+):
     async def unexpected_fetch(*, limit):
         pytest.fail(f"empty liquidation unexpectedly fetched {limit} US events")
 
