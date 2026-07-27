@@ -6,7 +6,7 @@
   <meta name="description" content="Auditable live sports-market research and controlled Polymarket US execution">
   <title>PelosiTracker Dashboard</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <link rel="stylesheet" href="/static/index.css?v=us-managed-trading-controls-2">
+  <link rel="stylesheet" href="/static/index.css?v=fortnite-lobby-1">
 </head>
 <body class="research-workstation">
 <div id="login-overlay">
@@ -33,14 +33,82 @@
   </header>
 
   <nav class="tab-carousel">
-    <button class="pill active" data-tab="tab-live">Live Radar</button>
+    <button class="pill active" data-tab="tab-lobby">Lobby</button>
+    <button class="pill" data-tab="tab-live">Live Radar</button>
     <button class="pill" data-tab="tab-discovery">Discovery</button>
     <button class="pill" data-tab="tab-us-research">Polymarket US Research</button>
     <button class="pill" id="bots-tab-button" data-tab="tab-bots">Custom Bots & Metrics</button>
   </nav>
 
+  <!-- TAB 0: LOBBY (landing) -->
+  <div id="tab-lobby" class="tab-content">
+    <div class="lb">
+      <aside class="lb-side">
+        <div class="lb-season">SEASON 3</div>
+        <div class="lb-levelcard">
+          <div class="lb-level"><span class="lb-level-num" id="lb-level">5</span><span class="lb-level-lbl">LEVEL</span></div>
+          <div class="lb-xp">
+            <div class="lb-xp-top"><span id="lb-xp-cur">67</span><span>/ 700</span></div>
+            <div class="lb-xp-bar"><i style="width:9.5%"></i></div>
+            <div class="lb-xp-next">Next reward · LVL 10 <b>&#9672; 10</b></div>
+          </div>
+        </div>
+        <div class="lb-pass">
+          <div class="lb-pass-row"><span>BATTLE PASS</span><b>TIER 4</b></div>
+          <div class="lb-xp-bar sm"><i style="width:60%"></i></div>
+        </div>
+        <div class="lb-daily">
+          <div class="lb-daily-h">DAILY CHALLENGES</div>
+          <div class="lb-chal"><span>Monitor 4 live events</span><span class="lb-chal-r">0 / 4 <b>&#9733; 500</b></span></div>
+          <div class="lb-chal"><span>Log a paper position</span><span class="lb-chal-r">0 / 1 <b>&#9733; 500</b></span></div>
+        </div>
+      </aside>
+
+      <section class="lb-stage">
+        <div class="lb-pods">
+          <div class="lb-pod is-ready" id="lb-pod-user">
+            <div class="lb-pod-status">READY</div>
+            <div class="lb-avatar" id="lb-avatar">AD</div>
+            <div class="lb-beam"></div>
+            <div class="lb-pod-name" id="lb-pod-name">ADMIN</div>
+          </div>
+          <div class="lb-pod is-empty">
+            <div class="lb-pod-status muted">EMPTY</div>
+            <button class="lb-add" type="button" aria-label="Invite teammate">+</button>
+            <div class="lb-beam"></div>
+            <div class="lb-pod-name muted">Invite</div>
+          </div>
+          <div class="lb-pod is-empty">
+            <div class="lb-pod-status muted">EMPTY</div>
+            <button class="lb-add" type="button" aria-label="Invite teammate">+</button>
+            <div class="lb-beam"></div>
+            <div class="lb-pod-name muted">Invite</div>
+          </div>
+        </div>
+        <div class="lb-feed"><span class="lb-feed-time">[9:32 AM]</span> <b>Party:</b> <span id="lb-feed-name">ADMIN</span> joined the party.</div>
+      </section>
+
+      <aside class="lb-right">
+        <div class="lb-mode">
+          <div class="lb-mode-new">NEW MODE AVAILABLE!</div>
+          <div class="lb-mode-name">SQUADS</div>
+          <button class="ghost lb-mode-change" type="button">&#8646; Change Mode</button>
+        </div>
+        <div class="lb-fill">
+          <span>Squad Fill</span>
+          <button class="lb-fill-toggle is-off" id="lb-fill" type="button">No Fill</button>
+        </div>
+        <button class="primary lb-ready" id="lb-ready" type="button">&#9654; READY</button>
+      </aside>
+    </div>
+    <div class="lb-bottom">
+      <span><b>Party</b> &middot; Hold to chat</span>
+      <span>Inspect Challenges &middot; News</span>
+    </div>
+  </div>
+
   <!-- TAB 1: LIVE RADAR -->
-  <div id="tab-live" class="tab-content">
+  <div id="tab-live" class="tab-content is-hidden">
     <h2 class="title glitch" data-text="Monitored events">Monitored events</h2>
     <div class="error" id="action-error" role="alert" hidden></div>
     <div id="event-action-status" class="event-action-status" role="status" aria-live="polite" hidden></div>
@@ -481,6 +549,6 @@
 
 
 <script src="/static/csrf.js" defer></script>
-<script src="/static/index.js?v=us-managed-trading-controls-2" defer></script>
+<script src="/static/index.js?v=fortnite-lobby-1" defer></script>
 </body>
 </html>

@@ -8,6 +8,7 @@
       document.querySelectorAll('.tab-content').forEach(tc => tc.classList.add('is-hidden'));
       const tab = e.target.dataset.tab;
       document.getElementById(tab).classList.remove('is-hidden');
+      if (tab === "tab-lobby") renderLobby();
       if (tab === "tab-live") renderEvents(lastEvents);
       if (tab === "tab-discovery") {
         renderBestBets();
@@ -28,12 +29,41 @@
     });
   });
 
+  // Lobby landing screen — personalized to the signed-in user.
+  function lobbyUserName() {
+    let n = window.currentUsername;
+    if (!n) { try { n = sessionStorage.getItem("pt_user"); } catch {} }
+    return (n && n.trim()) || "ADMIN";
+  }
+  function renderLobby() {
+    const up = lobbyUserName().toUpperCase();
+    const initials = (up.match(/[A-Z0-9]/g) || []).slice(0, 2).join("") || "AD";
+    const nameEl = document.getElementById("lb-pod-name");
+    const feedEl = document.getElementById("lb-feed-name");
+    const avEl = document.getElementById("lb-avatar");
+    if (nameEl) nameEl.textContent = up;
+    if (feedEl) feedEl.textContent = up;
+    if (avEl) avEl.textContent = initials;
+  }
+  const lbReady = document.getElementById("lb-ready");
+  if (lbReady) lbReady.addEventListener("click", () => {
+    const p = document.querySelector('[data-tab="tab-live"]');
+    if (p) p.click();
+  });
+  const lbFill = document.getElementById("lb-fill");
+  if (lbFill) lbFill.addEventListener("click", () => {
+    const off = lbFill.classList.toggle("is-off");
+    lbFill.textContent = off ? "No Fill" : "Fill";
+  });
+  renderLobby();
+
   // Auth & Login Logic
   document.querySelector("#login-form").addEventListener("submit", async e => {
     e.preventDefault();
     const form = e.currentTarget;
     const btn = form.querySelector("button");
     const err = document.querySelector("#login-error");
+    const typedUser = (form.username && form.username.value || "").trim();
     btn.disabled = true; err.hidden = true;
     try {
       const r = await fetch("/api/login", {
@@ -42,6 +72,9 @@
       });
       const data = await r.json().catch(()=>({}));
       if (!r.ok) throw new Error(data.detail || "Invalid credentials");
+
+      if (typedUser) { window.currentUsername = typedUser; try { sessionStorage.setItem("pt_user", typedUser); } catch {} }
+      renderLobby();
 
       const overlay = document.querySelector("#login-overlay");
       overlay.classList.add("dissolve");
@@ -2348,6 +2381,7 @@
       return;
     }
     window.appStarted = true;
+    renderLobby();
     fetch("/api/config").then(r=>r.json()).then(c=>{
       const prefix = c.workstation?.enabled ? "Local workstation · " : "";
       usExecutionEnabled = !!c.workstation?.polymarket_us_trading_enabled;
