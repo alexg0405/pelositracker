@@ -46,7 +46,8 @@ from .gameclock import game_progress, league_rule, validate_state_transition
 from .models import Event, GameState, Quote, as_json
 from .monitor_state import MonitorState
 from .sources import (_odds_quota, exclude_restricted_games, extract_polymarket_slug,
-                      infer_polymarket_event, odds_api_poll, polymarket_event,
+                      game_start_matches_slug, infer_polymarket_event, odds_api_poll,
+                      polymarket_event,
                       polymarket_market_stream, polymarket_sports_events,
                       polymarket_sports_stream, sports_game_status)
 from .actionnetwork import action_network_poll
@@ -70,6 +71,8 @@ from .polymarket_us_research import (
     fetch_public_sports_events as fetch_polymarket_us_events,
 )
 from .polymarket_us_trading import (
+    LIVE_POSITION_EXIT_PHRASE,
+    MAX_ARM_SECONDS,
     PolymarketUSAutoTrader,
     TradingPolicyError,
 )
@@ -971,6 +974,19 @@ async def live_trading_loop():
                 delay = live_trader.policy.cycle_seconds
                 if live_trader.policy.automation_enabled:
                     await _run_live_trading_cycle()
+                elif any(
+                    position["mode"] == "live"
+                    for position in await asyncio.to_thread(
+                        live_trader.positions,
+                        open_only=True,
+                    )
+                ):
+                    # Read-only reconciliation continues while automation is
+                    # off so a phone-side sale is reflected locally. This path
+                    # never previews, creates, modifies, or cancels an order.
+                    await asyncio.to_thread(
+                        live_trader.synchronize_live_positions
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1029,6 +1045,18 @@ async def lifespan(_: FastAPI):
         _config_state["auto_monitor"] = monitor_state.auto_monitor(False)
         _config_state["odds_api_enabled"] = monitor_state.odds_api_enabled(True)
         for event in monitor_state.events():
+            if not game_start_matches_slug(
+                event.polymarket_slug, event.game_start
+            ):
+                logger.warning(
+                    "Dropping persisted event with mismatched slug/start identity: "
+                    "%s (%s / %s)",
+                    event.name,
+                    event.polymarket_slug,
+                    event.game_start,
+                )
+                await asyncio.to_thread(monitor_state.delete_event, event.id)
+                continue
             store.add_event(event)
             _finalized.discard(event.id)
             _terminal_events.pop(event.id, None)
@@ -1173,6 +1201,9 @@ class LiveTradingConfigIn(BaseModel):
     execution_mode: str | None = None
     auto_cashout: bool | None = None
     require_engine_entry: bool | None = None
+    required_engine_gates: list[str] | None = None
+    trading_allocation_usd: float | None = None
+    risk_preset: str | None = None
     max_total_exposure_usd: float | None = None
     minimum_cash_reserve_usd: float | None = None
     max_position_usd: float | None = None
@@ -1198,7 +1229,7 @@ class LiveTradingConfigIn(BaseModel):
 
 class LiveTradingArmIn(BaseModel):
     confirmation: str
-    seconds: int = Field(default=1800, ge=60, le=1800)
+    seconds: int = Field(default=1800, ge=60, le=MAX_ARM_SECONDS)
 
 
 class LiveTradingLiquidateIn(BaseModel):
@@ -1207,6 +1238,14 @@ class LiveTradingLiquidateIn(BaseModel):
 
 
 class DryRunHistoryClearIn(BaseModel):
+    confirmation: str
+
+
+class LiveTradingPositionExitIn(BaseModel):
+    confirmation: str = ""
+
+
+class LivePerformanceResetIn(BaseModel):
     confirmation: str
 
 
@@ -1464,6 +1503,22 @@ async def polymarket_us_trading_status():
     return await asyncio.to_thread(_require_live_trader().status)
 
 
+@app.post(
+    "/api/polymarket-us/trading/sync",
+    dependencies=[Depends(verify_auth)],
+)
+async def polymarket_us_trading_sync():
+    try:
+        return await asyncio.to_thread(
+            _require_live_trader().synchronize_live_positions
+        )
+    except TradingPolicyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except Exception as exc:
+        logger.warning("Polymarket US portfolio synchronization failed: %s", exc)
+        raise HTTPException(502, f"Portfolio synchronization failed: {exc}") from exc
+
+
 @app.put(
     "/api/polymarket-us/trading/config",
     dependencies=[Depends(verify_auth)],
@@ -1500,6 +1555,17 @@ async def polymarket_us_trading_arm(payload: LiveTradingArmIn):
 )
 async def polymarket_us_trading_disarm():
     return await asyncio.to_thread(_require_live_trader().disarm, "dashboard")
+
+
+@app.post(
+    "/api/polymarket-us/trading/stop",
+    dependencies=[Depends(verify_auth)],
+)
+async def polymarket_us_trading_stop():
+    return await asyncio.to_thread(
+        _require_live_trader().stop_automation,
+        "dashboard",
+    )
 
 
 @app.post(
@@ -1570,6 +1636,59 @@ async def polymarket_us_trading_clear_dry_run_history(
         raise HTTPException(500, "Could not clear dry-run trade history") from exc
 
 
+@app.post(
+    "/api/polymarket-us/trading/positions/{position_id}/exit",
+    dependencies=[Depends(verify_auth)],
+)
+async def polymarket_us_trading_exit_position(
+    position_id: str,
+    payload: LiveTradingPositionExitIn,
+):
+    trader = _require_live_trader()
+    try:
+        position = await asyncio.to_thread(trader.position, position_id)
+        if position is None:
+            raise HTTPException(404, "Managed position was not found")
+        if position["mode"] == "live":
+            if trader.policy.execution_mode != "live":
+                raise HTTPException(
+                    409,
+                    "Set execution mode to live and save before selling a live position",
+                )
+            if not trader.is_armed():
+                raise HTTPException(
+                    409,
+                    "Live trading is disarmed; arm the live-order latch first",
+                )
+            if payload.confirmation != LIVE_POSITION_EXIT_PHRASE:
+                raise HTTPException(
+                    409,
+                    f'Type "{LIVE_POSITION_EXIT_PHRASE}" exactly to sell a live position',
+                )
+        us_payload = (
+            await fetch_polymarket_us_events(limit=500)
+            if position["mode"] == "live" and position["status"] == "open"
+            else {"events": []}
+        )
+        return await asyncio.to_thread(
+            trader.exit_position,
+            us_payload,
+            position_id=position_id,
+            confirmation=payload.confirmation,
+        )
+    except HTTPException:
+        raise
+    except TradingPolicyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except Exception as exc:
+        logger.warning(
+            "Could not exit managed Polymarket US position %s: %s",
+            position_id,
+            exc,
+        )
+        raise HTTPException(502, "Could not exit managed position") from exc
+
+
 @app.get(
     "/api/polymarket-us/trading/journal",
     dependencies=[Depends(verify_auth)],
@@ -1586,12 +1705,38 @@ async def polymarket_us_trading_positions():
     return await asyncio.to_thread(_require_live_trader().positions)
 
 
+@app.post(
+    "/api/polymarket-us/trading/positions/archive-exited",
+    dependencies=[Depends(verify_auth)],
+)
+async def polymarket_us_trading_archive_exited_positions():
+    return await asyncio.to_thread(
+        _require_live_trader().archive_exited_positions
+    )
+
+
 @app.get(
     "/api/polymarket-us/trading/performance",
     dependencies=[Depends(verify_auth)],
 )
 async def polymarket_us_trading_performance():
     return await asyncio.to_thread(_require_live_trader().performance)
+
+
+@app.post(
+    "/api/polymarket-us/trading/performance/reset-live",
+    dependencies=[Depends(verify_auth)],
+)
+async def polymarket_us_trading_reset_live_performance(
+    payload: LivePerformanceResetIn,
+):
+    try:
+        return await asyncio.to_thread(
+            _require_live_trader().reset_live_performance,
+            payload.confirmation,
+        )
+    except TradingPolicyError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 def _sort_events_by_edge():
@@ -1835,6 +1980,14 @@ async def add_event(payload: EventIn):
             "odds_api_sport": payload.odds_api_sport or inferred["odds_api_sport"],
             "game_start": payload.game_start or inferred["game_start"],
         })
+        if not game_start_matches_slug(
+            values.get("polymarket_slug"), values.get("game_start")
+        ):
+            raise HTTPException(
+                400,
+                "Polymarket fixture identity is inconsistent: the dated event "
+                "slug does not match the provider game start",
+            )
         # We now defer match_odds_api_event to the background polling task so the POST returns instantly.
     required = ("name", "sport", "home", "away")
     missing = [field for field in required if not values.get(field)]

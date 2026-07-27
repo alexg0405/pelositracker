@@ -433,7 +433,7 @@ dialog::backdrop { background: rgba(0,0,0,0.7); }
 }
 .us-trading-status {
   display:grid;
-  grid-template-columns:auto 1fr 2fr auto;
+  grid-template-columns:auto minmax(150px,1fr) minmax(180px,1.4fr) minmax(220px,2fr) auto;
   gap:10px;
   align-items:center;
   margin:14px 0;
@@ -460,7 +460,7 @@ dialog::backdrop { background: rgba(0,0,0,0.7); }
   letter-spacing:.06em;
   text-transform:uppercase;
 }
-.us-trading-form input,.us-trading-form select,.us-arm-row input {
+.us-trading-form input,.us-trading-form select,.us-arm-row input,.us-arm-row select {
   width:100%;
   margin:0;
 }
@@ -475,6 +475,61 @@ dialog::backdrop { background: rgba(0,0,0,0.7); }
 }
 .us-check input { width:auto; flex:0 0 auto; }
 .us-check-wide { grid-column:1/-1; }
+.us-engine-gates {
+  margin:0;
+  padding:12px;
+  border:1px solid var(--line);
+  background:rgba(0,0,0,.16);
+}
+.us-engine-gates legend {
+  padding:0 6px;
+  color:var(--cyan);
+  font:700 10px var(--mono);
+  letter-spacing:.06em;
+  text-transform:uppercase;
+}
+.us-engine-strict { margin-bottom:8px; }
+.us-engine-gate-actions {
+  display:flex;
+  flex-wrap:wrap;
+  gap:7px;
+  margin:10px 0;
+}
+.us-engine-gate-actions button { width:auto; margin:0; }
+.us-engine-gate-grid {
+  display:grid;
+  grid-template-columns:repeat(3,minmax(0,1fr));
+  gap:7px;
+}
+.us-engine-gate-grid label {
+  display:flex;
+  flex-direction:row;
+  align-items:flex-start;
+  gap:7px;
+  padding:8px;
+  color:var(--text);
+  border:1px solid rgba(43,57,71,.76);
+  background:rgba(8,13,18,.72);
+  cursor:pointer;
+  font:9px/1.35 var(--mono);
+  letter-spacing:0;
+  text-transform:none;
+}
+.us-engine-gate-grid label:has(input:disabled) {
+  color:var(--faint);
+  cursor:not-allowed;
+  opacity:.7;
+}
+.us-engine-gate-grid input { width:auto; margin-top:1px; flex:0 0 auto; }
+.us-always-enforced {
+  margin-top:10px;
+  padding:9px 10px;
+  color:var(--muted);
+  border-left:2px solid var(--yellow);
+  background:rgba(255,211,61,.05);
+  font:9px/1.5 var(--mono);
+}
+.us-always-enforced strong { color:var(--yellow); }
 .us-trading-actions {
   display:flex;
   flex-wrap:wrap;
@@ -604,6 +659,22 @@ dialog::backdrop { background: rgba(0,0,0,0.7); }
 .us-liquidate-status.is-working { color:var(--yellow); }
 .us-liquidate-status.is-success { color:var(--cyan); }
 .us-liquidate-status.is-error { color:var(--red); }
+button[aria-busy="true"] {
+  cursor:wait;
+  opacity:.78;
+}
+button[aria-busy="true"]::before {
+  content:"";
+  display:inline-block;
+  width:9px;
+  height:9px;
+  margin-right:7px;
+  border:1px solid currentColor;
+  border-right-color:transparent;
+  border-radius:50%;
+  animation:us-action-spin .65s linear infinite;
+}
+@keyframes us-action-spin { to { transform:rotate(360deg); } }
 .us-position-toolbar {
   display:flex;
   align-items:center;
@@ -633,9 +704,64 @@ dialog::backdrop { background: rgba(0,0,0,0.7); }
   flex:0 0 auto;
   margin:0;
 }
+.us-position-toolbar-actions {
+  display:flex;
+  align-items:center;
+  justify-content:flex-end;
+  gap:8px;
+}
+.us-venue-sync-bar {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  margin-top:12px;
+  padding:10px 12px;
+  border:1px solid rgba(41,231,214,.35);
+  background:rgba(41,231,214,.04);
+  font:10px/1.45 var(--mono);
+}
+.us-venue-sync-bar strong,.us-venue-sync-bar span {
+  display:block;
+}
+.us-venue-sync-bar strong { color:var(--text); }
+.us-venue-sync-bar span { color:var(--faint); }
+.us-venue-sync-bar span.is-error { color:var(--red); }
+.us-venue-sync-bar button {
+  flex:0 0 auto;
+  width:auto;
+  margin:0;
+}
+.us-venue-positions {
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+  max-height:260px;
+  margin-top:8px;
+  overflow-y:auto;
+}
+.us-venue-position {
+  display:grid;
+  grid-template-columns:minmax(220px,1.7fr) repeat(5,minmax(78px,.7fr));
+  gap:10px;
+  align-items:center;
+  padding:9px 11px;
+  border:1px solid var(--line);
+  background:rgba(0,0,0,.18);
+  font:9px/1.4 var(--mono);
+}
+.us-venue-position div { min-width:0; }
+.us-venue-position span,.us-venue-position strong { display:block; }
+.us-venue-position span { color:var(--faint); }
+.us-venue-position strong {
+  overflow:hidden;
+  color:var(--text);
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
 .us-arm-row {
   display:grid;
-  grid-template-columns:1fr auto;
+  grid-template-columns:minmax(0,1fr) minmax(140px,180px) auto;
   gap:10px;
   align-items:end;
   margin-top:14px;
@@ -644,6 +770,12 @@ dialog::backdrop { background: rgba(0,0,0,0.7); }
 }
 .us-arm-row button { height:42px; }
 .us-performance-panel { border-left:3px solid var(--cyan); }
+.us-performance-actions {
+  display:flex;
+  flex-wrap:wrap;
+  justify-content:flex-end;
+  gap:8px;
+}
 .us-performance-summary {
   display:grid;
   grid-template-columns:repeat(3,minmax(0,1fr));
@@ -728,7 +860,7 @@ dialog::backdrop { background: rgba(0,0,0,0.7); }
 }
 .us-position {
   display:grid;
-  grid-template-columns:minmax(180px,1.5fr) repeat(5,minmax(80px,.7fr));
+  grid-template-columns:minmax(180px,1.5fr) repeat(8,minmax(72px,.65fr)) auto;
   gap:10px;
   align-items:center;
   padding:10px 12px;
@@ -747,6 +879,17 @@ dialog::backdrop { background: rgba(0,0,0,0.7); }
 .us-position div > span { display:block; color:var(--faint); }
 .us-position div > strong { color:var(--text); }
 .us-position-reason { grid-column:1/-1; color:var(--yellow); }
+.us-position-action {
+  width:auto;
+  min-width:92px;
+  margin:0;
+  padding:7px 9px;
+  color:var(--coral);
+  border:1px solid rgba(255,77,46,.55);
+  background:rgba(255,77,46,.08);
+  font-size:9px;
+}
+.us-position-action:hover { background:rgba(255,77,46,.18); }
 .us-journal-row {
   display:grid;
   grid-template-columns:105px minmax(180px,1fr) minmax(260px,1.8fr);
@@ -764,7 +907,11 @@ dialog::backdrop { background: rgba(0,0,0,0.7); }
 .us-journal-status { color:var(--cyan); text-transform:uppercase; }
 .research-workstation #tab-bots { display:none !important; }
 code { color:var(--cyan); font-family:var(--mono); }
-
+.us-risk-preset-preview { display:flex; gap:12px; align-items:center; padding:11px 13px; border:1px solid rgba(56,214,220,.28); background:rgba(8,25,30,.72); font-size:12px; }
+.us-risk-preset-preview strong { color:var(--cyan); white-space:nowrap; }
+.us-risk-preset-preview span { color:var(--muted); }
+.us-trading-form label.is-derived-risk { opacity:.82; }
+.us-trading-form label.is-derived-risk input { background:rgba(22,44,47,.72); border-color:rgba(56,214,220,.25); color:#bde5e1; }
 @media(max-width:1120px) {
   .us-overview-grid,.us-activity-grid { grid-template-columns:1fr; }
   .us-trading-panel .us-trading-form { grid-template-columns:repeat(3,minmax(0,1fr)); }
@@ -772,6 +919,7 @@ code { color:var(--cyan); font-family:var(--mono); }
     grid-template-columns:minmax(220px,1.4fr) minmax(240px,1fr) minmax(220px,1fr);
   }
   #us-liquidate-submit { width:100%; }
+  .us-engine-gate-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
 }
 
 @media(max-width:820px) {
@@ -779,18 +927,23 @@ code { color:var(--cyan); font-family:var(--mono); }
     grid-template-columns:repeat(2,minmax(0,1fr));
   }
   .us-liquidate-copy,.us-liquidate-status { grid-column:1/-1; }
+  .us-risk-preset-preview { align-items:flex-start; flex-direction:column; }
 }
 
 @media(max-width:720px) {
   .header-brand { align-items:flex-start; flex-direction:column; }
   .us-status-grid { grid-template-columns:1fr; }
   .us-market { grid-template-columns:1fr; }
-  .us-performance-summary,.us-trading-status,.us-trading-panel .us-trading-form,.us-advanced-grid,.us-position,.us-journal-row,.us-liquidate-controls {
+  .us-performance-summary,.us-trading-status,.us-trading-panel .us-trading-form,.us-advanced-grid,.us-position,.us-venue-position,.us-journal-row,.us-liquidate-controls {
     grid-template-columns:1fr;
   }
   .us-check-wide,.us-position-reason { grid-column:1; }
   .us-arm-row { grid-template-columns:1fr; }
   .us-liquidate-copy,.us-liquidate-status { grid-column:1; }
   .us-position-toolbar { align-items:stretch; flex-direction:column; }
+  .us-position-toolbar-actions { justify-content:flex-start; flex-wrap:wrap; }
   .us-position-toolbar .compact-button { align-self:flex-start; }
+  .us-venue-sync-bar { align-items:flex-start; flex-direction:column; }
+  .us-engine-gate-grid { grid-template-columns:1fr; }
+  .us-position-action { justify-self:start; }
 }

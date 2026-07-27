@@ -292,12 +292,31 @@
   document.querySelector("#us-account-refresh")?.addEventListener("click", loadUSAccount);
 
   let usTradingLoading = false;
+  let usTradingReloadQueued = false;
   let lastUSTradingStatus = null;
   let lastTradingPerformance = null;
   let lastManagedPositions = [];
   let usPositionMode = "all";
   let usTradingFormDirty = false;
   let usTradingHydrationEpoch = 0;
+  let lastRiskPresets = {};
+
+  function refreshTradingInBackground(delay = 0) {
+    window.setTimeout(() => {
+      Promise.all([refreshUSStatus(), loadUSTrading()]).catch(() => {
+        // The loaders surface their own errors. Secondary dashboard hydration
+        // must not keep an operator action visually busy.
+      });
+    }, delay);
+  }
+
+  function delayedProgress(statusBox, delay, message) {
+    return window.setTimeout(() => {
+      if (!statusBox) return;
+      statusBox.className = "us-liquidate-status is-working";
+      statusBox.textContent = message;
+    }, delay);
+  }
 
   const executionSignalKey = (eventId, market, outcome) => [
     eventId,
@@ -357,6 +376,136 @@
     setUSTradingFormDirty(true);
   });
 
+  function setActionBusy(button, busy, pendingLabel = "") {
+    if (!button) return;
+    if (busy) {
+      button.dataset.idleLabel = button.textContent;
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
+      if (pendingLabel) button.textContent = pendingLabel;
+    } else {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+      if (button.dataset.idleLabel) {
+        button.textContent = button.dataset.idleLabel;
+        delete button.dataset.idleLabel;
+      }
+    }
+  }
+
+  const engineGateInputs = () => [
+    ...document.querySelectorAll("[data-engine-gate]")
+  ];
+
+  function updateEngineGateAvailability() {
+    const strict = document.querySelector("#us-require-engine")?.checked;
+    for (const input of engineGateInputs()) input.disabled = !!strict;
+    const grid = document.querySelector("#us-engine-gate-grid");
+    grid?.classList.toggle("is-strict", !!strict);
+  }
+
+  function setEngineGatePreset(kind) {
+    for (const input of engineGateInputs()) {
+      input.checked = kind === "all" || (
+        kind === "core" && input.hasAttribute("data-core-gate")
+      );
+    }
+    const strict = document.querySelector("#us-require-engine");
+    if (strict) strict.checked = false;
+    updateEngineGateAvailability();
+    usTradingHydrationEpoch += 1;
+    setUSTradingFormDirty(true);
+  }
+
+  document.querySelector("#us-require-engine")?.addEventListener(
+    "change",
+    updateEngineGateAvailability
+  );
+  document.querySelector("#us-gates-core")?.addEventListener(
+    "click",
+    () => setEngineGatePreset("core")
+  );
+  document.querySelector("#us-gates-all")?.addEventListener(
+    "click",
+    () => setEngineGatePreset("all")
+  );
+  document.querySelector("#us-gates-none")?.addEventListener(
+    "click",
+    () => setEngineGatePreset("none")
+  );
+
+  function updateRiskPresetUI({hydrate = false} = {}) {
+    const presetName = document.querySelector("#us-risk-preset")?.value || "custom";
+    const allocation = Number(
+      document.querySelector("#us-trading-allocation")?.value || 0
+    );
+    const preset = lastRiskPresets[presetName];
+    const named = presetName !== "custom" && !!preset;
+    for (const input of document.querySelectorAll("[data-derived-risk]")) {
+      input.readOnly = named;
+      input.closest("label")?.classList.toggle("is-derived-risk", named);
+    }
+    if (named && hydrate) {
+      const derived = preset.derived_policy || {};
+      const sourceAllocation = Number(derived.trading_allocation_usd || allocation || 1);
+      const scale = allocation > 0 ? allocation / sourceAllocation : 1;
+      const direct = {
+        "#us-max-open": derived.max_open_positions,
+        "#us-max-orders-hour": derived.max_orders_per_hour,
+        "#us-min-refs": derived.min_reference_sources,
+        "#us-min-quality": derived.min_signal_quality,
+        "#us-cycle-seconds": derived.cycle_seconds,
+        "#us-min-depth": derived.min_book_shares
+      };
+      const moneyValues = {
+        "#us-max-exposure": derived.max_total_exposure_usd,
+        "#us-cash-reserve": derived.minimum_cash_reserve_usd,
+        "#us-max-position": derived.max_position_usd,
+        "#us-max-event": derived.max_event_exposure_usd,
+        "#us-daily-loss": derived.max_daily_loss_usd
+      };
+      const percentValues = {
+        "#us-min-edge": derived.min_edge,
+        "#us-min-price": derived.min_entry_price,
+        "#us-max-price": derived.max_entry_price,
+        "#us-profit-target": derived.profit_target,
+        "#us-max-spread": derived.max_spread,
+        "#us-trailing-drawdown": derived.trailing_drawdown,
+        "#us-stop-loss": derived.stop_loss,
+        "#us-exit-edge": derived.exit_edge
+      };
+      for (const [selector, value] of Object.entries(direct)) {
+        const input = document.querySelector(selector);
+        if (input && value != null) input.value = value;
+      }
+      for (const [selector, value] of Object.entries(moneyValues)) {
+        const input = document.querySelector(selector);
+        if (input && value != null) input.value = (Number(value) * scale).toFixed(2);
+      }
+      for (const [selector, value] of Object.entries(percentValues)) {
+        const input = document.querySelector(selector);
+        if (input && value != null) input.value = Number(value) * 100;
+      }
+      const hold = document.querySelector("#us-min-hold");
+      if (hold && derived.min_hold_minutes != null) hold.value = derived.min_hold_minutes;
+    }
+    const preview = document.querySelector("#us-risk-preset-preview");
+    if (preview) {
+      preview.innerHTML = named
+        ? `<strong>${esc(preset.label)}</strong><span>${esc(preset.description)}</span><span>The server will derive and version every shaded field from the $${Number(allocation || 0).toFixed(2)} hard allocation when you save.</span>`
+        : "<strong>Custom controls</strong><span>The hard allocation still caps total managed exposure. Every detailed field remains editable and is saved exactly as shown.</span>";
+    }
+  }
+
+  document.querySelector("#us-risk-preset")?.addEventListener("change", () => {
+    updateRiskPresetUI({hydrate:true});
+  });
+  document.querySelector("#us-trading-allocation")?.addEventListener("input", () => {
+    if (document.querySelector("#us-risk-preset")?.value !== "custom") {
+      updateRiskPresetUI({hydrate:true});
+    }
+  });
+
   function applyTradingPolicy(status, {force = false, requestEpoch = null} = {}) {
     if (
       !force
@@ -368,8 +517,11 @@
       return false;
     }
     const policy = status?.policy || {};
+    lastRiskPresets = status?.risk_presets || lastRiskPresets;
     const values = {
       "#us-trading-mode": policy.execution_mode,
+      "#us-trading-allocation": policy.trading_allocation_usd,
+      "#us-risk-preset": policy.risk_preset || "custom",
       "#us-max-exposure": policy.max_total_exposure_usd,
       "#us-cash-reserve": policy.minimum_cash_reserve_usd,
       "#us-max-position": policy.max_position_usd,
@@ -398,6 +550,18 @@
     document.querySelector("#us-automation-enabled").checked = !!policy.automation_enabled;
     document.querySelector("#us-auto-cashout").checked = !!policy.auto_cashout;
     document.querySelector("#us-require-engine").checked = policy.require_engine_entry !== false;
+    const selectedGates = new Set(
+      Array.isArray(policy.required_engine_gates)
+        ? policy.required_engine_gates
+        : engineGateInputs()
+          .filter(input => input.hasAttribute("data-core-gate"))
+          .map(input => input.dataset.engineGate)
+    );
+    for (const input of engineGateInputs()) {
+      input.checked = selectedGates.has(input.dataset.engineGate);
+    }
+    updateEngineGateAvailability();
+    updateRiskPresetUI();
     return true;
   }
 
@@ -415,12 +579,81 @@
     const armText = armed && status.armed_until
       ? `Live order latch expires ${new Date(status.armed_until).toLocaleTimeString()}.`
       : "Live order latch is closed.";
+    const protectiveText = policy.execution_mode !== "live"
+      ? "Protective live exits are not applicable in dry run."
+      : !policy.auto_cashout
+        ? "Automatic cash-out is off."
+        : status.protective_exits_armed
+          ? "Protective auto-exits stay armed until policy save, disarm, stop, or restart."
+          : "Protective auto-exits are disarmed; arm live trading to enable them.";
+    const gateText = policy.require_engine_entry !== false
+      ? "Strict engine gates"
+      : `${(policy.required_engine_gates || []).length} selected engine gates`;
+    const allocationText = `$${Number(
+      policy.trading_allocation_usd || policy.max_total_exposure_usd || 0
+    ).toFixed(2)} allocation / ${String(policy.risk_preset || "custom")} risk`;
     box.className = `us-trading-status${armed ? " is-armed" : ""}`;
     box.innerHTML = `
       <strong>${policy.automation_enabled ? "Automation on" : "Automation off"}</strong>
       <span>${esc(armText)}</span>
+      <span>${esc(protectiveText)}</span>
       <span>${esc(status.last_cycle_summary || "No cycle yet.")}</span>
-      <span>${status.open_managed_positions || 0} open · $${Number(status.managed_exposure_usd || 0).toFixed(2)} managed exposure</span>`;
+      <span>${esc(allocationText)}</span>
+      <span>${status.open_managed_positions || 0} open · $${Number(status.managed_exposure_usd || 0).toFixed(2)} exposure · ${esc(gateText)}</span>`;
+  }
+
+  function venueSyncLabel(value) {
+    return ({
+      awaiting_sync: "awaiting first account sync",
+      entry_settlement_grace: "entry settling",
+      in_sync: "account quantity confirmed",
+      in_sync_with_manual_excess: "managed quantity confirmed; extra manual shares exist",
+      mismatch_pending_confirmation: "account change pending confirmation",
+      partially_sold_externally: "partially sold on phone/account",
+      externally_closed: "closed on phone/account",
+      sync_error: "account sync failed",
+      not_applicable: "dry run"
+    })[value] || String(value || "not synchronized");
+  }
+
+  function renderVenuePositions(status = lastUSTradingStatus) {
+    const body = document.querySelector("#us-venue-positions");
+    const syncStatus = document.querySelector("#us-venue-sync-status");
+    if (!body || !syncStatus) return;
+    const positions = Array.isArray(status?.venue_positions)
+      ? status.venue_positions
+      : [];
+    const syncedAt = status?.last_venue_sync_at
+      ? ` at ${new Date(status.last_venue_sync_at).toLocaleTimeString()}`
+      : "";
+    syncStatus.textContent = status?.last_venue_sync_error
+      ? `Sync failed${syncedAt}: ${status.last_venue_sync_error}`
+      : `${status?.last_venue_sync_summary || "Not synchronized yet."}${syncedAt}`;
+    syncStatus.classList.toggle("is-error", !!status?.last_venue_sync_error);
+    if (!positions.length) {
+      body.innerHTML = '<div class="metrics-empty">No non-zero positions in the latest authenticated account snapshot.</div>';
+      return;
+    }
+    body.innerHTML = positions.map(position => {
+      const net = Number(position.net_position || 0);
+      const available = position.qty_available == null
+        ? "unknown"
+        : Number(position.qty_available).toFixed(2);
+      const cost = position.cost_basis == null
+        ? "unknown"
+        : `$${Number(position.cost_basis).toFixed(2)}`;
+      const cash = position.cash_value == null
+        ? "unknown"
+        : `$${Number(position.cash_value).toFixed(2)}`;
+      return `<article class="us-venue-position">
+        <div><strong>${esc(position.title || position.market_slug)}</strong><span>${esc(position.outcome || position.market_slug)}</span></div>
+        <div><span>net shares</span><strong>${net >= 0 ? "+" : ""}${net.toFixed(2)}</strong></div>
+        <div><span>available</span><strong>${esc(available)}</strong></div>
+        <div><span>venue cost</span><strong>${esc(cost)}</strong></div>
+        <div><span>cash value</span><strong>${esc(cash)}</strong></div>
+        <div><span>venue realized</span><strong>${position.realized_pnl == null ? "unknown" : esc(money(Number(position.realized_pnl)))}</strong></div>
+      </article>`;
+    }).join("");
   }
 
   function renderManagedPositions(positions = lastManagedPositions) {
@@ -442,17 +675,52 @@
       const ret = position.return_fraction == null ? "—" : `${position.return_fraction >= 0 ? "+" : ""}${(position.return_fraction * 100).toFixed(1)}%`;
       const edge = position.current_execution_edge == null ? "—" : signedCents(position.current_execution_edge);
       const pnl = position.realized_pnl == null ? "—" : money(position.realized_pnl);
+      const quantity = Number(position.quantity || 0);
+      const initialQuantity = Number(
+        position.initial_quantity ?? position.quantity ?? 0
+      );
+      const initialCost = Number(
+        position.initial_cost_basis ?? position.cost_basis ?? 0
+      );
+      const remainingCost = Number(position.cost_basis || 0);
+      const cashoutValue = position.current_exit_value == null
+        ? null
+        : Number(position.current_exit_value) * quantity;
+      const markedPnl = cashoutValue == null
+        ? null
+        : cashoutValue - remainingCost;
+      const profitTargetReadings = Number(
+        position.profit_target_observation_count || 0
+      );
+      const profitLock = position.profit_lock_armed_at
+        ? `profit lock armed ${new Date(position.profit_lock_armed_at).toLocaleTimeString()}`
+        : profitTargetReadings > 0
+          ? `profit target confirmation ${Math.min(2, profitTargetReadings)}/2`
+          : "profit target not reached";
+      const venueState = venueSyncLabel(position.venue_sync_status);
+      const externalQuantity = Number(position.external_exit_quantity || 0);
+      const action = open
+        ? `<button class="us-position-action" type="button" data-exit-position="${esc(position.id)}" data-exit-mode="${esc(position.mode)}">${position.mode === "live" ? "Sell position" : "Remove simulation"}</button>`
+        : "<div></div>";
       return `<article class="us-position${open ? " is-open" : ""}">
         <div>
           <strong>${esc(position.event_name)}</strong>
           <span>${esc(position.market_type)} · ${esc(position.selection)} · ${esc(position.mode)}</span>
         </div>
-        <div><span>entry</span><strong>${cents(position.entry_cost)}</strong></div>
-        <div><span>cash-out bid</span><strong>${cents(position.current_exit_value)}</strong></div>
+        <div><span>bought</span><strong>${initialQuantity.toFixed(2)} @ ${cents(position.entry_cost)}</strong></div>
+        <div><span>total paid</span><strong>$${initialCost.toFixed(2)}</strong></div>
+        <div><span>remaining</span><strong>${quantity.toFixed(2)} shares</strong></div>
+        <div><span>cash-out quote</span><strong>${cents(position.current_exit_value)}${cashoutValue == null ? "" : ` / $${cashoutValue.toFixed(2)}`}</strong></div>
         <div><span>return</span><strong>${esc(ret)}</strong></div>
+        <div><span>${open ? "marked P/L" : "realized"}</span><strong>${open ? esc(money(markedPnl)) : esc(pnl)}</strong></div>
         <div><span>current edge</span><strong>${esc(edge)}</strong></div>
-        <div><span>${open ? "status" : "realized"}</span><strong>${open ? "OPEN" : esc(pnl)}</strong></div>
-        ${position.exit_reason ? `<div class="us-position-reason">${esc(position.exit_reason)}</div>` : ""}
+        <div><span>status</span><strong>${open ? "OPEN" : esc(String(position.status).toUpperCase())}</strong></div>
+        ${action}
+        <div class="us-position-reason">
+          ${esc(profitLock)} · ${esc(venueState)}
+          ${externalQuantity > 0 ? ` · ${externalQuantity.toFixed(2)} shares sold outside workstation` : ""}
+          ${position.exit_reason ? ` · ${esc(position.exit_reason)}` : ""}
+        </div>
       </article>`;
     }).join("");
   }
@@ -487,9 +755,13 @@
       const unpriced = Number(summary.unpriced_open_positions || 0);
       const complete = summary.total_net_complete !== false;
       const record = `${wins}–${losses}–${pushes}`;
-      const note = unpriced
+      const activityNote = unpriced
         ? `${unpriced} open position${unpriced === 1 ? "" : "s"} unpriced · total net is partial`
         : `${Number(summary.closed_positions || 0)} closed · ${Number(summary.open_positions || 0)} open`;
+      const sessionNote = summary.session_started_at
+        ? `display session since ${new Date(summary.session_started_at).toLocaleString()}`
+        : "";
+      const note = [sessionNote, activityNote].filter(Boolean).join(" · ");
       return `<article class="us-performance-card is-${esc(modeClass)}" data-performance-mode="${esc(summary.mode || "")}">
         <div class="us-performance-head"><strong>${esc(summary.label || summary.mode || "Mode")}</strong><span>${Number(summary.total_positions || 0)} trades</span></div>
         <div class="us-performance-hero">
@@ -531,6 +803,10 @@
       const depthMetric = details.executable_book_shares == null
         ? ""
         : `depth ${Number(details.executable_book_shares).toFixed(2)}/${Number(details.configured_min_book_shares ?? 0).toFixed(2)} shares`;
+      const selectedGateMetric = Array.isArray(details.selected_engine_gate_results)
+        && details.selected_engine_gate_results.length
+        ? `selected gates ${details.selected_engine_gate_results.map(gate => `${gate.code}:${gate.status || (gate.passed ? "pass" : "fail")}`).join(", ")}`
+        : "";
       const metrics = [
         details.signal_edge == null ? "" : `source edge ${signedCents(details.signal_edge)}`,
         details.configured_min_edge == null ? "" : `floor ${signedCents(details.configured_min_edge)}`,
@@ -541,10 +817,25 @@
         referenceMetric,
         bookMetric,
         depthMetric,
+        selectedGateMetric,
         details.authenticated_spread == null ? "" : `spread ${cents(details.authenticated_spread)}`,
         details.buying_power == null ? "" : `buying power $${Number(details.buying_power).toFixed(2)}`,
         details.available_capacity_usd == null ? "" : `capacity $${Number(details.available_capacity_usd).toFixed(2)}`,
-        details.return_fraction == null ? "" : `return ${(details.return_fraction * 100).toFixed(1)}%`
+        details.return_fraction == null ? "" : `return ${(details.return_fraction * 100).toFixed(1)}%`,
+        details.held_minutes == null ? "" : `held ${Number(details.held_minutes).toFixed(1)}m`,
+        details.profit_lock_armed == null
+          ? ""
+          : details.profit_lock_armed ? "profit lock ARMED" : "profit lock waiting",
+        details.profit_target_observation_count == null
+          ? ""
+          : `target confirmation ${Math.min(
+              Number(details.profit_target_confirmation_readings || 2),
+              Number(details.profit_target_observation_count || 0)
+            )}/${Number(details.profit_target_confirmation_readings || 2)}`,
+        details.estimated_cashout_value == null ? "" : `cash-out $${Number(details.estimated_cashout_value).toFixed(2)}`,
+        details.exit_book_depth == null ? "" : `exit depth ${Number(details.exit_book_depth).toFixed(2)} shares`,
+        details.quote_source ? `quote ${details.quote_source}` : "",
+        details.venue_sync_status ? `venue ${details.venue_sync_status}` : ""
       ].filter(Boolean).join(" · ");
       return `<article class="us-journal-row">
         <div class="us-journal-time">${esc(new Date(item.created_at).toLocaleTimeString())}<span>${esc(item.kind)}</span></div>
@@ -555,7 +846,10 @@
   }
 
   async function loadUSTrading() {
-    if (usTradingLoading) return;
+    if (usTradingLoading) {
+      usTradingReloadQueued = true;
+      return;
+    }
     usTradingLoading = true;
     const requestEpoch = usTradingHydrationEpoch;
     try {
@@ -576,12 +870,24 @@
         journalResponse.json().catch(()=>([])),
         performanceResponse.json().catch(()=>({}))
       ]);
+      if (statusResponse.status === 404) {
+        throw new Error(
+          "RESTART REQUIRED: this page loaded the new workstation UI from disk, " +
+          "but the running Python server is an older build without the trading API. " +
+          "Close every PelosiTracker command window, start exactly one server, then reload."
+        );
+      }
       if (!statusResponse.ok) throw new Error(detailMessage(status));
       if (!positionsResponse.ok) throw new Error(detailMessage(positions));
       if (!journalResponse.ok) throw new Error(detailMessage(journal));
       if (!performanceResponse.ok) throw new Error(detailMessage(performance));
+      // An operator action or form edit supersedes every response that began
+      // before it. Rendering stale status here was the reason automation could
+      // appear to switch itself back on after a reset.
+      if (requestEpoch !== usTradingHydrationEpoch) return;
       applyTradingPolicy(status, {requestEpoch});
       renderTradingStatus(status);
+      renderVenuePositions(status);
       renderTradingPerformance(performance);
       renderManagedPositions(Array.isArray(positions) ? positions : []);
       renderTradingJournal(Array.isArray(journal) ? journal : []);
@@ -590,20 +896,33 @@
       if (box) box.textContent = error.message || "Could not load automation controls";
     } finally {
       usTradingLoading = false;
+      if (usTradingReloadQueued) {
+        usTradingReloadQueued = false;
+        queueMicrotask(loadUSTrading);
+      }
     }
   }
 
   document.querySelector("#us-trading-form")?.addEventListener("submit", async event => {
     event.preventDefault();
+    const form = event.currentTarget;
+    if (!form.reportValidity()) return;
     const button = document.querySelector("#us-policy-save");
     const statusBox = document.querySelector("#us-trading-status");
-    button.disabled = true;
+    setActionBusy(button, true, "Saving policy…");
     statusBox.textContent = "Validating and saving the execution policy…";
     const payload = {
       execution_mode: document.querySelector("#us-trading-mode").value,
       automation_enabled: document.querySelector("#us-automation-enabled").checked,
       auto_cashout: document.querySelector("#us-auto-cashout").checked,
       require_engine_entry: document.querySelector("#us-require-engine").checked,
+      trading_allocation_usd: Number(
+        document.querySelector("#us-trading-allocation").value
+      ),
+      risk_preset: document.querySelector("#us-risk-preset").value,
+      required_engine_gates: engineGateInputs()
+        .filter(input => input.checked)
+        .map(input => input.dataset.engineGate),
       max_total_exposure_usd: Number(document.querySelector("#us-max-exposure").value),
       minimum_cash_reserve_usd: Number(document.querySelector("#us-cash-reserve").value),
       max_position_usd: Number(document.querySelector("#us-max-position").value),
@@ -643,7 +962,8 @@
     } catch (error) {
       statusBox.textContent = error.message || "Could not save execution policy";
     } finally {
-      button.disabled = false;
+      setActionBusy(button, false);
+      setUSTradingFormDirty(usTradingFormDirty);
     }
   });
 
@@ -653,44 +973,59 @@
     const response = await fetch(path, {method:"POST", ...options});
     const body = await response.json().catch(()=>({}));
     if (!response.ok) throw new Error(detailMessage(body));
-    await Promise.all([refreshUSStatus(), loadUSTrading()]);
+    refreshTradingInBackground();
     return body;
   }
 
   document.querySelector("#us-run-now")?.addEventListener("click", async event => {
     const button = event.currentTarget;
-    button.disabled = true;
+    setActionBusy(button, true, "Running cycle…");
     try {
       await tradingAction("/api/polymarket-us/trading/run", "Reviewing all monitored events and exact US lines…");
     } catch (error) {
       document.querySelector("#us-trading-status").textContent = error.message;
     } finally {
-      button.disabled = false;
+      setActionBusy(button, false);
     }
   });
   document.querySelector("#us-disarm")?.addEventListener("click", async event => {
     const button = event.currentTarget;
-    button.disabled = true;
+    setActionBusy(button, true, "Disarming…");
     try {
       await tradingAction("/api/polymarket-us/trading/disarm", "Closing the live-order latch…");
     } catch (error) {
       document.querySelector("#us-trading-status").textContent = error.message;
     } finally {
-      button.disabled = false;
+      setActionBusy(button, false);
     }
   });
+  function updateArmDurationLabel() {
+    const duration = document.querySelector("#us-arm-duration");
+    const button = document.querySelector("#us-arm");
+    if (!duration || !button || button.disabled) return;
+    button.textContent = `Arm for ${duration.selectedOptions[0]?.textContent || "30 minutes"}`;
+  }
+
+  document.querySelector("#us-arm-duration")?.addEventListener(
+    "change",
+    updateArmDurationLabel
+  );
+  updateArmDurationLabel();
+
   document.querySelector("#us-arm")?.addEventListener("click", async event => {
     const button = event.currentTarget;
-    button.disabled = true;
+    const duration = document.querySelector("#us-arm-duration");
+    const durationLabel = duration?.selectedOptions[0]?.textContent || "30 minutes";
+    setActionBusy(button, true, "Arming…");
     try {
       await tradingAction(
         "/api/polymarket-us/trading/arm",
-        "Requesting a 30-minute live-order latch…",
+        `Requesting a ${durationLabel} live-order latch…`,
         {
           headers: {"content-type":"application/json"},
           body: JSON.stringify({
             confirmation: document.querySelector("#us-arm-confirmation").value,
-            seconds: 1800
+            seconds: Number(duration?.value || 1800)
           })
         }
       );
@@ -698,26 +1033,144 @@
     } catch (error) {
       document.querySelector("#us-trading-status").textContent = error.message;
     } finally {
-      button.disabled = false;
+      setActionBusy(button, false);
+      updateArmDurationLabel();
     }
   });
   document.querySelector("#us-emergency-stop")?.addEventListener("click", async event => {
     if (!window.confirm("Stop automation, disarm live execution, and request cancellation of this service's managed open orders?")) return;
     const button = event.currentTarget;
-    button.disabled = true;
+    const stopStatus = document.querySelector("#us-stop-status");
+    setActionBusy(button, true, "Stopping…");
+    stopStatus.className = "us-liquidate-status is-working";
+    stopStatus.textContent = "Stopping automation, disarming live execution, and checking managed open orders…";
+    const progressTimer = delayedProgress(
+      stopStatus,
+      2000,
+      "The stop request is still processing. This usually means the local database is committing the stop or Polymarket US is answering a managed-order cancellation request."
+    );
     try {
-      const body = await tradingAction("/api/polymarket-us/trading/emergency-stop", "Stopping automation and checking managed open orders…");
+      const body = await tradingAction(
+        "/api/polymarket-us/trading/emergency-stop",
+        "Stopping automation and checking managed open orders…"
+      );
       usTradingHydrationEpoch += 1;
       setUSTradingFormDirty(false);
       applyTradingPolicy(body, {force:true});
+      renderTradingStatus(body);
+      const canceled = Array.isArray(body.cancel_requested)
+        ? body.cancel_requested.length
+        : 0;
+      const failures = Array.isArray(body.cancel_failures)
+        ? body.cancel_failures.length
+        : 0;
+      stopStatus.className = failures
+        ? "us-liquidate-status is-error"
+        : "us-liquidate-status is-success";
+      stopStatus.textContent = failures
+        ? `Automation is OFF. ${canceled} managed order cancellation request${canceled === 1 ? "" : "s"} sent; ${failures} venue response${failures === 1 ? "" : "s"} failed. Review the journal.`
+        : `Stopped. Automation is OFF, live trading is disarmed, and ${canceled} managed order cancellation request${canceled === 1 ? "" : "s"} ${canceled === 1 ? "was" : "were"} sent.`;
     } catch (error) {
-      document.querySelector("#us-trading-status").textContent = error.message;
+      stopStatus.className = "us-liquidate-status is-error";
+      stopStatus.textContent = `Stop could not be confirmed: ${error.message || "unknown error"}. Check the local service and manage live positions from Polymarket if necessary.`;
     } finally {
-      button.disabled = false;
+      window.clearTimeout(progressTimer);
+      setActionBusy(button, false);
     }
   });
-  document.querySelector("#us-performance-refresh")?.addEventListener("click", loadUSTrading);
-  document.querySelector("#us-trading-refresh")?.addEventListener("click", loadUSTrading);
+  for (const selector of ["#us-performance-refresh", "#us-trading-refresh"]) {
+    document.querySelector(selector)?.addEventListener("click", async event => {
+      const button = event.currentTarget;
+      setActionBusy(button, true, "Refreshing…");
+      try {
+        await loadUSTrading();
+      } finally {
+        setActionBusy(button, false);
+      }
+    });
+  }
+
+  document.querySelector("#us-live-tally-reset")?.addEventListener(
+    "click",
+    async event => {
+      const button = event.currentTarget;
+      const status = document.querySelector("#us-performance-action-status");
+      const openLive = Number(
+        lastTradingPerformance?.modes?.live?.open_positions || 0
+      );
+      if (openLive) {
+        status.className = "us-liquidate-status is-error";
+        status.textContent = `${openLive} live position${openLive === 1 ? "" : "s"} still open. Sell or synchronize those positions before resetting the live tally.`;
+        return;
+      }
+      if (lastUSTradingStatus?.armed) {
+        status.className = "us-liquidate-status is-error";
+        status.textContent = "Disarm live trading first. Resetting a tally while new entries are authorized would create an ambiguous session boundary.";
+        return;
+      }
+      if (!window.confirm(
+        "Start a fresh live W-L-P and net display at zero? Historical positions, the execution journal, and daily-loss safeguards will remain preserved."
+      )) return;
+
+      setActionBusy(button, true, "Resetting tally…");
+      status.className = "us-liquidate-status is-working";
+      status.textContent = "Creating a new local live-performance baseline; no order is being sent and no trade record is being deleted…";
+      const progressTimer = delayedProgress(
+        status,
+        1500,
+        "The local trade database is recording and verifying the new tally boundary. Positions, audit history, and risk controls remain untouched."
+      );
+      try {
+        const response = await fetch(
+          "/api/polymarket-us/trading/performance/reset-live",
+          {
+            method: "POST",
+            headers: {"content-type":"application/json"},
+            body: JSON.stringify({confirmation:"RESET LIVE TALLY"})
+          }
+        );
+        const body = await response.json().catch(()=>({}));
+        if (!response.ok) throw new Error(detailMessage(body));
+        status.className = "us-liquidate-status is-success";
+        status.textContent = body.summary || "Live performance tally reset.";
+        refreshTradingInBackground();
+      } catch (error) {
+        status.className = "us-liquidate-status is-error";
+        status.textContent = error.message || "Could not reset the live tally";
+      } finally {
+        window.clearTimeout(progressTimer);
+        setActionBusy(button, false);
+      }
+    }
+  );
+
+  document.querySelector("#us-venue-sync")?.addEventListener("click", async event => {
+    const button = event.currentTarget;
+    const syncStatus = document.querySelector("#us-venue-sync-status");
+    setActionBusy(button, true, "Synchronizing…");
+    if (syncStatus) {
+      syncStatus.classList.remove("is-error");
+      syncStatus.textContent = "Reading authenticated Polymarket US account positions…";
+    }
+    try {
+      const response = await fetch("/api/polymarket-us/trading/sync", {
+        method: "POST"
+      });
+      const body = await response.json().catch(()=>({}));
+      if (!response.ok) throw new Error(detailMessage(body));
+      if (syncStatus) {
+        syncStatus.textContent = body.summary || "Account sync completed.";
+      }
+      await loadUSTrading();
+    } catch (error) {
+      if (syncStatus) {
+        syncStatus.classList.add("is-error");
+        syncStatus.textContent = error.message || "Account sync failed";
+      }
+    } finally {
+      setActionBusy(button, false);
+    }
+  });
 
   document.querySelector(".us-position-filter")?.addEventListener("click", event => {
     const button = event.target.closest("[data-position-mode]");
@@ -728,6 +1181,121 @@
     });
     renderManagedPositions();
   });
+
+  document.querySelector("#us-clear-exited-positions")?.addEventListener(
+    "click",
+    async event => {
+      const exited = lastManagedPositions.filter(
+        position => position.status !== "open"
+      );
+      if (!window.confirm(
+        `Clear ${exited.length} exited position card${exited.length === 1 ? "" : "s"} from the managed-position view? Performance tallies, model observations, and the execution journal will be preserved.`
+      )) return;
+
+      const button = event.currentTarget;
+      const status = document.querySelector("#us-position-action-status");
+      const previousPositions = lastManagedPositions;
+      setActionBusy(button, true, "Clearing…");
+      status.className = "us-liquidate-status is-working";
+      status.textContent = "Archiving exited position cards from this view…";
+      usTradingHydrationEpoch += 1;
+      lastManagedPositions = lastManagedPositions.filter(
+        position => position.status === "open"
+      );
+      renderManagedPositions();
+      try {
+        const response = await fetch(
+          "/api/polymarket-us/trading/positions/archive-exited",
+          {method:"POST"}
+        );
+        const body = await response.json().catch(()=>({}));
+        if (!response.ok) throw new Error(detailMessage(body));
+        status.className = "us-liquidate-status is-success";
+        status.textContent = body.summary || "Exited position cards cleared from view.";
+      } catch (error) {
+        lastManagedPositions = previousPositions;
+        renderManagedPositions();
+        status.className = "us-liquidate-status is-error";
+        status.textContent = error.message || "Could not clear exited positions";
+      } finally {
+        setActionBusy(button, false);
+        usTradingHydrationEpoch += 1;
+        refreshTradingInBackground();
+      }
+    }
+  );
+
+  document.querySelector("#us-managed-positions")?.addEventListener(
+    "click",
+    async event => {
+      const button = event.target.closest("[data-exit-position]");
+      if (!button) return;
+      const positionId = button.dataset.exitPosition;
+      const position = lastManagedPositions.find(item => item.id === positionId);
+      if (!position || position.status !== "open") return;
+      const live = position.mode === "live";
+      const confirmationMessage = live
+        ? `Sell ${position.selection} in ${position.event_name} now? This sends a previewed fill-or-kill sell using the current authenticated US book.`
+        : `Remove the simulated ${position.selection} position from ${position.event_name}? This is immediate, needs no quote, and does not stop automation or erase other dry-run trades.`;
+      if (!window.confirm(confirmationMessage)) return;
+
+      const status = document.querySelector("#us-position-action-status");
+      const previousPositions = lastManagedPositions;
+      setActionBusy(
+        button,
+        true,
+        live ? "Selling…" : "Removing…"
+      );
+      status.className = "us-liquidate-status is-working";
+      status.textContent = live
+        ? `Loading the current US book and attempting to sell ${position.selection}…`
+        : `Removing simulated position ${position.selection} now…`;
+      const progressTimer = delayedProgress(
+        status,
+        live ? 2500 : 1200,
+        live
+          ? `Waiting for an authenticated US quote and sell response for ${position.selection}; the position remains visible on your Polymarket account until the venue confirms it.`
+          : `Removal request sent for ${position.selection}. Waiting for the local trade database to commit and verify the deletion.`
+      );
+      usTradingHydrationEpoch += 1;
+      if (!live) {
+        lastManagedPositions = lastManagedPositions.filter(
+          item => item.id !== positionId
+        );
+        renderManagedPositions();
+      }
+      try {
+        const response = await fetch(
+          `/api/polymarket-us/trading/positions/${encodeURIComponent(positionId)}/exit`,
+          {
+            method: "POST",
+            headers: {"content-type":"application/json"},
+            body: JSON.stringify({
+              confirmation: live ? "SELL LIVE POSITION" : ""
+            })
+          }
+        );
+        const body = await response.json().catch(()=>({}));
+        if (!response.ok) throw new Error(detailMessage(body));
+        status.className = body.status === "blocked"
+          ? "us-liquidate-status is-error"
+          : "us-liquidate-status is-success";
+        status.textContent = body.summary || (
+          live ? "Live sell attempt completed." : "Simulation removed."
+        );
+      } catch (error) {
+        lastManagedPositions = previousPositions;
+        renderManagedPositions();
+        status.className = "us-liquidate-status is-error";
+        status.textContent = error.message || "Could not close the position";
+      } finally {
+        window.clearTimeout(progressTimer);
+        setActionBusy(button, false);
+        usTradingHydrationEpoch += 1;
+        refreshTradingInBackground();
+      }
+    }
+  );
 
   function updateLiquidationMode() {
     const form = document.querySelector("#us-liquidate-form");
@@ -741,7 +1309,7 @@
     if (button) {
       button.textContent = mode === "live"
         ? "Sell all open live positions"
-        : "Stop automation + wipe dry-run trades";
+        : "Stop automation + wipe dry-run trades now";
     }
   }
 
@@ -768,11 +1336,51 @@
       : `EXECUTIVE DRY-RUN RESET: switch automatic analysis OFF and permanently remove all ${dryTotal} dry-run trade record${dryTotal === 1 ? "" : "s"}? No market mapping, quote, or fill is required. Live trades and the execution journal are preserved.`;
     if (!window.confirm(confirmationMessage)) return;
 
-    button.disabled = true;
+    const automationInput = document.querySelector("#us-automation-enabled");
+    const runNowButton = document.querySelector("#us-run-now");
+    const previousAutomation = automationInput?.checked;
+    const previousPositions = lastManagedPositions;
+    const previousStatus = lastUSTradingStatus;
+    setActionBusy(
+      button,
+      true,
+      live ? "Selling live positions…" : "Stopping & clearing now…"
+    );
     status.className = "us-liquidate-status is-working";
     status.textContent = live
       ? `Loading current US quotes and attempting ${openCount} live sale${openCount === 1 ? "" : "s"}...`
-      : "Stopping automation and wiping every dry-run position and history record...";
+      : "Sending one atomic request to stop automation and wipe the simulated ledger…";
+    let progressTimer = delayedProgress(
+      status,
+      1500,
+      live
+        ? "Still loading authenticated books and submitting fill-or-kill sell attempts. Polymarket US response time controls this step."
+        : "The reset request is processing. It does not need a market quote; a delay here means the local trade database is committing and verifying the wipe."
+    );
+    usTradingHydrationEpoch += 1;
+    if (!live) {
+      if (automationInput) {
+        automationInput.checked = false;
+        automationInput.disabled = true;
+      }
+      if (runNowButton) runNowButton.disabled = true;
+      lastManagedPositions = lastManagedPositions.filter(
+        position => position.mode !== "dry_run"
+      );
+      renderManagedPositions();
+      if (lastUSTradingStatus) {
+        renderTradingStatus({
+          ...lastUSTradingStatus,
+          policy: {
+            ...(lastUSTradingStatus.policy || {}),
+            automation_enabled: false
+          },
+          last_cycle_summary: (
+            "Stop accepted locally; clearing the simulated ledger now."
+          )
+        });
+      }
+    }
     try {
       const response = await fetch(
         live
@@ -797,16 +1405,42 @@
           : "Automation stopped and all dry-run positions and history were wiped."
       );
       if (live) document.querySelector("#us-liquidate-confirmation").value = "";
-      await Promise.all([refreshUSStatus(), loadUSTrading()]);
+      if (!live) {
+        const stoppedStatus = {
+          ...(lastUSTradingStatus || {}),
+          armed: false,
+          armed_until: null,
+          protective_exits_armed: false,
+          policy: {
+            ...(lastUSTradingStatus?.policy || {}),
+            automation_enabled: false
+          },
+          last_cycle_summary: body.summary
+        };
+        setUSTradingFormDirty(false);
+        applyTradingPolicy(stoppedStatus, {force:true});
+        renderTradingStatus(stoppedStatus);
+      }
+      usTradingHydrationEpoch += 1;
+      refreshTradingInBackground();
     } catch (error) {
+      if (!live) {
+        lastManagedPositions = previousPositions;
+        renderManagedPositions();
+        if (automationInput) automationInput.checked = !!previousAutomation;
+        if (previousStatus) renderTradingStatus(previousStatus);
+      }
       status.className = "us-liquidate-status is-error";
       status.textContent = error.message || (
         live
           ? "Could not attempt position sales"
-          : "Could not complete the executive dry-run reset"
+          : "Could not complete the atomic dry-run reset"
       );
     } finally {
-      button.disabled = false;
+      window.clearTimeout(progressTimer);
+      if (automationInput) automationInput.disabled = false;
+      if (runNowButton) runNowButton.disabled = false;
+      setActionBusy(button, false);
       updateLiquidationMode();
     }
   });

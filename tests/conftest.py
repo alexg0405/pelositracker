@@ -18,3 +18,6 @@ os.environ["LEDGER_DB"] = _temporary_db("test_ledger_")
 os.environ["ACCOUNTS_DB"] = _temporary_db("test_accounts_")
 os.environ["HISTORY_DB"] = _temporary_db("test_history_")
 os.environ["STATE_DB"] = _temporary_db("test_state_")
+os.environ["POLYMARKET_US_TRADING_DB"] = _temporary_db("test_us_trading_")
+os.environ["ENABLE_PAPER_BOTS"] = "true"
+os.environ["ENABLE_POLYMARKET_US_TRADING"] = "true"

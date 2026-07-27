@@ -402,6 +402,8 @@ def _matchup_separator(title: str) -> re.Match | None:
 _LIVE_GAME_STATUSES = {"live", "in progress", "inprogress", "playing", "halftime", "intermission"}
 _FINAL_GAME_STATUSES = {"final", "ended", "closed", "complete", "completed", "finished", "cancelled", "canceled"}
 _UPCOMING_GAME_STATUSES = {"scheduled", "upcoming", "not started", "pregame", "pre game", "delayed", "postponed"}
+_SLUG_DATE = re.compile(r"(?:^|-)(20\d{2}-\d{2}-\d{2})(?:-|$)")
+_MAX_SLUG_START_DRIFT_DAYS = 7
 
 
 def _tag_labels(event: dict) -> list[str]:
@@ -445,6 +447,34 @@ def sports_game_status(payload) -> str | None:
     return None
 
 
+def game_start_matches_slug(
+    slug: str | None,
+    game_start: str | None,
+    *,
+    max_drift_days: int = _MAX_SLUG_START_DRIFT_DAYS,
+) -> bool:
+    """Reject a dated fixture whose provider start was rewritten far away.
+
+    Sports slugs carry the fixture date. A short drift allows time-zone
+    boundaries and ordinary postponements, but a June fixture claiming an
+    August start is a different or corrupted event and must not be monitored.
+    Slugs without a date retain the existing behavior.
+    """
+    match = _SLUG_DATE.search(str(slug or ""))
+    if match is None:
+        return True
+    if not game_start:
+        return True
+    start = _parse_iso(game_start)
+    if start is None:
+        return False
+    try:
+        slug_date = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    return abs((start.date() - slug_date).days) <= max(0, int(max_drift_days))
+
+
 def exclude_restricted_games(games: list[dict]) -> list[dict]:
     """Drop region-restricted games. Only useful from an *unrestricted* host
     region where a subset of events is restricted; from a restricted region
@@ -473,6 +503,8 @@ def filter_sports_games(events: list[dict]) -> list[dict]:
         # Real first-pitch/tip time lives on the market (top-level startDate is
         # just when the market was created).
         game_start = next((m.get("gameStartTime") for m in markets if m.get("gameStartTime")), None)
+        if not game_start_matches_slug(slug, game_start):
+            continue
         inferred = infer_polymarket_event(event)
         provider_status = next((sports_game_status(m) for m in markets if sports_game_status(m)),
                                sports_game_status(event))

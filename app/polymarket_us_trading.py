@@ -31,11 +31,213 @@ from .lines import is_spread_market, is_total_market, quote_line_side
 from .models import Event, Signal
 
 
-POLICY_VERSION = "pmus-live-risk-policy-v1"
+POLICY_VERSION = "pmus-live-risk-policy-v3-allocation-presets"
+RISK_PRESET_VERSION = "risk-presets-v1"
+_CONTROL_TOKEN_KEY = "_execution_control_token"
+RISK_PRESETS: dict[str, dict[str, Any]] = {
+    "cautious": {
+        "label": "Cautious",
+        "description": "Higher evidence bars, smaller positions, and more cash left unused.",
+        "exposure_fraction": 0.50,
+        "position_fraction": 0.10,
+        "event_fraction": 0.20,
+        "daily_loss_fraction": 0.10,
+        "minimum_cash_reserve_fraction": 0.50,
+        "max_open_positions": 3,
+        "max_orders_per_hour": 3,
+        "min_edge": 0.06,
+        "min_signal_quality": 75.0,
+        "min_reference_sources": 2,
+        "min_entry_price": 0.15,
+        "max_entry_price": 0.85,
+        "max_spread": 0.02,
+        "min_book_shares": 10.0,
+        "min_hold_minutes": 20.0,
+        "profit_target": 0.15,
+        "trailing_drawdown": 0.04,
+        "stop_loss": 0.12,
+        "exit_edge": 0.01,
+        "cycle_seconds": 45,
+        "candidate_cooldown_seconds": 600,
+    },
+    "balanced": {
+        "label": "Balanced",
+        "description": "Moderate sizing and evidence requirements for ordinary use.",
+        "exposure_fraction": 0.70,
+        "position_fraction": 0.15,
+        "event_fraction": 0.30,
+        "daily_loss_fraction": 0.18,
+        "minimum_cash_reserve_fraction": 0.30,
+        "max_open_positions": 5,
+        "max_orders_per_hour": 5,
+        "min_edge": 0.04,
+        "min_signal_quality": 65.0,
+        "min_reference_sources": 2,
+        "min_entry_price": 0.12,
+        "max_entry_price": 0.88,
+        "max_spread": 0.03,
+        "min_book_shares": 5.0,
+        "min_hold_minutes": 15.0,
+        "profit_target": 0.12,
+        "trailing_drawdown": 0.04,
+        "stop_loss": 0.16,
+        "exit_edge": 0.0,
+        "cycle_seconds": 30,
+        "candidate_cooldown_seconds": 420,
+    },
+    "active": {
+        "label": "Active",
+        "description": "More positions and faster review while retaining positive-edge controls.",
+        "exposure_fraction": 0.85,
+        "position_fraction": 0.20,
+        "event_fraction": 0.40,
+        "daily_loss_fraction": 0.30,
+        "minimum_cash_reserve_fraction": 0.15,
+        "max_open_positions": 7,
+        "max_orders_per_hour": 8,
+        "min_edge": 0.025,
+        "min_signal_quality": 55.0,
+        "min_reference_sources": 1,
+        "min_entry_price": 0.10,
+        "max_entry_price": 0.90,
+        "max_spread": 0.04,
+        "min_book_shares": 3.0,
+        "min_hold_minutes": 10.0,
+        "profit_target": 0.10,
+        "trailing_drawdown": 0.05,
+        "stop_loss": 0.22,
+        "exit_edge": 0.0,
+        "cycle_seconds": 20,
+        "candidate_cooldown_seconds": 240,
+    },
+    "aggressive": {
+        "label": "Aggressive research",
+        "description": "Broadest bounded profile; still keeps every venue and allocation safeguard.",
+        "exposure_fraction": 0.95,
+        "position_fraction": 0.25,
+        "event_fraction": 0.50,
+        "daily_loss_fraction": 0.45,
+        "minimum_cash_reserve_fraction": 0.05,
+        "max_open_positions": 10,
+        "max_orders_per_hour": 12,
+        "min_edge": 0.015,
+        "min_signal_quality": 45.0,
+        "min_reference_sources": 1,
+        "min_entry_price": 0.08,
+        "max_entry_price": 0.92,
+        "max_spread": 0.06,
+        "min_book_shares": 1.0,
+        "min_hold_minutes": 5.0,
+        "profit_target": 0.08,
+        "trailing_drawdown": 0.06,
+        "stop_loss": 0.28,
+        "exit_edge": -0.01,
+        "cycle_seconds": 15,
+        "candidate_cooldown_seconds": 120,
+    },
+}
 ARM_PHRASE = "ARM LIVE TRADING"
 LIVE_LIQUIDATION_PHRASE = "SELL ALL LIVE POSITIONS"
+LIVE_POSITION_EXIT_PHRASE = "SELL LIVE POSITION"
 DRY_RUN_HISTORY_CLEAR_PHRASE = "CLEAR DRY RUN HISTORY"
-MAX_ARM_SECONDS = 30 * 60
+LIVE_PERFORMANCE_RESET_PHRASE = "RESET LIVE TALLY"
+# The dashboard offers bounded presets up to four hours. Restarting, saving a
+# policy, disarming, or stopping still closes the process-local live latch.
+DEFAULT_ARM_SECONDS = 30 * 60
+MAX_ARM_SECONDS = 4 * 60 * 60
+VENUE_RECONCILIATION_GRACE_SECONDS = 15
+VENUE_MISMATCH_CONFIRMATIONS = 2
+PROFIT_TARGET_CONFIRMATION_READINGS = 2
+ENGINE_GATE_CATALOG = (
+    {
+        "code": "provider_freshness",
+        "label": "Fresh provider data",
+        "description": "Require trusted, non-future provider time inside the engine age limit.",
+        "core": True,
+    },
+    {
+        "code": "reference_source_support",
+        "label": "Reference-source support",
+        "description": "Require the engine's independent source-family check to pass.",
+        "core": True,
+    },
+    {
+        "code": "market_identity",
+        "label": "Exact market identity",
+        "description": "Require unambiguous event, market, line, scope, and outcome identity.",
+        "core": True,
+    },
+    {
+        "code": "market_status",
+        "label": "Open market status",
+        "description": "Require an active, unresolved, unrestricted market accepting orders.",
+        "core": True,
+    },
+    {
+        "code": "entry_price_range",
+        "label": "Engine entry-price bracket",
+        "description": "Require the engine price to remain inside its 5c-95c entry bracket.",
+        "core": True,
+    },
+    {
+        "code": "executable_fill",
+        "label": "Engine executable-fill proof",
+        "description": "Require complete engine-side depth, fee metadata, and a simulated fill.",
+        "core": False,
+    },
+    {
+        "code": "consensus_policy",
+        "label": "Versioned consensus policy",
+        "description": "Require support for the selected consensus method.",
+        "core": False,
+    },
+    {
+        "code": "model_sample_support",
+        "label": "Model sample support",
+        "description": "Require the chronological model-selection sample minimum.",
+        "core": False,
+    },
+    {
+        "code": "calibration_support",
+        "label": "Calibration artifact",
+        "description": "Require a validated, versioned calibration policy.",
+        "core": False,
+    },
+    {
+        "code": "uncertainty_support",
+        "label": "Uncertainty bootstrap",
+        "description": "Require enough event-block bootstrap draws.",
+        "core": False,
+    },
+    {
+        "code": "probability_net_ev_positive",
+        "label": "Probability net EV is positive",
+        "description": "Require the historical bootstrap probability floor.",
+        "core": False,
+    },
+    {
+        "code": "minimum_expected_value",
+        "label": "Minimum expected dollars",
+        "description": "Require the engine's expected paper-dollar value floor.",
+        "core": False,
+    },
+    {
+        "code": "net_edge",
+        "label": "Engine net-edge floor",
+        "description": "Require calibrated probability minus executable cost to clear its floor.",
+        "core": True,
+    },
+    {
+        "code": "signal_quality",
+        "label": "Engine signal-quality floor",
+        "description": "Require the engine's reliability summary to clear its threshold.",
+        "core": True,
+    },
+)
+ENGINE_GATE_CODES = frozenset(item["code"] for item in ENGINE_GATE_CATALOG)
+CORE_ENGINE_GATES = tuple(
+    item["code"] for item in ENGINE_GATE_CATALOG if item["core"]
+)
 _TERMINAL_ORDER_STATES = {
     "ORDER_STATE_FILLED",
     "ORDER_STATE_CANCELED",
@@ -125,12 +327,54 @@ class TradingExecutionError(RuntimeError):
     """A bounded venue or execution failure."""
 
 
+def risk_preset_fields(name: str, allocation: float) -> dict[str, Any]:
+    """Return deterministic execution limits for one operator-selected risk style."""
+    if name not in RISK_PRESETS:
+        raise TradingPolicyError(f"unknown risk preset: {name}")
+    if not math.isfinite(allocation) or allocation <= 0:
+        raise TradingPolicyError("trading_allocation_usd must be greater than zero")
+    preset = RISK_PRESETS[name]
+    def money(fraction: float) -> float:
+        return round(max(0.01, allocation * fraction), 2)
+
+    return {
+        "risk_preset": name,
+        "risk_preset_version": RISK_PRESET_VERSION,
+        "trading_allocation_usd": round(allocation, 2),
+        "max_total_exposure_usd": money(preset["exposure_fraction"]),
+        "minimum_cash_reserve_usd": round(
+            allocation * preset["minimum_cash_reserve_fraction"], 2
+        ),
+        "max_position_usd": money(preset["position_fraction"]),
+        "max_event_exposure_usd": money(preset["event_fraction"]),
+        "max_daily_loss_usd": money(preset["daily_loss_fraction"]),
+        **{
+            key: value
+            for key, value in preset.items()
+            if key
+            not in {
+                "label",
+                "description",
+                "exposure_fraction",
+                "position_fraction",
+                "event_fraction",
+                "daily_loss_fraction",
+                "minimum_cash_reserve_fraction",
+            }
+        },
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class TradingPolicy:
     automation_enabled: bool = False
     execution_mode: str = "dry_run"
     auto_cashout: bool = False
     require_engine_entry: bool = True
+    required_engine_gates: tuple[str, ...] = CORE_ENGINE_GATES
+    trading_allocation_usd: float = 10.0
+    risk_preset: str = "custom"
+    risk_preset_version: str = RISK_PRESET_VERSION
     max_total_exposure_usd: float = 9.50
     minimum_cash_reserve_usd: float = 0.50
     max_position_usd: float = 1.75
@@ -157,6 +401,20 @@ class TradingPolicy:
     def from_mapping(cls, values: Mapping[str, Any]) -> "TradingPolicy":
         known = {field.name for field in fields(cls)}
         clean = {key: value for key, value in values.items() if key in known}
+        # Policies saved before the allocation field existed used total exposure
+        # as their outer boundary. Preserve that exact configuration on upgrade
+        # by adopting at least that amount as the initial hard allocation.
+        if "trading_allocation_usd" not in clean:
+            clean["trading_allocation_usd"] = max(
+                10.0, float(clean.get("max_total_exposure_usd", 0.0) or 0.0)
+            )
+        if "required_engine_gates" in clean:
+            raw_gates = clean["required_engine_gates"]
+            if not isinstance(raw_gates, (list, tuple)):
+                raise TradingPolicyError("required_engine_gates must be a list")
+            clean["required_engine_gates"] = tuple(
+                dict.fromkeys(str(code) for code in raw_gates)
+            )
         policy = cls(**clean)
         policy.validate()
         return policy
@@ -165,6 +423,7 @@ class TradingPolicy:
         if self.execution_mode not in {"dry_run", "live"}:
             raise TradingPolicyError("execution_mode must be dry_run or live")
         money_fields = (
+            "trading_allocation_usd",
             "max_total_exposure_usd",
             "minimum_cash_reserve_usd",
             "max_position_usd",
@@ -175,8 +434,16 @@ class TradingPolicy:
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise TradingPolicyError(f"{name} must be a non-negative number")
+        if self.trading_allocation_usd <= 0:
+            raise TradingPolicyError("trading_allocation_usd must be greater than zero")
         if self.max_total_exposure_usd <= 0:
             raise TradingPolicyError("max_total_exposure_usd must be greater than zero")
+        if self.max_total_exposure_usd > self.trading_allocation_usd:
+            raise TradingPolicyError(
+                "maximum total exposure cannot exceed the hard trading allocation"
+            )
+        if self.risk_preset not in {"custom", *RISK_PRESETS}:
+            raise TradingPolicyError("risk_preset must be custom or a named preset")
         if not 0 < self.max_position_usd <= self.max_total_exposure_usd:
             raise TradingPolicyError(
                 "max_position_usd must be positive and no larger than total exposure"
@@ -189,6 +456,12 @@ class TradingPolicy:
             raise TradingPolicyError("position and order limits must be at least one")
         if self.min_reference_sources < 1:
             raise TradingPolicyError("min_reference_sources must be at least one")
+        unknown_gates = set(self.required_engine_gates) - ENGINE_GATE_CODES
+        if unknown_gates:
+            raise TradingPolicyError(
+                "unknown required engine gate(s): "
+                + ", ".join(sorted(unknown_gates))
+            )
         if not MIN_ENTRY_PRICE < self.min_entry_price < self.max_entry_price < MAX_ENTRY_PRICE:
             raise TradingPolicyError(
                 "entry prices must stay strictly inside the established 5c–95c bounds"
@@ -581,8 +854,49 @@ def _executable_book_quote(
     )
 
 
+def _size_aware_exit_quote(
+    book: Mapping[str, Any] | None,
+    position_side: str,
+    quantity: float,
+) -> tuple[str, float, float, float] | None:
+    """Return state, average exit value, LONG limit price, and total depth.
+
+    The limit price is the worst level required to fill the complete managed
+    quantity. The average value is used for cash-out monitoring, avoiding a
+    misleading top-of-book mark that cannot fill the position.
+    """
+    if quantity <= 0:
+        return None
+    data = _book_market_data(book)
+    state = str(data.get("state") or "").upper()
+    if position_side == "long":
+        levels = sorted(_book_levels(data, "bids"), reverse=True)
+    else:
+        levels = sorted(_book_levels(data, "offers"))
+    total_depth = sum(level_quantity for _, level_quantity in levels)
+    remaining = quantity
+    notional = 0.0
+    limit_price: float | None = None
+    for price, level_quantity in levels:
+        taken = min(remaining, level_quantity)
+        if taken <= 0:
+            continue
+        exit_value = price if position_side == "long" else 1.0 - price
+        notional += taken * exit_value
+        remaining -= taken
+        limit_price = price
+        if remaining <= 1e-8:
+            break
+    if remaining > 1e-8 or limit_price is None:
+        return None
+    return state, notional / quantity, limit_price, total_depth
+
+
 def _price_amount(value: float) -> dict[str, Any]:
-    return {"value": round(value, 8), "currency": "USD"}
+    # Polymarket US defines Amount.value as a string.  Sending a JSON number is
+    # accepted by some read/preview paths but rejected by live order handling.
+    encoded = f"{round(value, 8):.8f}".rstrip("0").rstrip(".")
+    return {"value": encoded or "0", "currency": "USD"}
 
 
 def _order_fill(
@@ -652,26 +966,94 @@ class PolymarketUSAutoTrader:
         self._client_factory = client_factory
         self._clock = clock
         self._armed_until = 0.0
+        # Entry authority expires after the operator-selected bounded duration.
+        # Protective cash-out
+        # authority is separate: arming live trading enables it for the life of
+        # this process, and save/disarm/stop/restart always clears it.
+        self._protective_exits_armed = False
+        # Incrementing this token invalidates a cycle that was already in
+        # progress. It is deliberately independent of the cycle lock so an
+        # operator stop/reset can take effect without waiting for venue I/O.
+        self._control_generation = 0
         self._last_cycle_at: float | None = None
         self._last_cycle_summary = "Automation has not run yet."
         self._last_cycle_evaluations: tuple[dict[str, Any], ...] = ()
+        self._last_venue_sync_at: float | None = None
+        self._last_venue_sync_summary = "Venue positions have not been synchronized yet."
+        self._last_venue_sync_error: str | None = None
+        self._last_venue_positions: tuple[dict[str, Any], ...] = ()
         self._candidate_seen: dict[str, float] = {}
         self._qualification_seen: dict[str, float] = {}
         self._journal_writes = 0
         with self._lock:
             self._db.initialize(_SCHEMA, component="polymarket_us_live_trading", version=1)
+            self._db.migrate_columns(
+                "polymarket_us_live_trading",
+                2,
+                {
+                    "live_managed_positions": {
+                        "initial_quantity": "DOUBLE PRECISION",
+                        "initial_cost_basis": "DOUBLE PRECISION",
+                        "external_exit_quantity": "DOUBLE PRECISION",
+                        "venue_sync_status": "TEXT",
+                        "venue_net_position": "DOUBLE PRECISION",
+                        "venue_qty_available": "DOUBLE PRECISION",
+                        "venue_observed_quantity": "DOUBLE PRECISION",
+                        "venue_mismatch_count": "INTEGER",
+                        "venue_sync_ts": "DOUBLE PRECISION",
+                        "venue_update_time": "TEXT",
+                        "profit_lock_armed_ts": "DOUBLE PRECISION",
+                        "profit_lock_price": "DOUBLE PRECISION",
+                    },
+                },
+            )
+            self._db.migrate_columns(
+                "polymarket_us_live_trading",
+                3,
+                {
+                    "live_managed_positions": {
+                        "dashboard_hidden": "INTEGER",
+                    },
+                },
+            )
+            self._db.migrate_columns(
+                "polymarket_us_live_trading",
+                4,
+                {
+                    "live_managed_positions": {
+                        "profit_target_observed_ts": "DOUBLE PRECISION",
+                        "profit_target_observation_count": "INTEGER",
+                        "profit_target_observed_price": "DOUBLE PRECISION",
+                    },
+                },
+            )
+        self._control_token = ""
         self._policy = self._load_policy()
 
     def close(self) -> None:
         with self._lock:
             self._armed_until = 0.0
+            self._protective_exits_armed = False
             self._db.close()
 
     @property
     def policy(self) -> TradingPolicy:
+        self._refresh_policy_authority()
         return self._policy
 
     def _load_policy(self) -> TradingPolicy:
+        policy, token = self._stored_policy_state()
+        if policy is None:
+            policy = TradingPolicy()
+            token = self._save_policy(policy)
+        elif not token:
+            # Policies written before cross-process execution authority existed
+            # receive a token on first load. This changes no policy value.
+            token = self._save_policy(policy)
+        self._control_token = token
+        return policy
+
+    def _stored_policy_state(self) -> tuple[TradingPolicy | None, str]:
         with self._lock:
             with self._db.cursor() as cur:
                 self._db.execute(
@@ -681,16 +1063,25 @@ class PolymarketUSAutoTrader:
                 )
                 row = cur.fetchone()
         if row is None:
-            policy = TradingPolicy()
-            self._save_policy(policy)
-            return policy
+            return None, ""
         try:
-            return TradingPolicy.from_mapping(json.loads(row[0]))
+            raw = json.loads(row[0])
+            if not isinstance(raw, Mapping):
+                raise TypeError("stored policy payload must be an object")
+            return (
+                TradingPolicy.from_mapping(raw),
+                str(raw.get(_CONTROL_TOKEN_KEY) or ""),
+            )
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise TradingPolicyError("stored trading policy is invalid") from exc
 
-    def _save_policy(self, policy: TradingPolicy) -> None:
-        payload = json.dumps(asdict(policy), sort_keys=True, separators=(",", ":"))
+    def _save_policy(self, policy: TradingPolicy) -> str:
+        token = uuid4().hex
+        payload = json.dumps(
+            {**asdict(policy), _CONTROL_TOKEN_KEY: token},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         with self._lock:
             with self._db.transaction() as cur:
                 self._db.execute(
@@ -700,16 +1091,73 @@ class PolymarketUSAutoTrader:
                        payload=EXCLUDED.payload,updated_ts=EXCLUDED.updated_ts""",
                     (1, payload, self._clock()),
                 )
+        self._control_token = token
+        return token
+
+    def _adopt_stored_policy(
+        self,
+        policy: TradingPolicy,
+        token: str,
+    ) -> None:
+        """Adopt a policy saved by another runtime and revoke local authority."""
+        self._policy = policy
+        self._control_token = token
+        self._armed_until = 0.0
+        self._protective_exits_armed = False
+        self._control_generation += 1
+        self._last_cycle_summary = (
+            "A newer execution policy was saved by another local server. "
+            "This runtime disarmed itself and adopted that saved policy."
+        )
+
+    def _refresh_policy_authority(self) -> bool:
+        """Make the database policy authoritative across local server processes."""
+        policy, token = self._stored_policy_state()
+        if policy is None:
+            return False
+        if token != self._control_token:
+            self._adopt_stored_policy(policy, token)
+            return True
+        return False
+
+    def _execution_authority_is_current(
+        self,
+        generation: int,
+        token: str,
+        mode: str,
+    ) -> bool:
+        """Fail closed before any fill when another process changed controls."""
+        if not self._cycle_is_current(generation):
+            return False
+        policy, stored_token = self._stored_policy_state()
+        if policy is None:
+            return False
+        if (
+            stored_token != token
+            or not policy.automation_enabled
+            or policy.execution_mode != mode
+        ):
+            if stored_token != self._control_token:
+                self._adopt_stored_policy(policy, stored_token)
+            return False
+        return True
 
     def configure(self, values: Mapping[str, Any]) -> TradingPolicy:
+        self._refresh_policy_authority()
         current = asdict(self._policy)
         current.update(values)
+        selected_preset = str(current.get("risk_preset") or "custom")
+        if selected_preset in RISK_PRESETS:
+            allocation = float(current.get("trading_allocation_usd") or 0.0)
+            current.update(risk_preset_fields(selected_preset, allocation))
         policy = TradingPolicy.from_mapping(current)
         self._save_policy(policy)
         self._policy = policy
+        self._control_generation += 1
         # Any limit or mode edit closes the latch. The operator must review the
         # saved policy and explicitly re-arm it.
         self._armed_until = 0.0
+        self._protective_exits_armed = False
         self._journal(
             "configuration",
             "saved",
@@ -720,7 +1168,13 @@ class PolymarketUSAutoTrader:
     def is_armed(self) -> bool:
         return self._clock() < self._armed_until
 
-    def arm(self, confirmation: str, *, seconds: int = MAX_ARM_SECONDS) -> dict[str, Any]:
+    def arm(
+        self,
+        confirmation: str,
+        *,
+        seconds: int = DEFAULT_ARM_SECONDS,
+    ) -> dict[str, Any]:
+        self._refresh_policy_authority()
         if confirmation != ARM_PHRASE:
             raise TradingPolicyError(f'type "{ARM_PHRASE}" exactly to arm live execution')
         if not self._policy.automation_enabled:
@@ -730,26 +1184,82 @@ class PolymarketUSAutoTrader:
         if not self._key_id or not self._secret_key:
             raise TradingPolicyError("both Polymarket US API credential values are required")
         seconds = max(60, min(int(seconds), MAX_ARM_SECONDS))
+        # Rotating the shared token makes this arming action the only current
+        # authority. A second server with the same database remains disarmed.
+        self._save_policy(self._policy)
+        self._control_generation += 1
         self._armed_until = self._clock() + seconds
+        self._protective_exits_armed = True
         self._journal(
             "safety",
             "live_armed",
-            payload={"expires_at": self._armed_until, "seconds": seconds},
+            payload={
+                "expires_at": self._armed_until,
+                "seconds": seconds,
+                "protective_exits_armed_until_stop_or_restart": True,
+            },
         )
         return self.status()
 
     def disarm(self, reason: str = "manual") -> dict[str, Any]:
+        self._refresh_policy_authority()
         self._armed_until = 0.0
+        self._protective_exits_armed = False
+        self._control_generation += 1
+        self._save_policy(self._policy)
         self._journal("safety", "disarmed", payload={"reason": reason})
         return self.status()
 
-    def emergency_stop(self) -> dict[str, Any]:
+    def _stop_automation_controls(self, reason: str) -> float:
+        """Close every execution latch before doing any potentially slow cleanup."""
+        self._refresh_policy_authority()
+        stopped_at = self._clock()
         self._armed_until = 0.0
+        self._protective_exits_armed = False
+        self._control_generation += 1
         self._policy = TradingPolicy.from_mapping({
             **asdict(self._policy),
             "automation_enabled": False,
         })
+        self._last_cycle_summary = (
+            "Automation stop accepted; no new entries can start and any active "
+            "analysis cycle has been invalidated."
+        )
         self._save_policy(self._policy)
+        return stopped_at
+
+    def stop_automation(self, reason: str = "manual") -> dict[str, Any]:
+        """Fast stop acknowledgement with no venue reads or order cancellation."""
+        stopped_at = self._stop_automation_controls(reason)
+        self._journal(
+            "safety",
+            "automation_stopped",
+            payload={
+                "reason": reason,
+                "live_disarmed": True,
+                "active_cycle_invalidated": True,
+                "venue_cleanup_deferred": True,
+            },
+        )
+        return {
+            "policy": asdict(self._policy),
+            "armed": False,
+            "armed_until": None,
+            "protective_exits_armed": False,
+            "last_cycle_summary": self._last_cycle_summary,
+            "stop_ack": {
+                "accepted_at": datetime.fromtimestamp(
+                    stopped_at, timezone.utc
+                ).isoformat(),
+                "automation_disabled": True,
+                "live_disarmed": True,
+                "active_cycle_invalidated": True,
+                "venue_cleanup_deferred": True,
+            },
+        }
+
+    def emergency_stop(self) -> dict[str, Any]:
+        stopped_at = self._stop_automation_controls("emergency_stop")
         canceled: list[str] = []
         failures: list[dict[str, str]] = []
         managed = self._managed_open_orders()
@@ -774,7 +1284,11 @@ class PolymarketUSAutoTrader:
         self._journal(
             "safety",
             "emergency_stop",
-            payload={"cancel_requested": canceled, "failures": failures},
+            payload={
+                "controls_stopped_at": stopped_at,
+                "cancel_requested": canceled,
+                "failures": failures,
+            },
         )
         return {
             **self.status(),
@@ -783,12 +1297,25 @@ class PolymarketUSAutoTrader:
         }
 
     def status(self) -> dict[str, Any]:
+        self._refresh_policy_authority()
         positions = self.positions(open_only=True)
         exposure = sum(float(row["cost_basis"]) for row in positions)
         now = self._clock()
         return {
             "policy_version": POLICY_VERSION,
             "policy": asdict(self._policy),
+            "risk_preset_version": RISK_PRESET_VERSION,
+            "risk_presets": {
+                name: {
+                    "label": values["label"],
+                    "description": values["description"],
+                    "derived_policy": risk_preset_fields(
+                        name, self._policy.trading_allocation_usd
+                    ),
+                }
+                for name, values in RISK_PRESETS.items()
+            },
+            "engine_gate_catalog": [dict(item) for item in ENGINE_GATE_CATALOG],
             "credentials_configured": bool(self._key_id and self._secret_key),
             "armed": self.is_armed(),
             "armed_until": (
@@ -797,6 +1324,13 @@ class PolymarketUSAutoTrader:
                 else None
             ),
             "restart_behavior": "always_disarmed",
+            "protective_exits_armed": (
+                self._protective_exits_armed
+                and self._policy.automation_enabled
+                and self._policy.execution_mode == "live"
+                and self._policy.auto_cashout
+            ),
+            "protective_exit_behavior": "armed_until_save_disarm_stop_or_restart",
             "open_managed_positions": len(positions),
             "managed_exposure_usd": round(exposure, 2),
             "last_cycle_at": (
@@ -805,6 +1339,18 @@ class PolymarketUSAutoTrader:
                 else None
             ),
             "last_cycle_summary": self._last_cycle_summary,
+            "last_venue_sync_at": (
+                datetime.fromtimestamp(
+                    self._last_venue_sync_at, timezone.utc
+                ).isoformat()
+                if self._last_venue_sync_at
+                else None
+            ),
+            "last_venue_sync_summary": self._last_venue_sync_summary,
+            "last_venue_sync_error": self._last_venue_sync_error,
+            "venue_positions": [
+                dict(item) for item in self._last_venue_positions
+            ],
             # This is execution-layer metadata only. It lets the workstation
             # distinguish a research signal from an exactly mapped US contract
             # without writing anything back into the calculation engine.
@@ -846,8 +1392,18 @@ class PolymarketUSAutoTrader:
             result.append(item)
         return result
 
-    def positions(self, *, open_only: bool = False) -> list[dict[str, Any]]:
-        where = " WHERE status='open'" if open_only else ""
+    def positions(
+        self,
+        *,
+        open_only: bool = False,
+        include_hidden: bool = False,
+    ) -> list[dict[str, Any]]:
+        if open_only:
+            where = " WHERE status='open'"
+        elif include_hidden:
+            where = ""
+        else:
+            where = " WHERE COALESCE(dashboard_hidden,0)=0"
         with self._lock:
             with self._db.cursor(dict_rows=True) as cur:
                 self._db.execute(
@@ -857,6 +1413,25 @@ class PolymarketUSAutoTrader:
                 )
                 rows = [dict(row) for row in cur.fetchall()]
         for row in rows:
+            row["initial_quantity"] = float(
+                row.get("initial_quantity")
+                if row.get("initial_quantity") is not None
+                else row["quantity"]
+            )
+            row["initial_cost_basis"] = float(
+                row.get("initial_cost_basis")
+                if row.get("initial_cost_basis") is not None
+                else row["cost_basis"]
+            )
+            row["external_exit_quantity"] = float(
+                row.get("external_exit_quantity") or 0.0
+            )
+            row["venue_mismatch_count"] = int(
+                row.get("venue_mismatch_count") or 0
+            )
+            row["profit_target_observation_count"] = int(
+                row.get("profit_target_observation_count") or 0
+            )
             for key in ("opened_ts", "updated_ts", "closed_ts"):
                 value = row.get(key)
                 row[key.removesuffix("_ts") + "_at"] = (
@@ -864,7 +1439,416 @@ class PolymarketUSAutoTrader:
                     if value is not None
                     else None
                 )
+            for key in (
+                "venue_sync_ts",
+                "profit_lock_armed_ts",
+                "profit_target_observed_ts",
+            ):
+                value = row.get(key)
+                row[key.removesuffix("_ts") + "_at"] = (
+                    datetime.fromtimestamp(float(value), timezone.utc).isoformat()
+                    if value is not None
+                    else None
+                )
         return rows
+
+    def archive_exited_positions(self) -> dict[str, Any]:
+        """Hide exited cards while preserving performance and audit evidence."""
+        with self._lock:
+            with self._db.transaction() as cur:
+                self._db.execute(
+                    cur,
+                    """UPDATE live_managed_positions
+                       SET dashboard_hidden=1
+                       WHERE status!='open'
+                         AND COALESCE(dashboard_hidden,0)=0""",
+                )
+                archived = max(0, int(cur.rowcount or 0))
+        self._journal(
+            "position_control",
+            "exited_archived",
+            payload={
+                "archived_positions": archived,
+                "positions_deleted": False,
+                "performance_preserved": True,
+                "execution_journal_preserved": True,
+            },
+        )
+        return {
+            "archived_positions": archived,
+            "positions_deleted": False,
+            "performance_preserved": True,
+            "execution_journal_preserved": True,
+            "summary": (
+                f"Cleared {archived} exited position card"
+                f"{'' if archived == 1 else 's'} from the managed-position view. "
+                "Tallies and audit history were preserved."
+            ),
+        }
+
+    def position(self, position_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            with self._db.cursor(dict_rows=True) as cur:
+                self._db.execute(
+                    cur,
+                    "SELECT * FROM live_managed_positions WHERE id=%s",
+                    (position_id,),
+                )
+                row = cur.fetchone()
+        return dict(row) if row is not None else None
+
+    def synchronize_live_positions(self) -> dict[str, Any]:
+        """Read the authoritative venue portfolio and reconcile local live rows.
+
+        This method never creates, cancels, modifies, previews, or closes an
+        order. Two identical mismatch snapshots are required before local
+        quantity is reduced, which avoids treating a transient portfolio lag as
+        a phone-side sale.
+        """
+        if not self._cycle_lock.acquire(timeout=20):
+            raise TradingPolicyError(
+                "the current trading cycle did not finish in time; try sync again"
+            )
+        try:
+            return self._reconcile_live_positions()
+        finally:
+            self._cycle_lock.release()
+
+    @staticmethod
+    def _venue_position_view(
+        market_slug: str,
+        position: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        metadata = position.get("marketMetadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        return {
+            "market_slug": market_slug,
+            "title": str(metadata.get("title") or market_slug),
+            "outcome": str(metadata.get("outcome") or ""),
+            "net_position": _amount(position.get("netPosition")) or 0.0,
+            "qty_available": _amount(position.get("qtyAvailable")),
+            "cost_basis": _amount(position.get("cost")),
+            "cash_value": _amount(position.get("cashValue")),
+            "realized_pnl": _amount(position.get("realized")),
+            "expired": bool(position.get("expired")),
+            "update_time": str(position.get("updateTime") or "") or None,
+        }
+
+    @staticmethod
+    def _read_venue_positions(client: Any) -> dict[str, dict[str, Any]]:
+        gathered: dict[str, dict[str, Any]] = {}
+        cursor: str | None = None
+        for _ in range(20):
+            params: dict[str, Any] = {"limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            page = client.portfolio.positions(params)
+            if not isinstance(page, Mapping):
+                raise TradingExecutionError(
+                    "Polymarket US returned an invalid portfolio response"
+                )
+            raw_positions = page.get("positions")
+            if not isinstance(raw_positions, Mapping):
+                raise TradingExecutionError(
+                    "Polymarket US portfolio response has no positions map"
+                )
+            for slug, value in raw_positions.items():
+                if isinstance(value, Mapping):
+                    gathered[str(slug)] = dict(value)
+            if bool(page.get("eof", True)):
+                return gathered
+            cursor = str(page.get("nextCursor") or "")
+            if not cursor:
+                raise TradingExecutionError(
+                    "Polymarket US portfolio pagination ended without a cursor"
+                )
+        raise TradingExecutionError(
+            "Polymarket US portfolio exceeded the bounded pagination limit"
+        )
+
+    def _set_venue_sync_observation(
+        self,
+        position_id: str,
+        *,
+        status: str,
+        net_position: float,
+        qty_available: float | None,
+        observed_quantity: float,
+        mismatch_count: int,
+        update_time: str | None,
+    ) -> None:
+        with self._lock:
+            with self._db.transaction() as cur:
+                self._db.execute(
+                    cur,
+                    """UPDATE live_managed_positions SET
+                       venue_sync_status=%s,venue_net_position=%s,
+                       venue_qty_available=%s,venue_observed_quantity=%s,
+                       venue_mismatch_count=%s,venue_sync_ts=%s,
+                       venue_update_time=%s,updated_ts=%s
+                       WHERE id=%s AND mode='live' AND status='open'""",
+                    (
+                        status,
+                        net_position,
+                        qty_available,
+                        observed_quantity,
+                        mismatch_count,
+                        self._clock(),
+                        update_time,
+                        self._clock(),
+                        position_id,
+                    ),
+                )
+
+    def _apply_external_quantity(
+        self,
+        position: Mapping[str, Any],
+        *,
+        observed_quantity: float,
+        net_position: float,
+        qty_available: float | None,
+        update_time: str | None,
+    ) -> str:
+        current_quantity = float(position["quantity"])
+        remaining = max(0.0, min(current_quantity, observed_quantity))
+        externally_closed = max(0.0, current_quantity - remaining)
+        now = self._clock()
+        fully_closed = remaining <= 1e-8
+        sync_status = (
+            "externally_closed"
+            if fully_closed
+            else "partially_sold_externally"
+        )
+        with self._lock:
+            with self._db.transaction() as cur:
+                self._db.execute(
+                    cur,
+                    """UPDATE live_managed_positions SET
+                       initial_quantity=COALESCE(initial_quantity,quantity),
+                       initial_cost_basis=COALESCE(initial_cost_basis,cost_basis),
+                       external_exit_quantity=
+                           COALESCE(external_exit_quantity,0)+%s,
+                       quantity=%s,cost_basis=%s,status=%s,updated_ts=%s,
+                       closed_ts=%s,exit_reason=%s,realized_pnl=NULL,
+                       return_fraction=NULL,venue_sync_status=%s,
+                       venue_net_position=%s,venue_qty_available=%s,
+                       venue_observed_quantity=%s,venue_mismatch_count=0,
+                       venue_sync_ts=%s,venue_update_time=%s
+                       WHERE id=%s AND mode='live' AND status='open'""",
+                    (
+                        externally_closed,
+                        remaining,
+                        remaining * float(position["entry_cost"]),
+                        "external_closed" if fully_closed else "open",
+                        now,
+                        now if fully_closed else None,
+                        (
+                            "external_phone_or_manual_close"
+                            if fully_closed
+                            else "external_phone_or_manual_partial_sale"
+                        ),
+                        sync_status,
+                        net_position,
+                        qty_available,
+                        observed_quantity,
+                        now,
+                        update_time,
+                        position["id"],
+                    ),
+                )
+        self._journal(
+            "venue_reconciliation",
+            sync_status,
+            event_id=position["event_id"],
+            event_name=position["event_name"],
+            market_slug=position["market_slug"],
+            selection=position["selection"],
+            payload={
+                "position_id": position["id"],
+                "previous_managed_quantity": current_quantity,
+                "remaining_managed_quantity": remaining,
+                "externally_closed_quantity": externally_closed,
+                "venue_net_position": net_position,
+                "realized_pnl_verified": False,
+                "reason": (
+                    "venue portfolio changed outside this workstation; local "
+                    "quantity was reconciled without inventing an exit price"
+                ),
+            },
+        )
+        return sync_status
+
+    def _reconcile_live_positions(self) -> dict[str, Any]:
+        now = self._clock()
+        if not self._key_id or not self._secret_key:
+            raise TradingExecutionError(
+                "Polymarket US credentials are required for venue synchronization"
+            )
+        try:
+            with self._client() as client:
+                venue_positions = self._read_venue_positions(client)
+        except Exception as exc:
+            error = self._safe_error(exc)
+            self._last_venue_sync_at = now
+            self._last_venue_sync_error = error
+            self._last_venue_sync_summary = f"Venue sync failed: {error}"
+            with self._lock:
+                with self._db.transaction() as cur:
+                    self._db.execute(
+                        cur,
+                        """UPDATE live_managed_positions SET
+                           venue_sync_status='sync_error',venue_sync_ts=%s
+                           WHERE mode='live' AND status='open'""",
+                        (now,),
+                    )
+            self._journal(
+                "venue_reconciliation",
+                "sync_error",
+                payload={"error": error, "read_only": True},
+            )
+            return {
+                "status": "error",
+                "summary": self._last_venue_sync_summary,
+                "error": error,
+                "positions": [],
+            }
+
+        views = [
+            self._venue_position_view(slug, value)
+            for slug, value in venue_positions.items()
+        ]
+        views.sort(
+            key=lambda item: (
+                abs(float(item["net_position"])),
+                item["market_slug"],
+            ),
+            reverse=True,
+        )
+        self._last_venue_positions = tuple(
+            item
+            for item in views
+            if abs(float(item["net_position"])) > 1e-8
+        )
+        self._last_venue_sync_at = now
+        self._last_venue_sync_error = None
+
+        in_sync = 0
+        pending = 0
+        partial = 0
+        closed = 0
+        grace = 0
+        for position in [
+            row
+            for row in self.positions(open_only=True)
+            if row["mode"] == "live"
+        ]:
+            raw = venue_positions.get(str(position["market_slug"]), {})
+            net_position = _amount(raw.get("netPosition")) or 0.0
+            qty_available = _amount(raw.get("qtyAvailable"))
+            update_time = str(raw.get("updateTime") or "") or None
+            observed = (
+                max(0.0, net_position)
+                if position["position_side"] == "long"
+                else max(0.0, -net_position)
+            )
+            current_quantity = float(position["quantity"])
+            if now - float(position["opened_ts"]) < VENUE_RECONCILIATION_GRACE_SECONDS:
+                grace += 1
+                self._set_venue_sync_observation(
+                    position["id"],
+                    status="entry_settlement_grace",
+                    net_position=net_position,
+                    qty_available=qty_available,
+                    observed_quantity=observed,
+                    mismatch_count=0,
+                    update_time=update_time,
+                )
+                continue
+            if observed + 1e-8 >= current_quantity:
+                in_sync += 1
+                self._set_venue_sync_observation(
+                    position["id"],
+                    status=(
+                        "in_sync"
+                        if observed <= current_quantity + 1e-8
+                        else "in_sync_with_manual_excess"
+                    ),
+                    net_position=net_position,
+                    qty_available=qty_available,
+                    observed_quantity=observed,
+                    mismatch_count=0,
+                    update_time=update_time,
+                )
+                continue
+
+            previous_observed = position.get("venue_observed_quantity")
+            same_observation = (
+                previous_observed is not None
+                and abs(float(previous_observed) - observed) <= 1e-8
+            )
+            mismatch_count = (
+                int(position.get("venue_mismatch_count") or 0) + 1
+                if same_observation
+                else 1
+            )
+            if mismatch_count < VENUE_MISMATCH_CONFIRMATIONS:
+                pending += 1
+                self._set_venue_sync_observation(
+                    position["id"],
+                    status="mismatch_pending_confirmation",
+                    net_position=net_position,
+                    qty_available=qty_available,
+                    observed_quantity=observed,
+                    mismatch_count=mismatch_count,
+                    update_time=update_time,
+                )
+                self._journal(
+                    "venue_reconciliation",
+                    "mismatch_pending",
+                    event_id=position["event_id"],
+                    event_name=position["event_name"],
+                    market_slug=position["market_slug"],
+                    selection=position["selection"],
+                    payload={
+                        "position_id": position["id"],
+                        "managed_quantity": current_quantity,
+                        "observed_same_side_quantity": observed,
+                        "confirmation": mismatch_count,
+                        "required_confirmations": VENUE_MISMATCH_CONFIRMATIONS,
+                    },
+                )
+                continue
+            outcome = self._apply_external_quantity(
+                position,
+                observed_quantity=observed,
+                net_position=net_position,
+                qty_available=qty_available,
+                update_time=update_time,
+            )
+            if outcome == "externally_closed":
+                closed += 1
+            else:
+                partial += 1
+
+        self._last_venue_sync_summary = (
+            f"Venue sync complete: {len(self._last_venue_positions)} account "
+            f"positions; {in_sync} managed in sync, {pending} pending confirmation, "
+            f"{partial} partial external sale, {closed} external close"
+            + (f", {grace} settling." if grace else ".")
+        )
+        return {
+            "status": "ok",
+            "summary": self._last_venue_sync_summary,
+            "error": None,
+            "positions": [dict(item) for item in self._last_venue_positions],
+            "managed": {
+                "in_sync": in_sync,
+                "pending": pending,
+                "partial_external": partial,
+                "externally_closed": closed,
+                "settling": grace,
+            },
+        }
 
     def performance(self) -> dict[str, Any]:
         """Aggregate managed trade results without loading position history.
@@ -890,6 +1874,7 @@ class PolymarketUSAutoTrader:
             "open_unrealized_pnl_usd": 0.0,
             "total_net_usd": 0.0,
             "total_net_complete": True,
+            "session_started_at": None,
         }
         modes = {
             "dry_run": {**empty, "mode": "dry_run", "label": "Dry run"},
@@ -897,6 +1882,18 @@ class PolymarketUSAutoTrader:
         }
         with self._lock:
             with self._db.cursor(dict_rows=True) as cur:
+                self._db.execute(
+                    cur,
+                    """SELECT status,MAX(created_ts) AS reset_ts
+                       FROM live_trading_journal
+                       WHERE kind='performance_reset' AND status IN ('dry_run','live')
+                       GROUP BY status""",
+                )
+                reset_cutoffs = {
+                    str(row["status"]): float(row["reset_ts"])
+                    for row in cur.fetchall()
+                    if row["reset_ts"] is not None
+                }
                 self._db.execute(
                     cur,
                     """SELECT mode,
@@ -944,8 +1941,13 @@ class PolymarketUSAutoTrader:
                                                ELSE 0 END),0)
                                   AS open_unrealized_pnl_usd
                        FROM live_managed_positions
-                       WHERE mode IN ('dry_run','live')
+                       WHERE (mode='dry_run' AND opened_ts>%s)
+                          OR (mode='live' AND opened_ts>%s)
                        GROUP BY mode""",
+                    (
+                        reset_cutoffs.get("dry_run", 0.0),
+                        reset_cutoffs.get("live", 0.0),
+                    ),
                 )
                 rows = [dict(row) for row in cur.fetchall()]
 
@@ -992,6 +1994,12 @@ class PolymarketUSAutoTrader:
             return bucket
 
         for bucket in modes.values():
+            cutoff = reset_cutoffs.get(bucket["mode"])
+            bucket["session_started_at"] = (
+                datetime.fromtimestamp(cutoff, timezone.utc).isoformat()
+                if cutoff is not None
+                else None
+            )
             finish(bucket)
         combined = {
             **empty,
@@ -1022,7 +2030,70 @@ class PolymarketUSAutoTrader:
                     "Realized net plus priced open unrealized P/L. Completeness "
                     "is false when any open position lacks a cash-out mark."
                 ),
+                "session_reset": (
+                    "A live tally reset changes this display baseline only. "
+                    "Positions, the execution journal, and risk-control history "
+                    "remain preserved."
+                ),
             },
+        }
+
+    def reset_live_performance(self, confirmation: str) -> dict[str, Any]:
+        """Start a fresh live display tally without deleting execution evidence."""
+        if confirmation != LIVE_PERFORMANCE_RESET_PHRASE:
+            raise TradingPolicyError(
+                f'type "{LIVE_PERFORMANCE_RESET_PHRASE}" exactly to reset the '
+                "live tally"
+            )
+        if self.is_armed():
+            raise TradingPolicyError(
+                "disarm live trading before resetting its performance tally"
+            )
+        with self._lock:
+            with self._db.cursor() as cur:
+                self._db.execute(
+                    cur,
+                    """SELECT COUNT(*) FROM live_managed_positions
+                       WHERE mode='live' AND status='open'""",
+                )
+                open_positions = int(cur.fetchone()[0] or 0)
+            if open_positions:
+                raise TradingPolicyError(
+                    f"{open_positions} open live position"
+                    f"{'' if open_positions == 1 else 's'} remain; sell or "
+                    "synchronize them before starting a fresh live tally"
+                )
+            previous = dict(self.performance()["modes"]["live"])
+            reset_at = self._clock()
+            self._journal(
+                "performance_reset",
+                "live",
+                payload={
+                    "mode": "live",
+                    "reset_at": reset_at,
+                    "previous_total_positions": previous["total_positions"],
+                    "previous_wins": previous["wins"],
+                    "previous_losses": previous["losses"],
+                    "previous_pushes": previous["pushes"],
+                    "previous_total_net_usd": previous["total_net_usd"],
+                    "positions_preserved": True,
+                    "execution_journal_preserved": True,
+                    "risk_history_preserved": True,
+                    "reason": "operator_started_new_live_tally_session",
+                },
+            )
+        reset_at_iso = datetime.fromtimestamp(reset_at, timezone.utc).isoformat()
+        return {
+            "mode": "live",
+            "reset_at": reset_at_iso,
+            "previous": previous,
+            "positions_preserved": True,
+            "execution_journal_preserved": True,
+            "risk_history_preserved": True,
+            "summary": (
+                "Live W-L-P and net display reset to zero. Historical positions, "
+                "the execution journal, and daily-loss safeguards were preserved."
+            ),
         }
 
     def liquidate_open_positions(
@@ -1043,9 +2114,10 @@ class PolymarketUSAutoTrader:
             raise TradingPolicyError("mode must be dry_run or live")
         if mode == "dry_run":
             return self.clear_dry_run_history(DRY_RUN_HISTORY_CLEAR_PHRASE)
-        if not self._cycle_lock.acquire(blocking=False):
+        self._control_generation += 1
+        if not self._cycle_lock.acquire(timeout=20):
             raise TradingPolicyError(
-                "a trading analysis or liquidation cycle is already running"
+                "the current trading cycle did not stop in time; try the sale again"
             )
         try:
             positions = [
@@ -1079,7 +2151,7 @@ class PolymarketUSAutoTrader:
                     )
                 if not self.is_armed():
                     raise TradingPolicyError(
-                        "live trading is disarmed; arm the 30-minute live-order latch first"
+                        "live trading is disarmed; arm the live-order latch first"
                     )
                 if confirmation != LIVE_LIQUIDATION_PHRASE:
                     raise TradingPolicyError(
@@ -1100,45 +2172,9 @@ class PolymarketUSAutoTrader:
             reason = f"manual_clear_all_{mode}"
 
             for position in positions:
-                market = markets.get(str(position["market_slug"]))
-                failure = ""
-                exit_value: float | None = None
-                order_long_price: float | None = None
-                if market is None:
-                    failure = "current Polymarket US market snapshot is unavailable"
-                elif (
-                    not market.get("active", True)
-                    or market.get("closed")
-                    or market.get("hidden")
-                    or str(market.get("state") or "OPEN").upper()
-                    not in {"OPEN", "MARKET_STATE_OPEN", "EP3_STATUS_OPEN"}
-                ):
-                    failure = "the Polymarket US market is not open for an exit"
-                else:
-                    sides = [
-                        side
-                        for side in market.get("sides", [])
-                        if isinstance(side, Mapping)
-                        and bool(side.get("long"))
-                        == (position["position_side"] == "long")
-                    ]
-                    if len(sides) != 1:
-                        failure = "the managed position no longer maps to one exact side"
-                    else:
-                        prices = _book_prices(market, sides[0])
-                        if prices is None or prices[2] is None:
-                            failure = "a complete executable cash-out quote is unavailable"
-                        else:
-                            exit_value = prices[2]
-                            order_long_price = _amount(
-                                market.get(
-                                    "long_best_bid"
-                                    if position["position_side"] == "long"
-                                    else "long_best_ask"
-                                )
-                            )
-                            if order_long_price is None:
-                                failure = "the executable sell limit is unavailable"
+                market, exit_value, order_long_price, failure = (
+                    self._manual_exit_quote(position, markets)
+                )
 
                 if failure:
                     self._journal(
@@ -1166,6 +2202,7 @@ class PolymarketUSAutoTrader:
 
                 assert exit_value is not None
                 assert order_long_price is not None
+                assert market is not None
                 attempted += 1
                 did_fill = self._attempt_exit(
                     position,
@@ -1217,6 +2254,208 @@ class PolymarketUSAutoTrader:
         finally:
             self._cycle_lock.release()
 
+    def exit_position(
+        self,
+        us_payload: Mapping[str, Any],
+        *,
+        position_id: str,
+        confirmation: str = "",
+    ) -> dict[str, Any]:
+        """Force-remove one simulation or attempt one bounded live sale."""
+        position = self.position(position_id)
+        if position is None:
+            raise TradingPolicyError("managed position was not found")
+        if position["status"] != "open":
+            raise TradingPolicyError("managed position is already closed")
+
+        # Invalidate an analysis cycle immediately so it cannot mark, exit, or
+        # recreate this position while the operator action is taking priority.
+        self._control_generation += 1
+        candidate_key = ":".join((
+            str(position["event_id"]),
+            str(position["market_slug"]),
+            str(position["position_side"]),
+        ))
+        self._candidate_seen[candidate_key] = self._clock()
+
+        if position["mode"] == "dry_run":
+            with self._lock:
+                with self._db.transaction() as cur:
+                    self._db.execute(
+                        cur,
+                        "DELETE FROM live_managed_orders WHERE position_id=%s",
+                        (position_id,),
+                    )
+                    self._db.execute(
+                        cur,
+                        """DELETE FROM live_managed_positions
+                           WHERE id=%s AND mode='dry_run' AND status='open'""",
+                        (position_id,),
+                    )
+                    if int(cur.rowcount or 0) != 1:
+                        raise TradingPolicyError(
+                            "dry-run position changed before it could be removed"
+                        )
+            summary = (
+                f"Removed dry-run position {position['selection']} from "
+                f"{position['event_name']}. Automation remains "
+                f"{'ON' if self._policy.automation_enabled else 'OFF'}."
+            )
+            self._journal(
+                "position_control",
+                "dry_run_removed",
+                event_id=position["event_id"],
+                event_name=position["event_name"],
+                market_slug=position["market_slug"],
+                selection=position["selection"],
+                payload={
+                    "position_id": position_id,
+                    "mode": "dry_run",
+                    "automation_enabled": self._policy.automation_enabled,
+                    "quote_required": False,
+                },
+            )
+            return {
+                "position_id": position_id,
+                "mode": "dry_run",
+                "status": "removed",
+                "remaining": sum(
+                    1
+                    for item in self.positions(open_only=True)
+                    if item["mode"] == "dry_run"
+                ),
+                "automation_enabled": self._policy.automation_enabled,
+                "quote_required": False,
+                "summary": summary,
+            }
+
+        if self._policy.execution_mode != "live":
+            raise TradingPolicyError(
+                "set execution mode to live and save the policy before selling "
+                "a live position"
+            )
+        if not self.is_armed():
+            raise TradingPolicyError(
+                "live trading is disarmed; arm the live-order latch first"
+            )
+        if confirmation != LIVE_POSITION_EXIT_PHRASE:
+            raise TradingPolicyError(
+                f'type "{LIVE_POSITION_EXIT_PHRASE}" exactly to sell a live position'
+            )
+        if not self._cycle_lock.acquire(timeout=20):
+            raise TradingPolicyError(
+                "the current trading cycle did not stop in time; try the sale again"
+            )
+        try:
+            markets = {
+                str(market.get("slug")): dict(market)
+                for event in us_payload.get("events", [])
+                if isinstance(event, Mapping)
+                for market in event.get("markets", [])
+                if isinstance(market, Mapping) and market.get("slug")
+            }
+            market, exit_value, order_long_price, failure = (
+                self._manual_exit_quote(position, markets)
+            )
+            if failure:
+                self._journal(
+                    "exit",
+                    "manual_individual_blocked",
+                    event_id=position["event_id"],
+                    event_name=position["event_name"],
+                    market_slug=position["market_slug"],
+                    selection=position["selection"],
+                    payload={
+                        "position_id": position_id,
+                        "mode": "live",
+                        "reason": failure,
+                    },
+                )
+                return {
+                    "position_id": position_id,
+                    "mode": "live",
+                    "status": "blocked",
+                    "remaining": 1,
+                    "summary": failure,
+                }
+            assert market is not None
+            assert exit_value is not None
+            assert order_long_price is not None
+            filled = self._attempt_exit(
+                position,
+                market,
+                exit_value=exit_value,
+                order_long_price=order_long_price,
+                reason="manual_individual_live",
+            )
+            return {
+                "position_id": position_id,
+                "mode": "live",
+                "status": "filled" if filled else "not_filled",
+                "remaining": 0 if filled else 1,
+                "summary": (
+                    f"Sold live position {position['selection']}."
+                    if filled
+                    else "The live sell did not fill; the position remains open."
+                ),
+            }
+        finally:
+            self._cycle_lock.release()
+
+    @staticmethod
+    def _manual_exit_quote(
+        position: Mapping[str, Any],
+        markets: Mapping[str, Mapping[str, Any]],
+    ) -> tuple[
+        dict[str, Any] | None,
+        float | None,
+        float | None,
+        str,
+    ]:
+        market = markets.get(str(position["market_slug"]))
+        if market is None:
+            return None, None, None, (
+                "current Polymarket US market snapshot is unavailable"
+            )
+        if (
+            not market.get("active", True)
+            or market.get("closed")
+            or market.get("hidden")
+            or str(market.get("state") or "OPEN").upper()
+            not in {"OPEN", "MARKET_STATE_OPEN", "EP3_STATUS_OPEN"}
+        ):
+            return dict(market), None, None, (
+                "the Polymarket US market is not open for an exit"
+            )
+        sides = [
+            side
+            for side in market.get("sides", [])
+            if isinstance(side, Mapping)
+            and bool(side.get("long"))
+            == (position["position_side"] == "long")
+        ]
+        if len(sides) != 1:
+            return dict(market), None, None, (
+                "the managed position no longer maps to one exact side"
+            )
+        prices = _book_prices(market, sides[0])
+        if prices is None or prices[2] is None:
+            return dict(market), None, None, (
+                "a complete executable cash-out quote is unavailable"
+            )
+        order_long_price = _amount(
+            market.get(
+                "long_best_bid"
+                if position["position_side"] == "long"
+                else "long_best_ask"
+            )
+        )
+        if order_long_price is None:
+            return dict(market), None, None, (
+                "the executable sell limit is unavailable"
+            )
+        return dict(market), prices[2], order_long_price, ""
+
     def clear_dry_run_history(self, confirmation: str) -> dict[str, Any]:
         """Force-clear every simulated trade while preserving live and audit data."""
         if confirmation != DRY_RUN_HISTORY_CLEAR_PHRASE:
@@ -1224,12 +2463,14 @@ class PolymarketUSAutoTrader:
                 f'type "{DRY_RUN_HISTORY_CLEAR_PHRASE}" exactly to clear dry-run '
                 "trade history"
             )
+        self._refresh_policy_authority()
         stopped_policy = TradingPolicy.from_mapping({
             **asdict(self._policy),
             "automation_enabled": False,
         })
+        control_token = uuid4().hex
         policy_payload = json.dumps(
-            asdict(stopped_policy),
+            {**asdict(stopped_policy), _CONTROL_TOKEN_KEY: control_token},
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -1238,7 +2479,10 @@ class PolymarketUSAutoTrader:
             # stop and deleting the simulated ledger in one transaction means no
             # quote, mapping, fill, or cycle-lock state can prevent the wipe.
             self._policy = stopped_policy
+            self._control_token = control_token
             self._armed_until = 0.0
+            self._protective_exits_armed = False
+            self._control_generation += 1
             with self._db.transaction() as cur:
                 self._db.execute(
                     cur,
@@ -1351,7 +2595,15 @@ class PolymarketUSAutoTrader:
             )
             return {"status": "busy", "evaluated": 0, "qualified": 0}
         try:
-            return self._run_cycle(monitored, us_payload)
+            self._refresh_policy_authority()
+            generation = self._control_generation
+            control_token = self._control_token
+            return self._run_cycle(
+                monitored,
+                us_payload,
+                generation=generation,
+                control_token=control_token,
+            )
         finally:
             self._cycle_lock.release()
 
@@ -1359,6 +2611,9 @@ class PolymarketUSAutoTrader:
         self,
         monitored: Iterable[tuple[Event, Iterable[Signal]]],
         us_payload: Mapping[str, Any],
+        *,
+        generation: int,
+        control_token: str,
     ) -> dict[str, Any]:
         now = self._clock()
         self._last_cycle_at = now
@@ -1366,6 +2621,24 @@ class PolymarketUSAutoTrader:
             self._last_cycle_evaluations = ()
             self._last_cycle_summary = "Automation is off; no candidates were evaluated."
             return {"status": "off", "evaluated": 0, "qualified": 0}
+        # Reconcile the authenticated venue portfolio before any live mark,
+        # exit, or entry. Dry-run-only cycles stay fully offline.
+        has_open_live = any(
+            position["mode"] == "live"
+            for position in self.positions(open_only=True)
+        )
+        if (
+            self._policy.execution_mode == "live"
+            or has_open_live
+        ) and self._key_id and self._secret_key:
+            venue_sync = self._reconcile_live_positions()
+        else:
+            venue_sync = {
+                "status": "skipped",
+                "summary": "Venue sync is not needed for this dry-run-only cycle.",
+                "error": None,
+                "positions": [],
+            }
         us_events = [
             event for event in us_payload.get("events", [])
             if isinstance(event, Mapping) and not event.get("ended")
@@ -1377,6 +2650,8 @@ class PolymarketUSAutoTrader:
             (event, list(signals)) for event, signals in monitored
         ]
         for event, signals in monitored_list:
+            if not self._cycle_is_current(generation):
+                return self._stopped_cycle_result()
             signal_list = signals
             match = _event_match(event, us_events)
             if match is None:
@@ -1398,6 +2673,8 @@ class PolymarketUSAutoTrader:
                 continue
             us_event, event_score = match
             for signal in signal_list:
+                if not self._cycle_is_current(generation):
+                    return self._stopped_cycle_result()
                 candidate, reason = self._map_signal(event, signal, us_event, event_score)
                 if candidate is None:
                     self._qualification_rejection(
@@ -1434,10 +2711,19 @@ class PolymarketUSAutoTrader:
             reverse=True,
         )
 
-        marked, exited = self._mark_and_exit(monitored_list, us_events)
+        if not self._cycle_is_current(generation):
+            return self._stopped_cycle_result()
+        marked, exited = self._mark_and_exit(
+            monitored_list,
+            us_events,
+            generation=generation,
+            control_token=control_token,
+        )
         placed = 0
         venue_checks = 0
         for index, (candidate, evaluation) in enumerate(mapped):
+            if not self._cycle_is_current(generation):
+                return self._stopped_cycle_result()
             if self._position_exists(candidate):
                 evaluation.update(
                     state="position_open",
@@ -1459,7 +2745,13 @@ class PolymarketUSAutoTrader:
                 break
             venue_checks += 1
             self._candidate_seen[candidate.key] = now
-            entered, state, reason, audit = self._attempt_entry(candidate)
+            entered, state, reason, audit = self._attempt_entry(
+                candidate,
+                generation=generation,
+                control_token=control_token,
+            )
+            if state == "automation_stopped":
+                return self._stopped_cycle_result()
             evaluation.update(state=state, reason=reason, **audit)
             if audit.get("authenticated_entry_cost") is not None:
                 evaluation["us_entry_cost"] = audit["authenticated_entry_cost"]
@@ -1491,6 +2783,28 @@ class PolymarketUSAutoTrader:
             "marks": marked,
             "exits": exited,
             "summary": self._last_cycle_summary,
+            "venue_sync": venue_sync,
+        }
+
+    def _cycle_is_current(self, generation: int) -> bool:
+        return (
+            self._policy.automation_enabled
+            and generation == self._control_generation
+        )
+
+    def _stopped_cycle_result(self) -> dict[str, Any]:
+        self._last_cycle_evaluations = ()
+        self._last_cycle_summary = (
+            "Automation was stopped; the in-progress analysis cycle was canceled."
+        )
+        return {
+            "status": "stopped",
+            "evaluated": 0,
+            "qualified": 0,
+            "entries": 0,
+            "marks": 0,
+            "exits": 0,
+            "summary": self._last_cycle_summary,
         }
 
     def _candidate_evaluation(
@@ -1517,6 +2831,11 @@ class PolymarketUSAutoTrader:
             "reference_sources": signal.n_reference_sources,
             "configured_min_reference_sources": (
                 self._policy.min_reference_sources
+            ),
+            "require_engine_entry": self._policy.require_engine_entry,
+            "required_engine_gates": list(self._policy.required_engine_gates),
+            "selected_engine_gate_results": self._selected_engine_gate_results(
+                signal
             ),
             "us_event_slug": us_event_slug or None,
             "us_market_slug": None,
@@ -1576,9 +2895,54 @@ class PolymarketUSAutoTrader:
                 ),
                 "execution_mode": self._policy.execution_mode,
                 "require_engine_entry": self._policy.require_engine_entry,
+                "required_engine_gates": list(
+                    self._policy.required_engine_gates
+                ),
+                "selected_engine_gate_results": (
+                    self._selected_engine_gate_results(signal)
+                    if signal else []
+                ),
                 "engine_action": signal.action if signal else None,
             },
         )
+
+    def _selected_engine_gate_results(self, signal: Signal) -> list[dict[str, Any]]:
+        selected = set(self._policy.required_engine_gates)
+        return [
+            dict(gate)
+            for gate in signal.gate_results or []
+            if str(gate.get("code") or "") in selected
+        ]
+
+    def _engine_gate_blocker(self, signal: Signal) -> str:
+        policy = self._policy
+        if policy.require_engine_entry:
+            return (
+                ""
+                if signal.action == "PAPER_BET"
+                else "strict engine mode requires every entry gate to clear"
+            )
+        by_code: dict[str, dict[str, Any]] = {}
+        duplicates: set[str] = set()
+        for gate in signal.gate_results or []:
+            code = str(gate.get("code") or "")
+            if code in by_code:
+                duplicates.add(code)
+            else:
+                by_code[code] = dict(gate)
+        failures: list[str] = []
+        for code in policy.required_engine_gates:
+            gate = by_code.get(code)
+            if code in duplicates:
+                failures.append(f"{code}=duplicate")
+            elif gate is None:
+                failures.append(f"{code}=missing")
+            elif gate.get("passed") is not True:
+                status = str(gate.get("status") or "unknown").casefold()
+                failures.append(f"{code}={status}")
+        if not failures:
+            return ""
+        return "selected engine gate(s) did not clear: " + ", ".join(failures)
 
     def _map_signal(
         self,
@@ -1588,8 +2952,9 @@ class PolymarketUSAutoTrader:
         event_score: float,
     ) -> tuple[MappedCandidate | None, str]:
         policy = self._policy
-        if signal.action != "PAPER_BET" and policy.require_engine_entry:
-            return None, "existing engine action is not PAPER_BET"
+        engine_gate_blocker = self._engine_gate_blocker(signal)
+        if engine_gate_blocker:
+            return None, engine_gate_blocker
         probability = _signal_probability(signal)
         if probability is None:
             return None, "model probability is unavailable"
@@ -1691,7 +3056,17 @@ class PolymarketUSAutoTrader:
     def _attempt_entry(
         self,
         candidate: MappedCandidate,
+        *,
+        generation: int,
+        control_token: str,
     ) -> tuple[bool, str, str | None, dict[str, Any]]:
+        if not self._cycle_is_current(generation):
+            return (
+                False,
+                "automation_stopped",
+                "automation was stopped before the candidate could be evaluated",
+                {},
+            )
         if self._position_exists(candidate):
             return (
                 False,
@@ -1710,6 +3085,14 @@ class PolymarketUSAutoTrader:
         )
         daily_loss = self._daily_realized_loss()
         reasons = []
+        if (
+            policy.execution_mode == "live"
+            and self._last_venue_sync_error is not None
+        ):
+            reasons.append(
+                "authenticated venue position sync is unavailable; live entry "
+                "is paused to avoid account-state divergence"
+            )
         if len(open_positions) >= policy.max_open_positions:
             reasons.append("maximum open positions reached")
         if daily_loss >= policy.max_daily_loss_usd:
@@ -1730,6 +3113,13 @@ class PolymarketUSAutoTrader:
         book_quote = ExecutableBookQuote("", None, None, None, None, None, None, 0.0)
         venue_checked = False
         if not reasons:
+            if not self._cycle_is_current(generation):
+                return (
+                    False,
+                    "automation_stopped",
+                    "automation was stopped before the venue check",
+                    {},
+                )
             if not self._key_id or not self._secret_key:
                 reasons.append("Polymarket US credentials are not configured")
             else:
@@ -1817,6 +3207,9 @@ class PolymarketUSAutoTrader:
                         f"{candidate.entry_cost * 100:.1f}c"
                     )
         audit = {
+            "risk_preset": policy.risk_preset,
+            "risk_preset_version": policy.risk_preset_version,
+            "trading_allocation_usd": policy.trading_allocation_usd,
             "public_entry_cost": public_entry_cost,
             "authenticated_book_state": book_quote.state or None,
             "authenticated_best_bid": book_quote.best_bid,
@@ -1848,6 +3241,13 @@ class PolymarketUSAutoTrader:
                 extra=audit,
             )
             return False, "blocked", " | ".join(reasons), audit
+        if not self._cycle_is_current(generation):
+            return (
+                False,
+                "automation_stopped",
+                "automation was stopped before order sizing",
+                audit,
+            )
 
         # Sizing is execution policy, not a new probability calculation.  It
         # increases gradually with already-computed edge and quality, remains
@@ -1878,6 +3278,17 @@ class PolymarketUSAutoTrader:
 
         order = self._entry_order(candidate, quantity)
         if policy.execution_mode == "dry_run":
+            if not self._execution_authority_is_current(
+                generation,
+                control_token,
+                "dry_run",
+            ):
+                return (
+                    False,
+                    "automation_stopped",
+                    "saved execution controls changed before the simulated fill",
+                    audit,
+                )
             self._create_position(
                 candidate,
                 quantity=quantity,
@@ -1895,17 +3306,25 @@ class PolymarketUSAutoTrader:
                 },
             )
             return True, "simulated_fill", None, audit
-        if not self.is_armed():
+        if not self._execution_authority_is_current(
+            generation,
+            control_token,
+            "live",
+        ) or not self.is_armed():
             self._journal_candidate(
                 candidate,
                 "rejected",
-                reasons=["live mode is disarmed or its 30-minute latch expired"],
+                reasons=[
+                    "live mode is disarmed, its selected latch expired, or a "
+                    "newer server changed the saved execution controls"
+                ],
                 extra=audit,
             )
             return (
                 False,
                 "live_disarmed",
-                "live mode is disarmed or its 30-minute latch expired",
+                "live mode is disarmed, its selected latch expired, or a "
+                "newer server changed the saved execution controls",
                 audit,
             )
         try:
@@ -1943,6 +3362,30 @@ class PolymarketUSAutoTrader:
                         False,
                         "blocked",
                         "previewed fee-adjusted edge is below the policy floor",
+                        audit,
+                    )
+                if (
+                    not self._execution_authority_is_current(
+                        generation,
+                        control_token,
+                        "live",
+                    )
+                    or not self.is_armed()
+                ):
+                    self._journal_candidate(
+                        candidate,
+                        "rejected",
+                        reasons=[
+                            "automation was stopped or live execution was disarmed "
+                            "after preview"
+                        ],
+                        extra=audit,
+                    )
+                    return (
+                        False,
+                        "automation_stopped",
+                        "automation was stopped or live execution was disarmed "
+                        "after preview",
                         audit,
                     )
                 response = client.orders.create(order)
@@ -2009,6 +3452,9 @@ class PolymarketUSAutoTrader:
         self,
         monitored: list[tuple[Event, Iterable[Signal]]],
         us_events: list[Mapping[str, Any]],
+        *,
+        generation: int,
+        control_token: str,
     ) -> tuple[int, int]:
         monitored_by_id = {
             event.id: (event, list(signals)) for event, signals in monitored
@@ -2019,11 +3465,107 @@ class PolymarketUSAutoTrader:
             for market in event.get("markets", [])
             if isinstance(market, Mapping) and market.get("slug")
         }
+        open_positions = self.positions(open_only=True)
+        authenticated_books: dict[str, Mapping[str, Any]] = {}
+        book_errors: dict[str, str] = {}
+        live_slugs = {
+            str(position["market_slug"])
+            for position in open_positions
+            if position["mode"] == "live"
+        }
+        if live_slugs:
+            try:
+                with self._client() as client:
+                    for slug in live_slugs:
+                        try:
+                            book = client.markets.book(slug)
+                            if isinstance(book, Mapping):
+                                authenticated_books[slug] = book
+                            else:
+                                book_errors[slug] = (
+                                    "authenticated order book response was invalid"
+                                )
+                        except Exception as exc:
+                            book_errors[slug] = self._safe_error(exc)
+            except Exception as exc:
+                error = self._safe_error(exc)
+                book_errors.update(
+                    (slug, error)
+                    for slug in live_slugs
+                    if slug not in authenticated_books
+                )
         marked = 0
         exited = 0
-        for position in self.positions(open_only=True):
+        for position in open_positions:
+            if not self._cycle_is_current(generation):
+                break
             market = markets.get(position["market_slug"])
-            if market is None:
+            probability = (
+                self._position_probability(position, market, monitored_by_id)
+                if market is not None
+                else None
+            )
+            quantity = float(position["quantity"])
+            exit_depth: float | None = None
+            quote_source = "public_us_snapshot"
+            if position["mode"] == "live":
+                book = authenticated_books.get(str(position["market_slug"]))
+                size_quote = _size_aware_exit_quote(
+                    book,
+                    str(position["position_side"]),
+                    quantity,
+                )
+                if size_quote is None:
+                    reason = book_errors.get(
+                        str(position["market_slug"]),
+                        "authenticated order book cannot fill the complete position",
+                    )
+                    self._journal(
+                        "mark",
+                        "unavailable",
+                        event_id=position["event_id"],
+                        event_name=position["event_name"],
+                        market_slug=position["market_slug"],
+                        selection=position["selection"],
+                        payload={
+                            "position_id": position["id"],
+                            "reason": reason,
+                            "quantity": quantity,
+                            "quote_source": "authenticated_us_book",
+                        },
+                    )
+                    continue
+                state, exit_value, exit_long_price, exit_depth = size_quote
+                if state != "MARKET_STATE_OPEN":
+                    self._journal(
+                        "mark",
+                        "unavailable",
+                        event_id=position["event_id"],
+                        event_name=position["event_name"],
+                        market_slug=position["market_slug"],
+                        selection=position["selection"],
+                        payload={
+                            "position_id": position["id"],
+                            "reason": (
+                                "authenticated order book is not open "
+                                f"({state or 'unknown'})"
+                            ),
+                            "quote_source": "authenticated_us_book",
+                        },
+                    )
+                    continue
+                entry_quote = _executable_book_quote(
+                    book,
+                    str(position["position_side"]),
+                )
+                current_edge = (
+                    probability - entry_quote.entry_cost
+                    if probability is not None
+                    and entry_quote.entry_cost is not None
+                    else None
+                )
+                quote_source = "authenticated_us_book_size_aware"
+            elif market is None:
                 self._journal(
                     "mark",
                     "unavailable",
@@ -2034,40 +3576,98 @@ class PolymarketUSAutoTrader:
                     payload={"reason": "current US market snapshot unavailable"},
                 )
                 continue
-            sides = [
-                side for side in market.get("sides", [])
-                if isinstance(side, Mapping)
-                and bool(side.get("long")) == (position["position_side"] == "long")
-            ]
-            if len(sides) != 1:
-                continue
-            prices = _book_prices(market, sides[0])
-            if prices is None:
-                continue
-            _, _, exit_value, _ = prices
-            if exit_value is None:
-                continue
-            # The API expresses both LONG and SHORT order limits as a LONG/YES
-            # price. A cash-out must cross the side that is executable now:
-            # LONG sells at the LONG bid; SHORT sells at the LONG ask.
-            exit_long_price = _amount(
-                market.get(
-                    "long_best_bid"
-                    if position["position_side"] == "long"
-                    else "long_best_ask"
+            else:
+                sides = [
+                    side for side in market.get("sides", [])
+                    if isinstance(side, Mapping)
+                    and bool(side.get("long"))
+                    == (position["position_side"] == "long")
+                ]
+                if len(sides) != 1:
+                    continue
+                prices = _book_prices(market, sides[0])
+                if prices is None:
+                    continue
+                entry_cost_now, _, exit_value, _ = prices
+                if exit_value is None:
+                    continue
+                # The API expresses both LONG and SHORT order limits as a
+                # LONG/YES price.
+                exit_long_price = _amount(
+                    market.get(
+                        "long_best_bid"
+                        if position["position_side"] == "long"
+                        else "long_best_ask"
+                    )
                 )
-            )
-            if exit_long_price is None:
-                continue
-            probability = self._position_probability(
-                position, market, monitored_by_id
-            )
-            current_edge = probability - (
-                prices[0]
-            ) if probability is not None else None
+                if exit_long_price is None:
+                    continue
+                current_edge = (
+                    probability - entry_cost_now
+                    if probability is not None
+                    else None
+                )
             entry_cost = float(position["entry_cost"])
             return_fraction = exit_value / entry_cost - 1.0
             peak = max(float(position["highest_exit_value"]), exit_value)
+            held_minutes = (
+                self._clock() - float(position["opened_ts"])
+            ) / 60.0
+            prior_lock = position.get("profit_lock_armed_ts") is not None
+            target_hit = return_fraction >= self._policy.profit_target
+            prior_target_count = int(
+                position.get("profit_target_observation_count") or 0
+            )
+            prior_target_ts = position.get("profit_target_observed_ts")
+            confirmation_window = max(
+                120.0,
+                float(self._policy.cycle_seconds) * 3.0,
+            )
+            consecutive_target = (
+                target_hit
+                and prior_target_count > 0
+                and prior_target_ts is not None
+                and self._clock() - float(prior_target_ts) <= confirmation_window
+            )
+            if prior_lock:
+                target_count = max(
+                    PROFIT_TARGET_CONFIRMATION_READINGS,
+                    prior_target_count,
+                )
+                target_observed_ts = prior_target_ts
+                target_observed_price = position.get(
+                    "profit_target_observed_price"
+                )
+            elif target_hit:
+                target_count = (
+                    prior_target_count + 1 if consecutive_target else 1
+                )
+                target_observed_ts = (
+                    prior_target_ts if consecutive_target else self._clock()
+                )
+                target_observed_price = max(
+                    float(position.get("profit_target_observed_price") or 0.0),
+                    exit_value,
+                )
+            else:
+                # Confirmation requires consecutive executable readings. A
+                # quote that falls back below target resets an unarmed attempt.
+                target_count = 0
+                target_observed_ts = None
+                target_observed_price = None
+            target_confirmed = (
+                target_hit
+                and (
+                    target_count >= PROFIT_TARGET_CONFIRMATION_READINGS
+                    or held_minutes >= self._policy.min_hold_minutes
+                )
+            )
+            profit_lock_armed = prior_lock or target_confirmed
+            new_lock_ts = (
+                self._clock()
+                if profit_lock_armed and not prior_lock
+                else None
+            )
             self._update_mark(
                 position["id"],
                 exit_value=exit_value,
@@ -2075,6 +3675,11 @@ class PolymarketUSAutoTrader:
                 probability=probability,
                 edge=current_edge,
                 return_fraction=return_fraction,
+                profit_lock_armed_ts=new_lock_ts,
+                profit_lock_price=peak if new_lock_ts is not None else None,
+                profit_target_observed_ts=target_observed_ts,
+                profit_target_observation_count=target_count,
+                profit_target_observed_price=target_observed_price,
             )
             marked += 1
             self._journal(
@@ -2090,10 +3695,66 @@ class PolymarketUSAutoTrader:
                     "highest_exit_value": peak,
                     "return_fraction": return_fraction,
                     "execution_edge": current_edge,
+                    "quantity": quantity,
+                    "estimated_cashout_value": exit_value * quantity,
+                    "exit_book_depth": exit_depth,
+                    "quote_source": quote_source,
+                    "profit_lock_armed": profit_lock_armed,
+                    "profit_target_hit": target_hit,
+                    "profit_target_observation_count": target_count,
+                    "profit_target_confirmation_readings": (
+                        PROFIT_TARGET_CONFIRMATION_READINGS
+                    ),
+                    "profit_target_confirmed": target_confirmed,
+                    "held_minutes": held_minutes,
+                    "venue_sync_status": position.get("venue_sync_status"),
                 },
             )
-            reason = self._exit_reason(position, exit_value, peak, current_edge)
-            if reason and self._policy.auto_cashout:
+            reason = self._exit_reason(
+                position,
+                exit_value,
+                peak,
+                current_edge,
+                profit_lock_armed=profit_lock_armed,
+            )
+            if (
+                reason
+                and self._policy.auto_cashout
+                and self._cycle_is_current(generation)
+            ):
+                if not self._execution_authority_is_current(
+                    generation,
+                    control_token,
+                    str(self._policy.execution_mode),
+                ):
+                    break
+                if (
+                    position["mode"] == "live"
+                    and str(position.get("venue_sync_status") or "")
+                    in {
+                        "sync_error",
+                        "mismatch_pending_confirmation",
+                        "entry_settlement_grace",
+                    }
+                ):
+                    self._journal(
+                        "exit",
+                        "blocked",
+                        event_id=position["event_id"],
+                        event_name=position["event_name"],
+                        market_slug=position["market_slug"],
+                        selection=position["selection"],
+                        payload={
+                            "position_id": position["id"],
+                            "reason": (
+                                "venue quantity is not yet confirmed; protective "
+                                "cash-out will retry after reconciliation"
+                            ),
+                            "venue_sync_status": position.get("venue_sync_status"),
+                            "exit_trigger": reason,
+                        },
+                    )
+                    continue
                 exited += int(
                     self._attempt_exit(
                         position,
@@ -2101,6 +3762,7 @@ class PolymarketUSAutoTrader:
                         exit_value=exit_value,
                         order_long_price=exit_long_price,
                         reason=reason,
+                        protective=True,
                     )
                 )
         return marked, exited
@@ -2134,22 +3796,25 @@ class PolymarketUSAutoTrader:
         exit_value: float,
         peak: float,
         current_edge: float | None,
+        *,
+        profit_lock_armed: bool = False,
     ) -> str | None:
         policy = self._policy
-        held = (self._clock() - float(position["opened_ts"])) / 60.0
-        if held < policy.min_hold_minutes:
-            return None
         entry = float(position["entry_cost"])
         return_fraction = exit_value / entry - 1.0
         edge_invalid = current_edge is not None and current_edge <= policy.exit_edge
         trailing = peak > 0 and exit_value <= peak * (1.0 - policy.trailing_drawdown)
-        # A profit target alone does not trigger an immediate penny scalp.  The
-        # model must have lost its entry edge or price must pull back materially
-        # from a previously observed peak.
-        if return_fraction >= policy.profit_target and (edge_invalid or trailing):
+        # Hard risk exits are never delayed by the profit-oriented minimum hold.
+        if return_fraction <= -policy.stop_loss:
+            return "hard_stop_loss"
+        # Reaching the target arms a durable lock. It exits only after later
+        # edge decay or a material pullback from the observed high, so a one
+        # cent uptick is not treated as a successful scalp.
+        if (
+            profit_lock_armed
+            and (edge_invalid or trailing)
+        ):
             return "profit_lock_after_edge_decay" if edge_invalid else "trailing_profit_lock"
-        if return_fraction <= -policy.stop_loss and edge_invalid:
-            return "stop_loss_with_model_invalidation"
         if current_edge is not None and current_edge <= -max(0.03, policy.min_edge):
             return "model_reversal"
         return None
@@ -2162,8 +3827,14 @@ class PolymarketUSAutoTrader:
         exit_value: float,
         order_long_price: float,
         reason: str,
+        protective: bool = False,
     ) -> bool:
         quantity = float(position["quantity"])
+        candidate_key = ":".join((
+            str(position["event_id"]),
+            str(position["market_slug"]),
+            str(position["position_side"]),
+        ))
         if position["mode"] == "dry_run":
             self._close_position(
                 position["id"], exit_value=exit_value, reason=reason, order_id=None
@@ -2182,8 +3853,14 @@ class PolymarketUSAutoTrader:
                     "exit_value": exit_value,
                 },
             )
+            self._candidate_seen[candidate_key] = self._clock()
             return True
-        if not self.is_armed():
+        live_authorized = (
+            self._protective_exits_armed
+            if protective
+            else self.is_armed()
+        )
+        if not live_authorized:
             self._journal(
                 "exit",
                 "blocked",
@@ -2191,7 +3868,15 @@ class PolymarketUSAutoTrader:
                 event_name=position["event_name"],
                 market_slug=position["market_slug"],
                 selection=position["selection"],
-                payload={"reason": "live mode is disarmed", "exit_trigger": reason},
+                payload={
+                    "reason": (
+                        "protective auto-exits are disarmed"
+                        if protective
+                        else "live entry/order latch is disarmed"
+                    ),
+                    "exit_trigger": reason,
+                    "protective_exit": protective,
+                },
             )
             return False
         intent = (
@@ -2208,7 +3893,7 @@ class PolymarketUSAutoTrader:
             "tif": "TIME_IN_FORCE_FILL_OR_KILL",
             "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
             "synchronousExecution": True,
-            "maxBlockTime": "5s",
+            "maxBlockTime": "5",
         }
         try:
             with self._client() as client:
@@ -2286,6 +3971,7 @@ class PolymarketUSAutoTrader:
                 "execution_fees": execution_fees,
             },
         )
+        self._candidate_seen[candidate_key] = self._clock()
         return True
 
     @staticmethod
@@ -2303,7 +3989,7 @@ class PolymarketUSAutoTrader:
             "tif": "TIME_IN_FORCE_FILL_OR_KILL",
             "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
             "synchronousExecution": True,
-            "maxBlockTime": "5s",
+            "maxBlockTime": "5",
         }
 
     def _client(self):
@@ -2360,9 +4046,11 @@ class PolymarketUSAutoTrader:
                         cost_basis,opened_ts,updated_ts,highest_exit_value,
                         current_exit_value,current_model_probability,
                         current_execution_edge,return_fraction,entry_decision_id,
-                        entry_order_id)
+                        entry_order_id,initial_quantity,initial_cost_basis,
+                        external_exit_quantity,venue_sync_status,
+                        venue_mismatch_count)
                        VALUES (%s,%s,'open',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                               %s,%s,%s,%s,%s,%s,%s)""",
+                               %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (
                         position_id,
                         mode,
@@ -2389,6 +4077,11 @@ class PolymarketUSAutoTrader:
                         ),
                         candidate.signal.decision_id or candidate.signal.decision_hash,
                         order_id,
+                        quantity,
+                        quantity * entry_cost,
+                        0.0,
+                        "not_applicable" if mode == "dry_run" else "awaiting_sync",
+                        0,
                     ),
                 )
         return position_id
@@ -2413,6 +4106,11 @@ class PolymarketUSAutoTrader:
         probability: float | None,
         edge: float | None,
         return_fraction: float,
+        profit_lock_armed_ts: float | None = None,
+        profit_lock_price: float | None = None,
+        profit_target_observed_ts: float | None = None,
+        profit_target_observation_count: int = 0,
+        profit_target_observed_price: float | None = None,
     ) -> None:
         with self._lock:
             with self._db.transaction() as cur:
@@ -2421,10 +4119,21 @@ class PolymarketUSAutoTrader:
                     """UPDATE live_managed_positions SET updated_ts=%s,
                        highest_exit_value=%s,current_exit_value=%s,
                        current_model_probability=%s,current_execution_edge=%s,
-                       return_fraction=%s WHERE id=%s AND status='open'""",
+                       return_fraction=%s,
+                       profit_lock_armed_ts=COALESCE(
+                           profit_lock_armed_ts,%s
+                       ),
+                       profit_lock_price=COALESCE(profit_lock_price,%s),
+                       profit_target_observed_ts=%s,
+                       profit_target_observation_count=%s,
+                       profit_target_observed_price=%s
+                       WHERE id=%s AND status='open'""",
                     (
                         self._clock(), peak, exit_value, probability, edge,
-                        return_fraction, position_id,
+                        return_fraction, profit_lock_armed_ts,
+                        profit_lock_price, profit_target_observed_ts,
+                        profit_target_observation_count,
+                        profit_target_observed_price, position_id,
                     ),
                 )
 
@@ -2615,6 +4324,7 @@ class PolymarketUSAutoTrader:
                 self._db.execute(
                     cur,
                     """SELECT id FROM live_trading_journal
+                       WHERE kind!='performance_reset'
                        ORDER BY created_ts ASC LIMIT %s""",
                     (excess,),
                 )
@@ -2631,6 +4341,9 @@ class PolymarketUSAutoTrader:
         # an arbitrary object repr in the durable journal.
         message = getattr(exc, "message", None) or str(exc) or type(exc).__name__
         safe = str(message)
+        status_code = getattr(exc, "status_code", None)
+        if status_code is not None:
+            safe = f"HTTP {status_code} {type(exc).__name__}: {safe}"
         for credential in (self._key_id, self._secret_key):
             if credential:
                 safe = safe.replace(credential, "[redacted]")

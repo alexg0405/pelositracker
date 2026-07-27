@@ -1,6 +1,11 @@
 from datetime import datetime, timedelta, timezone
 
-from app.sources import _game_window, exclude_restricted_games, filter_sports_games
+from app.sources import (
+    _game_window,
+    exclude_restricted_games,
+    filter_sports_games,
+    game_start_matches_slug,
+)
 
 
 def _ev(title, tags, orderbook=True, accepting=True, slug=None):
@@ -53,6 +58,26 @@ def test_drops_futures_submarkets_untradeable_and_nonsports():
         _ev("Who will be UFC champion at the end of 2026?", ["UFC"]),
     ]
     assert filter_sports_games(events) == []
+
+
+def test_dated_slug_rejects_a_provider_start_rewritten_to_a_different_fixture():
+    assert game_start_matches_slug(
+        "mlb-atl-cws-2026-06-11", "2026-08-20T18:10:00Z"
+    ) is False
+    assert game_start_matches_slug(
+        "mlb-atl-cws-2026-06-11", "2026-06-12T00:10:00Z"
+    ) is True
+    assert game_start_matches_slug(
+        "undated-tournament-matchup", "2026-08-20T18:10:00Z"
+    ) is True
+
+    corrupted = _ev(
+        "Atlanta Braves vs. Chicago White Sox",
+        ["MLB"],
+        slug="mlb-atl-cws-2026-06-11",
+    )
+    corrupted["markets"][0]["gameStartTime"] = "2026-08-20T18:10:00Z"
+    assert filter_sports_games([corrupted]) == []
 
 
 def test_game_window_tags_live_upcoming_and_drops_stale():

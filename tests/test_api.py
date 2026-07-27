@@ -173,11 +173,19 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "/api/polymarket-us/events" in javascript
         assert "/api/polymarket-us/account" in javascript
         assert "/api/polymarket-us/trading/status" in javascript
+        assert "/api/polymarket-us/trading/sync" in javascript
         assert "/api/polymarket-us/trading/config" in javascript
         assert "/api/polymarket-us/trading/arm" in javascript
         assert "/api/polymarket-us/trading/emergency-stop" in javascript
+        assert "Stop automation now" in html
+        assert 'id="us-stop-status"' in html
+        assert "Automation is OFF" in javascript
+        assert "refreshTradingInBackground" in javascript
         assert "Raw long bid" in javascript
         assert "ARM LIVE TRADING" in html
+        assert 'id="us-arm-duration"' in html
+        assert '<option value="14400">4 hours</option>' in html
+        assert "updateArmDurationLabel" in javascript
         assert "one-cent gain alone never triggers an exit" in html.casefold()
         assert "usTradingFormDirty" in javascript
         assert "requestEpoch !== usTradingHydrationEpoch" in javascript
@@ -189,17 +197,43 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert 'id="us-performance-summary"' in html
         assert "function renderTradingPerformance" in javascript
         assert "/api/polymarket-us/trading/performance" in javascript
+        assert "/api/polymarket-us/trading/performance/reset-live" in javascript
+        assert "Reset live tally" in html
+        assert 'id="us-performance-action-status"' in html
         assert "/api/polymarket-us/trading/liquidate" in javascript
         assert "/api/polymarket-us/trading/history/dry-run" in javascript
+        assert 'data-engine-gate="provider_freshness"' in html
+        assert "required_engine_gates" in javascript
+        assert "Use core gates" in html
+        assert "Always enforced:" in html
+        assert "data-exit-position" in javascript
+        assert "/positions/${encodeURIComponent(positionId)}/exit" in javascript
+        assert 'id="us-clear-exited-positions"' in html
+        assert "/api/polymarket-us/trading/positions/archive-exited" in javascript
+        assert "Performance tallies, model observations, and the execution journal will be preserved." in javascript
+        assert "Stop accepted locally" in javascript
+        assert "usTradingReloadQueued" in javascript
+        assert 'step="any"' in html
         assert "Total net" in javascript
         assert "W–L–P" in javascript
         assert 'id="us-liquidate-form"' in html
         assert "SELL ALL LIVE POSITIONS" in html
         assert 'class="us-activity-grid section-gap"' in html
         assert "Stop automation + wipe dry-run trades" in html
-        assert "Dry run is an executive reset" in html
+        assert "Dry run is one atomic reset" in html
         assert 'id="us-clear-dry-history"' not in html
         assert "No market mapping, quote, or fill is required" in javascript
+        reset_start = javascript.index(
+            'document.querySelector("#us-liquidate-form")?.addEventListener("submit"'
+        )
+        reset_handler = javascript[
+            reset_start:javascript.index("updateLiquidationMode();", reset_start)
+        ]
+        assert "/api/polymarket-us/trading/history/dry-run" in reset_handler
+        assert "/api/polymarket-us/trading/stop" not in reset_handler
+        assert "Sync phone/account" in html
+        assert "total paid" in javascript
+        assert "Protective auto-exits stay armed" in javascript
 
 
 def test_workstation_exposes_only_bounded_polymarket_us_trading_routes():
@@ -211,19 +245,25 @@ def test_workstation_exposes_only_bounded_polymarket_us_trading_routes():
         "/api/polymarket-us/events",
         "/api/polymarket-us/account",
         "/api/polymarket-us/trading/status",
+        "/api/polymarket-us/trading/sync",
         "/api/polymarket-us/trading/config",
         "/api/polymarket-us/trading/arm",
         "/api/polymarket-us/trading/disarm",
+        "/api/polymarket-us/trading/stop",
         "/api/polymarket-us/trading/emergency-stop",
         "/api/polymarket-us/trading/run",
         "/api/polymarket-us/trading/journal",
         "/api/polymarket-us/trading/positions",
+        "/api/polymarket-us/trading/positions/archive-exited",
         "/api/polymarket-us/trading/performance",
+        "/api/polymarket-us/trading/performance/reset-live",
         "/api/polymarket-us/trading/liquidate",
         "/api/polymarket-us/trading/history/dry-run",
+        "/api/polymarket-us/trading/positions/{position_id}/exit",
     }
-    # There is deliberately no arbitrary create/modify/cancel/close route. The
-    # only execution surface is the policy-controlled automation manager.
+    # There is deliberately no arbitrary order-management route. The one
+    # position-exit route can only act on a position created and tracked by the
+    # bounded automation manager.
     assert not any(
         fragment in path
         for path in us_paths
@@ -277,6 +317,49 @@ def test_live_trading_api_defaults_disarmed_and_rejects_unsafe_policy(
             main_module.auth_manager.revoke(token)
 
 
+def test_dry_reset_route_stops_automation_in_one_request_and_live_tally_resets(
+    enabled_live_trading,
+):
+    with TestClient(app) as client:
+        authenticated = main_module.auth_manager.login("admin", "admin")
+        assert authenticated is not None
+        token, session = authenticated
+        client.cookies.set(main_module._cookie_name("session_token"), token)
+        client.cookies.set(main_module._cookie_name("csrf_token"), session.csrf_token)
+        client.headers.update({"X-CSRF-Token": session.csrf_token})
+        try:
+            configured = client.put(
+                "/api/polymarket-us/trading/config",
+                json={
+                    "automation_enabled": True,
+                    "execution_mode": "dry_run",
+                },
+            )
+            assert configured.status_code == 200
+            assert configured.json()["policy"]["automation_enabled"] is True
+
+            reset = client.request(
+                "DELETE",
+                "/api/polymarket-us/trading/history/dry-run",
+                json={"confirmation": "CLEAR DRY RUN HISTORY"},
+            )
+            assert reset.status_code == 200
+            assert reset.json()["automation_enabled"] is False
+            assert reset.json()["verified_remaining_positions"] == 0
+            status = client.get("/api/polymarket-us/trading/status")
+            assert status.json()["policy"]["automation_enabled"] is False
+
+            live_tally = client.post(
+                "/api/polymarket-us/trading/performance/reset-live",
+                json={"confirmation": "RESET LIVE TALLY"},
+            )
+            assert live_tally.status_code == 200
+            assert live_tally.json()["positions_preserved"] is True
+            assert live_tally.json()["risk_history_preserved"] is True
+        finally:
+            main_module.auth_manager.revoke(token)
+
+
 def test_empty_mode_liquidation_returns_without_fetching_market_inventory(
     monkeypatch,
     enabled_live_trading,
@@ -321,6 +404,58 @@ def test_empty_mode_liquidation_returns_without_fetching_market_inventory(
             assert response.status_code == 200
             assert response.json()["requested"] == 0
             assert response.json()["remaining"] == 0
+        finally:
+            main_module.auth_manager.revoke(token)
+
+
+def test_individual_dry_run_exit_is_bounded_and_skips_market_inventory(
+    monkeypatch,
+    enabled_live_trading,
+):
+    async def unexpected_fetch(*, limit):
+        pytest.fail(f"dry-run position removal unexpectedly fetched {limit} US events")
+
+    with TestClient(app) as client:
+        authenticated = main_module.auth_manager.login("admin", "admin")
+        assert authenticated is not None
+        token, session = authenticated
+        client.cookies.set(main_module._cookie_name("session_token"), token)
+        client.cookies.set(main_module._cookie_name("csrf_token"), session.csrf_token)
+        client.headers.update({"X-CSRF-Token": session.csrf_token})
+        assert main_module.live_trader is not None
+        monkeypatch.setattr(
+            main_module.live_trader,
+            "position",
+            lambda position_id: {
+                "id": position_id,
+                "mode": "dry_run",
+                "status": "open",
+            },
+        )
+        monkeypatch.setattr(
+            main_module.live_trader,
+            "exit_position",
+            lambda _payload, *, position_id, confirmation: {
+                "position_id": position_id,
+                "status": "removed",
+                "confirmation": confirmation,
+            },
+        )
+        monkeypatch.setattr(
+            main_module,
+            "fetch_polymarket_us_events",
+            unexpected_fetch,
+        )
+
+        try:
+            response = client.post(
+                "/api/polymarket-us/trading/positions/dry-1/exit",
+                json={"confirmation": ""},
+            )
+
+            assert response.status_code == 200
+            assert response.json()["position_id"] == "dry-1"
+            assert response.json()["status"] == "removed"
         finally:
             main_module.auth_manager.revoke(token)
 
