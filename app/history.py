@@ -1,6 +1,7 @@
 import threading
 import time
 import json
+import os
 from typing import Iterable
 
 from .database import Database
@@ -105,6 +106,31 @@ class HistoryDB:
         self.backend = self._db.backend
         self._conn = self._db.connection
         self._lock = threading.Lock()
+        # The live engine still receives every websocket update. Persistence is
+        # sampled separately because multi-megabyte order-book telemetry at
+        # sub-second frequency does not improve a 15-second research model.
+        self._quote_last: dict[tuple[str, str, str, str, str], tuple[float, tuple]] = {}
+        workstation = os.getenv("WORKSTATION_MODE", "").strip().casefold() in {
+            "1", "true", "yes", "on",
+        }
+        try:
+            self._quote_min_seconds = max(
+                0.0,
+                float(os.getenv(
+                    "HISTORY_QUOTE_MIN_SECONDS",
+                    "5" if workstation else "0",
+                )),
+            )
+            self._quote_heartbeat_seconds = max(
+                self._quote_min_seconds,
+                float(os.getenv(
+                    "HISTORY_QUOTE_HEARTBEAT_SECONDS",
+                    "15" if workstation else "0",
+                )),
+            )
+        except ValueError:
+            self._quote_min_seconds = 0.0
+            self._quote_heartbeat_seconds = 0.0
         with self._lock:
             self._db.initialize(_SCHEMA, component="history", version=1)
             self._db.migrate_columns("history", 2, {
@@ -192,6 +218,9 @@ class HistoryDB:
                     "evidence_json": "TEXT",
                 },
             })
+            self._db.migrate_columns("history", 6, {
+                "states_history": {"sport_state_json": "TEXT"},
+            })
 
     def close(self) -> None:
         with self._lock:
@@ -201,10 +230,39 @@ class HistoryDB:
         with self._lock:
             rows = []
             for q in quotes:
+                observed = q.observed_at.timestamp()
+                key = (
+                    q.event_id,
+                    q.market,
+                    q.outcome,
+                    q.source_family,
+                    q.token_id or "",
+                )
+                # Price/status identity is the material event for historical
+                # modeling. Full depth remains archived at a heartbeat, while
+                # depth-only churn is not allowed to write hundreds of rows/sec.
+                fingerprint = (
+                    q.probability,
+                    q.ask,
+                    q.bid,
+                    q.active,
+                    q.resolved,
+                    q.accepting_orders,
+                    q.restricted,
+                    q.fee_rate,
+                )
+                prior = self._quote_last.get(key)
+                if prior is not None:
+                    elapsed = max(0.0, observed - prior[0])
+                    if elapsed < self._quote_min_seconds:
+                        continue
+                    if fingerprint == prior[1] and elapsed < self._quote_heartbeat_seconds:
+                        continue
+                self._quote_last[key] = (observed, fingerprint)
                 rows.append((
                     q.event_id, q.market, q.outcome, q.source,
                     q.probability, q.ask, q.bid, q.liquidity,
-                    q.observed_at.timestamp(),
+                    observed,
                     q.provider_timestamp.timestamp() if q.provider_timestamp else None,
                     q.received_at.timestamp(), q.processed_at.timestamp(), q.source_family,
                     q.decimal_odds, q.bid_size, q.ask_size, q.market_liquidity,
@@ -221,6 +279,15 @@ class HistoryDB:
                     q.raw_payload_hash, q.normalization_version, q.mapping_decision_id,
                     int(q.negative_risk) if q.negative_risk is not None else None,
                 ))
+
+            # Provider universes are bounded in normal operation, but release
+            # stale in-process sampling keys after long workstation sessions.
+            if len(self._quote_last) > 100_000:
+                cutoff = time.time() - 24 * 3600
+                self._quote_last = {
+                    key: value for key, value in self._quote_last.items()
+                    if value[0] >= cutoff
+                }
 
             if not rows:
                 return
@@ -258,9 +325,10 @@ class HistoryDB:
                         canonical_event_id, league_id, sport_id, home_team_id,
                         away_team_id, regulation_period, overtime_number,
                         normalized_seconds_remaining, clock_direction, live, ended,
-                        sequence, state_hash, state_schema_version, finished_timestamp)
+                        sequence, state_hash, state_schema_version, finished_timestamp,
+                        sport_state_json)
                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                               %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                               %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (state.event_id, state.home_score, state.away_score, 
                      state.period, state.clock, state.status, state.observed_at.timestamp(),
                      state.source, state.possession,
@@ -274,7 +342,8 @@ class HistoryDB:
                      int(state.live) if state.live is not None else None,
                      int(state.ended) if state.ended is not None else None,
                      state.sequence, state.state_hash, state.state_schema_version,
-                     state.finished_timestamp.timestamp() if state.finished_timestamp else None)
+                     state.finished_timestamp.timestamp() if state.finished_timestamp else None,
+                     json.dumps(state.sport_state, sort_keys=True, separators=(",", ":")))
                 )
 
     def log_outcome(self, event: Event, pregame_spread: float | None, pregame_total: float | None, final_state: GameState | None) -> None:

@@ -6,9 +6,10 @@
   <meta name="description" content="Auditable live sports-market research and controlled Polymarket US execution">
   <title>PelosiTracker Dashboard</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <link rel="stylesheet" href="/static/index.css?v=fortnite-lobby-1">
+  <link rel="stylesheet" href="/static/index.css?v=hosted-research-lobby-2">
 </head>
 <body class="research-workstation">
+<a class="skip-link" href="#main-content">Skip to dashboard</a>
 <div id="login-overlay">
   <div class="login-box">
     <h1 class="glitch" data-text="PelosiAlpha">Pelosi<span>Alpha</span></h1>
@@ -23,7 +24,7 @@
   </div>
 </div>
 
-<main class="wrap">
+<main class="wrap" id="main-content">
   <header>
     <div class="brand"><span class="dot" aria-hidden="true"></span><div><h1 class="glitch" data-text="PelosiTracker">PelosiTracker</h1><small>Auditable research, paper tracking, and controlled US execution</small></div></div>
     <div class="header-brand">
@@ -32,16 +33,16 @@
     </div>
   </header>
 
-  <nav class="tab-carousel">
-    <button class="pill active" data-tab="tab-lobby">Lobby</button>
-    <button class="pill" data-tab="tab-live">Live Radar</button>
-    <button class="pill" data-tab="tab-discovery">Discovery</button>
-    <button class="pill" data-tab="tab-us-research">Polymarket US Research</button>
-    <button class="pill" id="bots-tab-button" data-tab="tab-bots">Custom Bots & Metrics</button>
+  <nav class="tab-carousel" id="global-tab-nav" aria-label="Primary workspace" role="tablist">
+    <button class="pill active" id="tab-lobby-button" data-tab="tab-lobby" role="tab" aria-controls="tab-lobby" aria-selected="true">Lobby</button>
+    <button class="pill" id="tab-live-button" data-tab="tab-live" role="tab" aria-controls="tab-live" aria-selected="false">Live Radar</button>
+    <button class="pill" id="tab-discovery-button" data-tab="tab-discovery" role="tab" aria-controls="tab-discovery" aria-selected="false">Discovery</button>
+    <button class="pill" id="tab-us-research-button" data-tab="tab-us-research" role="tab" aria-controls="tab-us-research" aria-selected="false">Polymarket US Research</button>
+    <button class="pill" id="bots-tab-button" data-tab="tab-bots" role="tab" aria-controls="tab-bots" aria-selected="false">Custom Bots & Metrics</button>
   </nav>
 
   <!-- TAB 0: LOBBY (landing) -->
-  <div id="tab-lobby" class="tab-content">
+  <div id="tab-lobby" class="tab-content" role="tabpanel" aria-labelledby="tab-lobby-button">
     <div class="lb">
       <aside class="lb-side">
         <div class="lb-season">SEASON 3</div>
@@ -49,13 +50,13 @@
           <div class="lb-level"><span class="lb-level-num" id="lb-level">5</span><span class="lb-level-lbl">LEVEL</span></div>
           <div class="lb-xp">
             <div class="lb-xp-top"><span id="lb-xp-cur">67</span><span>/ 700</span></div>
-            <div class="lb-xp-bar"><i style="width:9.5%"></i></div>
+            <div class="lb-xp-bar"><i class="lb-xp-progress-10"></i></div>
             <div class="lb-xp-next">Next reward · LVL 10 <b>&#9672; 10</b></div>
           </div>
         </div>
         <div class="lb-pass">
           <div class="lb-pass-row"><span>BATTLE PASS</span><b>TIER 4</b></div>
-          <div class="lb-xp-bar sm"><i style="width:60%"></i></div>
+          <div class="lb-xp-bar sm"><i class="lb-xp-progress-60"></i></div>
         </div>
         <div class="lb-daily">
           <div class="lb-daily-h">DAILY CHALLENGES</div>
@@ -108,7 +109,7 @@
   </div>
 
   <!-- TAB 1: LIVE RADAR -->
-  <div id="tab-live" class="tab-content is-hidden">
+  <div id="tab-live" class="tab-content is-hidden" role="tabpanel" aria-labelledby="tab-live-button">
     <h2 class="title glitch" data-text="Monitored events">Monitored events</h2>
     <div class="error" id="action-error" role="alert" hidden></div>
     <div id="event-action-status" class="event-action-status" role="status" aria-live="polite" hidden></div>
@@ -124,7 +125,7 @@
   </div>
 
   <!-- TAB 2: DISCOVERY -->
-  <div id="tab-discovery" class="tab-content is-hidden">
+  <div id="tab-discovery" class="tab-content is-hidden" role="tabpanel" aria-labelledby="tab-discovery-button">
     <div class="panel pad section-gap">
       <div class="browse-head">
         <h2 class="title">Best current bets</h2>
@@ -156,6 +157,11 @@
         <h2 class="title">Live Polymarket games</h2>
         <div class="inline-controls">
           <label class="auto-monitor-label" title="Master switch for paid sportsbook polling"><input class="compact-input" type="checkbox" id="odds-api-toggle"> Odds API polling</label>
+          <label class="auto-monitor-label" for="odds-api-interval">Every
+            <input class="compact-number" id="odds-api-interval" type="number" min="5" max="3600" step="1" inputmode="decimal" aria-describedby="odds-api-status">
+            seconds
+          </label>
+          <button class="ghost compact-button" id="odds-api-interval-save" type="button">Apply interval</button>
           <label class="auto-monitor-label"><input class="compact-input" type="checkbox" id="auto-monitor-toggle"> Auto-Monitor</label>
           <button class="ghost compact-button" id="discover-refresh" type="button">Refresh List</button>
         </div>
@@ -163,13 +169,40 @@
       <div id="odds-api-status" class="odds-api-status" role="status" aria-live="polite">Loading Odds API status…</div>
       <div id="discover-refresh-status" class="refresh-status" role="status" aria-live="polite"></div>
       <input class="search-gap" id="discover-search" placeholder="Filter games…" autocomplete="off">
+      <div class="discover-batch-bar">
+        <div class="discover-batch-copy">
+          <strong id="discover-selection-count">0 selected</strong>
+          <span>Select several games, then add them together without leaving Discovery.</span>
+        </div>
+        <div class="discover-batch-actions">
+          <button class="ghost compact-button" id="discover-select-visible" type="button">Select visible</button>
+          <button class="ghost compact-button" id="discover-clear-selection" type="button" disabled>Clear</button>
+          <button class="primary compact-button" id="discover-monitor-selected" type="button" disabled>Monitor selected</button>
+        </div>
+      </div>
+      <div id="discover-batch-status" class="refresh-status discover-batch-status" role="status" aria-live="polite"></div>
       <div id="discover-list" class="discover-list" aria-live="polite"></div>
     </div>
   </div>
 
   <!-- TAB 3: POLYMARKET US RESEARCH SIDECAR -->
-  <div id="tab-us-research" class="tab-content is-hidden">
-    <section class="panel pad section-gap us-research-hero">
+  <div id="tab-us-research" class="tab-content is-hidden" role="tabpanel" aria-labelledby="tab-us-research-button">
+    <nav class="research-section-nav" aria-label="Polymarket US research sections">
+      <span class="research-section-nav-label">Workspace map</span>
+      <div class="research-section-nav-scroll">
+        <a class="research-section-link active" data-research-section="us-research-overview" href="#us-research-overview" aria-current="location">Status</a>
+        <a class="research-section-link" data-research-section="us-performance" href="#us-performance">Performance</a>
+        <a class="research-section-link" data-research-section="us-ledger" href="#us-ledger">Trade data</a>
+        <a class="research-section-link" data-research-section="us-advisor" href="#us-advisor">Advisor</a>
+        <a class="research-section-link" data-research-section="us-auto-trader" href="#us-auto-trader">Auto trader</a>
+        <a class="research-section-link" data-research-section="us-activity" href="#us-activity">Positions &amp; log</a>
+        <a class="research-section-link" data-research-section="us-model-lab" href="#us-model-lab">Model lab</a>
+        <a class="research-section-link" data-research-section="us-market-browser" href="#us-market-browser">US markets</a>
+      </div>
+      <a class="research-section-top" href="#global-tab-nav" aria-label="Back to the top of the workspace">Top ↑</a>
+    </nav>
+
+    <section class="panel pad section-gap us-research-hero research-anchor" id="us-research-overview">
       <div class="browse-head">
         <div>
           <h2 class="title">Polymarket US research & execution</h2>
@@ -186,7 +219,7 @@
     </section>
 
     <div class="us-overview-grid section-gap">
-      <section class="panel pad us-performance-panel">
+      <section class="panel pad us-performance-panel research-anchor" id="us-performance">
         <div class="browse-head">
           <div>
             <h2 class="title">Trading performance</h2>
@@ -208,18 +241,160 @@
         <div class="browse-head">
           <div>
             <h2 class="title">Account connection</h2>
-            <div class="field-note">After adding the Key ID and one-time Secret Key to the server environment, test authentication here. Credentials never leave the backend or appear in the journal.</div>
+            <div class="field-note">Use a server environment key, or paste a key from your phone for this server process only. Runtime credentials are verified before use and this application never writes them to browser storage, a database, the journal, or Git.</div>
           </div>
           <button class="ghost compact-button" id="us-account-refresh" type="button">Test account key</button>
         </div>
         <div id="us-account-status" class="refresh-status" role="status" aria-live="polite"></div>
+        <details class="advanced us-runtime-credentials">
+          <summary>Use a key for this server session</summary>
+          <form id="us-runtime-credential-form" autocomplete="off">
+            <label>Polymarket US Key ID
+              <input id="us-runtime-key-id" required maxlength="1000" autocapitalize="none" spellcheck="false" autocomplete="off">
+            </label>
+            <label>One-time Secret Key
+              <input id="us-runtime-secret-key" required type="password" maxlength="8000" autocapitalize="none" spellcheck="false" autocomplete="new-password">
+            </label>
+            <div class="us-runtime-credential-actions">
+              <button class="primary compact-button" id="us-runtime-credential-save" type="submit">Verify &amp; use session key</button>
+              <button class="ghost compact-button" id="us-runtime-credential-clear" type="button">Forget runtime key</button>
+            </div>
+          </form>
+          <div class="field-note">Changing or forgetting a key immediately stops automation and closes the live arm. A runtime key disappears on server restart. Open live managed positions block account switching so they cannot be detached from their account.</div>
+        </details>
         <div id="us-account" class="us-account-view">
           <div class="metrics-empty">No account request has been made. Public US market data below does not require a key.</div>
         </div>
       </section>
     </div>
 
-    <section class="panel pad section-gap us-trading-panel">
+    <section class="panel pad section-gap us-performance-ledger-panel research-anchor" id="us-ledger">
+      <div class="browse-head">
+        <div>
+          <h2 class="title">Trade performance datasheet</h2>
+          <div class="field-note">Every retained managed trade, its execution result, line type, entry-time signal, and immutable settings snapshot. A win means positive realized after-cost P/L; it is not a claim about the final game result.</div>
+        </div>
+        <div class="us-performance-actions">
+          <button class="ghost compact-button" id="us-ledger-export" type="button">Export filtered CSV</button>
+          <button class="ghost compact-button" id="us-ledger-refresh" type="button">Refresh datasheet</button>
+        </div>
+      </div>
+      <div class="us-ledger-filters">
+        <label>Execution
+          <select id="us-ledger-mode">
+            <option value="all">Dry run + live</option>
+            <option value="dry_run">Dry run only</option>
+            <option value="live">Live only</option>
+          </select>
+        </label>
+        <label>Line type
+          <select id="us-ledger-market-type">
+            <option value="all">All line types</option>
+            <option value="moneyline">Moneyline</option>
+            <option value="spread">Spread / run line</option>
+            <option value="total">Game total</option>
+          </select>
+        </label>
+        <label>Result
+          <select id="us-ledger-result">
+            <option value="all">All results</option>
+            <option value="open">Open</option>
+            <option value="win">Profitable close</option>
+            <option value="loss">Losing close</option>
+            <option value="push">Flat close</option>
+            <option value="unverified">External / unverified close</option>
+          </select>
+        </label>
+        <label>Event or selection
+          <input id="us-ledger-query" type="search" maxlength="200" placeholder="Filter names or market slug">
+        </label>
+      </div>
+      <div id="us-ledger-status" class="refresh-status" role="status" aria-live="polite">Open this tab or refresh to load the retained trade ledger.</div>
+      <div id="us-ledger-summary" class="us-policy-advisor-summary"></div>
+      <details class="advanced us-ledger-settings" open>
+        <summary>Settings producing the filtered results</summary>
+        <div class="field-note">Groups use the exact policy snapshot recorded at entry. Read win rate beside sample size, net, and after-cost ROI; small groups are weak evidence.</div>
+        <div id="us-ledger-settings-groups" class="us-ledger-settings-groups"></div>
+      </details>
+      <div class="us-ledger-table-wrap">
+        <table class="us-ledger-table">
+          <thead>
+            <tr>
+              <th>Opened</th>
+              <th>Mode</th>
+              <th>Result</th>
+              <th>Event / selection</th>
+              <th>Line</th>
+              <th>Buy</th>
+              <th>Stake</th>
+              <th>Net</th>
+              <th>Edge</th>
+              <th>Quality</th>
+              <th>Settings</th>
+            </tr>
+          </thead>
+          <tbody id="us-ledger-rows">
+            <tr><td colspan="11">No trade data loaded.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel pad section-gap us-policy-advisor-panel research-anchor" id="us-advisor">
+      <div class="browse-head">
+        <div>
+          <h2 class="title">Reactive settings advisor</h2>
+          <div class="field-note">Compares realized after-cost managed trades across whole events, estimates how many logged opportunities would clear alternative execution filters, and reports the fitted sport model's shadow readiness. It does not alter probability, edge, signal quality, calibration, or engine gates.</div>
+        </div>
+        <button class="ghost compact-button" id="us-policy-advisor-refresh" type="button">Analyze current data</button>
+      </div>
+      <div class="us-policy-advisor-controls">
+        <label>Goal
+          <select id="us-policy-advisor-objective">
+            <option value="protect_profit">Protect profit</option>
+            <option value="balanced" selected>Balanced</option>
+            <option value="more_trades">Seek more qualified trades</option>
+          </select>
+        </label>
+        <label>Desired qualified trades / hour
+          <input id="us-policy-advisor-target" type="number" min="0.25" max="30" step="0.25" value="4">
+        </label>
+        <label>Analyze trade mode
+          <select id="us-policy-advisor-mode">
+            <option value="live">Live fills</option>
+            <option value="dry_run">Dry-run fills</option>
+          </select>
+        </label>
+        <label>History window
+          <select id="us-policy-advisor-lookback">
+            <option value="0">All retained history</option>
+            <option value="7">Last 7 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="90">Last 90 days</option>
+            <option value="180">Last 180 days</option>
+            <option value="365">Last year</option>
+          </select>
+        </label>
+      </div>
+      <fieldset class="us-advisor-market-types">
+        <legend>Line types to compare</legend>
+        <label><input type="checkbox" data-advisor-market-type="moneyline" checked> Moneyline</label>
+        <label><input type="checkbox" data-advisor-market-type="spread" checked> Spread / run line</label>
+        <label><input type="checkbox" data-advisor-market-type="total" checked> Game total</label>
+      </fieldset>
+      <div class="notice us-safety-note"><strong>Reactive, not automatic:</strong> changing the goal or requested frequency generates a new auditable comparison. A recommendation changes nothing until you explicitly apply it. Applying switches the risk style to Custom and disarms live orders so you can review and re-arm.</div>
+      <div id="us-policy-advisor-status" class="refresh-status" role="status" aria-live="polite">Run an analysis to compare the current policy with available trade and model evidence.</div>
+      <div id="us-policy-advisor-result" class="us-policy-advisor-result">
+        <div class="metrics-empty">No recommendation has been generated in this page session.</div>
+      </div>
+      <div class="us-policy-advisor-actions">
+        <button class="ghost compact-button" id="us-policy-advisor-download" type="button" disabled>Download analysis JSON</button>
+        <small>Exports the complete scope, diagnostics, candidate frontier, and validation evidence for independent review.</small>
+      </div>
+      <div id="us-policy-advisor-sessions" class="us-policy-advisor-sessions"></div>
+    </section>
+
+    <section class="panel pad section-gap us-trading-panel research-anchor" id="us-auto-trader">
       <div class="browse-head">
         <div>
           <h2 class="title">Automatic trade controls</h2>
@@ -227,13 +402,24 @@
         </div>
         <span id="us-trading-mode-badge" class="us-venue-badge">DISARMED</span>
       </div>
+      <div id="us-trading-lanes" class="us-trading-lanes" aria-label="Automation lanes">
+        <button type="button" data-trading-lane="dry_run">
+          <strong>Dry-run lane</strong>
+          <span id="us-dry-run-lane-summary">Loading separate simulated settings…</span>
+        </button>
+        <button type="button" data-trading-lane="live">
+          <strong>Live lane</strong>
+          <span id="us-live-lane-summary">Loading separate live settings…</span>
+        </button>
+      </div>
       <div id="us-trading-status" class="us-trading-status" role="status" aria-live="polite">Loading execution policy…</div>
       <form id="us-trading-form" class="us-trading-form">
-        <label>Execution mode
+        <label>Automation lane
           <select id="us-trading-mode">
             <option value="dry_run">Dry run / simulated fills</option>
             <option value="live">Live Polymarket US orders</option>
           </select>
+          <span class="field-note">Switching lanes loads that lane’s independently saved policy. Both lanes may run at the same time.</span>
         </label>
         <label>Managed trading allocation ($)
           <input id="us-trading-allocation" type="number" min="0.01" step="0.01" required>
@@ -250,6 +436,13 @@
           <span class="field-note">Named styles derive the risk fields below; Custom leaves every field editable.</span>
         </label>
         <div id="us-risk-preset-preview" class="us-risk-preset-preview us-check-wide" aria-live="polite"></div>
+        <fieldset class="us-line-type-policy us-check-wide">
+          <legend>Line types eligible for automatic entry</legend>
+          <label><input type="checkbox" data-entry-market-type="moneyline"> Moneyline</label>
+          <label><input type="checkbox" data-entry-market-type="spread"> Spread / run line</label>
+          <label><input type="checkbox" data-entry-market-type="total"> Game total</label>
+          <div class="field-note">This is an execution filter only. Disabled types are still calculated and visible elsewhere, but the auto trader will not enter them. At least one type must remain selected.</div>
+        </fieldset>
         <details class="advanced us-check-wide us-policy-derived">
           <summary>Derived bankroll and entry limits</summary>
           <div class="us-advanced-grid">
@@ -271,6 +464,10 @@
         <label>Minimum edge (%)
           <input id="us-min-edge" data-derived-risk type="number" min="0" max="99" step="any" required>
         </label>
+        <label>Maximum edge (%)
+          <input id="us-max-edge" data-derived-risk type="number" min="0.1" max="100" step="any" required>
+          <span class="field-note">Execution-side anomaly ceiling. It does not change how edge is calculated.</span>
+        </label>
         <label>Minimum signal quality (0–100)
           <input id="us-min-quality" data-derived-risk type="number" min="0" max="100" step="any" required>
         </label>
@@ -291,6 +488,55 @@
         </details>
         <label class="us-check"><input id="us-automation-enabled" type="checkbox"> Run automatic analysis cycles</label>
         <label class="us-check"><input id="us-auto-cashout" type="checkbox"> Allow logical automatic cash-out</label>
+        <fieldset class="us-adaptive-exit us-check-wide">
+          <legend>Adaptive MLB cash-out research</legend>
+          <label class="us-check"><input id="us-adaptive-exit-enabled" type="checkbox"> Learn from live MLB game state and adapt eligible profit exits</label>
+          <label class="us-check"><input id="us-volatility-stop-enabled" type="checkbox"> Protect ordinary MLB stops with bounded state-aware confirmation</label>
+          <div class="field-note">The overlay now observes moneylines, run lines, and totals. It never changes probability, edge, signal quality, calibration, or entry gates. Stop confirmation can briefly hold an ordinary drawdown when the game is live and model edge has not materially reversed; the separate catastrophic boundary remains immediate.</div>
+          <div class="us-adaptive-exit-grid">
+            <label>Response mode
+              <select id="us-adaptive-exit-profile">
+                <option value="observe">Observe only</option>
+                <option value="guarded">Guarded</option>
+                <option value="balanced">Balanced</option>
+                <option value="responsive">Responsive</option>
+              </select>
+            </label>
+            <label>Prediction horizon (minutes)
+              <input id="us-adaptive-exit-horizon" type="number" min="0.5" max="15" step="0.5" required>
+            </label>
+            <label>Full-support sample target
+              <input id="us-adaptive-exit-min-samples" type="number" min="5" max="10000" step="1" required>
+            </label>
+            <label>Maximum tightening (%)
+              <input id="us-adaptive-exit-max-tightening" type="number" min="0" max="60" step="0.5" required>
+            </label>
+            <label>Stop confirmation readings
+              <input id="us-stop-confirmation-readings" type="number" min="2" max="10" step="1" required>
+            </label>
+            <label>Maximum ordinary-stop grace (minutes)
+              <input id="us-stop-grace-minutes" type="number" min="0.5" max="15" step="0.5" required>
+            </label>
+            <label>Catastrophic stop multiplier
+              <input id="us-catastrophic-stop-multiplier" type="number" min="1.1" max="3" step="0.05" required>
+              <span class="field-note">Example: a 20% stop with 1.75× retains an immediate 35% catastrophic boundary.</span>
+            </label>
+            <label>Post-exit shadow tracking (minutes)
+              <input id="us-post-exit-tracking-minutes" type="number" min="5" max="180" step="5" required>
+              <span class="field-note">Tracks the sold contract without placing another order, so missed rebounds and avoided losses become measurable.</span>
+            </label>
+          </div>
+          <div id="us-adaptive-exit-status" class="us-adaptive-exit-status" role="status" aria-live="polite">No adaptive observations yet.</div>
+          <details class="us-exit-recovery-audit">
+            <summary>After-sale outcome audit</summary>
+            <div class="field-note">Read-only counterfactual marks for recently sold MLB positions. These observations never place, cancel, or modify an order.</div>
+            <div id="us-exit-recovery-list" class="us-exit-recovery-list">No tracked exits yet.</div>
+          </details>
+          <div class="us-adaptive-exit-actions">
+            <button class="ghost compact-button" id="us-adaptive-exit-clear" type="button">Clear adaptive learning history</button>
+            <span>Movement and post-exit recovery evidence are event-balanced and persist locally until you explicitly clear them.</span>
+          </div>
+        </fieldset>
         <fieldset class="us-engine-gates us-check-wide">
           <legend>Existing engine gates used for automatic entry</legend>
           <label class="us-check us-engine-strict"><input id="us-require-engine" type="checkbox"> Strict mode: require the engine to clear every entry gate</label>
@@ -318,7 +564,7 @@
           </div>
           <div class="us-always-enforced"><strong>Always enforced:</strong> exact Polymarket US contract mapping, open authenticated order book, hard 5c–95c price range, your price/spread/depth settings, buying power and exposure limits, and live arm/preview/fee-adjusted-edge checks.</div>
         </fieldset>
-        <div class="field-note us-check-wide">An exit needs the minimum hold plus either a meaningful gain with edge decay/trailing pullback, a stop with model invalidation, or a material model reversal. A one-cent gain alone never triggers an exit.</div>
+        <div class="field-note us-check-wide">Profit exits still need a meaningful gain followed by edge decay or a trailing pullback. Ordinary MLB stops can require consecutive readings and a short game-state-aware grace period; terminal, irreversible, materially reversed, and catastrophic conditions remain immediate. A one-cent gain alone never triggers an exit.</div>
         <details class="advanced us-check-wide us-policy-advanced">
           <summary>Advanced risk and exit limits</summary>
           <div class="us-advanced-grid">
@@ -327,6 +573,16 @@
             </label>
             <label>Maximum live entries / hour
               <input id="us-max-orders-hour" data-derived-risk type="number" min="1" step="1" required>
+            </label>
+            <label>Maximum entries per event / hour
+              <input id="us-max-event-entries-hour" data-derived-risk type="number" min="1" max="50" step="1" required>
+            </label>
+            <label>Candidate retry cooldown (seconds)
+              <input id="us-candidate-cooldown" data-derived-risk type="number" min="10" max="7200" step="1" required>
+            </label>
+            <label>Minimum MLB regulation game remaining (%)
+              <input id="us-min-mlb-remaining" data-derived-risk type="number" min="0" max="100" step="1" required>
+              <span class="field-note">0 disables this entry filter. A positive value requires explicit inning state.</span>
             </label>
             <label>Minimum independent references
               <input id="us-min-refs" data-derived-risk type="number" min="1" step="1" required>
@@ -351,32 +607,45 @@
             </label>
           </div>
         </details>
+        <section class="us-risk-session-control us-check-wide">
+          <div>
+            <strong>Entry circuit breakers</strong>
+            <span id="us-risk-session-summary">Loading the hourly-entry and rolling realized-loss counters…</span>
+            <small>Starting a new risk session resets those two entry counters and the candidate retry cooldown. It preserves every trade and audit record. Per-position stops, exposure, cash reserve, authenticated venue checks, price, liquidity, edge, quality, and selected engine gates cannot be bypassed here.</small>
+          </div>
+          <button class="ghost" id="us-risk-session-reset" type="button">Start new risk session</button>
+          <div id="us-risk-session-status" class="us-liquidate-status" role="status" aria-live="assertive"></div>
+        </section>
         <div class="us-trading-actions us-check-wide">
           <button class="primary" id="us-policy-save" type="submit">Save execution policy</button>
           <button class="ghost" id="us-run-now" type="button">Run one cycle now</button>
-          <button class="ghost" id="us-disarm" type="button">Disarm live orders</button>
+          <button class="ghost" id="us-disarm" type="button" disabled>Disarm live orders</button>
           <button class="danger" id="us-emergency-stop" type="button">Stop automation now</button>
         </div>
         <div id="us-stop-status" class="us-liquidate-status us-check-wide" role="status" aria-live="assertive"></div>
       </form>
       <div class="us-arm-row">
-        <label>To arm live mode, type <code>ARM LIVE TRADING</code>
-          <input id="us-arm-confirmation" autocomplete="off" placeholder="ARM LIVE TRADING">
+        <label class="us-approval-toggle">
+          <input id="us-arm-confirmation" type="checkbox" disabled>
+          <span>I approve live orders for the selected duration</span>
         </label>
         <label>Arm duration
-          <select id="us-arm-duration">
+          <select id="us-arm-duration" disabled>
             <option value="1800">30 minutes</option>
             <option value="3600">1 hour</option>
             <option value="7200">2 hours</option>
             <option value="14400">4 hours</option>
           </select>
         </label>
-        <button class="danger" id="us-arm" type="button">Arm for 30 minutes</button>
+        <button class="danger" id="us-arm" type="button" disabled>Arm for 30 minutes</button>
+      </div>
+      <div id="us-live-control-hint" class="field-note us-live-control-hint">
+        Switch to the live lane to arm or disarm real orders. Dry-run automation can run without arming.
       </div>
       <div class="notice us-safety-note"><strong>Recommended rollout:</strong> start with strict mode or the core-gates preset and run dry-run until the journal shows exact event/line mappings and exits you agree with. Selective mode changes only which existing engine gate results this execution sidecar requires; it never changes their calculations. Live mode still requires positive source edge and every authenticated US execution safeguard.</div>
     </section>
 
-    <div class="us-activity-grid section-gap">
+    <div class="us-activity-grid section-gap" id="us-activity">
       <section class="panel pad us-positions-panel">
         <div class="browse-head">
           <div>
@@ -401,8 +670,8 @@
             </label>
           </fieldset>
           <label id="us-liquidate-confirm-row" class="us-liquidate-confirm" hidden>
-            Confirm live bulk sale
-            <input id="us-liquidate-confirmation" autocomplete="off" placeholder="SELL ALL LIVE POSITIONS">
+            <input id="us-liquidate-confirmation" type="checkbox">
+            <span>I approve attempts to sell every open live position</span>
           </label>
           <button class="danger" id="us-liquidate-submit" type="submit">Stop automation + wipe dry-run trades now</button>
           <div id="us-liquidate-status" class="us-liquidate-status" role="status" aria-live="polite"></div>
@@ -443,7 +712,64 @@
       </section>
     </div>
 
-    <section class="panel pad">
+    <section class="panel pad section-gap model-lab-panel research-anchor" id="us-model-lab">
+      <div class="browse-head">
+        <div>
+          <h2 class="title">Sport Model Lab</h2>
+          <div class="field-note">Local research only. It records the existing engine output beside sport-specific live state and price movement, then labels observations after the final. The MLB candidate is state-aware, not a momentum score. It never changes a production probability, activates a model, or authorizes a trade.</div>
+        </div>
+        <div class="model-lab-actions">
+          <button class="ghost compact-button" id="model-lab-export" type="button">Archive research snapshot</button>
+          <button class="ghost compact-button" id="model-lab-refresh" type="button">Refresh lab</button>
+        </div>
+      </div>
+      <div class="notice us-safety-note"><strong>No silent learning:</strong> fitting creates a versioned comparison candidate with a chronological event-block test. Promotion remains a separate reviewed process and is not available from this screen.</div>
+      <details class="advanced research-evidence-transfer">
+        <summary>Merge local and hosted research evidence</summary>
+        <div class="field-note">Download a secret-free archive from the local workstation, then upload that same file on the hosted site. Imports are idempotent and include closed trade outcomes, settings-at-entry, audit rows, adaptive-exit labels, and Model Lab observations. Open positions, orders, credentials, cookies, and execution controls are excluded.</div>
+        <div class="research-evidence-actions">
+          <button class="ghost compact-button" id="research-evidence-export" type="button">Download evidence archive</button>
+          <input id="research-evidence-file" type="file" accept=".gz,application/gzip">
+          <button class="primary compact-button" id="research-evidence-import" type="button">Merge selected archive</button>
+        </div>
+        <div id="research-evidence-status" class="refresh-status" role="status" aria-live="polite"></div>
+      </details>
+      <div id="model-lab-status" class="refresh-status" role="status" aria-live="polite">Loading sport readiness and observations...</div>
+      <div id="model-lab-archive-status" class="model-lab-archive-status"></div>
+      <div id="model-lab-targets" class="model-lab-targets"></div>
+      <div id="model-lab-profiles" class="model-lab-profiles"></div>
+      <div id="mlb-model-blueprint" class="mlb-model-blueprint"></div>
+      <div class="model-lab-grid">
+        <div>
+          <h3>Collected segments</h3>
+          <div id="model-lab-segments" class="model-lab-segments"><div class="metrics-empty">No observations yet.</div></div>
+        </div>
+        <div>
+          <h3>Manual candidate fit</h3>
+          <form id="model-lab-fit-form" class="model-lab-fit-form">
+            <label>Sport
+              <select id="model-lab-fit-sport">
+                <option value="basketball">Basketball</option>
+                <option value="football">Football</option>
+                <option value="hockey">Hockey</option>
+                <option value="soccer">Soccer</option>
+                <option value="baseball">Baseball / MLB</option>
+                <option value="tennis">Tennis (blocked pending state)</option>
+              </select>
+            </label>
+            <label>League (optional exact segment)
+              <input id="model-lab-fit-league" maxlength="50" placeholder="NBA, NFL, NHL, MLS...">
+            </label>
+            <button class="primary" id="model-lab-fit-submit" type="submit">Fit research candidate</button>
+          </form>
+          <div id="model-lab-fit-result" class="model-lab-fit-result">No candidate has been fitted in this session.</div>
+        </div>
+      </div>
+      <h3>Recent live-state observations</h3>
+      <div id="model-lab-momentum" class="model-lab-momentum"><div class="metrics-empty">Waiting for moneyline observations.</div></div>
+    </section>
+
+    <section class="panel pad research-anchor" id="us-market-browser">
       <div class="browse-head">
         <div>
           <h2 class="title">US/mobile sports inventory</h2>
@@ -458,7 +784,7 @@
   </div>
 
   <!-- CUSTOM BOTS & METRICS (hidden at runtime when paper bots are disabled) -->
-  <div id="tab-bots" class="tab-content is-hidden">
+  <div id="tab-bots" class="tab-content is-hidden" role="tabpanel" aria-labelledby="bots-tab-button">
     <div class="panel pad section-gap accent-border">
       <h2 class="title accent-text">Create Custom Bot</h2>
       <div class="error" id="bot-error" role="alert" hidden></div>
@@ -549,6 +875,6 @@
 
 
 <script src="/static/csrf.js" defer></script>
-<script src="/static/index.js?v=fortnite-lobby-1" defer></script>
+<script src="/static/index.js?v=hosted-research-lobby-2" defer></script>
 </body>
 </html>

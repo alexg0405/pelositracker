@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import logging
 import os
 import re
+import tempfile
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -13,11 +16,21 @@ import secrets
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from fastapi import FastAPI, HTTPException, Request, Response, Depends, Form
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
+from starlette.background import BackgroundTask
 
 from .engine import SignalEngine
 from . import __version__, backtest, shadow_eval
@@ -61,6 +74,7 @@ from .telemetry import memory_snapshot, runtime_telemetry, start_memory_trace
 from .identity import (CanonicalEvent, MappingDecision, MappingStatus)
 from .domain.time import parse_provider_timestamp
 from .http_clients import close_shared_client, open_shared_client
+from .mlb_live import is_mlb_event, mlb_linescore_poll
 from .notify import notify_webhook
 from .polymarket_us_research import (
     AUTHENTICATED_BASE_URL as POLYMARKET_US_AUTHENTICATED_BASE_URL,
@@ -71,10 +85,16 @@ from .polymarket_us_research import (
     fetch_public_sports_events as fetch_polymarket_us_events,
 )
 from .polymarket_us_trading import (
-    LIVE_POSITION_EXIT_PHRASE,
     MAX_ARM_SECONDS,
     PolymarketUSAutoTrader,
     TradingPolicyError,
+)
+from .approval import approval_granted, approval_instruction
+from .sport_model_lab import SportModelLab, _baseball_live_state
+from .research_bundle import (
+    ResearchBundleError,
+    merge_research_bundle,
+    write_research_bundle,
 )
 
 
@@ -88,6 +108,8 @@ account_book: AccountBook | None = None
 history_db: HistoryDB | None = None
 monitor_state: MonitorState | None = None
 live_trader: PolymarketUSAutoTrader | None = None
+dry_run_trader: PolymarketUSAutoTrader | None = None
+model_lab: SportModelLab | None = None
 engine = SignalEngine(settings.confidence_threshold,
                       settings.edge_threshold,
                       settings.max_data_age_seconds,
@@ -131,7 +153,11 @@ _sports_status_compact: "OrderedDict[str, dict]" = OrderedDict()
 _sports_status_detail: dict[str, dict] = {}
 _SPORTS_STATUS_TTL_SECONDS = 600.0  # drop slugs untouched for 10 min
 _SPORTS_STATUS_MAX = 512  # hard cap on compact entries (LRU eviction)
-_config_state = {"auto_monitor": False, "odds_api_enabled": True}
+_config_state = {
+    "auto_monitor": False,
+    "odds_api_enabled": True,
+    "odds_api_poll_seconds": settings.odds_poll_seconds,
+}
 
 _auth_users_env = os.getenv("AUTHORIZED_USERS")
 if _auth_users_env:
@@ -164,6 +190,17 @@ async def verify_auth(request: Request):
                 or not secrets.compare_digest(header, session.csrf_token)):
             raise HTTPException(status_code=403, detail="CSRF validation failed")
     request.state.session = session
+
+
+async def verify_execution_admin(request: Request):
+    """Restrict account credentials and evidence imports to the site operator."""
+    await verify_auth(request)
+    username = request.state.session.username
+    sole_authorized_user = (
+        len(AUTHORIZED_USERS) == 1 and username in AUTHORIZED_USERS
+    )
+    if username != settings.admin_username and not sole_authorized_user:
+        raise HTTPException(status_code=403, detail="Operator access required")
 
 def _notify_subscribers() -> None:
     """Wake every SSE client that a snapshot changed (coalesced per client)."""
@@ -764,6 +801,15 @@ async def record(event_id: str, *, as_of: datetime | None = None) -> None:
         # Ledger commits fsync to disk; keep that off the event loop.
         if ledger is not None and event is not None and signals:
             await asyncio.to_thread(ledger.record_signals, event, signals)
+        if model_lab is not None and event is not None and signals:
+            await asyncio.to_thread(
+                model_lab.record,
+                event,
+                signals,
+                store.quote_values(event_id),
+                list(store.states.get(event_id, [])),
+                as_of=decision_at,
+            )
         # A terminal state can arrive while the ledger write is in flight. It
         # closes the gate immediately; do not begin a new account entry after it.
         if event_id in _terminal_events or event_id in _finalized:
@@ -887,6 +933,10 @@ async def finalize_event(event_id: str, *, canceled: bool = False) -> None:
                     ledger.void_event(event_id, status="canceled")
                 if account_book is not None:
                     account_book.void_event(event_id)
+                if model_lab is not None and event is not None:
+                    model_lab.settle_event(
+                        event, settle_home, settle_away, canceled=True
+                    )
                 return
             if ledger is not None:
                 ledger.snapshot_closing(event_id)
@@ -898,6 +948,8 @@ async def finalize_event(event_id: str, *, canceled: bool = False) -> None:
                 prior = _pregame.get(event_id, {})
                 final_state = states[-1] if states else None
                 history_db.log_outcome(event, prior.get("spread"), prior.get("total"), final_state)
+            if model_lab is not None and event is not None and states:
+                model_lab.settle_event(event, settle_home, settle_away)
 
         await asyncio.to_thread(_writes)
         if monitor_state is not None:
@@ -934,92 +986,168 @@ async def auto_monitor_loop():
         await asyncio.sleep(60)
 
 
-def _live_trading_snapshot() -> list[tuple[Event, list]]:
+def _live_trading_snapshot() -> tuple[
+    list[tuple[Event, list]],
+    dict[str, GameState],
+]:
     """Take one small, internally consistent input snapshot for the sidecar.
 
     Signals are immutable for the duration of a cycle from the trader's point of
     view.  The existing engine and live store remain the sole calculation path.
     """
     with store.lock:
-        return [
+        monitored = [
             (event, list(store.signals.get(event.id, [])))
             for event in store.events.values()
             if event.id not in _terminal_events and event.id not in _finalized
         ]
+        latest_states = {
+            event.id: store.states[event.id][-1]
+            for event, _ in monitored
+            if store.states.get(event.id)
+        }
+        return monitored, latest_states
 
 
-async def _run_live_trading_cycle() -> dict[str, Any]:
-    if live_trader is None:
+async def _run_execution_trading_cycle(
+    trader: PolymarketUSAutoTrader,
+) -> dict[str, Any]:
+    """Run one isolated automation lane against the shared read-only inputs."""
+    if trader is None:
         raise TradingPolicyError(
             "Polymarket US execution is disabled on this deployment"
         )
-    snapshot = _live_trading_snapshot()
-    if not live_trader.policy.automation_enabled:
-        return await asyncio.to_thread(
-            live_trader.run_cycle, snapshot, {"events": []}
+    snapshot, game_states = _live_trading_snapshot()
+    if not trader.policy.automation_enabled:
+        result = await asyncio.to_thread(
+            trader.run_cycle,
+            snapshot,
+            {"events": []},
+            game_states=game_states,
         )
-    if not snapshot:
-        return await asyncio.to_thread(
-            live_trader.run_cycle, snapshot, {"events": []}
+    elif not snapshot:
+        result = await asyncio.to_thread(
+            trader.run_cycle,
+            snapshot,
+            {"events": []},
+            game_states=game_states,
         )
-    payload = await fetch_polymarket_us_events(limit=500)
-    return await asyncio.to_thread(live_trader.run_cycle, snapshot, payload)
+    else:
+        payload = await fetch_polymarket_us_events(limit=500)
+        result = await asyncio.to_thread(
+            trader.run_cycle,
+            snapshot,
+            payload,
+            game_states=game_states,
+        )
+    if model_lab is not None:
+        positions = await asyncio.to_thread(
+            trader.positions,
+            include_hidden=True,
+        )
+        await asyncio.to_thread(model_lab.link_execution_results, positions)
+    return result
 
 
-async def live_trading_loop():
+async def _run_live_trading_cycle() -> dict[str, Any]:
+    """Backward-compatible primary-lane helper used by existing API callers."""
+    return await _run_execution_trading_cycle(_require_live_trader())
+
+
+async def execution_trading_loop(
+    trader: PolymarketUSAutoTrader,
+    *,
+    lane: Literal["live", "dry_run"],
+):
     while True:
         delay = 30
         try:
-            if live_trader is not None:
-                delay = live_trader.policy.cycle_seconds
-                if live_trader.policy.automation_enabled:
-                    await _run_live_trading_cycle()
-                elif any(
+            delay = trader.policy.cycle_seconds
+            if trader.policy.automation_enabled:
+                await _run_execution_trading_cycle(trader)
+            elif lane == "live" and any(
                     position["mode"] == "live"
                     for position in await asyncio.to_thread(
-                        live_trader.positions,
+                        trader.positions,
                         open_only=True,
                     )
-                ):
-                    # Read-only reconciliation continues while automation is
-                    # off so a phone-side sale is reflected locally. This path
-                    # never previews, creates, modifies, or cancels an order.
-                    await asyncio.to_thread(
-                        live_trader.synchronize_live_positions
-                    )
+            ):
+                # Read-only reconciliation continues while live automation is
+                # off so a phone-side sale is reflected locally. The isolated
+                # dry-run lane never authenticates or reconciles venue orders.
+                await asyncio.to_thread(trader.synchronize_live_positions)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("Polymarket US automation cycle failed: %s", exc)
+            logger.warning(
+                "Polymarket US %s automation cycle failed: %s",
+                lane,
+                exc,
+            )
         await asyncio.sleep(max(10, delay))
+
+
+async def live_trading_loop():
+    """Backward-compatible loop for the primary live lane."""
+    trader = _require_live_trader()
+    await execution_trading_loop(trader, lane="live")
+
+
+def _pin_execution_lane(
+    trader: PolymarketUSAutoTrader,
+    mode: Literal["live", "dry_run"],
+) -> None:
+    """Keep a workstation lane permanently assigned to one execution mode."""
+    if trader.policy.execution_mode == mode:
+        return
+    trader.configure({
+        "execution_mode": mode,
+        "automation_enabled": False,
+    })
 
 
 def _start_event_feeds(event: Event) -> None:
     group = []
     if event.polymarket_slug:
         group.append(asyncio.create_task(
-            polymarket_market_stream(event, on_quotes, on_polymarket_snapshot)
+            polymarket_market_stream(
+                event,
+                on_quotes,
+                on_polymarket_snapshot,
+                on_state,
+            )
         ))
     if event.odds_api_sport:
         group.append(asyncio.create_task(odds_api_poll(
             event,
             on_quotes,
             enabled=lambda: _config_state["odds_api_enabled"],
+            interval_seconds=lambda: _config_state.get(
+                "odds_api_poll_seconds",
+                settings.odds_poll_seconds,
+            ),
         )))
         if settings.enable_action_network:
             group.append(asyncio.create_task(action_network_poll(event, on_quotes)))
         if settings.enable_pinnacle_guest:
             group.append(asyncio.create_task(pinnacle_poll(
                 event, on_quotes, api_key=settings.pinnacle_guest_api_key)))
+    if settings.enable_mlb_live_feed and is_mlb_event(event):
+        group.append(asyncio.create_task(mlb_linescore_poll(
+            event,
+            on_state,
+            interval_seconds=settings.mlb_live_poll_seconds,
+        )))
     tasks[event.id] = group
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global ledger, account_book, history_db, monitor_state, live_trader
+    global ledger, account_book, history_db, monitor_state
+    global live_trader, dry_run_trader, model_lab
     sports_task: asyncio.Task | None = None
     auto_task: asyncio.Task | None = None
-    live_trading_task: asyncio.Task | None = None
+    execution_tasks: list[asyncio.Task] = []
     if settings.enable_memory_trace:
         start_memory_trace()
     open_shared_client()  # shared keep-alive pool for one-shot provider fetches
@@ -1030,9 +1158,37 @@ async def lifespan(_: FastAPI):
         monitor_state = MonitorState()
         live_trader = (
             PolymarketUSAutoTrader(
-                str(settings.polymarket_us_trading_db),
+                (
+                    str(settings.polymarket_us_trading_db)
+                    if settings.workstation_mode
+                    else None
+                ),
                 key_id=settings.polymarket_us_key_id,
                 secret_key=settings.polymarket_us_secret_key,
+            )
+            if (
+                settings.workstation_mode
+                or settings.enable_polymarket_us_trading
+            )
+            else None
+        )
+        dry_run_trader = (
+            PolymarketUSAutoTrader(
+                str(settings.polymarket_us_dry_run_db),
+                key_id=settings.polymarket_us_key_id,
+                secret_key=settings.polymarket_us_secret_key,
+            )
+            if settings.workstation_mode and live_trader is not None
+            else None
+        )
+        if dry_run_trader is not None:
+            _pin_execution_lane(live_trader, "live")
+            _pin_execution_lane(dry_run_trader, "dry_run")
+        model_lab = (
+            SportModelLab(
+                str(settings.model_lab_db)
+                if settings.workstation_mode
+                else None
             )
             if (
                 settings.workstation_mode
@@ -1044,6 +1200,9 @@ async def lifespan(_: FastAPI):
             account_book.seed(DEFAULT_STRATEGIES)
         _config_state["auto_monitor"] = monitor_state.auto_monitor(False)
         _config_state["odds_api_enabled"] = monitor_state.odds_api_enabled(True)
+        _config_state["odds_api_poll_seconds"] = (
+            monitor_state.odds_api_poll_seconds(settings.odds_poll_seconds)
+        )
         for event in monitor_state.events():
             if not game_start_matches_slug(
                 event.polymarket_slug, event.game_start
@@ -1065,7 +1224,13 @@ async def lifespan(_: FastAPI):
             lambda: list(store.events.values()), on_state, on_sports_status))
         auto_task = asyncio.create_task(auto_monitor_loop())
         if live_trader is not None:
-            live_trading_task = asyncio.create_task(live_trading_loop())
+            execution_tasks.append(asyncio.create_task(
+                execution_trading_loop(live_trader, lane="live")
+            ))
+        if dry_run_trader is not None:
+            execution_tasks.append(asyncio.create_task(
+                execution_trading_loop(dry_run_trader, lane="dry_run")
+            ))
         yield
     finally:
         # Close the entry gate, then let any already-running record() section
@@ -1081,8 +1246,7 @@ async def lifespan(_: FastAPI):
             background.append(sports_task)
         if auto_task is not None:
             background.append(auto_task)
-        if live_trading_task is not None:
-            background.append(live_trading_task)
+        background.extend(execution_tasks)
         background.extend(_notification_tasks)
         _notification_tasks.clear()
         await _cancel_tasks(background)
@@ -1091,7 +1255,13 @@ async def lifespan(_: FastAPI):
         await close_shared_client()
 
         for database_store in (
-            ledger, account_book, history_db, monitor_state, live_trader
+            ledger,
+            account_book,
+            history_db,
+            monitor_state,
+            live_trader,
+            dry_run_trader,
+            model_lab,
         ):
             if database_store is not None:
                 try:
@@ -1104,6 +1274,8 @@ async def lifespan(_: FastAPI):
         history_db = None
         monitor_state = None
         live_trader = None
+        dry_run_trader = None
+        model_lab = None
         with store.lock:
             store.events.clear()
             store.states.clear()
@@ -1194,14 +1366,26 @@ class StrategyUpdateIn(BaseModel):
 class ConfigIn(BaseModel):
     auto_monitor: bool | None = None
     odds_api_enabled: bool | None = None
+    odds_api_poll_seconds: float | None = Field(default=None, ge=5, le=3600)
 
 
 class LiveTradingConfigIn(BaseModel):
     automation_enabled: bool | None = None
     execution_mode: str | None = None
     auto_cashout: bool | None = None
+    adaptive_exit_enabled: bool | None = None
+    adaptive_exit_profile: str | None = None
+    adaptive_exit_horizon_minutes: float | None = None
+    adaptive_exit_min_samples: int | None = None
+    adaptive_exit_max_tightening: float | None = None
+    volatility_stop_enabled: bool | None = None
+    stop_confirmation_readings: int | None = None
+    stop_grace_minutes: float | None = None
+    catastrophic_stop_multiplier: float | None = None
+    post_exit_tracking_minutes: float | None = None
     require_engine_entry: bool | None = None
     required_engine_gates: list[str] | None = None
+    allowed_market_types: list[str] | None = None
     trading_allocation_usd: float | None = None
     risk_preset: str | None = None
     max_total_exposure_usd: float | None = None
@@ -1212,6 +1396,7 @@ class LiveTradingConfigIn(BaseModel):
     max_open_positions: int | None = None
     max_orders_per_hour: int | None = None
     min_edge: float | None = None
+    max_edge: float | None = None
     min_signal_quality: float | None = None
     min_reference_sources: int | None = None
     min_entry_price: float | None = None
@@ -1225,6 +1410,8 @@ class LiveTradingConfigIn(BaseModel):
     exit_edge: float | None = None
     cycle_seconds: int | None = None
     candidate_cooldown_seconds: int | None = None
+    max_entries_per_event_per_hour: int | None = None
+    min_mlb_fraction_remaining: float | None = None
 
 
 class LiveTradingArmIn(BaseModel):
@@ -1241,12 +1428,45 @@ class DryRunHistoryClearIn(BaseModel):
     confirmation: str
 
 
+class AdaptiveExitHistoryClearIn(BaseModel):
+    confirmation: str
+
+
 class LiveTradingPositionExitIn(BaseModel):
     confirmation: str = ""
 
 
 class LivePerformanceResetIn(BaseModel):
     confirmation: str
+
+
+class RiskSessionResetIn(BaseModel):
+    confirmation: str
+
+
+class PolicyAdviceIn(BaseModel):
+    objective: Literal["protect_profit", "balanced", "more_trades"] = "balanced"
+    target_trades_per_hour: float = Field(default=4.0, ge=0.25, le=30)
+    analysis_mode: Literal["dry_run", "live"] | None = None
+    lookback_days: Literal[0, 7, 30, 90, 180, 365] = 0
+    market_types: list[Literal["moneyline", "spread", "total"]] = Field(
+        default_factory=lambda: ["moneyline", "spread", "total"]
+    )
+
+
+class PolicyAdviceApplyIn(BaseModel):
+    confirmation: str
+
+
+class ModelLabFitIn(BaseModel):
+    sport: str = Field(min_length=1, max_length=50)
+    league: str = Field(default="", max_length=50)
+    market: Literal["moneyline"] = "moneyline"
+
+
+class RuntimeCredentialsIn(BaseModel):
+    key_id: str = Field(min_length=1, max_length=1_000)
+    secret_key: SecretStr
 
 
 @app.get("/")
@@ -1372,16 +1592,28 @@ async def config():
         "max_age_seconds": engine.max_age_seconds,
         "auto_monitor": _config_state["auto_monitor"],
         "odds_api_enabled": _config_state["odds_api_enabled"],
-        "odds_api_poll_seconds": settings.odds_poll_seconds,
+        "odds_api_poll_seconds": _config_state.get(
+            "odds_api_poll_seconds",
+            settings.odds_poll_seconds,
+        ),
         "workstation": {
             "enabled": settings.workstation_mode,
             "paper_bots_enabled": settings.enable_paper_bots,
             "polymarket_us_trading_enabled": live_trader is not None,
-            "polymarket_us": polymarket_us_credential_status(
-                settings.polymarket_us_key_id,
-                settings.polymarket_us_secret_key,
+            "polymarket_us": (
+                live_trader.credential_status()
+                if live_trader is not None
+                else polymarket_us_credential_status(
+                    settings.polymarket_us_key_id,
+                    settings.polymarket_us_secret_key,
+                )
             ),
             "live_trading": live_trader.status() if live_trader is not None else None,
+            "dry_run_trading": (
+                dry_run_trader.status()
+                if dry_run_trader is not None
+                else None
+            ),
         },
         "paper_bot_policy": {
             "enabled": settings.enable_paper_bots,
@@ -1406,11 +1638,27 @@ async def update_config(payload: ConfigIn):
                 monitor_state.set_odds_api_enabled,
                 payload.odds_api_enabled,
             )
+    if payload.odds_api_poll_seconds is not None:
+        _config_state["odds_api_poll_seconds"] = payload.odds_api_poll_seconds
+        if monitor_state is not None:
+            await asyncio.to_thread(
+                monitor_state.set_odds_api_poll_seconds,
+                payload.odds_api_poll_seconds,
+            )
     return await config()
 
 
 _discover_cache: dict = {"at": 0.0, "data": []}
 _polymarket_us_cache: dict = {"at": 0.0, "data": None}
+
+
+def _active_polymarket_us_credentials() -> tuple[str, str]:
+    if live_trader is not None:
+        return live_trader._credential_pair_for_server()
+    return (
+        settings.polymarket_us_key_id,
+        settings.polymarket_us_secret_key,
+    )
 
 
 @app.get("/api/discover", dependencies=[Depends(verify_auth)])
@@ -1438,15 +1686,20 @@ async def polymarket_us_status():
         "venue": "Polymarket US",
         "public_base_url": POLYMARKET_US_PUBLIC_BASE_URL,
         "authenticated_base_url": POLYMARKET_US_AUTHENTICATED_BASE_URL,
-        **polymarket_us_credential_status(
-            settings.polymarket_us_key_id,
-            settings.polymarket_us_secret_key,
+        **(
+            live_trader.credential_status()
+            if live_trader is not None
+            else polymarket_us_credential_status(
+                settings.polymarket_us_key_id,
+                settings.polymarket_us_secret_key,
+            )
         ),
     }
     if live_trader is not None:
         result.update({
             "trading_enabled": True,
             "automation": live_trader.status(),
+            "automation_lanes": await _execution_lane_summaries(),
         })
     return result
 
@@ -1470,19 +1723,95 @@ async def polymarket_us_events(refresh: bool = False, limit: int = 60):
 @app.get("/api/polymarket-us/account", dependencies=[Depends(verify_auth)])
 async def polymarket_us_account():
     """Read account balances and every position, including unmanaged positions."""
-    if not settings.polymarket_us_key_id or not settings.polymarket_us_secret_key:
+    key_id, secret_key = _active_polymarket_us_credentials()
+    if not key_id or not secret_key:
         raise HTTPException(
             409,
-            "Add POLYMARKET_US_KEY_ID and POLYMARKET_US_SECRET_KEY to .env, then restart",
+            "Add a session key below or configure POLYMARKET_US_KEY_ID and "
+            "POLYMARKET_US_SECRET_KEY in the server environment",
         )
     try:
         return await fetch_polymarket_us_account(
-            settings.polymarket_us_key_id,
-            settings.polymarket_us_secret_key,
+            key_id,
+            secret_key,
         )
     except PolymarketUSResearchError as exc:
         logger.warning("Polymarket US read-only account check failed: %s", exc)
         raise HTTPException(502, f"Polymarket US authentication failed: {exc}") from exc
+
+
+@app.post(
+    "/api/polymarket-us/runtime-credentials",
+    dependencies=[Depends(verify_execution_admin)],
+)
+async def polymarket_us_runtime_credentials(payload: RuntimeCredentialsIn):
+    """Verify and install a key in process memory only.
+
+    The request body is never logged or persisted. Installing a different
+    account revokes automation authority and is rejected while a live managed
+    position is open.
+    """
+    trader = _require_live_trader()
+    key_id = payload.key_id.strip()
+    secret_key = payload.secret_key.get_secret_value().strip()
+    if not secret_key:
+        raise HTTPException(422, "Secret Key is required")
+    try:
+        account = await fetch_polymarket_us_account(key_id, secret_key)
+        status = await asyncio.to_thread(
+            trader.set_runtime_credentials,
+            key_id,
+            secret_key,
+            source="runtime",
+        )
+    except PolymarketUSResearchError as exc:
+        logger.warning("Runtime Polymarket US credential verification failed")
+        raise HTTPException(502, f"Polymarket US authentication failed: {exc}") from exc
+    except TradingPolicyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    balances = account.get("balances") if isinstance(account, dict) else []
+    positions = account.get("positions") if isinstance(account, dict) else {}
+    return {
+        "status": "verified",
+        "credentials": status,
+        "account": {
+            "balance_records": len(balances) if isinstance(balances, list) else 0,
+            "position_records": len(positions) if isinstance(positions, dict) else 0,
+            "fetched_at": account.get("fetched_at") if isinstance(account, dict) else None,
+        },
+        "automation_stopped": True,
+        "message": (
+            "Credential verified and held in server process memory only. "
+            "Review the account, then explicitly enable and arm automation."
+        ),
+    }
+
+
+@app.delete(
+    "/api/polymarket-us/runtime-credentials",
+    dependencies=[Depends(verify_execution_admin)],
+)
+async def clear_polymarket_us_runtime_credentials():
+    trader = _require_live_trader()
+    source = (
+        "environment"
+        if settings.polymarket_us_key_id and settings.polymarket_us_secret_key
+        else "none"
+    )
+    try:
+        status = await asyncio.to_thread(
+            trader.set_runtime_credentials,
+            settings.polymarket_us_key_id,
+            settings.polymarket_us_secret_key,
+            source=source,
+        )
+    except TradingPolicyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "status": "runtime_credentials_forgotten",
+        "credentials": status,
+        "automation_stopped": True,
+    }
 
 
 def _require_live_trader() -> PolymarketUSAutoTrader:
@@ -1495,12 +1824,136 @@ def _require_live_trader() -> PolymarketUSAutoTrader:
     return live_trader
 
 
+def _require_execution_lane(
+    lane: Literal["live", "dry_run"] | None = None,
+) -> PolymarketUSAutoTrader:
+    """Return one isolated local automation lane.
+
+    Omitting ``lane`` preserves the original single-trader API behavior for
+    existing clients and deployments. The workstation UI always names a lane.
+    """
+    if lane == "dry_run":
+        if dry_run_trader is None:
+            if settings.workstation_mode:
+                raise HTTPException(
+                    409,
+                    "The isolated dry-run lane is unavailable; restart the "
+                    "local workstation.",
+                )
+            return _require_live_trader()
+        return dry_run_trader
+    return _require_live_trader()
+
+
+async def _execution_lane_summaries() -> dict[str, dict[str, Any]]:
+    summaries: dict[str, dict[str, Any]] = {}
+    for lane, trader in (
+        ("live", live_trader),
+        ("dry_run", dry_run_trader),
+    ):
+        if trader is None:
+            continue
+        status = await asyncio.to_thread(trader.status)
+        policy = status.get("policy") or {}
+        summaries[lane] = {
+            "lane": lane,
+            "automation_enabled": bool(policy.get("automation_enabled")),
+            "armed": bool(status.get("armed")),
+            "auto_cashout": bool(policy.get("auto_cashout")),
+            "open_positions": int(status.get("open_managed_positions") or 0),
+            "managed_exposure_usd": float(
+                status.get("managed_exposure_usd") or 0.0
+            ),
+            "last_cycle_summary": status.get("last_cycle_summary"),
+            "cycle_seconds": policy.get("cycle_seconds"),
+        }
+    return summaries
+
+
+async def _decorate_execution_status(
+    status: dict[str, Any],
+    *,
+    lane: Literal["live", "dry_run"] | None,
+    trader: PolymarketUSAutoTrader,
+) -> dict[str, Any]:
+    """Attach lane identity and both scheduler summaries to an action result."""
+    status["lane"] = lane or trader.policy.execution_mode
+    status["lanes"] = await _execution_lane_summaries()
+    return status
+
+
 @app.get(
     "/api/polymarket-us/trading/status",
     dependencies=[Depends(verify_auth)],
 )
-async def polymarket_us_trading_status():
-    return await asyncio.to_thread(_require_live_trader().status)
+async def polymarket_us_trading_status(
+    lane: Literal["live", "dry_run"] | None = None,
+):
+    trader = _require_execution_lane(lane)
+    status = await asyncio.to_thread(trader.status)
+    positions = await asyncio.to_thread(trader.positions, open_only=True)
+    mlb_events = {
+        event.id: event
+        for event in store.events.values()
+        if "baseball" in f"{event.sport} {event.league}".casefold()
+        or "mlb" in f"{event.sport} {event.league}".casefold()
+    }
+    state_ready_events = {
+        event_id
+        for event_id in mlb_events
+        if store.states.get(event_id)
+        and _baseball_live_state(
+            store.states[event_id][-1].period,
+            store.states[event_id][-1].clock,
+        )
+        is not None
+    }
+    eligible_positions = [
+        position
+        for position in positions
+        if str(position.get("event_id")) in mlb_events
+        and line_type(str(position.get("market_type") or ""))
+        in {"moneyline", "spread", "total"}
+    ]
+    eligible_state_positions = [
+        position
+        for position in eligible_positions
+        if str(position.get("event_id")) in state_ready_events
+    ]
+    adaptive = status.get("adaptive_exit") or {}
+    adaptive.update(
+        monitored_mlb_events=len(mlb_events),
+        live_state_mlb_events=len(state_ready_events),
+        eligible_open_positions=len(eligible_positions),
+        eligible_state_positions=len(eligible_state_positions),
+    )
+    if not adaptive.get("enabled"):
+        adaptive["collection_note"] = (
+            "Adaptive exit observation is disabled."
+        )
+    elif not eligible_positions:
+        adaptive["collection_note"] = (
+            "Adaptive exits learn executable movement while a managed MLB "
+            "moneyline, run-line, or total position is open; monitoring a game "
+            "alone populates the "
+            "separate Sport Model Lab."
+        )
+    elif not eligible_state_positions:
+        adaptive["collection_note"] = (
+            "An eligible MLB position is open, but no usable inning "
+            "state has arrived yet."
+        )
+    else:
+        adaptive["collection_note"] = (
+            "Eligible managed MLB positions have usable game state; "
+            "observations are retained in 30-second buckets when marked."
+        )
+    status["adaptive_exit"] = adaptive
+    return await _decorate_execution_status(
+        status,
+        lane=lane,
+        trader=trader,
+    )
 
 
 @app.post(
@@ -1523,27 +1976,62 @@ async def polymarket_us_trading_sync():
     "/api/polymarket-us/trading/config",
     dependencies=[Depends(verify_auth)],
 )
-async def polymarket_us_trading_config(payload: LiveTradingConfigIn):
-    trader = _require_live_trader()
+async def polymarket_us_trading_config(
+    payload: LiveTradingConfigIn,
+    lane: Literal["live", "dry_run"] | None = None,
+):
+    trader = _require_execution_lane(lane)
     try:
         values = payload.model_dump(exclude_none=True)
+        if lane is not None:
+            values["execution_mode"] = lane
         await asyncio.to_thread(trader.configure, values)
-        return await asyncio.to_thread(trader.status)
+        status = await asyncio.to_thread(trader.status)
+        return await _decorate_execution_status(
+            status,
+            lane=lane,
+            trader=trader,
+        )
     except TradingPolicyError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete(
+    "/api/polymarket-us/trading/adaptive-exit/history",
+    dependencies=[Depends(verify_auth)],
+)
+async def polymarket_us_trading_clear_adaptive_exit_history(
+    payload: AdaptiveExitHistoryClearIn,
+    lane: Literal["live", "dry_run"] | None = None,
+):
+    try:
+        return await asyncio.to_thread(
+            _require_execution_lane(lane).clear_adaptive_exit_history,
+            payload.confirmation,
+        )
+    except TradingPolicyError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.post(
     "/api/polymarket-us/trading/arm",
     dependencies=[Depends(verify_auth)],
 )
-async def polymarket_us_trading_arm(payload: LiveTradingArmIn):
-    trader = _require_live_trader()
+async def polymarket_us_trading_arm(
+    payload: LiveTradingArmIn,
+    lane: Literal["live", "dry_run"] | None = None,
+):
+    trader = _require_execution_lane(lane)
     try:
-        return await asyncio.to_thread(
+        status = await asyncio.to_thread(
             trader.arm,
             payload.confirmation,
             seconds=payload.seconds,
+        )
+        return await _decorate_execution_status(
+            status,
+            lane=lane,
+            trader=trader,
         )
     except TradingPolicyError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -1553,18 +2041,37 @@ async def polymarket_us_trading_arm(payload: LiveTradingArmIn):
     "/api/polymarket-us/trading/disarm",
     dependencies=[Depends(verify_auth)],
 )
-async def polymarket_us_trading_disarm():
-    return await asyncio.to_thread(_require_live_trader().disarm, "dashboard")
+async def polymarket_us_trading_disarm(
+    lane: Literal["live", "dry_run"] | None = None,
+):
+    trader = _require_execution_lane(lane)
+    status = await asyncio.to_thread(
+        trader.disarm,
+        "dashboard",
+    )
+    return await _decorate_execution_status(
+        status,
+        lane=lane,
+        trader=trader,
+    )
 
 
 @app.post(
     "/api/polymarket-us/trading/stop",
     dependencies=[Depends(verify_auth)],
 )
-async def polymarket_us_trading_stop():
-    return await asyncio.to_thread(
-        _require_live_trader().stop_automation,
+async def polymarket_us_trading_stop(
+    lane: Literal["live", "dry_run"] | None = None,
+):
+    trader = _require_execution_lane(lane)
+    status = await asyncio.to_thread(
+        trader.stop_automation,
         "dashboard",
+    )
+    return await _decorate_execution_status(
+        status,
+        lane=lane,
+        trader=trader,
     )
 
 
@@ -1572,17 +2079,37 @@ async def polymarket_us_trading_stop():
     "/api/polymarket-us/trading/emergency-stop",
     dependencies=[Depends(verify_auth)],
 )
-async def polymarket_us_trading_emergency_stop():
-    return await asyncio.to_thread(_require_live_trader().emergency_stop)
+async def polymarket_us_trading_emergency_stop(
+    lane: Literal["live", "dry_run"] | None = None,
+):
+    trader = _require_execution_lane(lane)
+    status = await asyncio.to_thread(
+        trader.emergency_stop
+    )
+    return await _decorate_execution_status(
+        status,
+        lane=lane,
+        trader=trader,
+    )
 
 
 @app.post(
     "/api/polymarket-us/trading/run",
     dependencies=[Depends(verify_auth)],
 )
-async def polymarket_us_trading_run():
+async def polymarket_us_trading_run(
+    lane: Literal["live", "dry_run"] | None = None,
+):
+    trader = _require_execution_lane(lane)
     try:
-        return await _run_live_trading_cycle()
+        status = await _run_execution_trading_cycle(
+            trader
+        )
+        return await _decorate_execution_status(
+            status,
+            lane=lane,
+            trader=trader,
+        )
     except TradingPolicyError as exc:
         raise HTTPException(409, str(exc)) from exc
     except Exception as exc:
@@ -1594,8 +2121,16 @@ async def polymarket_us_trading_run():
     "/api/polymarket-us/trading/liquidate",
     dependencies=[Depends(verify_auth)],
 )
-async def polymarket_us_trading_liquidate(payload: LiveTradingLiquidateIn):
-    trader = _require_live_trader()
+async def polymarket_us_trading_liquidate(
+    payload: LiveTradingLiquidateIn,
+    lane: Literal["live", "dry_run"] | None = None,
+):
+    if lane is not None and lane != payload.mode:
+        raise HTTPException(
+            400,
+            "The requested automation lane must match the liquidation mode",
+        )
+    trader = _require_execution_lane(lane)
     try:
         open_positions = await asyncio.to_thread(trader.positions, open_only=True)
         has_target = any(position["mode"] == payload.mode for position in open_positions)
@@ -1623,10 +2158,11 @@ async def polymarket_us_trading_liquidate(payload: LiveTradingLiquidateIn):
 )
 async def polymarket_us_trading_clear_dry_run_history(
     payload: DryRunHistoryClearIn,
+    lane: Literal["live", "dry_run"] | None = None,
 ):
     try:
         return await asyncio.to_thread(
-            _require_live_trader().clear_dry_run_history,
+            _require_execution_lane(lane).clear_dry_run_history,
             payload.confirmation,
         )
     except TradingPolicyError as exc:
@@ -1644,9 +2180,12 @@ async def polymarket_us_trading_exit_position(
     position_id: str,
     payload: LiveTradingPositionExitIn,
 ):
-    trader = _require_live_trader()
     try:
+        trader = _require_live_trader()
         position = await asyncio.to_thread(trader.position, position_id)
+        if position is None and dry_run_trader is not None:
+            trader = dry_run_trader
+            position = await asyncio.to_thread(trader.position, position_id)
         if position is None:
             raise HTTPException(404, "Managed position was not found")
         if position["mode"] == "live":
@@ -1660,10 +2199,10 @@ async def polymarket_us_trading_exit_position(
                     409,
                     "Live trading is disarmed; arm the live-order latch first",
                 )
-            if payload.confirmation != LIVE_POSITION_EXIT_PHRASE:
+            if not approval_granted(payload.confirmation):
                 raise HTTPException(
                     409,
-                    f'Type "{LIVE_POSITION_EXIT_PHRASE}" exactly to sell a live position',
+                    approval_instruction("sell a live position"),
                 )
         us_payload = (
             await fetch_polymarket_us_events(limit=500)
@@ -1693,25 +2232,35 @@ async def polymarket_us_trading_exit_position(
     "/api/polymarket-us/trading/journal",
     dependencies=[Depends(verify_auth)],
 )
-async def polymarket_us_trading_journal(limit: int = 100):
-    return await asyncio.to_thread(_require_live_trader().journal, limit=limit)
+async def polymarket_us_trading_journal(
+    limit: int = 100,
+    lane: Literal["live", "dry_run"] | None = None,
+):
+    return await asyncio.to_thread(
+        _require_execution_lane(lane).journal,
+        limit=limit,
+    )
 
 
 @app.get(
     "/api/polymarket-us/trading/positions",
     dependencies=[Depends(verify_auth)],
 )
-async def polymarket_us_trading_positions():
-    return await asyncio.to_thread(_require_live_trader().positions)
+async def polymarket_us_trading_positions(
+    lane: Literal["live", "dry_run"] | None = None,
+):
+    return await asyncio.to_thread(_require_execution_lane(lane).positions)
 
 
 @app.post(
     "/api/polymarket-us/trading/positions/archive-exited",
     dependencies=[Depends(verify_auth)],
 )
-async def polymarket_us_trading_archive_exited_positions():
+async def polymarket_us_trading_archive_exited_positions(
+    lane: Literal["live", "dry_run"] | None = None,
+):
     return await asyncio.to_thread(
-        _require_live_trader().archive_exited_positions
+        _require_execution_lane(lane).archive_exited_positions
     )
 
 
@@ -1719,8 +2268,211 @@ async def polymarket_us_trading_archive_exited_positions():
     "/api/polymarket-us/trading/performance",
     dependencies=[Depends(verify_auth)],
 )
-async def polymarket_us_trading_performance():
-    return await asyncio.to_thread(_require_live_trader().performance)
+async def polymarket_us_trading_performance(
+    lane: Literal["live", "dry_run"] | None = None,
+):
+    return await asyncio.to_thread(_require_execution_lane(lane).performance)
+
+
+@app.get(
+    "/api/polymarket-us/trading/performance-ledger",
+    dependencies=[Depends(verify_auth)],
+)
+async def polymarket_us_trading_performance_ledger(
+    mode: Literal["all", "dry_run", "live"] = "all",
+    market_type: Literal["all", "moneyline", "spread", "total"] = "all",
+    result: Literal[
+        "all",
+        "open",
+        "win",
+        "loss",
+        "push",
+        "unverified",
+    ] = "all",
+    query: str = "",
+    format: Literal["json", "csv"] = "json",
+    limit: int = 2_000,
+    lane: Literal["live", "dry_run"] | None = None,
+):
+    try:
+        ledger_view = await asyncio.to_thread(
+            _require_execution_lane(lane).performance_ledger,
+            mode=mode,
+            market_type=market_type,
+            result=result,
+            query=query,
+            limit=limit,
+        )
+    except TradingPolicyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if format == "json":
+        return ledger_view
+
+    output = io.StringIO(newline="")
+    columns = (
+        "opened_at",
+        "closed_at",
+        "mode",
+        "result",
+        "event_name",
+        "market_type",
+        "selection",
+        "quantity",
+        "entry_cost",
+        "cost_basis_usd",
+        "realized_net_usd",
+        "return_fraction",
+        "entry_signal_edge",
+        "entry_execution_edge",
+        "entry_signal_quality",
+        "entry_reference_sources",
+        "exit_reason",
+        "policy_session_id",
+        "policy_signature",
+        "entry_policy",
+    )
+    writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore")
+    writer.writeheader()
+
+    def safe_csv_cell(value: Any) -> Any:
+        if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+            return "'" + value
+        return value
+
+    for row in ledger_view["rows"]:
+        export_row = {key: safe_csv_cell(row.get(key)) for key in columns}
+        export_row["entry_policy"] = json.dumps(
+            row.get("entry_policy"),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        writer.writerow(export_row)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="trade-performance-{stamp}.csv"'
+            ),
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+async def _policy_advisor_model_evidence(
+    trader: PolymarketUSAutoTrader,
+) -> dict[str, Any]:
+    positions = await asyncio.to_thread(
+        trader.positions,
+        include_hidden=True,
+    )
+    decision_ids = [
+        str(position["entry_decision_id"])
+        for position in positions
+        if position.get("entry_decision_id")
+    ]
+    if model_lab is None:
+        return {
+            "mode": "unavailable",
+            "engine_impact": "none",
+            "stage": "model_lab_unavailable",
+            "live_eligible": False,
+            "live_blockers": ["local Sport Model Lab is unavailable"],
+            "decision_score_coverage": {
+                "requested": len(decision_ids),
+                "scored": 0,
+            },
+        }
+    await asyncio.to_thread(model_lab.link_execution_results, positions)
+    return await asyncio.to_thread(
+        model_lab.advisory_evidence,
+        decision_ids,
+        sport="baseball",
+    )
+
+
+@app.post(
+    "/api/polymarket-us/trading/policy-advisor/recommend",
+    dependencies=[Depends(verify_auth)],
+)
+async def polymarket_us_trading_policy_advice(
+    payload: PolicyAdviceIn,
+    lane: Literal["live", "dry_run"] | None = None,
+):
+    trader = _require_execution_lane(lane)
+    try:
+        model_evidence = await _policy_advisor_model_evidence(trader)
+        return await asyncio.to_thread(
+            trader.policy_advice,
+            objective=payload.objective,
+            target_trades_per_hour=payload.target_trades_per_hour,
+            model_evidence=model_evidence,
+            analysis_mode=payload.analysis_mode,
+            lookback_days=payload.lookback_days,
+            market_types=payload.market_types,
+        )
+    except TradingPolicyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get(
+    "/api/polymarket-us/trading/policy-advisor/history",
+    dependencies=[Depends(verify_auth)],
+)
+async def polymarket_us_trading_policy_advice_history(
+    limit: int = 10,
+    lane: Literal["live", "dry_run"] | None = None,
+):
+    return await asyncio.to_thread(
+        _require_execution_lane(lane).policy_advice_history,
+        limit=limit,
+    )
+
+
+@app.get(
+    "/api/polymarket-us/trading/policy-advisor/sessions",
+    dependencies=[Depends(verify_auth)],
+)
+async def polymarket_us_trading_policy_sessions(
+    limit: int = 20,
+    lane: Literal["live", "dry_run"] | None = None,
+):
+    return await asyncio.to_thread(
+        _require_execution_lane(lane).policy_sessions,
+        limit=limit,
+    )
+
+
+@app.get(
+    "/api/polymarket-us/trading/policy-advisor/model-readiness",
+    dependencies=[Depends(verify_auth)],
+)
+async def polymarket_us_trading_model_readiness(
+    lane: Literal["live", "dry_run"] | None = None,
+):
+    return await _policy_advisor_model_evidence(
+        _require_execution_lane(lane)
+    )
+
+
+@app.post(
+    "/api/polymarket-us/trading/policy-advisor/{advice_id}/apply",
+    dependencies=[Depends(verify_auth)],
+)
+async def polymarket_us_trading_apply_policy_advice(
+    advice_id: str,
+    payload: PolicyAdviceApplyIn,
+    lane: Literal["live", "dry_run"] | None = None,
+):
+    try:
+        return await asyncio.to_thread(
+            _require_execution_lane(lane).apply_policy_advice,
+            advice_id,
+            payload.confirmation,
+        )
+    except TradingPolicyError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.post(
@@ -1737,6 +2489,110 @@ async def polymarket_us_trading_reset_live_performance(
         )
     except TradingPolicyError as exc:
         raise HTTPException(409, str(exc)) from exc
+
+
+@app.post(
+    "/api/polymarket-us/trading/risk-session/reset",
+    dependencies=[Depends(verify_auth)],
+)
+async def polymarket_us_trading_reset_risk_session(
+    payload: RiskSessionResetIn,
+    lane: Literal["live", "dry_run"] | None = None,
+):
+    try:
+        return await asyncio.to_thread(
+            _require_execution_lane(lane).reset_risk_session,
+            payload.confirmation,
+        )
+    except TradingPolicyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+def _require_model_lab() -> SportModelLab:
+    if model_lab is None:
+        raise HTTPException(404, "The research Model Lab is unavailable")
+    return model_lab
+
+
+@app.get("/api/model-lab/summary", dependencies=[Depends(verify_auth)])
+async def model_lab_summary():
+    return await asyncio.to_thread(_require_model_lab().summary)
+
+
+@app.post("/api/model-lab/fit", dependencies=[Depends(verify_auth)])
+async def model_lab_fit(payload: ModelLabFitIn):
+    return await asyncio.to_thread(
+        _require_model_lab().fit_candidate,
+        sport=payload.sport,
+        league=payload.league,
+        market=payload.market,
+    )
+
+
+@app.post("/api/model-lab/export", dependencies=[Depends(verify_auth)])
+async def model_lab_export():
+    try:
+        return await asyncio.to_thread(_require_model_lab().create_export)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get(
+    "/api/research-data/export",
+    dependencies=[Depends(verify_execution_admin)],
+)
+async def export_research_data():
+    """Download secret-free evidence for a local-to-hosted merge."""
+    trader = _require_live_trader()
+    lab = _require_model_lab()
+    descriptor, archive_path = tempfile.mkstemp(
+        prefix="pelositracker-research-",
+        suffix=".ndjson.gz",
+    )
+    os.close(descriptor)
+    traders = {"live": trader}
+    if dry_run_trader is not None:
+        traders["dry_run"] = dry_run_trader
+    try:
+        await asyncio.to_thread(
+            write_research_bundle,
+            archive_path,
+            traders=traders,
+            model_lab=lab,
+        )
+    except Exception:
+        Path(archive_path).unlink(missing_ok=True)
+        raise
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+    return FileResponse(
+        archive_path,
+        media_type="application/gzip",
+        filename=f"pelositracker-research-{stamp}.ndjson.gz",
+        background=BackgroundTask(Path(archive_path).unlink, missing_ok=True),
+    )
+
+
+@app.post(
+    "/api/research-data/import",
+    dependencies=[Depends(verify_execution_admin)],
+)
+async def import_research_data(bundle: UploadFile = File(...)):
+    """Idempotently merge an exported archive into the central evidence store."""
+    trader = _require_live_trader()
+    lab = _require_model_lab()
+    try:
+        return await asyncio.to_thread(
+            merge_research_bundle,
+            bundle.file,
+            trader=trader,
+            model_lab=lab,
+        )
+    except ResearchBundleError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, f"Could not merge research evidence: {exc}") from exc
+    finally:
+        await bundle.close()
 
 
 def _sort_events_by_edge():

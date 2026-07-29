@@ -50,6 +50,30 @@ def _max_decision_rows() -> int:
     return max(0, rows)
 
 
+def _decision_mark_intervals() -> tuple[float, float]:
+    workstation = os.getenv("WORKSTATION_MODE", "").strip().casefold() in {
+        "1", "true", "yes", "on",
+    }
+    try:
+        minimum = max(
+            0.0,
+            float(os.getenv(
+                "DECISION_MARK_MIN_SECONDS",
+                "5" if workstation else "0",
+            )),
+        )
+        heartbeat = max(
+            minimum,
+            float(os.getenv(
+                "DECISION_MARK_HEARTBEAT_SECONDS",
+                "15" if workstation else "0",
+            )),
+        )
+    except ValueError:
+        return (5.0, 15.0) if workstation else (0.0, 0.0)
+    return minimum, heartbeat
+
+
 # A CLV close mark may only be recorded (replacing the last valid one) when these
 # typed execution-safety gates explicitly PASS. This replaces a fragile scan of
 # human-readable reason substrings: reason wording now has no policy effect, and a
@@ -192,6 +216,12 @@ class Ledger:
         self._last_prune = 0.0
         self._retention_seconds = _retention_seconds()
         self._max_decision_rows = _max_decision_rows()
+        self._decision_min_seconds, self._decision_heartbeat_seconds = (
+            _decision_mark_intervals()
+        )
+        self._decision_last: dict[
+            tuple[str, str, str], tuple[float, tuple]
+        ] = {}
         with self._lock:
             self._db.initialize(_SCHEMA, component="ledger", version=1)
             self._db.initialize(_SCHEMA_V2, component="ledger", version=2)
@@ -273,6 +303,11 @@ class Ledger:
                 "ON decision_marks(as_of);",
                 component="ledger", version=7,
             )
+            self._db.initialize(
+                "CREATE INDEX IF NOT EXISTS idx_decision_marks_as_of_key "
+                "ON decision_marks(as_of, decision_hash, market, outcome);",
+                component="ledger", version=8,
+            )
             # Bound the audit log at boot, not only while actively recording: a
             # process that starts against an already-oversized table (e.g. after
             # downtime, or right after an operator frees space) would otherwise
@@ -297,30 +332,121 @@ class Ledger:
             (now - self._retention_seconds,),
         )
         if self._max_decision_rows > 0:
-            # Keep only the newest N rows by as_of. The subquery rides the
-            # idx_decision_marks_as_of index (ORDER BY ... DESC LIMIT), so this
-            # stays cheap as the table grows. No-op when the table is under cap
-            # (the subquery's MIN is then the oldest row, and `< MIN` matches
-            # nothing).
+            # Find the exact Nth-newest row using the composite primary key as a
+            # deterministic tie-break. The previous MIN(as_of) deletion retained every row
+            # sharing the cutoff timestamp, so bursts with second-resolution
+            # timestamps could exceed the configured cap by hundreds of
+            # thousands of rows.
             self._db.execute(
                 cur,
-                """DELETE FROM decision_marks WHERE as_of < (
-                       SELECT MIN(as_of) FROM (
-                           SELECT as_of FROM decision_marks
-                           ORDER BY as_of DESC LIMIT %s
-                       ) AS keep
-                   )""",
-                (self._max_decision_rows,),
+                """SELECT as_of,decision_hash,market,outcome
+                   FROM decision_marks
+                   ORDER BY as_of DESC,decision_hash DESC,market DESC,outcome DESC
+                   LIMIT 1 OFFSET %s""",
+                (self._max_decision_rows - 1,),
             )
+            cutoff = cur.fetchone()
+            if cutoff is not None:
+                self._db.execute(
+                    cur,
+                    """DELETE FROM decision_marks
+                       WHERE as_of < %s
+                          OR (as_of=%s AND decision_hash<%s)
+                          OR (as_of=%s AND decision_hash=%s AND market<%s)
+                          OR (as_of=%s AND decision_hash=%s AND market=%s
+                              AND outcome<%s)""",
+                    (
+                        cutoff[0],
+                        cutoff[0], cutoff[1],
+                        cutoff[0], cutoff[1], cutoff[2],
+                        cutoff[0], cutoff[1], cutoff[2], cutoff[3],
+                    ),
+                )
 
     def close(self) -> None:
         with self._lock:
             self._db.close()
 
+    @staticmethod
+    def _decision_fingerprint(signal: Signal) -> tuple:
+        gates = tuple(
+            sorted(
+                (
+                    str(gate.get("code") or ""),
+                    gate.get("passed"),
+                )
+                for gate in (signal.gate_results or [])
+            )
+        )
+        return (
+            signal.action,
+            round(float(signal.market_probability), 4),
+            round(float(signal.consensus_probability), 4),
+            round(float(signal.edge), 4),
+            round(float(signal.confidence), 1),
+            gates,
+            tuple(signal.reasons),
+        )
+
+    def _decision_marks_to_persist(
+        self,
+        event: Event,
+        signals: list[Signal],
+    ) -> tuple[list[Signal], dict[tuple[str, str, str], tuple[float, tuple]]]:
+        selected: list[Signal] = []
+        updates: dict[tuple[str, str, str], tuple[float, tuple]] = {}
+        for signal in signals:
+            key = (event.id, signal.market, signal.outcome)
+            timestamp = signal.observed_at.timestamp()
+            fingerprint = self._decision_fingerprint(signal)
+            prior = self._decision_last.get(key)
+            if signal.action != "PAPER_BET" and prior is not None:
+                elapsed = max(0.0, timestamp - prior[0])
+                if elapsed < self._decision_min_seconds:
+                    continue
+                if (
+                    fingerprint == prior[1]
+                    and elapsed < self._decision_heartbeat_seconds
+                ):
+                    continue
+            selected.append(signal)
+            updates[key] = (timestamp, fingerprint)
+        return selected, updates
+
+    def _record_close_mark(self, cur, event: Event, signal: Signal) -> None:
+        if signal.market_probability <= 0 or not _close_mark_gates_pass(signal):
+            return
+        self._db.execute(
+            cur,
+            """INSERT INTO close_marks
+               (event_id, market, outcome, executable_probability,
+                consensus_probability, observed_at, decision_hash)
+               VALUES (%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT(event_id, market, outcome) DO UPDATE SET
+                 executable_probability=EXCLUDED.executable_probability,
+                 consensus_probability=EXCLUDED.consensus_probability,
+                 observed_at=EXCLUDED.observed_at,
+                 decision_hash=EXCLUDED.decision_hash
+               WHERE EXCLUDED.observed_at >= close_marks.observed_at
+                 AND close_marks.finalized_at IS NULL""",
+            (
+                event.id,
+                signal.market,
+                signal.outcome,
+                signal.market_probability,
+                signal.consensus_probability,
+                signal.observed_at.timestamp(),
+                signal.decision_hash,
+            ),
+        )
+
     def record_signals(self, event: Event, signals: Iterable[Signal]) -> int:
         """Log the entry snapshot of every PAPER_BET, once per selection."""
-        signals = list(signals)
-        now = max((signal.observed_at.timestamp() for signal in signals), default=_now())
+        all_signals = list(signals)
+        now = max(
+            (signal.observed_at.timestamp() for signal in all_signals),
+            default=_now(),
+        )
         rows = [
             (
                 event.id, event.name, event.sport, s.market, s.outcome, s.quote_source,
@@ -338,7 +464,7 @@ class Ledger:
                 s.independent_calibration_hash, s.independent_model_sample_size,
                 s.independent_model_event_count,
             )
-            for s in signals
+            for s in all_signals
             if s.action == "PAPER_BET"
             and entry_price_allowed(s.market_probability)
             and s.execution_complete
@@ -348,6 +474,10 @@ class Ledger:
             and s.execution_fee is not None and s.execution_fee >= 0
         ]
         with self._lock:
+            signals, cache_updates = self._decision_marks_to_persist(
+                event,
+                all_signals,
+            )
             inserted = 0
             with self._db.transaction() as cur:
                 for signal in signals:
@@ -397,24 +527,13 @@ class Ledger:
                           signal.independent_model_event_count,
                           signal.independent_model_registry_version),
                     )
-                    if signal.market_probability > 0 and _close_mark_gates_pass(signal):
-                        self._db.execute(
-                            cur,
-                            """INSERT INTO close_marks
-                               (event_id, market, outcome, executable_probability,
-                                consensus_probability, observed_at, decision_hash)
-                               VALUES (%s,%s,%s,%s,%s,%s,%s)
-                               ON CONFLICT(event_id, market, outcome) DO UPDATE SET
-                                 executable_probability=EXCLUDED.executable_probability,
-                                 consensus_probability=EXCLUDED.consensus_probability,
-                                 observed_at=EXCLUDED.observed_at,
-                                 decision_hash=EXCLUDED.decision_hash
-                               WHERE EXCLUDED.observed_at >= close_marks.observed_at
-                                 AND close_marks.finalized_at IS NULL""",
-                            (event.id, signal.market, signal.outcome,
-                             signal.market_probability, signal.consensus_probability,
-                             signal.observed_at.timestamp(), signal.decision_hash),
-                        )
+                    self._record_close_mark(cur, event, signal)
+                persisted_ids = {id(signal) for signal in signals}
+                for signal in all_signals:
+                    if id(signal) not in persisted_ids:
+                        # Close-line tracking remains live even when redundant
+                        # diagnostic rows are sampled off disk.
+                        self._record_close_mark(cur, event, signal)
                 for row in rows:
                     self._db.execute(
                         cur,
@@ -471,6 +590,7 @@ class Ledger:
                 if now - self._last_prune > _PRUNE_THROTTLE_SECONDS:
                     self._prune_decision_marks(cur, now)
                     self._last_prune = now
+            self._decision_last.update(cache_updates)
             return inserted
 
     def snapshot_closing(self, event_id: str,

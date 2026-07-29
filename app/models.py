@@ -89,6 +89,10 @@ class GameState:
     state_hash: str | None = None
     state_schema_version: str = "game-state-v2"
     finished_timestamp: datetime | None = None
+    # Provider-specific structured state.  It is intentionally a general
+    # envelope so MLB can add base/out/count context without making every other
+    # sport pretend those fields exist.
+    sport_state: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.provider_timestamp is None and self.observed_at is not None:

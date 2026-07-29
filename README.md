@@ -127,6 +127,34 @@ existing `DATABASE_URL` for persistent execution history, and retain
 defaults off, execution defaults to dry-run, every restart disarms the
 process-local live latch, and live arming requires the exact confirmation phrase.
 
+The authenticated **Account connection** panel can also verify and use a
+Polymarket US key pasted from a phone. That key is held only in server-process
+memory: the application does not write it to browser storage, PostgreSQL,
+SQLite, logs, exports, or Git, and it disappears on restart. Installing or forgetting a runtime key
+stops automation and disarms live execution. Account switching is blocked while
+a live managed position remains open.
+
+### Local and hosted research evidence
+
+Database files and trade records are intentionally ignored by Git. In
+production, `DATABASE_URL` is the central PostgreSQL evidence store; without it,
+the Polymarket US status panel explicitly reports hosted SQLite as ephemeral.
+The hosted Model Lab and managed-trade journal use the same PostgreSQL database
+with component-scoped migrations.
+
+To merge the existing workstation evidence after deployment:
+
+1. Open **Polymarket US Research → Model lab → Merge local and hosted research
+   evidence** on the local workstation.
+2. Download the compressed evidence archive.
+3. Open the same panel on the hosted site and upload that archive once.
+
+The merge is checksum-validated and idempotent. It carries closed managed
+trades, settings-at-entry, journal evidence, labeled adaptive-exit observations,
+and Model Lab observations/targets/candidates. It excludes every credential,
+cookie, environment value, order, open position, and execution control. Reusing
+the same archive is safe: existing hosted primary-key rows are preserved.
+
 ## Registering an event
 
 Paste the full event URL shown in Polymarket, for example:

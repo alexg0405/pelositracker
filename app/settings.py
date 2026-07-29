@@ -62,6 +62,8 @@ class Settings:
     enable_tennis_model: bool
     enable_lead_model: bool
     enable_soccer_model: bool
+    enable_mlb_live_feed: bool
+    mlb_live_poll_seconds: float
     edge_uncertainty_z: float
     latency_budget_seconds: float
     max_state_age_seconds: float
@@ -72,6 +74,8 @@ class Settings:
     polymarket_us_key_id: str
     polymarket_us_secret_key: str
     polymarket_us_trading_db: Path
+    polymarket_us_dry_run_db: Path
+    model_lab_db: Path
     odds_api_key: str
     odds_regions: str
     odds_markets: str
@@ -113,6 +117,10 @@ class Settings:
             enable_tennis_model=_bool(values, "ENABLE_TENNIS_MODEL", False),
             enable_lead_model=_bool(values, "ENABLE_LEAD_MODEL", False),
             enable_soccer_model=_bool(values, "ENABLE_SOCCER_MODEL", False),
+            enable_mlb_live_feed=_bool(values, "ENABLE_MLB_LIVE_FEED", False),
+            mlb_live_poll_seconds=_float(
+                values, "MLB_LIVE_POLL_SECONDS", 5.0, minimum=2.0
+            ),
             edge_uncertainty_z=_float(values, "PAPER_EDGE_UNCERTAINTY_Z", 1.0),
             latency_budget_seconds=_float(values, "PAPER_LATENCY_BUDGET_SECONDS", 8.0),
             max_state_age_seconds=_float(values, "PAPER_MAX_STATE_AGE_SECONDS", 30.0, minimum=1.0),
@@ -140,6 +148,15 @@ class Settings:
                     "POLYMARKET_US_TRADING_DB",
                     "polymarket-us-trading.db",
                 )
+            ),
+            polymarket_us_dry_run_db=Path(
+                values.get(
+                    "POLYMARKET_US_DRY_RUN_DB",
+                    "workstation-data/polymarket-us-dry-run.db",
+                )
+            ),
+            model_lab_db=Path(
+                values.get("MODEL_LAB_DB", "workstation-data/model-lab.db")
             ),
             odds_api_key=values.get("THE_ODDS_API_KEY", "").strip(),
             odds_regions=values.get("ODDS_REGIONS", "us").strip(),

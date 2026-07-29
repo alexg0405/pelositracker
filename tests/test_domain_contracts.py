@@ -80,6 +80,55 @@ def test_sports_state_fixture_verifies_score_orientation_and_time():
                                                 tzinfo=timezone.utc)
 
 
+def test_gamma_live_state_uses_documented_home_away_order_without_team_fields():
+    event = Event(
+        "Seattle Mariners vs. Texas Rangers",
+        "baseball",
+        "Texas Rangers",
+        "Seattle Mariners",
+        league="MLB",
+    )
+    state = _game_state_from_sports_payload(
+        event,
+        {
+            "slug": "mlb-sea-tex-2026-07-27",
+            "score": "2-7",
+            "period": "Bot 5th",
+            "live": True,
+            "ended": False,
+        },
+    )
+    assert state is not None and not state.quarantined
+    assert (state.home_score, state.away_score) == (2, 7)
+    assert (state.home_team_id, state.away_team_id) == (
+        "Texas Rangers",
+        "Seattle Mariners",
+    )
+    assert state.status == "in_progress"
+
+
+def test_nested_sports_event_state_is_flattened_and_terminal():
+    event = Event(
+        "Away vs Home",
+        "baseball",
+        "Home",
+        "Away",
+        league="MLB",
+    )
+    state = _game_state_from_sports_payload(
+        event,
+        {
+            "slug": "mlb-away-home-2026-07-27",
+            "ended": True,
+            "eventState": {"score": "4-3", "period": "End 9"},
+        },
+    )
+    assert state is not None and not state.quarantined
+    assert (state.home_score, state.away_score) == (4, 3)
+    assert state.period == "End 9"
+    assert state.status == "final"
+
+
 def test_unknown_clock_and_regressions_fail_closed():
     assert game_progress("basketball", "Q2", "", "nba") == (None, None)
     assert game_progress("soccer", "2H", "75:00", "epl")[1] == pytest.approx(1 / 6)

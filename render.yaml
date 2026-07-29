@@ -1,6 +1,8 @@
 # Render blueprint. The Docker image builds the Rust engine and runs uvicorn.
-# Sleeping instances pause live feeds. For durable data, set DATABASE_URL to a
-# PostgreSQL DSN or attach a disk and uncomment the SQLite paths below.
+# Sleeping instances pause live feeds. Hosted research/trading evidence is
+# durable only when DATABASE_URL points to PostgreSQL. SQLite remains the
+# workstation fallback and must not be treated as persistent on a free web
+# instance.
 services:
   - type: web
     name: live-edge-monitor
@@ -34,6 +36,8 @@ services:
         sync: false
       - key: POLYMARKET_US_SECRET_KEY
         sync: false
+      # Used only if DATABASE_URL is missing. The dashboard marks this fallback
+      # as non-durable on hosted instances.
       - key: POLYMARKET_US_TRADING_DB
         value: /app/data/polymarket-us-trading.db
       - key: MAX_DATA_AGE_SECONDS
@@ -50,7 +54,7 @@ services:
         value: "true"
       - key: ODDS_PLAYER_MARKETS  # e.g. player_points,player_rebounds (per sport)
         sync: false
-      - key: DATABASE_URL       # optional PostgreSQL; takes priority over SQLite
+      - key: DATABASE_URL       # required for durable hosted evidence
         sync: false
       # - key: LEDGER_DB
       #   value: /var/data/ledger.db

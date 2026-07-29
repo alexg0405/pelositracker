@@ -80,6 +80,35 @@ class MonitorState:
                     ("odds_api_enabled", "true" if enabled else "false"),
                 )
 
+    def odds_api_poll_seconds(self, default: float = 45.0) -> float:
+        """Return the persisted paid-feed interval, bounded to the UI policy."""
+        with self._lock:
+            with self._db.cursor() as cur:
+                self._db.execute(
+                    cur,
+                    "SELECT value FROM monitor_config WHERE key=%s",
+                    ("odds_api_poll_seconds",),
+                )
+                row = cur.fetchone()
+        if row is None:
+            return max(5.0, min(3600.0, float(default)))
+        try:
+            value = float(row[0])
+        except (TypeError, ValueError):
+            return max(5.0, min(3600.0, float(default)))
+        return max(5.0, min(3600.0, value))
+
+    def set_odds_api_poll_seconds(self, seconds: float) -> None:
+        value = max(5.0, min(3600.0, float(seconds)))
+        with self._lock:
+            with self._db.transaction() as cur:
+                self._db.execute(
+                    cur,
+                    """INSERT INTO monitor_config (key, value) VALUES (%s,%s)
+                       ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value""",
+                    ("odds_api_poll_seconds", f"{value:g}"),
+                )
+
     def save_event(self, event: Event) -> None:
         payload = json.dumps(as_json(event), separators=(",", ":"))
         with self._lock:

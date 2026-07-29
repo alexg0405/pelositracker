@@ -13,7 +13,7 @@ import hashlib
 import json
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 try:  # SQLite-only installs should not need a PostgreSQL driver at import time.
     import psycopg2
@@ -23,6 +23,7 @@ except ImportError:  # pragma: no cover - requirements include psycopg2 in CI
 
 
 _SERIAL_PRIMARY_KEY = re.compile(r"\bSERIAL\s+PRIMARY\s+KEY\b", re.IGNORECASE)
+_SAFE_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 # Postgres errors that mean the socket is dead -- typically a managed pooler
 # (e.g. Supabase) dropping an idle connection between polling cycles. We reconnect
@@ -167,7 +168,7 @@ class Database:
             raise
 
     def columns(self, table: str) -> set[str]:
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table):
+        if not _SAFE_IDENTIFIER.fullmatch(table):
             raise ValueError("unsafe table name")
         with self.cursor() as cur:
             if self.backend == "postgres":
@@ -315,6 +316,71 @@ class Database:
             psycopg2.extras.execute_batch(cur, statement, rows)
         else:
             cur.executemany(self.sql(statement), rows)
+
+    def iter_table_batches(
+        self,
+        table: str,
+        *,
+        batch_size: int = 500,
+    ) -> Iterator[list[dict[str, Any]]]:
+        """Stream a fixed table as JSON-compatible row dictionaries.
+
+        Callers supply table names from a hard-coded evidence allow-list. The
+        identifier check is a second boundary so neither an uploaded bundle nor
+        a request value can become SQL.
+        """
+        if not _SAFE_IDENTIFIER.fullmatch(table):
+            raise ValueError("unsafe table name")
+        size = max(1, min(int(batch_size), 5_000))
+        with self.cursor(dict_rows=True) as cur:
+            cur.execute(f"SELECT * FROM {table}")
+            while True:
+                rows = cur.fetchmany(size)
+                if not rows:
+                    break
+                yield [dict(row) for row in rows]
+
+    def merge_table_rows(
+        self,
+        table: str,
+        rows: Sequence[Mapping[str, Any]],
+    ) -> int:
+        """Idempotently merge evidence rows into one allow-listed table.
+
+        Mutable execution controls are deliberately not among the callers'
+        allow-lists. Evidence tables use text/composite primary keys, so
+        ``DO NOTHING`` makes repeated archive imports safe and cannot overwrite
+        newer hosted evidence.
+        """
+        if not rows:
+            return 0
+        if not _SAFE_IDENTIFIER.fullmatch(table):
+            raise ValueError("unsafe table name")
+        available = self.columns(table)
+        columns = tuple(rows[0].keys())
+        if (
+            not columns
+            or any(
+                not isinstance(name, str)
+                or not _SAFE_IDENTIFIER.fullmatch(name)
+                for name in columns
+            )
+            or any(name not in available for name in columns)
+        ):
+            raise ValueError(f"invalid evidence columns for {table}")
+        expected = set(columns)
+        if any(set(row.keys()) != expected for row in rows):
+            raise ValueError(f"inconsistent evidence rows for {table}")
+        placeholders = ",".join("%s" for _ in columns)
+        names = ",".join(columns)
+        statement = (
+            f"INSERT INTO {table} ({names}) VALUES ({placeholders}) "
+            "ON CONFLICT DO NOTHING"
+        )
+        values = [tuple(row[name] for name in columns) for row in rows]
+        with self.transaction() as cur:
+            self.execute_many(cur, statement, values)
+        return len(values)
 
     def close(self) -> None:
         self.connection.close()

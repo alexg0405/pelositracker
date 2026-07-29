@@ -1,13 +1,32 @@
 // Tab Navigation Logic
   // The CSRF-aware fetch wrapper now lives in the shared /static/csrf.js module,
   // loaded before this script (and before watch.js) so both pages behave the same.
-  document.querySelectorAll('.tab-carousel .pill').forEach(btn => {
-    btn.addEventListener('click', e => {
-      document.querySelectorAll('.tab-carousel .pill').forEach(b => b.classList.remove('active'));
-      e.target.classList.add('active');
+  const primaryTabButtons = [...document.querySelectorAll('.tab-carousel .pill')];
+  function activatePrimaryTab(button, {resetScroll = false} = {}) {
+      const tab = button?.dataset.tab;
+      if (!tab || !document.getElementById(tab)) return;
+      primaryTabButtons.forEach(candidate => {
+        const selected = candidate === button;
+        candidate.classList.toggle('active', selected);
+        candidate.setAttribute('aria-selected', String(selected));
+        candidate.tabIndex = selected ? 0 : -1;
+      });
       document.querySelectorAll('.tab-content').forEach(tc => tc.classList.add('is-hidden'));
-      const tab = e.target.dataset.tab;
-      document.getElementById(tab).classList.remove('is-hidden');
+      const panel = document.getElementById(tab);
+      panel.classList.remove('is-hidden');
+      if (resetScroll) {
+        window.scrollTo({top:Math.max(0, Number(panel.offsetTop || 0) - 8), behavior:"auto"});
+      }
+      try { sessionStorage.setItem("pelositracker-active-tab", tab); } catch {}
+      const restoreResearchSection = () => {
+        if (tab !== "tab-us-research" || window.location.hash.length <= 1) return;
+        const hashTarget = document.getElementById(
+          decodeURIComponent(window.location.hash.slice(1))
+        );
+        if (hashTarget && panel.contains(hashTarget)) {
+          hashTarget.scrollIntoView({block:"start"});
+        }
+      };
       if (tab === "tab-lobby") renderLobby();
       if (tab === "tab-live") renderEvents(lastEvents);
       if (tab === "tab-discovery") {
@@ -16,9 +35,15 @@
         refreshUSExecutionStatus();
       }
       if (tab === "tab-us-research") {
-        refreshUSStatus();
-        loadUSEvents();
-        loadUSTrading();
+        const researchRefreshes = [
+          refreshUSStatus(),
+          loadUSEvents(),
+          loadUSTrading(),
+          loadPerformanceLedger(),
+          loadModelLab(),
+          loadPolicyAdvisorSessions()
+        ];
+        Promise.allSettled(researchRefreshes).then(restoreResearchSection);
       }
       if (tab === "tab-bots") {
         refreshMetrics();
@@ -26,7 +51,20 @@
         refreshBotActivity();
         refreshBotGames();
       }
-    });
+  }
+  primaryTabButtons.forEach(btn => {
+    btn.addEventListener('click', () => activatePrimaryTab(btn, {resetScroll:true}));
+  });
+  document.querySelector("#global-tab-nav")?.addEventListener("keydown", event => {
+    if (event.key !== "ArrowRight" && event.key !== "ArrowLeft") return;
+    const available = primaryTabButtons.filter(button => !button.hidden);
+    const current = available.indexOf(document.activeElement);
+    if (current < 0) return;
+    event.preventDefault();
+    const step = event.key === "ArrowRight" ? 1 : -1;
+    const next = available[(current + step + available.length) % available.length];
+    next.focus();
+    activatePrimaryTab(next, {resetScroll:true});
   });
 
   // Lobby landing screen — personalized to the signed-in user.
@@ -93,6 +131,7 @@
   const cents = value => value == null ? "—" : `${(value * 100).toFixed(1)}¢`;
   const signedCents = value => value == null ? "—" : `${value >= 0 ? "+" : ""}${(value * 100).toFixed(1)}¢`;
   const money = value => value == null ? "—" : `${value >= 0 ? "+" : "-"}$${Math.abs(value).toFixed(2)}`;
+  const APPROVAL_TOKEN = "approve";
   const keyFor = (...parts) => encodeURIComponent(parts.join("|"));
   let refreshInFlight = false;
   const pendingEventRemovals = new Set();
@@ -117,6 +156,46 @@
   const liveTabVisible = () => !document.querySelector("#tab-live").classList.contains("is-hidden");
   const discoveryTabVisible = () => !document.querySelector("#tab-discovery").classList.contains("is-hidden");
   const usResearchTabVisible = () => !document.querySelector("#tab-us-research").classList.contains("is-hidden");
+
+  const researchSectionLinks = [
+    ...document.querySelectorAll("[data-research-section]")
+  ];
+  const researchSections = researchSectionLinks
+    .map(link => document.getElementById(link.dataset.researchSection))
+    .filter(Boolean);
+  let researchScrollFrame = null;
+
+  function setActiveResearchSection(sectionId) {
+    researchSectionLinks.forEach(link => {
+      const selected = link.dataset.researchSection === sectionId;
+      link.classList.toggle("active", selected);
+      if (selected) link.setAttribute("aria-current", "location");
+      else link.removeAttribute("aria-current");
+    });
+  }
+
+  function updateResearchSectionFromScroll() {
+    researchScrollFrame = null;
+    if (!usResearchTabVisible() || !researchSections.length) return;
+    const referenceLine = Math.min(180, Math.max(116, window.innerHeight * 0.2));
+    let active = researchSections[0];
+    for (const section of researchSections) {
+      if (section.getBoundingClientRect().top <= referenceLine) active = section;
+      else break;
+    }
+    setActiveResearchSection(active.id);
+  }
+
+  researchSectionLinks.forEach(link => {
+    link.addEventListener("click", () => {
+      setActiveResearchSection(link.dataset.researchSection);
+    });
+  });
+  window.addEventListener("scroll", () => {
+    if (researchScrollFrame != null) return;
+    researchScrollFrame = window.requestAnimationFrame(updateResearchSectionFromScroll);
+  }, {passive:true});
+  window.addEventListener("resize", updateResearchSectionFromScroll);
 
   function showBotActionStatus(message, state = "pending", clearAfter = 0) {
     const box = document.querySelector("#bot-action-status");
@@ -173,8 +252,13 @@
       const data = await response.json().catch(()=>({}));
       if (!response.ok) throw new Error(data.detail || "Status unavailable");
       usCredentialsConfigured = !!data.configured;
+      const credentialSource = data.credential_source === "runtime"
+        ? "session memory"
+        : data.credential_source === "environment"
+          ? "server environment"
+          : "";
       const key = data.configured
-        ? `Configured · ${esc(data.key_id_hint || "hidden")}`
+        ? `Configured · ${esc(data.key_id_hint || "hidden")}${credentialSource ? ` · ${credentialSource}` : ""}`
         : "Not configured";
       const automation = data.automation || {};
       const trading = !data.trading_enabled
@@ -187,10 +271,17 @@
       const deployment = data.workstation
         ? "Local / isolated"
         : data.trading_enabled ? "Hosted / enabled" : "Hosted / research only";
+      const storage = automation.storage || {};
+      const evidence = storage.durable
+        ? "Durable PostgreSQL"
+        : storage.backend
+          ? "Local / ephemeral SQLite"
+          : "Storage unavailable";
       box.innerHTML = `
         <div class="us-status-card"><span>Deployment</span><strong>${deployment}</strong></div>
         <div class="us-status-card"><span>API key</span><strong>${key}</strong></div>
-        <div class="us-status-card"><span>Trading</span><strong>${esc(trading)}</strong></div>`;
+        <div class="us-status-card"><span>Trading</span><strong>${esc(trading)}</strong></div>
+        <div class="us-status-card"><span>Evidence</span><strong>${esc(evidence)}</strong></div>`;
     } catch (error) {
       box.innerHTML = `<div class="error">${esc(error.message || "Could not read execution status")}</div>`;
     }
@@ -304,7 +395,7 @@
     button.textContent = "Testing…";
     status.textContent = usCredentialsConfigured
       ? "Signing a read-only balances and positions request…"
-      : "No key is configured. Add both values to .env and restart first.";
+      : "No key is configured. Paste a session key above or add both values to the server environment.";
     try {
       const response = await fetch("/api/polymarket-us/account", {cache:"no-store"});
       const data = await response.json().catch(()=>({}));
@@ -324,15 +415,165 @@
   document.querySelector("#us-events-search")?.addEventListener("input", renderUSEvents);
   document.querySelector("#us-account-refresh")?.addEventListener("click", loadUSAccount);
 
+  document.querySelector("#us-runtime-credential-form")?.addEventListener("submit", async event => {
+    event.preventDefault();
+    const button = document.querySelector("#us-runtime-credential-save");
+    const status = document.querySelector("#us-account-status");
+    const keyInput = document.querySelector("#us-runtime-key-id");
+    const secretInput = document.querySelector("#us-runtime-secret-key");
+    if (!button || !status || !keyInput || !secretInput) return;
+    setActionBusy(button, true, "Verifying...");
+    status.textContent = "Verifying the key directly with Polymarket US. Automation will be stopped before the session key becomes active...";
+    try {
+      const response = await fetch("/api/polymarket-us/runtime-credentials", {
+        method: "POST",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify({
+          key_id: keyInput.value.trim(),
+          secret_key: secretInput.value
+        })
+      });
+      const data = await response.json().catch(()=>({}));
+      if (!response.ok) throw new Error(data.detail || "Could not verify session key");
+      keyInput.value = "";
+      secretInput.value = "";
+      status.textContent = `${data.message} Key ${data.credentials?.key_id_hint || "verified"}.`;
+      await refreshUSStatus();
+      await loadUSAccount();
+      await loadUSTrading();
+    } catch (error) {
+      secretInput.value = "";
+      status.textContent = error.message || "Could not verify session key";
+    } finally {
+      setActionBusy(button, false);
+    }
+  });
+
+  document.querySelector("#us-runtime-credential-clear")?.addEventListener("click", async event => {
+    if (!window.confirm("Forget the runtime key and stop automation now? Environment credentials, if configured, will become active again.")) return;
+    const button = event.currentTarget;
+    const status = document.querySelector("#us-account-status");
+    setActionBusy(button, true, "Forgetting...");
+    if (status) status.textContent = "Stopping automation and clearing the runtime credential from server memory...";
+    try {
+      const response = await fetch("/api/polymarket-us/runtime-credentials", {method:"DELETE"});
+      const data = await response.json().catch(()=>({}));
+      if (!response.ok) throw new Error(data.detail || "Could not forget runtime key");
+      document.querySelector("#us-runtime-key-id").value = "";
+      document.querySelector("#us-runtime-secret-key").value = "";
+      if (status) status.textContent = data.credentials?.configured
+        ? "Runtime key forgotten. The server environment key is active; automation remains stopped."
+        : "Runtime key forgotten. No Polymarket US key is active; automation remains stopped.";
+      await refreshUSStatus();
+      await loadUSTrading();
+    } catch (error) {
+      if (status) status.textContent = error.message || "Could not forget runtime key";
+    } finally {
+      setActionBusy(button, false);
+    }
+  });
+
   let usTradingLoading = false;
   let usTradingReloadQueued = false;
   let lastUSTradingStatus = null;
   let lastTradingPerformance = null;
   let lastManagedPositions = [];
+  let lastPolicyAdvice = null;
+  let usLedgerLoaded = false;
+  let usLedgerLoading = false;
+  let usLedgerQueryTimer = null;
   let usPositionMode = "all";
   let usTradingFormDirty = false;
   let usTradingHydrationEpoch = 0;
   let lastRiskPresets = {};
+  let activeTradingLane = (() => {
+    try {
+      return window.localStorage.getItem("pelosi-trading-lane") === "live"
+        ? "live"
+        : "dry_run";
+    } catch {
+      return "dry_run";
+    }
+  })();
+
+  function tradingApi(path, lane = activeTradingLane) {
+    const separator = path.includes("?") ? "&" : "?";
+    return `${path}${separator}lane=${encodeURIComponent(lane)}`;
+  }
+
+  function renderTradingLanes(status = lastUSTradingStatus) {
+    const lanes = status?.lanes || {};
+    for (const lane of ["dry_run", "live"]) {
+      const laneStatus = lanes[lane] || {};
+      const button = document.querySelector(`[data-trading-lane="${lane}"]`);
+      button?.classList.toggle("is-active", lane === activeTradingLane);
+      const summary = document.querySelector(
+        lane === "live"
+          ? "#us-live-lane-summary"
+          : "#us-dry-run-lane-summary"
+      );
+      if (!summary) continue;
+      const state = laneStatus.automation_enabled ? "RUNNING" : "STOPPED";
+      const armed = lane === "live"
+        ? laneStatus.armed ? " · ARMED" : " · DISARMED"
+        : "";
+      summary.textContent = (
+        `${state}${armed} · ${Number(laneStatus.open_positions || 0)} open · ` +
+        `$${Number(laneStatus.managed_exposure_usd || 0).toFixed(2)} exposure`
+      );
+    }
+    const liveOnly = activeTradingLane === "live";
+    const disarm = document.querySelector("#us-disarm");
+    const arm = document.querySelector("#us-arm");
+    const armApproval = document.querySelector("#us-arm-confirmation");
+    const armDuration = document.querySelector("#us-arm-duration");
+    if (disarm) disarm.disabled = !liveOnly;
+    if (arm) arm.disabled = !liveOnly;
+    if (armApproval) armApproval.disabled = !liveOnly;
+    if (armDuration) armDuration.disabled = !liveOnly;
+    const laneHint = document.querySelector("#us-live-control-hint");
+    if (laneHint) {
+      laneHint.textContent = liveOnly
+        ? "Live-order controls apply only to this live lane."
+        : "Switch to the live lane to arm or disarm real orders. Dry-run automation can run without arming.";
+    }
+  }
+
+  async function switchTradingLane(lane) {
+    const next = lane === "live" ? "live" : "dry_run";
+    const selector = document.querySelector("#us-trading-mode");
+    if (next === activeTradingLane) {
+      if (selector) selector.value = next;
+      return;
+    }
+    if (
+      usTradingFormDirty
+      && !window.confirm(
+        "Discard the unsaved settings in this lane and switch automation lanes?"
+      )
+    ) {
+      if (selector) selector.value = activeTradingLane;
+      return;
+    }
+    activeTradingLane = next;
+    try {
+      window.localStorage.setItem("pelosi-trading-lane", next);
+    } catch {
+      // Storage can be disabled; the safe default remains the dry-run lane.
+    }
+    if (selector) selector.value = next;
+    const liquidationMode = document.querySelector(
+      `input[name="liquidate-mode"][value="${next}"]`
+    );
+    if (liquidationMode) {
+      liquidationMode.checked = true;
+      updateLiquidationMode();
+    }
+    usTradingHydrationEpoch += 1;
+    setUSTradingFormDirty(false);
+    renderTradingLanes();
+    await loadUSTrading();
+  }
 
   function refreshTradingInBackground(delay = 0) {
     window.setTimeout(() => {
@@ -374,7 +615,7 @@
     if (!usExecutionEnabled) return;
     try {
       const response = await fetch(
-        "/api/polymarket-us/trading/status",
+        tradingApi("/api/polymarket-us/trading/status"),
         {cache:"no-store"}
       );
       const status = await response.json().catch(()=>({}));
@@ -404,10 +645,28 @@
     }
   }
 
-  document.querySelector("#us-trading-form")?.addEventListener("input", () => {
+  document.querySelector("#us-trading-form")?.addEventListener("input", event => {
+    if (event.target?.id === "us-trading-mode") return;
     usTradingHydrationEpoch += 1;
     setUSTradingFormDirty(true);
+    invalidatePolicyAdvice(
+      "Execution controls were edited. Save them, then analyze again before applying suggested filters."
+    );
   });
+
+  document.querySelector("#us-trading-mode")?.addEventListener(
+    "change",
+    event => {
+      void switchTradingLane(event.currentTarget.value);
+    }
+  );
+  document.querySelector("#us-trading-lanes")?.addEventListener(
+    "click",
+    event => {
+      const button = event.target.closest("[data-trading-lane]");
+      if (button) void switchTradingLane(button.dataset.tradingLane);
+    }
+  );
 
   function setActionBusy(button, busy, pendingLabel = "") {
     if (!button) return;
@@ -426,8 +685,29 @@
     }
   }
 
+  async function fetchWithDeadline(
+    url,
+    options = {},
+    timeoutMs = 45000,
+    timeoutMessage = "The request took too long. Nothing was changed."
+  ) {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, {...options, signal:controller.signal});
+    } catch (error) {
+      if (error?.name === "AbortError") throw new Error(timeoutMessage);
+      throw error;
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  }
+
   const engineGateInputs = () => [
     ...document.querySelectorAll("[data-engine-gate]")
+  ];
+  const entryMarketTypeInputs = () => [
+    ...document.querySelectorAll("[data-entry-market-type]")
   ];
 
   function updateEngineGateAvailability() {
@@ -485,6 +765,8 @@
       const direct = {
         "#us-max-open": derived.max_open_positions,
         "#us-max-orders-hour": derived.max_orders_per_hour,
+        "#us-max-event-entries-hour": derived.max_entries_per_event_per_hour,
+        "#us-candidate-cooldown": derived.candidate_cooldown_seconds,
         "#us-min-refs": derived.min_reference_sources,
         "#us-min-quality": derived.min_signal_quality,
         "#us-cycle-seconds": derived.cycle_seconds,
@@ -499,6 +781,8 @@
       };
       const percentValues = {
         "#us-min-edge": derived.min_edge,
+        "#us-max-edge": derived.max_edge,
+        "#us-min-mlb-remaining": derived.min_mlb_fraction_remaining,
         "#us-min-price": derived.min_entry_price,
         "#us-max-price": derived.max_entry_price,
         "#us-profit-target": derived.profit_target,
@@ -550,6 +834,10 @@
       return false;
     }
     const policy = status?.policy || {};
+    const returnedLane = status?.lane || policy.execution_mode;
+    if (returnedLane === "live" || returnedLane === "dry_run") {
+      activeTradingLane = returnedLane;
+    }
     lastRiskPresets = status?.risk_presets || lastRiskPresets;
     const values = {
       "#us-trading-mode": policy.execution_mode,
@@ -561,6 +849,7 @@
       "#us-max-event": policy.max_event_exposure_usd,
       "#us-daily-loss": policy.max_daily_loss_usd,
       "#us-min-edge": policy.min_edge == null ? null : policy.min_edge * 100,
+      "#us-max-edge": policy.max_edge == null ? null : policy.max_edge * 100,
       "#us-min-quality": policy.min_signal_quality,
       "#us-min-price": policy.min_entry_price == null ? null : policy.min_entry_price * 100,
       "#us-max-price": policy.max_entry_price == null ? null : policy.max_entry_price * 100,
@@ -568,13 +857,32 @@
       "#us-profit-target": policy.profit_target == null ? null : policy.profit_target * 100,
       "#us-max-open": policy.max_open_positions,
       "#us-max-orders-hour": policy.max_orders_per_hour,
+      "#us-max-event-entries-hour": policy.max_entries_per_event_per_hour,
+      "#us-candidate-cooldown": policy.candidate_cooldown_seconds,
+      "#us-min-mlb-remaining": (
+        policy.min_mlb_fraction_remaining == null
+          ? null
+          : policy.min_mlb_fraction_remaining * 100
+      ),
       "#us-min-refs": policy.min_reference_sources,
       "#us-max-spread": policy.max_spread == null ? null : policy.max_spread * 100,
       "#us-min-depth": policy.min_book_shares,
       "#us-trailing-drawdown": policy.trailing_drawdown == null ? null : policy.trailing_drawdown * 100,
       "#us-stop-loss": policy.stop_loss == null ? null : policy.stop_loss * 100,
       "#us-exit-edge": policy.exit_edge == null ? null : policy.exit_edge * 100,
-      "#us-cycle-seconds": policy.cycle_seconds
+      "#us-cycle-seconds": policy.cycle_seconds,
+      "#us-adaptive-exit-profile": policy.adaptive_exit_profile || "observe",
+      "#us-adaptive-exit-horizon": policy.adaptive_exit_horizon_minutes,
+      "#us-adaptive-exit-min-samples": policy.adaptive_exit_min_samples,
+      "#us-adaptive-exit-max-tightening": (
+        policy.adaptive_exit_max_tightening == null
+          ? null
+          : policy.adaptive_exit_max_tightening * 100
+      ),
+      "#us-stop-confirmation-readings": policy.stop_confirmation_readings,
+      "#us-stop-grace-minutes": policy.stop_grace_minutes,
+      "#us-catastrophic-stop-multiplier": policy.catastrophic_stop_multiplier,
+      "#us-post-exit-tracking-minutes": policy.post_exit_tracking_minutes
     };
     for (const [selector, value] of Object.entries(values)) {
       const input = document.querySelector(selector);
@@ -582,6 +890,12 @@
     }
     document.querySelector("#us-automation-enabled").checked = !!policy.automation_enabled;
     document.querySelector("#us-auto-cashout").checked = !!policy.auto_cashout;
+    document.querySelector("#us-adaptive-exit-enabled").checked = (
+      !!policy.adaptive_exit_enabled
+    );
+    document.querySelector("#us-volatility-stop-enabled").checked = (
+      !!policy.volatility_stop_enabled
+    );
     document.querySelector("#us-require-engine").checked = policy.require_engine_entry !== false;
     const selectedGates = new Set(
       Array.isArray(policy.required_engine_gates)
@@ -593,13 +907,165 @@
     for (const input of engineGateInputs()) {
       input.checked = selectedGates.has(input.dataset.engineGate);
     }
+    const selectedMarketTypes = new Set(
+      Array.isArray(policy.allowed_market_types)
+        ? policy.allowed_market_types
+        : ["moneyline", "spread", "total"]
+    );
+    for (const input of entryMarketTypeInputs()) {
+      input.checked = selectedMarketTypes.has(input.dataset.entryMarketType);
+    }
     updateEngineGateAvailability();
+    updateAdaptiveExitAvailability();
+    updateStopGuardAvailability();
     updateRiskPresetUI();
+    renderTradingLanes(status);
     return true;
+  }
+
+  function updateAdaptiveExitAvailability() {
+    const enabled = !!document.querySelector("#us-adaptive-exit-enabled")?.checked;
+    for (const selector of [
+      "#us-adaptive-exit-profile",
+      "#us-adaptive-exit-horizon",
+      "#us-adaptive-exit-min-samples",
+      "#us-adaptive-exit-max-tightening"
+    ]) {
+      const input = document.querySelector(selector);
+      if (input) input.disabled = !enabled;
+    }
+  }
+
+  document.querySelector("#us-adaptive-exit-enabled")?.addEventListener(
+    "change",
+    updateAdaptiveExitAvailability
+  );
+
+  function updateStopGuardAvailability() {
+    const enabled = !!document.querySelector("#us-volatility-stop-enabled")?.checked;
+    for (const selector of [
+      "#us-stop-confirmation-readings",
+      "#us-stop-grace-minutes",
+      "#us-catastrophic-stop-multiplier"
+    ]) {
+      const input = document.querySelector(selector);
+      if (input) input.disabled = !enabled;
+    }
+  }
+
+  document.querySelector("#us-volatility-stop-enabled")?.addEventListener(
+    "change",
+    updateStopGuardAvailability
+  );
+
+  function renderAdaptiveExitStatus(status) {
+    const box = document.querySelector("#us-adaptive-exit-status");
+    if (!box) return;
+    const adaptive = status?.adaptive_exit || {};
+    const profiles = adaptive.profiles || {};
+    const profile = adaptive.selected_profile
+      || status?.policy?.adaptive_exit_profile
+      || "observe";
+    const profileLabel = profiles[profile]?.label || profile;
+    const observations = Number(adaptive.observations || 0);
+    const events = Number(adaptive.events || 0);
+    const labeled = Number(adaptive.labeled_observations || 0);
+    const labeledEvents = Number(adaptive.labeled_events || 0);
+    const score = adaptive.brier_score == null
+      ? "not available yet"
+      : Number(adaptive.brier_score).toFixed(3);
+    const monitored = Number(adaptive.monitored_mlb_events || 0);
+    const stateReady = Number(adaptive.live_state_mlb_events || 0);
+    const eligible = Number(adaptive.eligible_open_positions || 0);
+    const eligibleState = Number(adaptive.eligible_state_positions || 0);
+    const segments = Array.isArray(adaptive.market_segments)
+      ? adaptive.market_segments
+      : [];
+    const segmentText = segments.length
+      ? segments
+        .map(item => `${esc(item.market_type)} ${Number(item.observations || 0)}`)
+        .join(" / ")
+      : "no line-type observations yet";
+    const recovery = adaptive.exit_recovery || {};
+    const recovered = Number(recovery.recovered_entry || 0);
+    const recoveryExits = Number(recovery.exits || 0);
+    const tracking = Number(recovery.tracking || 0);
+    const rebound = recovery.average_rebound == null
+      ? "not available yet"
+      : `${(Number(recovery.average_rebound) * 100).toFixed(1)} cents`;
+    box.innerHTML = `
+      <strong>${adaptive.enabled
+        ? esc(profileLabel)
+        : status?.policy?.volatility_stop_enabled
+          ? "State-aware stop protection"
+          : "Disabled"}</strong>
+      <span>${observations} managed-position observations across ${events} MLB events</span>
+      <span>${labeled} labeled / ${labeledEvents} event-balanced support</span>
+      <span>${stateReady}/${monitored} monitored MLB events have usable state · ${eligibleState}/${eligible} eligible open positions are state-ready</span>
+      <span>Brier movement score ${esc(score)}</span>
+      <span>${segmentText}</span>
+      <span>Post-exit audit: ${recovered}/${recoveryExits} recovered to cost basis / ${tracking} tracking / average rebound ${rebound}</span>
+      <small>${esc(adaptive.collection_note || "Waiting for an eligible managed MLB position.")}</small>`;
+    const recoveryList = document.querySelector("#us-exit-recovery-list");
+    if (!recoveryList) return;
+    const recent = Array.isArray(recovery.recent) ? recovery.recent : [];
+    recoveryList.innerHTML = recent.length
+      ? recent.map(item => {
+        const entry = Number(item.entry_cost || 0);
+        const sold = Number(item.exit_value || 0);
+        const best = Number(item.best_exit_value || sold);
+        const worst = Number(item.worst_exit_value || sold);
+        const reboundCents = (best - sold) * 100;
+        const recoveredText = item.recovered_entry_at
+          ? "recovered to entry"
+          : item.recovered_half_loss_at
+            ? "recovered at least half the sold loss"
+            : "did not recover to entry";
+        const state = item.status === "tracking" ? "tracking" : "resolved";
+        return `<article class="us-exit-recovery-row">
+          <div>
+            <strong>${esc(item.event_name || "Unknown MLB event")}</strong>
+            <span>${esc(item.market_type || "line")} · ${esc(item.selection || "selection")}</span>
+          </div>
+          <div><span>Entry / sold</span><strong>${(entry * 100).toFixed(1)}¢ / ${(sold * 100).toFixed(1)}¢</strong></div>
+          <div><span>Best / worst after sale</span><strong>${(best * 100).toFixed(1)}¢ / ${(worst * 100).toFixed(1)}¢</strong></div>
+          <div><span>Audit result</span><strong>${esc(recoveredText)} · ${reboundCents >= 0 ? "+" : ""}${reboundCents.toFixed(1)}¢ · ${esc(state)}</strong></div>
+        </article>`;
+      }).join("")
+      : "No tracked exits yet.";
+  }
+
+  function renderRiskSessionStatus(status) {
+    const summary = document.querySelector("#us-risk-session-summary");
+    if (!summary) return;
+    const risk = status?.risk_session || {};
+    const orders = Number(risk.orders_last_hour || 0);
+    const orderLimit = Number(
+      risk.orders_limit ?? status?.policy?.max_orders_per_hour ?? 0
+    );
+    const loss = Number(risk.realized_loss_24h_usd || 0);
+    const lossLimit = Number(
+      risk.realized_loss_limit_usd
+        ?? status?.policy?.max_daily_loss_usd
+        ?? 0
+    );
+    const blockers = Array.isArray(risk.active_entry_blockers)
+      ? risk.active_entry_blockers.length
+      : 0;
+    const reset = risk.reset_at
+      ? ` · session reset ${new Date(risk.reset_at).toLocaleTimeString()}`
+      : "";
+    summary.textContent = (
+      `${orders}/${orderLimit} rolling live entries · ` +
+      `$${loss.toFixed(2)}/$${lossLimit.toFixed(2)} rolling gross realized loss` +
+      `${reset}${blockers ? " · ENTRY CIRCUIT BREAKER ACTIVE" : ""}`
+    );
   }
 
   function renderTradingStatus(status) {
     cacheUSExecutionStatus(status);
+    renderAdaptiveExitStatus(status);
+    renderRiskSessionStatus(status);
     const box = document.querySelector("#us-trading-status");
     const badge = document.querySelector("#us-trading-mode-badge");
     if (!box || !badge) return;
@@ -609,9 +1075,11 @@
     badge.textContent = armed
       ? "LIVE ARMED"
       : policy.execution_mode === "live" ? "LIVE · DISARMED" : "DRY RUN";
-    const armText = armed && status.armed_until
-      ? `Live order latch expires ${new Date(status.armed_until).toLocaleTimeString()}.`
-      : "Live order latch is closed.";
+    const armText = policy.execution_mode !== "live"
+      ? "Live-order arming does not apply to this dry-run lane."
+      : armed && status.armed_until
+        ? `Live order latch expires ${new Date(status.armed_until).toLocaleTimeString()}.`
+        : "Live order latch is closed.";
     const protectiveText = policy.execution_mode !== "live"
       ? "Protective live exits are not applicable in dry run."
       : !policy.auto_cashout
@@ -625,6 +1093,9 @@
     const allocationText = `$${Number(
       policy.trading_allocation_usd || policy.max_total_exposure_usd || 0
     ).toFixed(2)} allocation / ${String(policy.risk_preset || "custom")} risk`;
+    const lineTypeText = Array.isArray(policy.allowed_market_types)
+      ? `${policy.allowed_market_types.join(" / ")} entries`
+      : "moneyline / spread / total entries";
     box.className = `us-trading-status${armed ? " is-armed" : ""}`;
     box.innerHTML = `
       <strong>${policy.automation_enabled ? "Automation on" : "Automation off"}</strong>
@@ -632,7 +1103,7 @@
       <span>${esc(protectiveText)}</span>
       <span>${esc(status.last_cycle_summary || "No cycle yet.")}</span>
       <span>${esc(allocationText)}</span>
-      <span>${status.open_managed_positions || 0} open · $${Number(status.managed_exposure_usd || 0).toFixed(2)} exposure · ${esc(gateText)}</span>`;
+      <span>${status.open_managed_positions || 0} open · $${Number(status.managed_exposure_usd || 0).toFixed(2)} exposure · ${esc(lineTypeText)} · ${esc(gateText)}</span>`;
   }
 
   function venueSyncLabel(value) {
@@ -732,6 +1203,46 @@
           : "profit target not reached";
       const venueState = venueSyncLabel(position.venue_sync_status);
       const externalQuantity = Number(position.external_exit_quantity || 0);
+      const adaptive = position.adaptive_exit;
+      const adaptiveState = adaptive?.state || {};
+      const adaptiveProbability = adaptive?.predicted_adverse_probability;
+      const adaptiveLine = adaptive
+        ? [
+            adaptive.active
+              ? "adaptive tightening active"
+              : "adaptive observation",
+            adaptiveProbability == null
+              ? ""
+              : `${(Number(adaptiveProbability) * 100).toFixed(1)}% adverse-move forecast`,
+            adaptiveState.inning
+              ? `${adaptiveState.half || ""} ${adaptiveState.inning}`.trim()
+              : "",
+            adaptive.context_events == null
+              ? ""
+              : `${Number(adaptive.context_events)} context events`,
+            adaptive.tightening_fraction
+              ? `${(Number(adaptive.tightening_fraction) * 100).toFixed(1)}% tightening`
+              : "",
+            adaptive.reason || ""
+          ].filter(Boolean).join(" / ")
+        : "";
+      const stopGuard = position.stop_guard;
+      const stopGuardLine = stopGuard
+        ? [
+            `stop guard ${stopGuard.status || "inactive"}`,
+            stopGuard.confirmations == null
+              ? ""
+              : `${Number(stopGuard.confirmations)}/${Number(stopGuard.required_confirmations || 0)} readings`,
+            stopGuard.grace_seconds == null
+              ? ""
+              : `${Math.max(
+                0,
+                Number(stopGuard.grace_seconds)
+                  - Number(stopGuard.elapsed_seconds || 0)
+              ).toFixed(0)}s review remaining`,
+            stopGuard.reason || ""
+          ].filter(Boolean).join(" / ")
+        : "";
       const action = open
         ? `<button class="us-position-action" type="button" data-exit-position="${esc(position.id)}" data-exit-mode="${esc(position.mode)}">${position.mode === "live" ? "Sell position" : "Remove simulation"}</button>`
         : "<div></div>";
@@ -753,6 +1264,8 @@
           ${esc(profitLock)} · ${esc(venueState)}
           ${externalQuantity > 0 ? ` · ${externalQuantity.toFixed(2)} shares sold outside workstation` : ""}
           ${position.exit_reason ? ` · ${esc(position.exit_reason)}` : ""}
+          ${adaptiveLine ? `<span class="us-position-adaptive">${esc(adaptiveLine)}</span>` : ""}
+          ${stopGuardLine ? `<span class="us-position-adaptive">${esc(stopGuardLine)}</span>` : ""}
         </div>
       </article>`;
     }).join("");
@@ -812,6 +1325,640 @@
     }).join("");
   }
 
+  function ledgerSettingsText(settings) {
+    if (!settings) return "entry settings unavailable";
+    const lines = Array.isArray(settings.allowed_market_types)
+      ? settings.allowed_market_types.join("/")
+      : "legacy";
+    return [
+      `${lines} lines`,
+      settings.min_edge == null ? "" : `edge ${(Number(settings.min_edge) * 100).toFixed(1)}%`,
+      settings.min_signal_quality == null ? "" : `quality ${Number(settings.min_signal_quality).toFixed(0)}`,
+      settings.min_reference_sources == null ? "" : `refs ${settings.min_reference_sources}`,
+      settings.min_entry_price == null || settings.max_entry_price == null
+        ? ""
+        : `buy ${(Number(settings.min_entry_price) * 100).toFixed(0)}-${(Number(settings.max_entry_price) * 100).toFixed(0)}c`,
+      settings.max_spread == null ? "" : `spread <=${(Number(settings.max_spread) * 100).toFixed(1)}c`,
+      settings.profit_target == null ? "" : `target ${(Number(settings.profit_target) * 100).toFixed(1)}%`,
+      settings.stop_loss == null ? "" : `stop ${(Number(settings.stop_loss) * 100).toFixed(1)}%`
+    ].filter(Boolean).join(" · ");
+  }
+
+  function ledgerFilterParams(format = "json") {
+    return new URLSearchParams({
+      mode: document.querySelector("#us-ledger-mode")?.value || "all",
+      market_type: document.querySelector("#us-ledger-market-type")?.value || "all",
+      result: document.querySelector("#us-ledger-result")?.value || "all",
+      query: document.querySelector("#us-ledger-query")?.value?.trim() || "",
+      format,
+      limit: format === "csv" ? "10000" : "2000"
+    });
+  }
+
+  function renderPerformanceLedger(data) {
+    const status = document.querySelector("#us-ledger-status");
+    const summaryBox = document.querySelector("#us-ledger-summary");
+    const groupBox = document.querySelector("#us-ledger-settings-groups");
+    const rowBox = document.querySelector("#us-ledger-rows");
+    if (!status || !summaryBox || !groupBox || !rowBox) return;
+    const summary = data.summary || {};
+    const lineGroups = Array.isArray(data.line_type_summary)
+      ? data.line_type_summary
+      : [];
+    const cards = [
+      {label:"Filtered total", ...summary},
+      ...lineGroups.map(group => ({
+        label: String(group.market_type || "line").replaceAll("_", " "),
+        ...group
+      }))
+    ];
+    summaryBox.innerHTML = cards.map(card => `
+      <div>
+        <span>${esc(card.label)}</span>
+        <strong>${Number(card.wins || 0)}-${Number(card.losses || 0)}-${Number(card.pushes || 0)} · ${esc(pct(card.win_rate))}</strong>
+        <small>${Number(card.trades || 0)} trades / ${Number(card.events || 0)} events · ${esc(money(Number(card.realized_net_usd || 0)))} net · ${esc(pct(card.after_cost_roi))} ROI</small>
+      </div>`).join("");
+
+    const settingsGroups = Array.isArray(data.settings_groups)
+      ? data.settings_groups
+      : [];
+    groupBox.innerHTML = settingsGroups.length
+      ? settingsGroups.map(group => `
+        <article class="us-ledger-settings-group">
+          <div>
+            <strong>${esc(group.market_type)} · ${esc(group.mode)} · #${esc(group.policy_signature)}</strong>
+            <span>${Number(group.verifiable_closed || 0)} closes / ${Number(group.events || 0)} events · ${Number(group.wins || 0)}-${Number(group.losses || 0)}-${Number(group.pushes || 0)} · ${esc(pct(group.win_rate))} success</span>
+          </div>
+          <div>
+            <strong class="${Number(group.realized_net_usd || 0) >= 0 ? "is-positive" : "is-negative"}">${esc(money(Number(group.realized_net_usd || 0)))}</strong>
+            <span>${esc(pct(group.after_cost_roi))} after-cost ROI</span>
+          </div>
+          <small>${esc(ledgerSettingsText(group.settings))}</small>
+        </article>`).join("")
+      : '<div class="metrics-empty">No verifiable closed trades match these filters yet.</div>';
+
+    const rows = Array.isArray(data.rows) ? data.rows : [];
+    rowBox.innerHTML = rows.length
+      ? rows.map(row => {
+          const resultClass = ["win", "loss"].includes(row.result)
+            ? ` is-${row.result}`
+            : "";
+          const settings = ledgerSettingsText(row.entry_policy);
+          return `<tr>
+            <td>${esc(row.opened_at ? new Date(row.opened_at).toLocaleString() : "—")}</td>
+            <td>${esc(row.mode)}</td>
+            <td><strong class="us-ledger-result${resultClass}">${esc(row.result)}</strong></td>
+            <td><strong>${esc(row.event_name)}</strong><span>${esc(row.selection)}</span></td>
+            <td>${esc(row.market_type)}</td>
+            <td>${esc(cents(row.entry_cost))}</td>
+            <td>$${Number(row.cost_basis_usd || 0).toFixed(2)}</td>
+            <td>${row.realized_net_usd == null ? "—" : esc(money(Number(row.realized_net_usd)))}</td>
+            <td>${esc(signedCents(row.entry_execution_edge ?? row.entry_signal_edge))}</td>
+            <td>${row.entry_signal_quality == null ? "—" : Number(row.entry_signal_quality).toFixed(0)}</td>
+            <td><details><summary>#${esc(row.policy_signature)}</summary><span>${esc(settings)}</span></details></td>
+          </tr>`;
+        }).join("")
+      : '<tr><td colspan="11">No trades match the selected filters.</td></tr>';
+    const generated = data.generated_at
+      ? new Date(data.generated_at).toLocaleTimeString()
+      : "now";
+    status.className = "refresh-status";
+    status.textContent = (
+      `${Number(data.total_matching_rows || 0)} retained trade rows · refreshed ${generated}` +
+      (data.rows_truncated ? " · screen truncated; CSV can include up to 10,000 rows" : "") +
+      " · high rates from small samples are not reliable by themselves"
+    );
+  }
+
+  async function loadPerformanceLedger({quiet = false} = {}) {
+    if (usLedgerLoading) return;
+    usLedgerLoading = true;
+    const button = document.querySelector("#us-ledger-refresh");
+    const status = document.querySelector("#us-ledger-status");
+    if (!quiet) {
+      setActionBusy(button, true, "Refreshing…");
+      if (status) status.textContent = "Reading retained trades and exact entry-time settings…";
+    }
+    try {
+      const response = await fetch(
+        tradingApi(
+          `/api/polymarket-us/trading/performance-ledger?${ledgerFilterParams()}`
+        ),
+        {cache:"no-store"}
+      );
+      const data = await response.json().catch(()=>({}));
+      if (!response.ok) throw new Error(detailMessage(data));
+      usLedgerLoaded = true;
+      renderPerformanceLedger(data);
+    } catch (error) {
+      if (status) {
+        status.className = "refresh-status is-error";
+        status.textContent = error.message || "Could not load the performance datasheet";
+      }
+    } finally {
+      usLedgerLoading = false;
+      if (!quiet) setActionBusy(button, false);
+    }
+  }
+
+  document.querySelector("#us-ledger-refresh")?.addEventListener(
+    "click",
+    () => loadPerformanceLedger()
+  );
+  for (const selector of [
+    "#us-ledger-mode",
+    "#us-ledger-market-type",
+    "#us-ledger-result"
+  ]) {
+    document.querySelector(selector)?.addEventListener(
+      "change",
+      () => loadPerformanceLedger()
+    );
+  }
+  document.querySelector("#us-ledger-query")?.addEventListener("input", () => {
+    window.clearTimeout(usLedgerQueryTimer);
+    usLedgerQueryTimer = window.setTimeout(
+      () => loadPerformanceLedger({quiet:true}),
+      300
+    );
+  });
+  document.querySelector("#us-ledger-export")?.addEventListener(
+    "click",
+    async event => {
+      const button = event.currentTarget;
+      const status = document.querySelector("#us-ledger-status");
+      setActionBusy(button, true, "Exporting…");
+      if (status) status.textContent = "Building a CSV from the current datasheet filters…";
+      try {
+        const response = await fetch(
+          tradingApi(
+            `/api/polymarket-us/trading/performance-ledger?${ledgerFilterParams("csv")}`
+          ),
+          {cache:"no-store"}
+        );
+        if (!response.ok) {
+          const body = await response.json().catch(()=>({}));
+          throw new Error(detailMessage(body));
+        }
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        const disposition = response.headers.get("content-disposition") || "";
+        const match = disposition.match(/filename="([^"]+)"/);
+        link.href = url;
+        link.download = match?.[1] || "trade-performance.csv";
+        document.body.append(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+        if (status) status.textContent = "Filtered CSV downloaded. The on-screen datasheet remains unchanged.";
+      } catch (error) {
+        if (status) {
+          status.className = "refresh-status is-error";
+          status.textContent = error.message || "Could not export the filtered datasheet";
+        }
+      } finally {
+        setActionBusy(button, false);
+      }
+    }
+  );
+
+  function advisorSettingValue(field, value) {
+    if (field === "allowed_market_types") {
+      return Array.isArray(value) ? value.join(", ") : String(value || "none");
+    }
+    if ([
+      "min_edge",
+      "max_edge",
+      "min_entry_price",
+      "max_entry_price",
+      "min_mlb_fraction_remaining"
+    ].includes(field)) {
+      return `${(Number(value) * 100).toFixed(1)}%`;
+    }
+    if (field === "candidate_cooldown_seconds") return `${Number(value).toFixed(0)}s`;
+    return Number(value).toFixed(
+      field === "min_signal_quality" ? 0 : 0
+    );
+  }
+
+  function advisorDiagnosticTable(title, rows) {
+    if (!Array.isArray(rows) || !rows.length) return "";
+    return `<section class="us-advisor-diagnostic">
+      <h3>${esc(title)}</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Segment</th><th>Trades</th><th>Events</th><th>Net</th><th>ROI</th><th>Win rate</th></tr></thead>
+        <tbody>${rows.map(row => `<tr>
+          <td>${esc(row.label || "unknown")}</td>
+          <td>${Number(row.trades || 0)}</td>
+          <td>${Number(row.events || 0)}</td>
+          <td>${esc(money(Number(row.net_usd || 0)))}</td>
+          <td>${pct(row.turnover_roi)}</td>
+          <td>${pct(row.win_rate)}</td>
+        </tr>`).join("")}</tbody>
+      </table></div>
+    </section>`;
+  }
+
+  function advisorValidationBlockers(advice) {
+    if (advice?.validation_passed) return [];
+    const evidence = advice?.evidence || {};
+    const test = evidence.suggested_test || {};
+    const bootstrap = evidence.event_block_bootstrap || {};
+    const blockers = [];
+    const comparisons = [
+      [
+        Number(evidence.eligible_closed_trades || 0),
+        Number(evidence.minimum_closed_trades || 0),
+        "complete trades"
+      ],
+      [
+        Number(evidence.independent_events || 0),
+        Number(evidence.minimum_independent_events || 0),
+        "independent events"
+      ],
+      [
+        Number(test.trades || 0),
+        Number(evidence.minimum_test_trades || 0),
+        "later-event trades"
+      ],
+      [
+        Number(test.events || 0),
+        Number(evidence.minimum_test_events || 0),
+        "later test events"
+      ]
+    ];
+    for (const [actual, required, label] of comparisons) {
+      if (required > 0 && actual < required) {
+        blockers.push(`${actual}/${required} ${label}`);
+      }
+    }
+    if (test.turnover_roi == null || Number(test.turnover_roi) <= 0) {
+      blockers.push("later-event after-cost ROI is not positive");
+    }
+    if (
+      test.maximum_event_stake_share == null
+      || Number(test.maximum_event_stake_share) > 0.35
+    ) {
+      blockers.push("later-event stake concentration exceeds 35%");
+    }
+    if (
+      bootstrap.probability_positive == null
+      || Number(bootstrap.probability_positive) < 0.90
+    ) {
+      blockers.push("90% whole-event positive-return support is unavailable");
+    }
+    if (bootstrap.lower_95 == null || Number(bootstrap.lower_95) <= 0) {
+      blockers.push("whole-event lower confidence bound is not positive");
+    }
+    return blockers;
+  }
+
+  function invalidatePolicyAdvice(message) {
+    if (!lastPolicyAdvice) return;
+    lastPolicyAdvice = null;
+    const button = document.querySelector("#us-policy-advisor-apply");
+    const status = document.querySelector("#us-policy-advisor-status");
+    const body = document.querySelector("#us-policy-advisor-result");
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Analyze again before applying";
+    }
+    const download = document.querySelector("#us-policy-advisor-download");
+    if (download) download.disabled = true;
+    body?.classList.add("is-stale");
+    if (status) {
+      status.className = "refresh-status";
+      status.textContent = message;
+    }
+  }
+
+  function renderPolicyAdvice(advice) {
+    const body = document.querySelector("#us-policy-advisor-result");
+    const status = document.querySelector("#us-policy-advisor-status");
+    if (!body || !status) return;
+    lastPolicyAdvice = advice;
+    body.classList.remove("is-stale");
+    const evidence = advice.evidence || {};
+    const model = advice.model_evidence || {};
+    const bootstrap = evidence.event_block_bootstrap || {};
+    const changes = Object.entries(advice.changes || {});
+    const blockers = Array.isArray(model.live_blockers) ? model.live_blockers : [];
+    const currentRate = Number(evidence.current_estimated_qualified_per_hour || 0);
+    const suggestedRate = Number(evidence.suggested_estimated_qualified_per_hour || 0);
+    const diagnostics = advice.diagnostics || {};
+    const frontier = Array.isArray(advice.candidate_frontier)
+      ? advice.candidate_frontier
+      : [];
+    const validationBlockers = advisorValidationBlockers(advice);
+    const actionLabel = !changes.length
+      ? "No filter changes available"
+      : advice.apply_allowed
+        ? "Apply validated filters"
+        : "Preview exploratory filters";
+    const actionNote = advice.apply_allowed
+      ? "Validated application saves only the displayed execution filters and disarms live orders."
+      : "This result is not validated for one-click saving. Preview loads it into the form only; review it and use Save execution policy if you deliberately accept the risk.";
+    const download = document.querySelector("#us-policy-advisor-download");
+    if (download) download.disabled = false;
+    status.className = "refresh-status";
+    status.textContent = `${String(advice.status || "research").replaceAll("_", " ")} · ${evidence.analysis_mode || "current"} mode · ${Number(evidence.eligible_closed_trades || 0)} eligible closes across ${Number(evidence.independent_events || 0)} events · model stage ${String(model.stage || "unavailable").replaceAll("_", " ")}`;
+    body.innerHTML = `
+      <div class="us-policy-advisor-summary">
+        <div><span>Current qualified pace</span><strong>${currentRate.toFixed(2)}/hr</strong></div>
+        <div><span>Suggested qualified pace</span><strong>${suggestedRate.toFixed(2)}/hr</strong></div>
+        <div><span>Suggested test ROI</span><strong>${pct(evidence.suggested_test?.turnover_roi)}</strong></div>
+        <div><span>Whole-event confidence</span><strong>${bootstrap.probability_positive == null ? "not available" : `${(Number(bootstrap.probability_positive) * 100).toFixed(0)}% positive`}</strong></div>
+      </div>
+      <div class="us-policy-advisor-changes">
+        ${changes.length ? changes.map(([field, values]) => `<article class="us-policy-advisor-change">
+          <span>${esc(field.replaceAll("_", " "))}</span>
+          <strong>${esc(advisorSettingValue(field, values.current))} → ${esc(advisorSettingValue(field, values.suggested))}</strong>
+        </article>`).join("") : '<div class="metrics-empty">The best supported comparison does not change the current execution filters.</div>'}
+      </div>
+      <div class="us-policy-advisor-evidence">
+        Chronological evidence: ${Number(evidence.train_events || 0)} training events / ${Number(evidence.test_events || 0)} test events.
+        Event-block ROI interval: ${bootstrap.lower_95 == null ? "not available" : `${(Number(bootstrap.lower_95) * 100).toFixed(1)}% to ${(Number(bootstrap.upper_95) * 100).toFixed(1)}%`}.
+        Fitted-model decision coverage: ${Number(model.decision_score_coverage?.scored || 0)}/${Number(model.decision_score_coverage?.requested || 0)}.
+        ${blockers.length ? `Live-model blockers: ${esc(blockers.join(" · "))}.` : ""}
+        ${esc(advice.validation_note || "")}
+        Policy snapshot: ${esc(String(advice.source_policy_hash || "").slice(0, 12) || "unavailable")}.
+        ${esc(evidence.legacy_mode_warning || "")}
+        ${esc(advice.guarantee || "")}
+      </div>
+      <details class="advanced us-advisor-analysis" open>
+        <summary>Trade-data diagnostics</summary>
+        <div class="us-advisor-diagnostic-grid">
+          ${advisorDiagnosticTable("Line types", diagnostics.line_types)}
+          ${advisorDiagnosticTable("Edge bands", diagnostics.edge_bands)}
+          ${advisorDiagnosticTable("Signal-quality bands", diagnostics.quality_bands)}
+          ${advisorDiagnosticTable("Entry-price bands", diagnostics.price_bands)}
+          ${advisorDiagnosticTable("Repeat entries", diagnostics.entry_repetition)}
+          ${advisorDiagnosticTable("MLB game stage", diagnostics.game_stage)}
+          ${advisorDiagnosticTable("Exit reason", diagnostics.exit_reasons)}
+        </div>
+        <div class="us-policy-advisor-evidence">
+          MLB stage metadata: ${Number(diagnostics.game_stage_coverage?.known || 0)}/${Number(diagnostics.game_stage_coverage?.total || 0)} complete.
+          ${esc(evidence.selection_bias_warning || "")}
+        ${esc(evidence.multiple_testing_warning || "")}
+        ${validationBlockers.length ? `Validation blockers: ${esc(validationBlockers.join(" Â· "))}.` : ""}
+      </div>
+      </details>
+      <details class="advanced us-advisor-analysis">
+        <summary>Top candidate frontier</summary>
+        <div class="us-advisor-frontier">
+          ${frontier.length ? frontier.map((candidate, index) => `<article>
+            <strong>#${index + 1} · ${Number(candidate.opportunity_rate_per_hour || 0).toFixed(2)} qualified/hr</strong>
+            <span>Train ${pct(candidate.train?.turnover_roi)} · later events ${pct(candidate.test?.turnover_roi)}</span>
+            <small>${esc((candidate.settings?.allowed_market_types || []).join(", "))} · edge ${(Number(candidate.settings?.min_edge || 0) * 100).toFixed(1)}–${(Number(candidate.settings?.max_edge || 0) * 100).toFixed(1)}% · quality ${Number(candidate.settings?.min_signal_quality || 0).toFixed(0)} · ${Number(candidate.settings?.max_entries_per_event_per_hour || 0)} entries/event/hr</small>
+          </article>`).join("") : '<div class="metrics-empty">Not enough complete history to construct a candidate frontier.</div>'}
+        </div>
+      </details>
+      <div class="us-policy-advisor-actions">
+        <button class="primary compact-button" id="us-policy-advisor-apply" type="button" ${changes.length ? "" : "disabled"}>${esc(actionLabel)}</button>
+        <small>${esc(actionNote)}</small>
+      </div>`;
+    document.querySelector("#us-policy-advisor-apply")?.addEventListener(
+      "click",
+      advice.apply_allowed ? applyPolicyAdvice : previewPolicyAdvice
+    );
+  }
+
+  async function loadPolicyAdvisorSessions() {
+    const body = document.querySelector("#us-policy-advisor-sessions");
+    if (!body) return;
+    try {
+      const response = await fetch(
+        tradingApi(
+          "/api/polymarket-us/trading/policy-advisor/sessions?limit=6"
+        ),
+        {cache:"no-store"}
+      );
+      const sessions = await response.json().catch(()=>([]));
+      if (!response.ok) throw new Error(detailMessage(sessions));
+      body.innerHTML = Array.isArray(sessions) && sessions.length
+        ? sessions.map(session => `<article class="us-policy-session">
+            <strong>${new Date(session.started_at).toLocaleString()} · ${esc(session.mode)}</strong>
+            ${Number(session.trades || 0)} trades / ${Number(session.events || 0)} events / ${esc(money(Number(session.realized_net_usd || 0)))} realized
+            <br>${esc(String(session.reason || "").replaceAll("_", " "))}
+          </article>`).join("")
+        : "";
+    } catch (error) {
+      body.innerHTML = `<div class="metrics-empty">${esc(error.message || "Could not load settings sessions")}</div>`;
+    }
+  }
+
+  async function analyzePolicyAdvice({successPrefix = ""} = {}) {
+    const button = document.querySelector("#us-policy-advisor-refresh");
+    const status = document.querySelector("#us-policy-advisor-status");
+    const objective = document.querySelector("#us-policy-advisor-objective")?.value || "balanced";
+    const target = Number(document.querySelector("#us-policy-advisor-target")?.value || 4);
+    const analysisMode = document.querySelector("#us-policy-advisor-mode")?.value || "live";
+    const lookbackDays = Number(
+      document.querySelector("#us-policy-advisor-lookback")?.value || 0
+    );
+    const marketTypes = [
+      ...document.querySelectorAll("[data-advisor-market-type]:checked")
+    ].map(input => input.dataset.advisorMarketType);
+    if (!marketTypes.length) {
+      status.className = "refresh-status is-error";
+      status.textContent = "Select at least one line type to analyze.";
+      return null;
+    }
+    setActionBusy(button, true, "Analyzing...");
+    status.className = "refresh-status";
+    status.textContent = "Comparing chronological trade outcomes, logged opportunities, and fitted-model shadow readiness...";
+    try {
+      const response = await fetchWithDeadline(
+        tradingApi(
+          "/api/polymarket-us/trading/policy-advisor/recommend"
+        ),
+        {
+          method:"POST",
+          headers:{"content-type":"application/json"},
+          body:JSON.stringify({
+            objective,
+            target_trades_per_hour:target,
+            analysis_mode:analysisMode,
+            lookback_days:lookbackDays,
+            market_types:marketTypes
+          })
+        },
+        60000,
+        "The settings analysis exceeded 60 seconds. Try a shorter lookback or fewer line types."
+      );
+      const advice = await response.json().catch(()=>({}));
+      if (!response.ok) throw new Error(detailMessage(advice));
+      renderPolicyAdvice(advice);
+      if (successPrefix) {
+        status.textContent = `${successPrefix} ${status.textContent}`;
+      }
+      await loadPolicyAdvisorSessions();
+      return advice;
+    } catch (error) {
+      status.className = "refresh-status is-error";
+      status.textContent = error.message || "Could not generate settings advice";
+      return null;
+    } finally {
+      setActionBusy(button, false);
+    }
+  }
+
+  function previewPolicyAdvice() {
+    if (!lastPolicyAdvice?.suggested_policy) return;
+    const advice = lastPolicyAdvice;
+    const previewPolicy = {
+      ...(lastUSTradingStatus?.policy || {}),
+      ...advice.suggested_policy,
+      risk_preset:"custom"
+    };
+    usTradingHydrationEpoch += 1;
+    applyTradingPolicy(
+      {
+        ...(lastUSTradingStatus || {}),
+        policy:previewPolicy,
+        risk_presets:lastRiskPresets
+      },
+      {force:true}
+    );
+    setUSTradingFormDirty(true);
+    const button = document.querySelector("#us-policy-advisor-apply");
+    const status = document.querySelector("#us-policy-advisor-status");
+    const body = document.querySelector("#us-policy-advisor-result");
+    lastPolicyAdvice = null;
+    body?.classList.add("is-stale");
+    if (button) {
+      button.disabled = true;
+      button.removeAttribute("aria-busy");
+      button.textContent = "Preview loaded Â· review and save above";
+    }
+    if (status) {
+      status.className = "refresh-status";
+      status.textContent = (
+        "Exploratory filters were loaded into the execution form but were not saved. " +
+        "Review the highlighted unsaved controls, then use Save execution policy only if you accept the validation blockers."
+      );
+    }
+    document.querySelector("#us-policy-save")?.focus();
+  }
+
+  async function applyPolicyAdvice() {
+    if (!lastPolicyAdvice?.id) return;
+    const adviceId = lastPolicyAdvice.id;
+    if (!window.confirm(
+      "Apply these suggested execution filters? Live orders will be disarmed for review."
+    )) return;
+    const confirmation = APPROVAL_TOKEN;
+    const button = document.querySelector("#us-policy-advisor-apply");
+    const status = document.querySelector("#us-policy-advisor-status");
+    let applied = false;
+    let invalidated = false;
+    setActionBusy(button, true, "Applying...");
+    status.textContent = "Saving the recommended execution filters and disarming live orders...";
+    try {
+      const response = await fetchWithDeadline(
+        tradingApi(
+          `/api/polymarket-us/trading/policy-advisor/${encodeURIComponent(adviceId)}/apply`
+        ),
+        {
+          method:"POST",
+          headers:{"content-type":"application/json"},
+          body:JSON.stringify({confirmation})
+        },
+        20000,
+        "Applying the recommendation exceeded 20 seconds. The current policy will be reloaded before another attempt."
+      );
+      const result = await response.json().catch(()=>({}));
+      if (!response.ok) throw new Error(detailMessage(result));
+      usTradingHydrationEpoch += 1;
+      usTradingFormDirty = false;
+      status.className = "refresh-status";
+      status.textContent = result.summary || "Suggested filters applied; live orders are disarmed.";
+      lastPolicyAdvice = null;
+      applied = true;
+      setActionBusy(button, false);
+      if (button) {
+        button.disabled = true;
+        button.textContent = "Applied Â· refreshing analysis...";
+      }
+      refreshTradingInBackground();
+      void loadPolicyAdvisorSessions();
+      const refreshed = await analyzePolicyAdvice({
+        successPrefix: "Previous suggestion applied successfully. A fresh comparison is shown."
+      });
+      if (!refreshed && button?.isConnected) {
+        button.disabled = true;
+        button.removeAttribute("aria-busy");
+        button.textContent = "Applied Â· analyze again";
+      }
+    } catch (error) {
+      const message = error.message || "Could not apply settings advice";
+      if (
+        message.includes("already applied")
+        || message.includes("changed after this recommendation")
+        || message.includes("analyze the current settings")
+        || message.includes("exceeded 20 seconds")
+      ) {
+        setActionBusy(button, false);
+        invalidatePolicyAdvice(message);
+        invalidated = true;
+        refreshTradingInBackground();
+      } else {
+        status.className = "refresh-status is-error";
+        status.textContent = message;
+      }
+    } finally {
+      if (!applied && !invalidated) setActionBusy(button, false);
+    }
+  }
+
+  document.querySelector("#us-policy-advisor-refresh")?.addEventListener(
+    "click",
+    analyzePolicyAdvice
+  );
+  document.querySelector("#us-policy-advisor-objective")?.addEventListener(
+    "change",
+    () => invalidatePolicyAdvice(
+      "The advisor goal changed. Analyze current data again before applying."
+    )
+  );
+  document.querySelector("#us-policy-advisor-target")?.addEventListener(
+    "input",
+    () => invalidatePolicyAdvice(
+      "The desired trade rate changed. Analyze current data again before applying."
+    )
+  );
+  for (const selector of [
+    "#us-policy-advisor-mode",
+    "#us-policy-advisor-lookback",
+    "[data-advisor-market-type]"
+  ]) {
+    document.querySelectorAll(selector).forEach(input => input.addEventListener(
+      "change",
+      () => invalidatePolicyAdvice(
+        "The analysis scope changed. Analyze current data again before applying."
+      )
+    ));
+  }
+  document.querySelector("#us-policy-advisor-download")?.addEventListener(
+    "click",
+    () => {
+      if (!lastPolicyAdvice) return;
+      const blob = new Blob(
+        [JSON.stringify(lastPolicyAdvice, null, 2)],
+        {type:"application/json"}
+      );
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `execution-policy-analysis-${Date.now()}.json`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    }
+  );
+
   function renderTradingJournal(items) {
     const body = document.querySelector("#us-trading-journal");
     if (!body) return;
@@ -839,6 +1986,14 @@
       const selectedGateMetric = Array.isArray(details.selected_engine_gate_results)
         && details.selected_engine_gate_results.length
         ? `selected gates ${details.selected_engine_gate_results.map(gate => `${gate.code}:${gate.status || (gate.passed ? "pass" : "fail")}`).join(", ")}`
+        : "";
+      const stopGuard = details.stop_guard || {};
+      const stopGuardMetric = stopGuard.status
+        ? `stop guard ${stopGuard.status}${
+          stopGuard.confirmations == null
+            ? ""
+            : ` ${Number(stopGuard.confirmations)}/${Number(stopGuard.required_confirmations || 0)}`
+        }${stopGuard.reason ? `: ${stopGuard.reason}` : ""}`
         : "";
       const metrics = [
         details.signal_edge == null ? "" : `source edge ${signedCents(details.signal_edge)}`,
@@ -868,12 +2023,17 @@
         details.estimated_cashout_value == null ? "" : `cash-out $${Number(details.estimated_cashout_value).toFixed(2)}`,
         details.exit_book_depth == null ? "" : `exit depth ${Number(details.exit_book_depth).toFixed(2)} shares`,
         details.quote_source ? `quote ${details.quote_source}` : "",
-        details.venue_sync_status ? `venue ${details.venue_sync_status}` : ""
-      ].filter(Boolean).join(" · ");
+        details.venue_sync_status ? `venue ${details.venue_sync_status}` : "",
+        stopGuardMetric
+      ].filter(Boolean);
       return `<article class="us-journal-row">
         <div class="us-journal-time">${esc(new Date(item.created_at).toLocaleTimeString())}<span>${esc(item.kind)}</span></div>
         <div><strong>${esc(item.event_name || "System")}</strong><span>${esc([item.selection, item.market_slug].filter(Boolean).join(" · "))}</span></div>
-        <div><b class="us-journal-status">${esc(item.status)}</b><span>${esc(metrics)}</span>${reasons ? `<em>${esc(reasons)}</em>` : ""}</div>
+        <div class="us-journal-decision">
+          <b class="us-journal-status">${esc(item.status)}</b>
+          ${metrics.length ? `<div class="us-journal-metrics">${metrics.map(metric => `<span>${esc(metric)}</span>`).join("")}</div>` : ""}
+          ${reasons ? `<em>${esc(reasons)}</em>` : ""}
+        </div>
       </article>`;
     }).join("");
   }
@@ -892,10 +2052,10 @@
         journalResponse,
         performanceResponse
       ] = await Promise.all([
-        fetch("/api/polymarket-us/trading/status", {cache:"no-store"}),
-        fetch("/api/polymarket-us/trading/positions", {cache:"no-store"}),
-        fetch("/api/polymarket-us/trading/journal?limit=120", {cache:"no-store"}),
-        fetch("/api/polymarket-us/trading/performance", {cache:"no-store"})
+        fetch(tradingApi("/api/polymarket-us/trading/status"), {cache:"no-store"}),
+        fetch(tradingApi("/api/polymarket-us/trading/positions"), {cache:"no-store"}),
+        fetch(tradingApi("/api/polymarket-us/trading/journal?limit=120"), {cache:"no-store"}),
+        fetch(tradingApi("/api/polymarket-us/trading/performance"), {cache:"no-store"})
       ]);
       const [status, positions, journal, performance] = await Promise.all([
         statusResponse.json().catch(()=>({})),
@@ -944,10 +2104,45 @@
     const statusBox = document.querySelector("#us-trading-status");
     setActionBusy(button, true, "Saving policy…");
     statusBox.textContent = "Validating and saving the execution policy…";
+    const allowedMarketTypes = entryMarketTypeInputs()
+      .filter(input => input.checked)
+      .map(input => input.dataset.entryMarketType);
+    if (!allowedMarketTypes.length) {
+      setActionBusy(button, false);
+      statusBox.textContent = "Select at least one line type for automatic entry.";
+      entryMarketTypeInputs()[0]?.focus();
+      return;
+    }
     const payload = {
       execution_mode: document.querySelector("#us-trading-mode").value,
       automation_enabled: document.querySelector("#us-automation-enabled").checked,
       auto_cashout: document.querySelector("#us-auto-cashout").checked,
+      adaptive_exit_enabled: document.querySelector("#us-adaptive-exit-enabled").checked,
+      adaptive_exit_profile: document.querySelector("#us-adaptive-exit-profile").value,
+      adaptive_exit_horizon_minutes: Number(
+        document.querySelector("#us-adaptive-exit-horizon").value
+      ),
+      adaptive_exit_min_samples: Number(
+        document.querySelector("#us-adaptive-exit-min-samples").value
+      ),
+      adaptive_exit_max_tightening: Number(
+        document.querySelector("#us-adaptive-exit-max-tightening").value
+      ) / 100,
+      volatility_stop_enabled: document.querySelector(
+        "#us-volatility-stop-enabled"
+      ).checked,
+      stop_confirmation_readings: Number(
+        document.querySelector("#us-stop-confirmation-readings").value
+      ),
+      stop_grace_minutes: Number(
+        document.querySelector("#us-stop-grace-minutes").value
+      ),
+      catastrophic_stop_multiplier: Number(
+        document.querySelector("#us-catastrophic-stop-multiplier").value
+      ),
+      post_exit_tracking_minutes: Number(
+        document.querySelector("#us-post-exit-tracking-minutes").value
+      ),
       require_engine_entry: document.querySelector("#us-require-engine").checked,
       trading_allocation_usd: Number(
         document.querySelector("#us-trading-allocation").value
@@ -956,12 +2151,14 @@
       required_engine_gates: engineGateInputs()
         .filter(input => input.checked)
         .map(input => input.dataset.engineGate),
+      allowed_market_types: allowedMarketTypes,
       max_total_exposure_usd: Number(document.querySelector("#us-max-exposure").value),
       minimum_cash_reserve_usd: Number(document.querySelector("#us-cash-reserve").value),
       max_position_usd: Number(document.querySelector("#us-max-position").value),
       max_event_exposure_usd: Number(document.querySelector("#us-max-event").value),
       max_daily_loss_usd: Number(document.querySelector("#us-daily-loss").value),
       min_edge: Number(document.querySelector("#us-min-edge").value) / 100,
+      max_edge: Number(document.querySelector("#us-max-edge").value) / 100,
       min_signal_quality: Number(document.querySelector("#us-min-quality").value),
       min_entry_price: Number(document.querySelector("#us-min-price").value) / 100,
       max_entry_price: Number(document.querySelector("#us-max-price").value) / 100,
@@ -969,6 +2166,15 @@
       profit_target: Number(document.querySelector("#us-profit-target").value) / 100,
       max_open_positions: Number(document.querySelector("#us-max-open").value),
       max_orders_per_hour: Number(document.querySelector("#us-max-orders-hour").value),
+      max_entries_per_event_per_hour: Number(
+        document.querySelector("#us-max-event-entries-hour").value
+      ),
+      candidate_cooldown_seconds: Number(
+        document.querySelector("#us-candidate-cooldown").value
+      ),
+      min_mlb_fraction_remaining: Number(
+        document.querySelector("#us-min-mlb-remaining").value
+      ) / 100,
       min_reference_sources: Number(document.querySelector("#us-min-refs").value),
       max_spread: Number(document.querySelector("#us-max-spread").value) / 100,
       min_book_shares: Number(document.querySelector("#us-min-depth").value),
@@ -979,11 +2185,14 @@
     };
     const saveEpoch = ++usTradingHydrationEpoch;
     try {
-      const response = await fetch("/api/polymarket-us/trading/config", {
+      const response = await fetch(
+        tradingApi("/api/polymarket-us/trading/config"),
+        {
         method: "PUT",
         headers: {"content-type":"application/json"},
         body: JSON.stringify(payload)
-      });
+        }
+      );
       const body = await response.json().catch(()=>({}));
       if (!response.ok) throw new Error(detailMessage(body));
       if (saveEpoch === usTradingHydrationEpoch) {
@@ -1000,10 +2209,45 @@
     }
   });
 
+  document.querySelector("#us-adaptive-exit-clear")?.addEventListener(
+    "click",
+    async event => {
+      if (!window.confirm(
+        "Clear only the retained adaptive MLB movement history? Positions, trade history, journal entries, and core model data are preserved."
+      )) return;
+      const confirmation = APPROVAL_TOKEN;
+      const button = event.currentTarget;
+      const status = document.querySelector("#us-adaptive-exit-status");
+      setActionBusy(button, true, "Clearing learningâ€¦");
+      status.textContent = "Clearing retained adaptive movement observationsâ€¦";
+      try {
+        const response = await fetch(
+          tradingApi("/api/polymarket-us/trading/adaptive-exit/history"),
+          {
+            method: "DELETE",
+            headers: {"content-type":"application/json"},
+            body: JSON.stringify({confirmation})
+          }
+        );
+        const body = await response.json().catch(()=>({}));
+        if (!response.ok) throw new Error(detailMessage(body));
+        status.textContent = `Cleared ${Number(body.deleted_observations || 0)} observations. Positions and execution history were preserved.`;
+        await loadUSTrading();
+      } catch (error) {
+        status.textContent = error.message || "Could not clear adaptive learning history";
+      } finally {
+        setActionBusy(button, false);
+      }
+    }
+  );
+
   async function tradingAction(path, pending, options = {}) {
     const statusBox = document.querySelector("#us-trading-status");
     statusBox.textContent = pending;
-    const response = await fetch(path, {method:"POST", ...options});
+    const response = await fetch(
+      tradingApi(path),
+      {method:"POST", ...options}
+    );
     const body = await response.json().catch(()=>({}));
     if (!response.ok) throw new Error(detailMessage(body));
     refreshTradingInBackground();
@@ -1048,7 +2292,15 @@
   document.querySelector("#us-arm")?.addEventListener("click", async event => {
     const button = event.currentTarget;
     const duration = document.querySelector("#us-arm-duration");
+    const approval = document.querySelector("#us-arm-confirmation");
     const durationLabel = duration?.selectedOptions[0]?.textContent || "30 minutes";
+    if (!approval?.checked) {
+      document.querySelector("#us-trading-status").textContent = (
+        "Check the approval box before arming live orders."
+      );
+      approval?.focus();
+      return;
+    }
     setActionBusy(button, true, "Arming…");
     try {
       await tradingAction(
@@ -1057,12 +2309,12 @@
         {
           headers: {"content-type":"application/json"},
           body: JSON.stringify({
-            confirmation: document.querySelector("#us-arm-confirmation").value,
+            confirmation: APPROVAL_TOKEN,
             seconds: Number(duration?.value || 1800)
           })
         }
       );
-      document.querySelector("#us-arm-confirmation").value = "";
+      approval.checked = false;
     } catch (error) {
       document.querySelector("#us-trading-status").textContent = error.message;
     } finally {
@@ -1111,6 +2363,57 @@
       setActionBusy(button, false);
     }
   });
+  document.querySelector("#us-risk-session-reset")?.addEventListener(
+    "click",
+    async event => {
+      const button = event.currentTarget;
+      const status = document.querySelector("#us-risk-session-status");
+      if (lastUSTradingStatus?.armed) {
+        status.className = "us-liquidate-status is-error";
+        status.textContent = "Disarm live trading first. Starting a fresh risk window while live orders are authorized is not allowed.";
+        return;
+      }
+      if (!window.confirm(
+        "Start a fresh hourly-entry and rolling realized-loss window? This can permit new entries again, but it does not erase P/L or bypass position stops, exposure, cash, venue, liquidity, edge, quality, or engine safeguards."
+      )) return;
+      const confirmation = APPROVAL_TOKEN;
+      setActionBusy(button, true, "Starting session…");
+      status.className = "us-liquidate-status is-working";
+      status.textContent = "Recording a new auditable risk-session boundary and clearing the candidate retry cooldown…";
+      const progressTimer = delayedProgress(
+        status,
+        1500,
+        "The local trade database is committing the new risk boundary. Existing trades and journal evidence are being preserved."
+      );
+      try {
+        const response = await fetch(
+          tradingApi("/api/polymarket-us/trading/risk-session/reset"),
+          {
+            method: "POST",
+            headers: {"content-type":"application/json"},
+            body: JSON.stringify({confirmation})
+          }
+        );
+        const body = await response.json().catch(()=>({}));
+        if (!response.ok) throw new Error(detailMessage(body));
+        status.className = "us-liquidate-status is-success";
+        status.textContent = body.summary || "New risk session started.";
+        if (body.current) {
+          renderRiskSessionStatus({
+            policy: lastUSTradingStatus?.policy || {},
+            risk_session: body.current
+          });
+        }
+        await loadUSTrading();
+      } catch (error) {
+        status.className = "us-liquidate-status is-error";
+        status.textContent = error.message || "Could not start a new risk session";
+      } finally {
+        window.clearTimeout(progressTimer);
+        setActionBusy(button, false);
+      }
+    }
+  );
   for (const selector of ["#us-performance-refresh", "#us-trading-refresh"]) {
     document.querySelector(selector)?.addEventListener("click", async event => {
       const button = event.currentTarget;
@@ -1155,11 +2458,14 @@
       );
       try {
         const response = await fetch(
-          "/api/polymarket-us/trading/performance/reset-live",
+          tradingApi(
+            "/api/polymarket-us/trading/performance/reset-live",
+            "live"
+          ),
           {
             method: "POST",
             headers: {"content-type":"application/json"},
-            body: JSON.stringify({confirmation:"RESET LIVE TALLY"})
+            body: JSON.stringify({confirmation:APPROVAL_TOKEN})
           }
         );
         const body = await response.json().catch(()=>({}));
@@ -1238,7 +2544,9 @@
       renderManagedPositions();
       try {
         const response = await fetch(
-          "/api/polymarket-us/trading/positions/archive-exited",
+          tradingApi(
+            "/api/polymarket-us/trading/positions/archive-exited"
+          ),
           {method:"POST"}
         );
         const body = await response.json().catch(()=>({}));
@@ -1304,7 +2612,7 @@
             method: "POST",
             headers: {"content-type":"application/json"},
             body: JSON.stringify({
-              confirmation: live ? "SELL LIVE POSITION" : ""
+              confirmation: live ? APPROVAL_TOKEN : ""
             })
           }
         );
@@ -1338,7 +2646,7 @@
     const confirmation = document.querySelector("#us-liquidate-confirmation");
     const button = document.querySelector("#us-liquidate-submit");
     if (confirmationRow) confirmationRow.hidden = mode !== "live";
-    if (mode !== "live" && confirmation) confirmation.value = "";
+    if (mode !== "live" && confirmation) confirmation.checked = false;
     if (button) {
       button.textContent = mode === "live"
         ? "Sell all open live positions"
@@ -1364,6 +2672,13 @@
       lastTradingPerformance?.modes?.dry_run?.total_positions
       ?? lastManagedPositions.filter(position => position.mode === "dry_run").length
     );
+    const liveApproval = document.querySelector("#us-liquidate-confirmation");
+    if (live && !liveApproval?.checked) {
+      status.className = "us-liquidate-status is-error";
+      status.textContent = "Check the approval box before selling live positions.";
+      liveApproval?.focus();
+      return;
+    }
     const confirmationMessage = live
       ? `Attempt to sell all ${openCount} open live position${openCount === 1 ? "" : "s"}? Each order will be previewed and submitted as fill-or-kill.`
       : `EXECUTIVE DRY-RUN RESET: switch automatic analysis OFF and permanently remove all ${dryTotal} dry-run trade record${dryTotal === 1 ? "" : "s"}? No market mapping, quote, or fill is required. Live trades and the execution journal are preserved.`;
@@ -1417,17 +2732,20 @@
     try {
       const response = await fetch(
         live
-          ? "/api/polymarket-us/trading/liquidate"
-          : "/api/polymarket-us/trading/history/dry-run",
+          ? tradingApi("/api/polymarket-us/trading/liquidate", "live")
+          : tradingApi(
+              "/api/polymarket-us/trading/history/dry-run",
+              "dry_run"
+            ),
         {
           method: live ? "POST" : "DELETE",
           headers: {"content-type":"application/json"},
           body: JSON.stringify(live
             ? {
                 mode,
-                confirmation: document.querySelector("#us-liquidate-confirmation").value
+                confirmation: APPROVAL_TOKEN
               }
-            : {confirmation:"CLEAR DRY RUN HISTORY"})
+            : {confirmation:APPROVAL_TOKEN})
         });
       const body = await response.json().catch(()=>({}));
       if (!response.ok) throw new Error(detailMessage(body));
@@ -1437,7 +2755,7 @@
           ? "Position sale attempts completed."
           : "Automation stopped and all dry-run positions and history were wiped."
       );
-      if (live) document.querySelector("#us-liquidate-confirmation").value = "";
+      if (live) document.querySelector("#us-liquidate-confirmation").checked = false;
       if (!live) {
         const stoppedStatus = {
           ...(lastUSTradingStatus || {}),
@@ -1478,6 +2796,296 @@
     }
   });
   updateLiquidationMode();
+
+  let modelLabLoading = false;
+  let modelLabFitInProgress = false;
+  let modelLabFitStartedAt = 0;
+  let modelLabFitProgressTimer = null;
+
+  function renderModelLab(data) {
+    const thresholds = data.thresholds || {};
+    const profiles = Array.isArray(data.profiles) ? data.profiles : [];
+    const segments = Array.isArray(data.segments) ? data.segments : [];
+    const recent = Array.isArray(data.recent_momentum) ? data.recent_momentum : [];
+    const profileBox = document.querySelector("#model-lab-profiles");
+    const mlbBox = document.querySelector("#mlb-model-blueprint");
+    const segmentBox = document.querySelector("#model-lab-segments");
+    const momentumBox = document.querySelector("#model-lab-momentum");
+    const targetBox = document.querySelector("#model-lab-targets");
+    const archiveBox = document.querySelector("#model-lab-archive-status");
+    const targetDefinitions = data.target_definitions || {};
+    const targetCounts = Array.isArray(data.target_counts) ? data.target_counts : [];
+    const archive = data.archive || {};
+    if (targetBox) {
+      targetBox.innerHTML = Object.entries(targetDefinitions).map(([name, definition]) => {
+        const count = targetCounts.find(row => row.target_name === name);
+        const unavailable = definition.version === "not-yet-linked";
+        return `<article class="model-lab-target">
+          <strong>${esc(name.replaceAll("_", " "))}</strong>
+          <span>${unavailable ? "NOT YET LINKED" : `${Number(count?.target_count || 0)} labels across ${Number(count?.event_count || 0)} events`}</span>
+          <small>${esc(definition.meaning || "")}</small>
+        </article>`;
+      }).join("");
+    }
+    if (archiveBox) {
+      const latestArchive = archive.latest_export;
+      archiveBox.textContent = latestArchive
+        ? `Latest immutable snapshot: ${new Date(latestArchive.created_at).toLocaleString()} · ${Number(latestArchive.observation_count || 0)} observations · manifest ${String(latestArchive.manifest_hash || "").slice(0, 12)}`
+        : archive.available
+          ? `No immutable research snapshot yet. Archive directory: ${archive.directory || "local workstation data"}`
+          : "Immutable filesystem exports are unavailable for this database.";
+    }
+    if (profileBox) {
+      profileBox.innerHTML = profiles.map(profile => {
+        const missing = (profile.missing_features || []).join(", ");
+        return `<article class="model-lab-profile ${profile.supported ? "is-ready" : "is-blocked"}">
+          <div><strong>${esc(profile.label)}</strong><b>${profile.supported ? "CAPTURE READY" : "STATE INCOMPLETE"}</b></div>
+          <span>${esc(profile.note)}</span>
+          <small>Inputs: ${esc((profile.available_features || []).join(", ") || "none")}${missing ? ` · missing ${esc(missing)}` : ""}</small>
+        </article>`;
+      }).join("");
+    }
+    if (mlbBox) {
+      const blueprint = data.mlb_research_blueprint || {};
+      const steps = Array.isArray(blueprint.priority_order)
+        ? blueprint.priority_order
+        : [];
+      const references = Array.isArray(data.research_references)
+        ? data.research_references
+        : [];
+      mlbBox.innerHTML = `<h3>MLB predictive hierarchy</h3>
+        <p>${esc(blueprint.objective || "Building a calibrated live-state model.")}</p>
+        <div class="mlb-blueprint-grid">${steps.map(step => `<article class="mlb-blueprint-step">
+          <strong>${Number(step.rank || 0)}. ${esc(String(step.group || "").replaceAll("_", " "))}</strong>
+          <span>${esc((step.parameters || []).join(" · "))}</span>
+          <small>${esc(step.availability || "")}</small>
+        </article>`).join("")}</div>
+        <div class="mlb-blueprint-references">Research basis: ${references.map(reference =>
+          `<a href="${esc(reference.url)}" target="_blank" rel="noopener">${esc(reference.title)}</a>`
+        ).join(" · ")}</div>`;
+    }
+    if (segmentBox) {
+      segmentBox.innerHTML = segments.length
+        ? segments.map(segment => `<article class="model-lab-segment">
+            <div><strong>${esc([segment.sport, segment.league].filter(Boolean).join(" / "))}</strong><b>${segment.research_fit_ready ? "FIT READY" : segment.fit_supported ? "COLLECTING" : "INPUT BLOCKED"}</b></div>
+            <span>${Number(segment.observations || 0)} observations across ${Number(segment.observed_events || 0)} monitored events · ${Number(segment.state_observations || 0)} with live state across ${Number(segment.state_events || 0)} events</span>
+            <span>${Number(segment.settled_observations || 0)} labeled across ${Number(segment.settled_events || 0)} settled events · ${Number(segment.fit_observations || 0)} fit-ready rows across ${Number(segment.fit_events || 0)} events</span>
+            ${String(segment.sport || "").toLowerCase() === "baseball" ? `<span>${Number(segment.rich_state_observations || 0)} official base/out/count rows across ${Number(segment.rich_state_events || 0)} events · average state completeness ${(Number(segment.average_state_completeness || 0) * 100).toFixed(0)}%</span>` : ""}
+            <small>${segment.last_observed_at ? `last ${esc(new Date(segment.last_observed_at).toLocaleString())}` : "no timestamp"} · research minimum ${Number(thresholds.research_min_events || 0)} events / ${Number(thresholds.research_min_observations || 0)} observations</small>
+          </article>`).join("")
+        : '<div class="metrics-empty">No moneyline observations yet. Monitoring live events will populate this automatically.</div>';
+    }
+    if (momentumBox) {
+      momentumBox.innerHTML = recent.length
+        ? recent.map(row => {
+            const move = row.market_move == null ? "first sample" : `market ${signedCents(row.market_move)}`;
+            const score = row.score_swing == null ? "score baseline" : `score swing ${Number(row.score_swing) >= 0 ? "+" : ""}${Number(row.score_swing).toFixed(1)}`;
+            const baseballState = row.baseball_inning == null
+              ? ""
+              : `${row.baseball_half === "bottom" ? "Bot" : row.baseball_half === "top" ? "Top" : "End"} ${Number(row.baseball_inning)}`;
+            const clock = baseballState || (
+              row.fraction_remaining == null
+                ? "clock unavailable"
+                : `${(Number(row.fraction_remaining) * 100).toFixed(0)}% remaining`
+            );
+            return `<article>
+              <div><strong>${esc(row.event_name)}</strong><span>${esc(row.outcome)}</span></div>
+              <div><b>${esc(move)}</b><span>${esc(score)} · ${esc(clock)}</span></div>
+              <div><b>${signedCents(Number(row.model_probability) - Number(row.market_probability))}</b><span>model-market gap · quality ${Number(row.signal_quality || 0).toFixed(0)}</span></div>
+            </article>`;
+          }).join("")
+        : '<div class="metrics-empty">Waiting for live moneyline observations.</div>';
+    }
+    const latest = Array.isArray(data.candidates) ? data.candidates[0] : null;
+    const result = document.querySelector("#model-lab-fit-result");
+    if (result && latest && !modelLabFitInProgress) {
+      const details = latest.details || {};
+      result.innerHTML = `<strong>${esc(latest.status)}</strong><span>${esc([latest.sport, latest.league, latest.market].filter(Boolean).join(" / "))}</span><small>${esc(details.reason || `Brier improvement ${Number(details.brier_improvement || 0).toFixed(4)}`)} · research-only · never promoted</small>`;
+    }
+  }
+
+  async function loadModelLab() {
+    if (modelLabLoading) return;
+    const status = document.querySelector("#model-lab-status");
+    if (!status) return;
+    modelLabLoading = true;
+    try {
+      const response = await fetch("/api/model-lab/summary", {cache:"no-store"});
+      const data = await response.json().catch(()=>({}));
+      if (!response.ok) throw new Error(detailMessage(data));
+      renderModelLab(data);
+      const total = (data.segments || []).reduce(
+        (sum, segment) => sum + Number(segment.observations || 0), 0
+      );
+      status.className = "refresh-status";
+      status.textContent = `${total} bounded observations · 15-second selection buckets · engine impact: none`;
+    } catch (error) {
+      status.className = "refresh-status is-error";
+      status.textContent = error.message || "Could not load the local Model Lab";
+    } finally {
+      modelLabLoading = false;
+    }
+  }
+
+  document.querySelector("#research-evidence-export")?.addEventListener("click", async event => {
+    const button = event.currentTarget;
+    const status = document.querySelector("#research-evidence-status");
+    setActionBusy(button, true, "Building archive...");
+    if (status) {
+      status.className = "refresh-status";
+      status.textContent = "Building a compressed, secret-free evidence archive. Large local histories can take a minute...";
+    }
+    try {
+      const response = await fetch("/api/research-data/export", {cache:"no-store"});
+      if (!response.ok) {
+        const data = await response.json().catch(()=>({}));
+        throw new Error(detailMessage(data));
+      }
+      const blob = await response.blob();
+      const disposition = response.headers.get("content-disposition") || "";
+      const match = disposition.match(/filename=\"?([^\";]+)\"?/i);
+      const filename = match?.[1] || "pelositracker-research.ndjson.gz";
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      if (status) status.textContent = `Downloaded ${filename} (${(blob.size / 1048576).toFixed(1)} MB). Upload this file on the hosted site to merge it.`;
+    } catch (error) {
+      if (status) {
+        status.className = "refresh-status is-error";
+        status.textContent = error.message || "Could not export research evidence";
+      }
+    } finally {
+      setActionBusy(button, false);
+    }
+  });
+
+  document.querySelector("#research-evidence-import")?.addEventListener("click", async event => {
+    const button = event.currentTarget;
+    const input = document.querySelector("#research-evidence-file");
+    const status = document.querySelector("#research-evidence-status");
+    const file = input?.files?.[0];
+    if (!file) {
+      if (status) {
+        status.className = "refresh-status is-error";
+        status.textContent = "Choose a .ndjson.gz evidence archive first.";
+      }
+      return;
+    }
+    if (!window.confirm(`Merge ${file.name} into this site's durable research store? Existing rows are preserved and repeated imports are safe.`)) return;
+    setActionBusy(button, true, "Uploading & validating...");
+    if (status) {
+      status.className = "refresh-status";
+      status.textContent = `Uploading ${(file.size / 1048576).toFixed(1)} MB, validating its checksum, then merging by immutable evidence ID...`;
+    }
+    try {
+      const form = new FormData();
+      form.append("bundle", file, file.name);
+      const response = await fetch("/api/research-data/import", {
+        method: "POST",
+        body: form
+      });
+      const data = await response.json().catch(()=>({}));
+      if (!response.ok) throw new Error(detailMessage(data));
+      if (input) input.value = "";
+      if (status) {
+        status.textContent = `${Number(data.rows || 0).toLocaleString()} evidence rows validated and processed idempotently · checksum ${String(data.sha256 || "").slice(0, 12)} · existing hosted rows preserved.`;
+      }
+      await loadModelLab();
+      await loadUSTrading();
+    } catch (error) {
+      if (status) {
+        status.className = "refresh-status is-error";
+        status.textContent = error.message || "Could not merge research evidence";
+      }
+    } finally {
+      setActionBusy(button, false);
+    }
+  });
+
+  document.querySelector("#model-lab-refresh")?.addEventListener("click", async event => {
+    const button = event.currentTarget;
+    setActionBusy(button, true, "Refreshing...");
+    await loadModelLab();
+    setActionBusy(button, false);
+  });
+
+  document.querySelector("#model-lab-export")?.addEventListener("click", async event => {
+    const button = event.currentTarget;
+    const status = document.querySelector("#model-lab-status");
+    setActionBusy(button, true, "Archiving...");
+    if (status) {
+      status.className = "refresh-status";
+      status.textContent = "Writing a content-hashed local snapshot. Trading calculations remain unchanged...";
+    }
+    try {
+      const response = await fetch("/api/model-lab/export", {method: "POST"});
+      const data = await response.json().catch(()=>({}));
+      if (!response.ok) throw new Error(detailMessage(data));
+      if (status) {
+        status.textContent = `Snapshot archived: ${Number(data.counts?.observations || 0)} observations · ${Number(data.counts?.targets || 0)} explicit labels · manifest ${String(data.manifest_hash || "").slice(0, 12)}`;
+      }
+      await loadModelLab();
+    } catch (error) {
+      if (status) {
+        status.className = "refresh-status is-error";
+        status.textContent = error.message || "Could not archive the research snapshot";
+      }
+    } finally {
+      setActionBusy(button, false);
+    }
+  });
+
+  document.querySelector("#model-lab-fit-form")?.addEventListener("submit", async event => {
+    event.preventDefault();
+    const button = document.querySelector("#model-lab-fit-submit");
+    const result = document.querySelector("#model-lab-fit-result");
+    if (modelLabFitInProgress) return;
+    modelLabFitInProgress = true;
+    modelLabFitStartedAt = Date.now();
+    setActionBusy(button, true, "Fitting offline...");
+    const renderFitProgress = () => {
+      const elapsed = Math.max(
+        0,
+        Math.floor((Date.now() - modelLabFitStartedAt) / 1000)
+      );
+      result.innerHTML = `<strong>Research fit running</strong><span>${elapsed}s elapsed</span><small>Optimizing the chronological event-block candidate and walk-forward checks. The rest of the workstation remains active.</small>`;
+    };
+    renderFitProgress();
+    modelLabFitProgressTimer = window.setInterval(renderFitProgress, 1000);
+    try {
+      const response = await fetchWithDeadline(
+        "/api/model-lab/fit",
+        {
+          method: "POST",
+          headers: {"content-type":"application/json"},
+          body: JSON.stringify({
+            sport: document.querySelector("#model-lab-fit-sport").value,
+            league: document.querySelector("#model-lab-fit-league").value.trim(),
+            market: "moneyline"
+          })
+        },
+        180000,
+        "The research fit exceeded three minutes. Restart the workstation to cancel the old fit, then try again with the optimized fitter."
+      );
+      const data = await response.json().catch(()=>({}));
+      if (!response.ok) throw new Error(detailMessage(data));
+      const details = data.details || {};
+      result.innerHTML = `<strong>${esc(data.status)}</strong><span>${esc(details.reason || "Candidate comparison completed.")}</span><small>Artifact ${esc(String(details.artifact_hash || "").slice(0, 12))} · research-only · not installed</small>`;
+    } catch (error) {
+      result.textContent = error.message || "Could not fit the research candidate";
+    } finally {
+      modelLabFitInProgress = false;
+      window.clearInterval(modelLabFitProgressTimer);
+      modelLabFitProgressTimer = null;
+      setActionBusy(button, false);
+      await loadModelLab();
+    }
+  });
 
   function renderCarousel(present){
     const el=document.querySelector("#line-filter");
@@ -1970,6 +3578,7 @@
     events = (events || []).filter(view => !pendingEventRemovals.has(view.event.id));
     lastEvents = events;
     renderBestBets();
+    if (discoveryTabVisible()) renderDiscover();
     // Keep the newest data for navigation/recommendations, but do not build and
     // replace the heavy Live Radar DOM while another tab is visible.
     if (!liveTabVisible() || document.activeElement?.closest("[data-save-position]")) return;
@@ -2035,7 +3644,8 @@
   document.querySelector("#form").addEventListener("submit",async event=>{event.preventDefault();const form=event.currentTarget,button=document.querySelector("#submit-event"),box=document.querySelector("#form-error");
     const payload=Object.fromEntries(new FormData(form));Object.keys(payload).forEach(k=>{if(!payload[k])delete payload[k]});button.disabled=true;box.hidden=true;
     try{const response=await fetch("/api/events",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(payload)});const body=await response.json().catch(()=>({}));if(!response.ok)throw new Error(body.detail||`Could not monitor event (${response.status})`);form.reset();await refresh();
-      document.querySelector('[data-tab="tab-live"]').click();
+      const status=document.querySelector("#discover-batch-status");
+      if(status){status.className="refresh-status discover-batch-status is-success";status.textContent="Event added to Live Radar. You can keep working in Discovery."}
     }
     catch(error){box.textContent=error.message;box.hidden=false}finally{button.disabled=false}});
 
@@ -2157,18 +3767,61 @@
     }
     if(removePosition){removePosition.disabled=true;try{const response=await fetch(`/api/events/${encodeURIComponent(removePosition.dataset.eventId)}/positions/${encodeURIComponent(removePosition.dataset.tokenId)}`,{method:"DELETE"});if(response.ok)await refresh()}catch{}finally{removePosition.disabled=false}}
     if(chartBtn){viewChart(chartBtn.dataset.chartEvent, chartBtn.dataset.chartTitle)}});
-  let discoverGames = [];
+  let discoverGames = [], discoverBatchActive = false;
+  const selectedDiscoverSlugs = new Set();
   function discoverStatus(game){
     if(game.status==="live")return '<span class="g-live">● LIVE</span> ';
     if(game.status==="started")return '<span class="g-started">◌ STARTED</span> ';
     return "";
   }
+  function monitoredDiscoverSlugs(){
+    return new Set(lastEvents.map(view=>String(view?.event?.polymarket_slug||"")).filter(Boolean));
+  }
+  function visibleDiscoverGames(){
+    const q=(document.querySelector("#discover-search").value||"").toLowerCase();
+    return discoverGames.filter(g=>!q||`${g.title} ${g.league||""}`.toLowerCase().includes(q));
+  }
+  function updateDiscoverBatchControls(shown,monitored){
+    for(const slug of [...selectedDiscoverSlugs]){
+      if(monitored.has(slug)||!discoverGames.some(game=>game.slug===slug))selectedDiscoverSlugs.delete(slug);
+    }
+    const available=shown.filter(game=>!monitored.has(game.slug));
+    const allVisibleSelected=available.length>0&&available.every(game=>selectedDiscoverSlugs.has(game.slug));
+    const count=selectedDiscoverSlugs.size;
+    const countBox=document.querySelector("#discover-selection-count");
+    const selectVisible=document.querySelector("#discover-select-visible");
+    const clear=document.querySelector("#discover-clear-selection");
+    const monitor=document.querySelector("#discover-monitor-selected");
+    if(countBox)countBox.textContent=`${count} selected`;
+    if(selectVisible){
+      selectVisible.disabled=discoverBatchActive||!available.length;
+      selectVisible.textContent=allVisibleSelected?"Deselect visible":"Select visible";
+      selectVisible.dataset.mode=allVisibleSelected?"deselect":"select";
+    }
+    if(clear)clear.disabled=discoverBatchActive||!count;
+    if(monitor){
+      monitor.disabled=discoverBatchActive||!count;
+      monitor.textContent=discoverBatchActive
+        ?"Adding events…"
+        : count ? `Monitor ${count} selected` : "Monitor selected";
+    }
+  }
   function renderDiscover() {
     const list=document.querySelector("#discover-list");
+    const monitored=monitoredDiscoverSlugs();
+    const shown=visibleDiscoverGames();
+    updateDiscoverBatchControls(shown,monitored);
     if(!discoverGames.length){list.innerHTML='<div class="discover-empty">No live or upcoming games found right now.</div>';return}
-    const q=(document.querySelector("#discover-search").value||"").toLowerCase();
-    const shown=discoverGames.filter(g=>!q||`${g.title} ${g.league||""}`.toLowerCase().includes(q));
-    list.innerHTML=shown.length?shown.map(g=>`<div class="game" data-slug="${esc(g.slug)}" role="button" tabindex="0" title="${esc(g.title)}"><div><div class="g-title">${esc(g.title)}</div><div class="g-league">${discoverStatus(g)}${esc(g.league||"sports")}${g.reference_adapter===false?' · PRICE ONLY — NO REFERENCE ADAPTER':''}</div></div><span class="g-add">+ Monitor</span></div>`).join(""):'<div class="discover-empty">No games match.</div>';
+    list.innerHTML=shown.length?shown.map(g=>{
+      const isMonitored=monitored.has(g.slug);
+      const isSelected=!isMonitored&&selectedDiscoverSlugs.has(g.slug);
+      const state=isMonitored?"Monitoring":isSelected?"Selected":"Select";
+      return `<label class="game discover-game${isMonitored?" is-monitored":""}${isSelected?" is-selected":""}" data-slug="${esc(g.slug)}" title="${esc(g.title)}">
+        <input class="discover-game-check" type="checkbox" ${isMonitored?"checked disabled":discoverBatchActive?"disabled":""} ${isSelected?"checked":""} data-discover-select="${esc(g.slug)}" aria-label="${esc(isMonitored?`${g.title} is already monitored`:`Select ${g.title}`)}">
+        <span class="discover-game-copy"><span class="g-title">${esc(g.title)}</span><span class="g-league">${discoverStatus(g)}${esc(g.league||"sports")}${g.reference_adapter===false?' · PRICE ONLY — NO REFERENCE ADAPTER':''}</span></span>
+        <span class="g-add${isMonitored?" is-monitored":""}">${esc(state)}</span>
+      </label>`;
+    }).join(""):'<div class="discover-empty">No games match.</div>';
   }
   let discoverRequest = null;
   async function loadDiscover(manual=false) {
@@ -2217,26 +3870,68 @@
     })();
     return discoverRequest;
   }
-  async function monitorGame(slug,row) {
-    const box=document.querySelector("#form-error");
-    let addBtn = null;
-    if(row){
-      row.setAttribute("aria-disabled","true");
-      addBtn = row.querySelector(".g-add");
-      if(addBtn) addBtn.textContent = "Adding...";
-    }
-    box.hidden=true;
-    try{const r=await fetch("/api/events",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({polymarket_url:`https://polymarket.com/event/${slug}`})});
-      const body=await r.json().catch(()=>({}));if(!r.ok)throw new Error(body.detail||`Could not monitor (${r.status})`);await refresh();await refreshMetrics();
-      document.querySelector('[data-tab="tab-live"]').click();
-    }
-    catch(error){
-      box.textContent=error.message;box.hidden=false;
-      if(addBtn) addBtn.textContent = "+ Monitor";
-    }
-    finally{if(row)row.removeAttribute("aria-disabled")}
+  async function addDiscoveredGame(slug) {
+    const response=await fetch("/api/events",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({polymarket_url:`https://polymarket.com/event/${slug}`})});
+    const body=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(body.detail||`Could not monitor (${response.status})`);
+    return body;
   }
-  document.querySelector("#discover-list").addEventListener("click",e=>{const row=e.target.closest("[data-slug]");if(row&&row.getAttribute("aria-disabled")!=="true")monitorGame(row.dataset.slug,row)});
+  async function monitorSelectedDiscoverGames(){
+    const status=document.querySelector("#discover-batch-status");
+    const monitored=monitoredDiscoverSlugs();
+    const slugs=[...selectedDiscoverSlugs].filter(slug=>!monitored.has(slug));
+    if(!slugs.length){renderDiscover();return}
+    discoverBatchActive=true;
+    renderDiscover();
+    const failures=[];
+    let added=0;
+    for(let index=0;index<slugs.length;index+=1){
+      const slug=slugs[index];
+      if(status){
+        status.className="refresh-status discover-batch-status is-working";
+        status.textContent=`Adding ${index+1} of ${slugs.length} to Live Radar…`;
+      }
+      try{
+        await addDiscoveredGame(slug);
+        selectedDiscoverSlugs.delete(slug);
+        added+=1;
+      }catch(error){
+        failures.push(`${slug}: ${error.message||"could not add"}`);
+      }
+    }
+    discoverBatchActive=false;
+    await refresh();
+    await refreshMetrics();
+    renderDiscover();
+    if(status){
+      status.className=`refresh-status discover-batch-status ${failures.length?"is-error":"is-success"}`;
+      status.textContent=failures.length
+        ? `Added ${added} of ${slugs.length}. ${failures.length} failed: ${failures.join(" | ")}`
+        : `Added ${added} event${added===1?"":"s"} to Live Radar. Discovery remains open.`;
+    }
+  }
+  document.querySelector("#discover-list").addEventListener("change",event=>{
+    const input=event.target.closest("[data-discover-select]");
+    if(!input||input.disabled)return;
+    const slug=input.dataset.discoverSelect;
+    if(input.checked)selectedDiscoverSlugs.add(slug);else selectedDiscoverSlugs.delete(slug);
+    renderDiscover();
+  });
+  document.querySelector("#discover-select-visible").addEventListener("click",event=>{
+    const monitored=monitoredDiscoverSlugs();
+    const available=visibleDiscoverGames().filter(game=>!monitored.has(game.slug));
+    if(event.currentTarget.dataset.mode==="deselect"){
+      available.forEach(game=>selectedDiscoverSlugs.delete(game.slug));
+    }else{
+      available.forEach(game=>selectedDiscoverSlugs.add(game.slug));
+    }
+    renderDiscover();
+  });
+  document.querySelector("#discover-clear-selection").addEventListener("click",()=>{
+    selectedDiscoverSlugs.clear();
+    renderDiscover();
+  });
+  document.querySelector("#discover-monitor-selected").addEventListener("click",monitorSelectedDiscoverGames);
   document.querySelector("#best-bets").addEventListener("click",e=>{const row=e.target.closest("[data-goto-event]");if(row)gotoEvent(row.dataset.gotoEvent)});
   document.querySelector("#best-bets").addEventListener("keydown",e=>{if(e.key!=="Enter"&&e.key!==" ")return;const row=e.target.closest("[data-goto-event]");if(row){e.preventDefault();gotoEvent(row.dataset.gotoEvent)}});
   document.querySelector("#discover-search").addEventListener("input",renderDiscover);
@@ -2362,6 +4057,57 @@
     }
   });
 
+  document.querySelector("#odds-api-interval-save")?.addEventListener("click", async event => {
+    const button = event.currentTarget;
+    const input = document.querySelector("#odds-api-interval");
+    const seconds = Number(input?.value);
+    const status = document.querySelector("#odds-api-status");
+    if (!Number.isFinite(seconds) || seconds < 5 || seconds > 3600) {
+      if (status) {
+        status.className = "odds-api-status is-error";
+        status.textContent = "Enter an interval from 5 to 3,600 seconds.";
+      }
+      input?.focus();
+      return;
+    }
+    button.disabled = true;
+    if (input) input.disabled = true;
+    button.textContent = "Applying…";
+    if (status) {
+      status.className = "odds-api-status";
+      status.textContent = `Applying a ${seconds.toFixed(0)}-second Odds API interval…`;
+    }
+    try {
+      const response = await fetch("/api/config", {
+        method: "POST",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify({odds_api_poll_seconds: seconds})
+      });
+      const config = await response.json().catch(()=>({}));
+      if (!response.ok) {
+        const detail = Array.isArray(config.detail)
+          ? config.detail.map(item => item.msg).filter(Boolean).join("; ")
+          : config.detail;
+        throw new Error(detail || `Could not update (${response.status})`);
+      }
+      if (input) input.value = Number(config.odds_api_poll_seconds || seconds);
+      showOddsApiStatus(
+        config.odds_api_enabled,
+        config.odds_api_poll_seconds,
+        `Interval saved · paid polling will use ${Number(config.odds_api_poll_seconds).toFixed(0)} seconds per eligible monitored event without a restart.`
+      );
+    } catch (error) {
+      if (status) {
+        status.className = "odds-api-status is-error";
+        status.textContent = `${error.message||"Could not update the interval"}. Setting was not changed.`;
+      }
+    } finally {
+      button.disabled = false;
+      if (input) input.disabled = false;
+      button.textContent = "Apply interval";
+    }
+  });
+
   // Only start the app data fetching after successful login or if already authenticated.
   // We check if the events endpoint succeeds. If so, we are logged in, hide overlay immediately.
   async function checkAuthAndStart() {
@@ -2382,6 +4128,21 @@
     }
     window.appStarted = true;
     renderLobby();
+    try {
+      const savedTab = sessionStorage.getItem("pelositracker-active-tab");
+      const restorableTabs = new Set([
+        "tab-lobby",
+        "tab-live",
+        "tab-discovery",
+        "tab-us-research"
+      ]);
+      const savedButton = restorableTabs.has(savedTab)
+        ? document.querySelector(`[data-tab="${savedTab}"]`)
+        : null;
+      if (savedButton && !savedButton.classList.contains("active")) {
+        activatePrimaryTab(savedButton);
+      }
+    } catch {}
     fetch("/api/config").then(r=>r.json()).then(c=>{
       const prefix = c.workstation?.enabled ? "Local workstation · " : "";
       usExecutionEnabled = !!c.workstation?.polymarket_us_trading_enabled;
@@ -2390,6 +4151,7 @@
       if (botsButton) botsButton.hidden = c.paper_bot_policy?.enabled === false;
       if(document.querySelector("#auto-monitor-toggle")) document.querySelector("#auto-monitor-toggle").checked = !!c.auto_monitor;
       if(document.querySelector("#odds-api-toggle")) document.querySelector("#odds-api-toggle").checked = !!c.odds_api_enabled;
+      if(document.querySelector("#odds-api-interval")) document.querySelector("#odds-api-interval").value = Number(c.odds_api_poll_seconds || 45);
       showOddsApiStatus(c.odds_api_enabled, c.odds_api_poll_seconds);
       const policy=document.querySelector("#bot-policy");
       if(policy&&c.paper_bot_policy){
@@ -2415,6 +4177,12 @@
       setInterval(loadDiscover,60000);
       setInterval(refreshBotGames,30000);
       setInterval(()=>{if(usResearchTabVisible())loadUSEvents()},60000);
+      setInterval(()=>{if(usResearchTabVisible())loadModelLab()},30000);
+      setInterval(()=>{
+        if(usResearchTabVisible() && usLedgerLoaded) {
+          loadPerformanceLedger({quiet:true});
+        }
+      },30000);
       setInterval(()=>{
         if(usResearchTabVisible()) loadUSTrading();
         else if(discoveryTabVisible()) refreshUSExecutionStatus();
@@ -2430,6 +4198,9 @@
       refreshUSStatus();
       loadUSEvents();
       loadUSTrading();
+      loadPerformanceLedger({quiet:true});
+      loadModelLab();
+      loadPolicyAdvisorSessions();
     }
     if (botsTabVisible()) {
       refreshMetrics();

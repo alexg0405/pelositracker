@@ -833,6 +833,7 @@ async def polymarket_market_stream(
     event: Event,
     emit: Callable[[list[Quote]], Awaitable[None]],
     snapshot_emit: Callable[[Event, list[Quote]], Awaitable[None]] | None = None,
+    state_emit: Callable[[GameState], Awaitable[None]] | None = None,
 ):
     if not event.polymarket_slug:
         return
@@ -840,6 +841,15 @@ async def polymarket_market_stream(
     while True:
         try:
             data = await polymarket_event(event.polymarket_slug)
+            # Gamma includes the current sports score/period on the event
+            # object. The change-only sports websocket does not guarantee an
+            # initial packet after this workstation starts or an event is
+            # added, so seed the live state from the same public snapshot used
+            # to build the market universe.
+            if state_emit is not None:
+                state = _game_state_from_sports_payload(event, data)
+                if state is not None:
+                    await state_emit(state)
             token_meta = _polymarket_token_meta(data)
             if not token_meta:
                 if snapshot_emit is not None:
@@ -953,13 +963,14 @@ async def polymarket_sports_stream(events: Callable[[], list[Event]],
                         await ws.send("pong")
                         continue
                     data = json.loads(raw)
-                    slug = data.get("slug")
+                    payload = _sports_state_payload(data)
+                    slug = payload.get("slug")
                     if slug and status_emit is not None:
-                        await status_emit(str(slug), data)
+                        await status_emit(str(slug), payload)
                     matched = next((e for e in events() if e.polymarket_slug == slug), None)
                     if not matched:
                         continue
-                    state = _game_state_from_sports_payload(matched, data)
+                    state = _game_state_from_sports_payload(matched, payload)
                     if state is not None:
                         await emit(state)
         except asyncio.CancelledError:
@@ -970,8 +981,46 @@ async def polymarket_sports_stream(events: Callable[[], list[Event]],
             await asyncio.sleep(backoff.next_delay())
 
 
+def _sports_state_payload(data: dict) -> dict:
+    """Flatten documented sports-state envelopes without discarding metadata."""
+    payload = data.get("payload")
+    source = payload if isinstance(payload, dict) else data
+    event_state = source.get("eventState") or source.get("event_state")
+    if not isinstance(event_state, dict):
+        return dict(source)
+    merged = dict(source)
+    merged.update(event_state)
+    for key in (
+        "slug",
+        "homeTeam",
+        "home_team",
+        "awayTeam",
+        "away_team",
+        "gameId",
+        "game_id",
+        "leagueAbbreviation",
+        "league_abbreviation",
+        "timestamp",
+        "updatedAt",
+        "last_updated",
+        "last_update",
+    ):
+        if merged.get(key) is None and source.get(key) is not None:
+            merged[key] = source[key]
+    return merged
+
+
 def _game_state_from_sports_payload(event: Event, data: dict) -> GameState | None:
-    """Parse a sports update while retaining uncertainty about score orientation."""
+    """Parse a documented home-away sports score without inventing team order.
+
+    Sports websocket packets may name both teams, while Gamma's event snapshot
+    commonly omits those names. Polymarket documents the score string as
+    ``home-away``. When explicit names are supplied they must match the
+    registered event; when both are absent, the event's already-verified
+    home/away identity supplies the orientation. A partial or conflicting pair
+    remains quarantined.
+    """
+    data = _sports_state_payload(data)
     score = str(data.get("score", "")).split("-")
     if len(score) != 2:
         return None
@@ -981,11 +1030,37 @@ def _game_state_from_sports_payload(event: Event, data: dict) -> GameState | Non
 
     provider_home = str(data.get("homeTeam") or data.get("home_team") or "").strip()
     provider_away = str(data.get("awayTeam") or data.get("away_team") or "").strip()
-    orientation_verified = bool(
-        provider_home and provider_away
-        and team_match_score(event.home, provider_home) is not None
-        and team_match_score(event.away, provider_away) is not None
+    if provider_home and provider_away:
+        orientation_verified = bool(
+            team_match_score(event.home, provider_home) is not None
+            and team_match_score(event.away, provider_away) is not None
+        )
+    elif not provider_home and not provider_away:
+        orientation_verified = bool(
+            event.home
+            and event.away
+            and event.home not in {"Outcome A", "Outcome B"}
+            and event.away not in {"Outcome A", "Outcome B"}
+        )
+        if orientation_verified:
+            provider_home = event.home
+            provider_away = event.away
+    else:
+        orientation_verified = False
+    raw_status = next(
+        (
+            data.get(key)
+            for key in ("status", "gameStatus", "game_status", "state")
+            if data.get(key)
+        ),
+        None,
     )
+    if bool(data.get("ended")):
+        status = "final"
+    elif bool(data.get("live")):
+        status = str(raw_status or "in_progress")
+    else:
+        status = str(raw_status or "scheduled")
     received_at = datetime.now(timezone.utc)
     provider_timestamp = _provider_time(
         data.get("timestamp") or data.get("updatedAt") or data.get("last_updated")
@@ -999,7 +1074,7 @@ def _game_state_from_sports_payload(event: Event, data: dict) -> GameState | Non
         str(data.get("clock") or data.get("elapsed") or ""),
         "Polymarket sports",
         possession=data.get("turn"),
-        status=str(data.get("status", "in_progress")),
+        status=status,
         provider_timestamp=provider_timestamp,
         received_at=received_at,
         processed_at=datetime.now(timezone.utc),
@@ -1017,7 +1092,11 @@ def _game_state_from_sports_payload(event: Event, data: dict) -> GameState | Non
         state_hash=hashlib.sha256(
             json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest(),
-        finished_timestamp=_provider_time(data.get("finished_timestamp")),
+        finished_timestamp=_provider_time(
+            data.get("finished_timestamp")
+            or data.get("finishedTimestamp")
+            or data.get("finishedAt")
+        ),
     )
 
 
@@ -1160,6 +1239,7 @@ async def odds_api_poll(
     emit: Callable[[list[Quote]], Awaitable[None]],
     *,
     enabled: Callable[[], bool] | None = None,
+    interval_seconds: Callable[[], float] | None = None,
 ):
     key = os.getenv("THE_ODDS_API_KEY")
     if not key or not event.odds_api_sport:
@@ -1167,7 +1247,14 @@ async def odds_api_poll(
 
     # Lower interval = fresher sportsbook lines but more (paid) API credits.
     # Polymarket streams in real time regardless; this only paces The Odds API.
-    interval = max(5.0, float(os.getenv("ODDS_POLL_SECONDS", "45")))
+    def current_interval() -> float:
+        raw = (
+            interval_seconds()
+            if interval_seconds is not None
+            else float(os.getenv("ODDS_POLL_SECONDS", "45"))
+        )
+        return max(5.0, min(3600.0, float(raw)))
+
     backoff = RetryBackoff(base_seconds=5, cap_seconds=180)
     async with httpx.AsyncClient(timeout=15) as client:
         while True:
@@ -1188,7 +1275,7 @@ async def odds_api_poll(
                     else:
                         logger.warning("Could not resolve Odds API event ID for %s; retrying",
                                        event.name)
-                        await asyncio.sleep(interval)
+                        await asyncio.sleep(current_interval())
                         continue
                 # Event-ID resolution yields to the event loop. Recheck so a
                 # switch flipped while that lookup was in flight cannot be
@@ -1219,6 +1306,7 @@ async def odds_api_poll(
                 runtime_telemetry.increment(f"odds_api_error_{type(exc).__name__}")
                 logger.warning("The Odds API poll failed for %s (%s)", event.name,
                                type(exc).__name__)
+            interval = current_interval()
             await asyncio.sleep(max(interval, backoff.next_delay()) if failed else interval)
 
 

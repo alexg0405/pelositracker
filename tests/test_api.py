@@ -27,7 +27,9 @@ def create_manual_event(client):
 @pytest.fixture
 def enabled_live_trading(monkeypatch, tmp_path):
     trading_db = tmp_path / "polymarket-us-trading.db"
+    dry_run_db = tmp_path / "polymarket-us-dry-run.db"
     monkeypatch.setenv("POLYMARKET_US_TRADING_DB", str(trading_db))
+    monkeypatch.setenv("POLYMARKET_US_DRY_RUN_DB", str(dry_run_db))
     monkeypatch.setattr(
         main_module,
         "settings",
@@ -35,6 +37,7 @@ def enabled_live_trading(monkeypatch, tmp_path):
             main_module.settings,
             enable_polymarket_us_trading=True,
             polymarket_us_trading_db=trading_db,
+            polymarket_us_dry_run_db=dry_run_db,
         ),
     )
 
@@ -119,7 +122,16 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "Signal quality" in javascript
         assert "Edge buffer" in javascript or "edge_buffer" in javascript
         assert "Allow logical automatic cash-out" in html
+        assert 'data-trading-lane="dry_run"' in html
+        assert 'data-trading-lane="live"' in html
+        assert "Both lanes may run at the same time" in html
+        assert "function tradingApi" in javascript
+        assert "switchTradingLane" in javascript
         assert "data-cashout-toggle" in javascript
+        assert 'id="discover-monitor-selected"' in html
+        assert "selectedDiscoverSlugs" in javascript
+        assert "Discovery remains open" in javascript
+        assert "is already monitored" in javascript
         assert 'id="discover-refresh-status"' in html
         assert "/api/discover?refresh=true" in javascript
         assert 'id="bot-activity"' in html
@@ -162,7 +174,11 @@ def test_dashboard_contains_merged_ui_behaviors():
             in html.casefold()
         )
         assert 'id="odds-api-toggle"' in html
+        assert 'id="odds-api-interval"' in html
+        assert 'id="odds-api-interval-save"' in html
         assert "odds_api_enabled" in javascript
+        assert "odds_api_poll_seconds" in javascript
+        assert "Apply interval" in javascript
         assert 'fetch("/api/config", {' in javascript
         assert "backend pollers are paused" in javascript
         assert 'id="tab-us-research"' in html
@@ -175,6 +191,7 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "/api/polymarket-us/trading/status" in javascript
         assert "/api/polymarket-us/trading/sync" in javascript
         assert "/api/polymarket-us/trading/config" in javascript
+        assert "/api/polymarket-us/trading/adaptive-exit/history" in javascript
         assert "/api/polymarket-us/trading/arm" in javascript
         assert "/api/polymarket-us/trading/emergency-stop" in javascript
         assert "Stop automation now" in html
@@ -182,7 +199,10 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "Automation is OFF" in javascript
         assert "refreshTradingInBackground" in javascript
         assert "Raw long bid" in javascript
-        assert "ARM LIVE TRADING" in html
+        assert 'id="us-arm-confirmation" type="checkbox"' in html
+        assert "I approve live orders for the selected duration" in html
+        assert 'const APPROVAL_TOKEN = "approve";' in javascript
+        assert "window.prompt" not in javascript
         assert 'id="us-arm-duration"' in html
         assert '<option value="14400">4 hours</option>' in html
         assert "updateArmDurationLabel" in javascript
@@ -200,6 +220,11 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "/api/polymarket-us/trading/performance/reset-live" in javascript
         assert "Reset live tally" in html
         assert 'id="us-performance-action-status"' in html
+        assert "/api/polymarket-us/trading/risk-session/reset" in javascript
+        assert 'id="us-risk-session-reset"' in html
+        assert "Start new risk session" in html
+        assert "Start a fresh hourly-entry and rolling realized-loss window?" in javascript
+        assert "does not erase P/L or bypass position stops" in javascript
         assert "/api/polymarket-us/trading/liquidate" in javascript
         assert "/api/polymarket-us/trading/history/dry-run" in javascript
         assert 'data-engine-gate="provider_freshness"' in html
@@ -217,7 +242,8 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "Total net" in javascript
         assert "W–L–P" in javascript
         assert 'id="us-liquidate-form"' in html
-        assert "SELL ALL LIVE POSITIONS" in html
+        assert 'id="us-liquidate-confirmation" type="checkbox"' in html
+        assert "I approve attempts to sell every open live position" in html
         assert 'class="us-activity-grid section-gap"' in html
         assert "Stop automation + wipe dry-run trades" in html
         assert "Dry run is one atomic reset" in html
@@ -234,6 +260,41 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "Sync phone/account" in html
         assert "total paid" in javascript
         assert "Protective auto-exits stay armed" in javascript
+        assert 'id="us-adaptive-exit-enabled"' in html
+        assert "Adaptive MLB cash-out research" in html
+        assert "adverse-move forecast" in javascript
+        assert "Clear only the retained adaptive MLB movement history?" in javascript
+        assert 'id="model-lab-export"' in html
+        assert 'id="model-lab-targets"' in html
+        assert "/api/model-lab/export" in javascript
+        assert "Archive research snapshot" in html
+        assert "after_cost_strategy_pnl" not in javascript
+        assert 'id="us-policy-advisor-refresh"' in html
+        assert 'id="us-policy-advisor-objective"' in html
+        assert 'id="us-policy-advisor-mode"' in html
+        assert 'id="us-policy-advisor-lookback"' in html
+        assert 'id="us-policy-advisor-download"' in html
+        assert 'data-advisor-market-type="moneyline"' in html
+        assert "/api/polymarket-us/trading/policy-advisor/recommend" in javascript
+        assert "Apply these suggested execution filters?" in javascript
+        assert "Previous suggestion applied successfully" in javascript
+        assert "Analyze again before applying" in javascript
+        assert "Preview exploratory filters" in javascript
+        assert "previewPolicyAdvice" in javascript
+        assert "were loaded into the execution form but were not saved" in javascript
+        assert "fetchWithDeadline" in javascript
+        assert "exceeded 20 seconds" in javascript
+        assert "Validation blockers:" in javascript
+        assert 'data-entry-market-type="moneyline"' in html
+        assert 'data-entry-market-type="spread"' in html
+        assert 'data-entry-market-type="total"' in html
+        assert 'id="us-max-edge"' in html
+        assert 'id="us-max-event-entries-hour"' in html
+        assert 'id="us-candidate-cooldown"' in html
+        assert 'id="us-min-mlb-remaining"' in html
+        assert 'id="us-ledger-market-type"' in html
+        assert 'id="us-ledger-export"' in html
+        assert "/api/polymarket-us/trading/performance-ledger" in javascript
 
 
 def test_workstation_exposes_only_bounded_polymarket_us_trading_routes():
@@ -244,9 +305,11 @@ def test_workstation_exposes_only_bounded_polymarket_us_trading_routes():
         "/api/polymarket-us/status",
         "/api/polymarket-us/events",
         "/api/polymarket-us/account",
+        "/api/polymarket-us/runtime-credentials",
         "/api/polymarket-us/trading/status",
         "/api/polymarket-us/trading/sync",
         "/api/polymarket-us/trading/config",
+        "/api/polymarket-us/trading/adaptive-exit/history",
         "/api/polymarket-us/trading/arm",
         "/api/polymarket-us/trading/disarm",
         "/api/polymarket-us/trading/stop",
@@ -256,7 +319,14 @@ def test_workstation_exposes_only_bounded_polymarket_us_trading_routes():
         "/api/polymarket-us/trading/positions",
         "/api/polymarket-us/trading/positions/archive-exited",
         "/api/polymarket-us/trading/performance",
+        "/api/polymarket-us/trading/performance-ledger",
         "/api/polymarket-us/trading/performance/reset-live",
+        "/api/polymarket-us/trading/policy-advisor/recommend",
+        "/api/polymarket-us/trading/policy-advisor/history",
+        "/api/polymarket-us/trading/policy-advisor/sessions",
+        "/api/polymarket-us/trading/policy-advisor/model-readiness",
+        "/api/polymarket-us/trading/policy-advisor/{advice_id}/apply",
+        "/api/polymarket-us/trading/risk-session/reset",
         "/api/polymarket-us/trading/liquidate",
         "/api/polymarket-us/trading/history/dry-run",
         "/api/polymarket-us/trading/positions/{position_id}/exit",
@@ -287,12 +357,33 @@ def test_live_trading_api_defaults_disarmed_and_rejects_unsafe_policy(
             configured = client.put("/api/polymarket-us/trading/config", json={
                 "automation_enabled": False,
                 "execution_mode": "dry_run",
+                "allowed_market_types": ["moneyline", "total"],
+                "adaptive_exit_enabled": True,
+                "adaptive_exit_profile": "observe",
+                "adaptive_exit_horizon_minutes": 2.5,
+                "adaptive_exit_min_samples": 20,
+                "adaptive_exit_max_tightening": 0.25,
+                "volatility_stop_enabled": True,
+                "stop_confirmation_readings": 4,
+                "stop_grace_minutes": 2.5,
+                "catastrophic_stop_multiplier": 1.8,
+                "post_exit_tracking_minutes": 45,
             })
             assert configured.status_code == 200
             status = configured.json()
             assert status["armed"] is False
             assert status["policy"]["execution_mode"] == "dry_run"
             assert status["policy"]["automation_enabled"] is False
+            assert status["policy"]["allowed_market_types"] == [
+                "moneyline",
+                "total",
+            ]
+            assert status["policy"]["adaptive_exit_enabled"] is True
+            assert status["policy"]["adaptive_exit_horizon_minutes"] == 2.5
+            assert status["policy"]["volatility_stop_enabled"] is True
+            assert status["policy"]["stop_confirmation_readings"] == 4
+            assert status["policy"]["post_exit_tracking_minutes"] == 45
+            assert status["adaptive_exit"]["observations"] == 0
             assert status["restart_behavior"] == "always_disarmed"
 
             performance = client.get("/api/polymarket-us/trading/performance")
@@ -301,6 +392,24 @@ def test_live_trading_api_defaults_disarmed_and_rejects_unsafe_policy(
             assert set(summary["modes"]) == {"dry_run", "live"}
             assert summary["combined"]["mode"] == "combined"
 
+            ledger = client.get(
+                "/api/polymarket-us/trading/performance-ledger",
+                params={
+                    "mode": "dry_run",
+                    "market_type": "moneyline",
+                    "result": "all",
+                },
+            )
+            assert ledger.status_code == 200
+            assert ledger.json()["filters"]["market_type"] == "moneyline"
+            exported = client.get(
+                "/api/polymarket-us/trading/performance-ledger",
+                params={"format": "csv", "market_type": "moneyline"},
+            )
+            assert exported.status_code == 200
+            assert exported.headers["content-type"].startswith("text/csv")
+            assert "entry_policy" in exported.text.splitlines()[0]
+
             unsafe = client.put("/api/polymarket-us/trading/config", json={
                 "min_entry_price": 0.05,
             })
@@ -308,11 +417,124 @@ def test_live_trading_api_defaults_disarmed_and_rejects_unsafe_policy(
             assert "5c" in unsafe.json()["detail"]
 
             arm = client.post("/api/polymarket-us/trading/arm", json={
-                "confirmation": "ARM LIVE TRADING",
+                "confirmation": " APPROVE ",
                 "seconds": 1800,
             })
             assert arm.status_code == 400
             assert "enable automation" in arm.json()["detail"]
+
+            rejected_clear = client.request(
+                "DELETE",
+                "/api/polymarket-us/trading/adaptive-exit/history",
+                json={"confirmation": "clear it"},
+            )
+            assert rejected_clear.status_code == 409
+            cleared = client.request(
+                "DELETE",
+                "/api/polymarket-us/trading/adaptive-exit/history",
+                json={"confirmation": "APPROVE"},
+            )
+            assert cleared.status_code == 200
+            assert cleared.json()["retained_positions"] is True
+            assert cleared.json()["retained_journal"] is True
+        finally:
+            main_module.auth_manager.revoke(token)
+
+
+def test_live_and_dry_run_lanes_keep_independent_policies_and_controls(
+    enabled_live_trading,
+):
+    with TestClient(app) as client:
+        authenticated = main_module.auth_manager.login("admin", "admin")
+        assert authenticated is not None
+        token, session = authenticated
+        client.cookies.set(main_module._cookie_name("session_token"), token)
+        client.cookies.set(main_module._cookie_name("csrf_token"), session.csrf_token)
+        client.headers.update({"X-CSRF-Token": session.csrf_token})
+        try:
+            assert main_module.live_trader is not None
+            assert main_module.dry_run_trader is not None
+            assert main_module.live_trader.path != main_module.dry_run_trader.path
+
+            live = client.put(
+                "/api/polymarket-us/trading/config",
+                params={"lane": "live"},
+                json={
+                    "execution_mode": "dry_run",
+                    "automation_enabled": True,
+                    "min_edge": 0.071,
+                    "cycle_seconds": 31,
+                },
+            )
+            dry = client.put(
+                "/api/polymarket-us/trading/config",
+                params={"lane": "dry_run"},
+                json={
+                    "execution_mode": "live",
+                    "automation_enabled": True,
+                    "min_edge": 0.012,
+                    "cycle_seconds": 11,
+                },
+            )
+            assert live.status_code == 200
+            assert dry.status_code == 200
+            assert live.json()["policy"]["execution_mode"] == "live"
+            assert dry.json()["policy"]["execution_mode"] == "dry_run"
+
+            live_status = client.get(
+                "/api/polymarket-us/trading/status",
+                params={"lane": "live"},
+            ).json()
+            dry_status = client.get(
+                "/api/polymarket-us/trading/status",
+                params={"lane": "dry_run"},
+            ).json()
+            assert live_status["policy"]["min_edge"] == pytest.approx(0.071)
+            assert live_status["policy"]["cycle_seconds"] == 31
+            assert dry_status["policy"]["min_edge"] == pytest.approx(0.012)
+            assert dry_status["policy"]["cycle_seconds"] == 11
+            assert set(dry_status["lanes"]) == {"live", "dry_run"}
+
+            stopped_dry = client.post(
+                "/api/polymarket-us/trading/stop",
+                params={"lane": "dry_run"},
+            )
+            assert stopped_dry.status_code == 200
+            assert stopped_dry.json()["lane"] == "dry_run"
+            assert (
+                stopped_dry.json()["lanes"]["live"]["automation_enabled"]
+                is True
+            )
+            assert client.get(
+                "/api/polymarket-us/trading/status",
+                params={"lane": "dry_run"},
+            ).json()["policy"]["automation_enabled"] is False
+            assert client.get(
+                "/api/polymarket-us/trading/status",
+                params={"lane": "live"},
+            ).json()["policy"]["automation_enabled"] is True
+
+            resumed_dry = client.put(
+                "/api/polymarket-us/trading/config",
+                params={"lane": "dry_run"},
+                json={"automation_enabled": True},
+            )
+            assert resumed_dry.status_code == 200
+            cleared_dry = client.request(
+                "DELETE",
+                "/api/polymarket-us/trading/history/dry-run",
+                params={"lane": "dry_run"},
+                json={"confirmation": "approve"},
+            )
+            assert cleared_dry.status_code == 200
+            assert client.get(
+                "/api/polymarket-us/trading/status",
+                params={"lane": "dry_run"},
+            ).json()["policy"]["automation_enabled"] is False
+            assert client.get(
+                "/api/polymarket-us/trading/status",
+                params={"lane": "live"},
+            ).json()["policy"]["automation_enabled"] is True
         finally:
             main_module.auth_manager.revoke(token)
 
@@ -341,7 +563,7 @@ def test_dry_reset_route_stops_automation_in_one_request_and_live_tally_resets(
             reset = client.request(
                 "DELETE",
                 "/api/polymarket-us/trading/history/dry-run",
-                json={"confirmation": "CLEAR DRY RUN HISTORY"},
+                json={"confirmation": "approve"},
             )
             assert reset.status_code == 200
             assert reset.json()["automation_enabled"] is False
@@ -351,11 +573,101 @@ def test_dry_reset_route_stops_automation_in_one_request_and_live_tally_resets(
 
             live_tally = client.post(
                 "/api/polymarket-us/trading/performance/reset-live",
-                json={"confirmation": "RESET LIVE TALLY"},
+                json={"confirmation": "APPROVE"},
             )
             assert live_tally.status_code == 200
             assert live_tally.json()["positions_preserved"] is True
             assert live_tally.json()["risk_history_preserved"] is True
+
+            rejected_risk_reset = client.post(
+                "/api/polymarket-us/trading/risk-session/reset",
+                json={"confirmation": "reset"},
+            )
+            assert rejected_risk_reset.status_code == 409
+            risk_reset = client.post(
+                "/api/polymarket-us/trading/risk-session/reset",
+                json={"confirmation": "approve"},
+            )
+            assert risk_reset.status_code == 200
+            assert risk_reset.json()["current"]["orders_last_hour"] == 0
+            assert risk_reset.json()["current"]["realized_loss_24h_usd"] == 0
+            assert risk_reset.json()["per_position_stop_loss_preserved"] is True
+        finally:
+            main_module.auth_manager.revoke(token)
+
+
+def test_policy_advisor_api_reports_model_readiness_and_applies_explicitly(
+    enabled_live_trading,
+):
+    with TestClient(app) as client:
+        authenticated = main_module.auth_manager.login("admin", "admin")
+        assert authenticated is not None
+        token, session = authenticated
+        client.cookies.set(main_module._cookie_name("session_token"), token)
+        client.cookies.set(main_module._cookie_name("csrf_token"), session.csrf_token)
+        client.headers.update({"X-CSRF-Token": session.csrf_token})
+        try:
+            recommended = client.post(
+                "/api/polymarket-us/trading/policy-advisor/recommend",
+                json={
+                    "objective": "more_trades",
+                    "target_trades_per_hour": 8,
+                    "analysis_mode": "live",
+                    "lookback_days": 30,
+                    "market_types": ["moneyline"],
+                },
+            )
+            assert recommended.status_code == 200
+            advice = recommended.json()
+            assert advice["model_used_to_change_settings"] is False
+            assert advice["model_evidence"]["engine_impact"] == "none"
+            assert advice["suggested_policy"]["max_orders_per_hour"] == 8
+            assert advice["scope"] == {
+                "analysis_mode": "live",
+                "lookback_days": 30,
+                "market_types": ["moneyline"],
+            }
+            assert advice["apply_allowed"] is False
+            assert len(advice["source_policy_hash"]) == 64
+
+            history = client.get(
+                "/api/polymarket-us/trading/policy-advisor/history"
+            )
+            assert history.status_code == 200
+            assert history.json()[0]["id"] == advice["id"]
+            sessions = client.get(
+                "/api/polymarket-us/trading/policy-advisor/sessions"
+            )
+            assert sessions.status_code == 200
+            assert sessions.json()
+            readiness = client.get(
+                "/api/polymarket-us/trading/policy-advisor/model-readiness"
+            )
+            assert readiness.status_code == 200
+            assert readiness.json()["live_eligible"] is False
+
+            rejected = client.post(
+                f"/api/polymarket-us/trading/policy-advisor/{advice['id']}/apply",
+                json={"confirmation": "apply"},
+            )
+            assert rejected.status_code == 409
+            held_back = client.post(
+                f"/api/polymarket-us/trading/policy-advisor/{advice['id']}/apply",
+                json={"confirmation": "APPROVE"},
+            )
+            assert held_back.status_code == 409
+            assert "diagnostic only" in held_back.json()["detail"]
+
+            refreshed = client.post(
+                "/api/polymarket-us/trading/policy-advisor/recommend",
+                json={
+                    "objective": "more_trades",
+                    "target_trades_per_hour": 9,
+                },
+            )
+            assert refreshed.status_code == 200
+            assert refreshed.json()["id"] != advice["id"]
+            assert refreshed.json()["apply_allowed"] is False
         finally:
             main_module.auth_manager.revoke(token)
 
@@ -494,6 +806,35 @@ def test_odds_api_master_switch_updates_without_changing_auto_monitor(monkeypatc
     assert response["odds_api_enabled"] is False
     assert response["auto_monitor"] is True
     assert monitor.values == [False]
+
+
+def test_odds_api_interval_updates_and_persists_without_restart(monkeypatch):
+    class MonitorStub:
+        def __init__(self):
+            self.values = []
+
+        def set_odds_api_poll_seconds(self, value):
+            self.values.append(value)
+
+    monitor = MonitorStub()
+    monkeypatch.setattr(
+        main_module,
+        "_config_state",
+        {
+            "auto_monitor": False,
+            "odds_api_enabled": True,
+            "odds_api_poll_seconds": 45.0,
+        },
+    )
+    monkeypatch.setattr(main_module, "monitor_state", monitor)
+
+    response = asyncio.run(main_module.update_config(
+        main_module.ConfigIn(odds_api_poll_seconds=12.5)
+    ))
+
+    assert response["odds_api_poll_seconds"] == 12.5
+    assert response["odds_api_enabled"] is True
+    assert monitor.values == [12.5]
 
 
 def test_event_history_api_caps_default_and_requested_page_size(monkeypatch):

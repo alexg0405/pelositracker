@@ -364,6 +364,66 @@ def test_odds_poll_master_switch_prevents_calls_until_enabled(monkeypatch):
     assert calls == 1
 
 
+def test_odds_poll_reads_runtime_interval_between_paid_requests(monkeypatch):
+    target = event(odds_api_event_id="game")
+    interval = 45.0
+    calls = 0
+    sleeps = []
+
+    class Response:
+        headers = {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "id": "game",
+                "home_team": target.home,
+                "away_team": target.away,
+                "bookmakers": [],
+            }
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return Response()
+
+    async def sleep(seconds):
+        nonlocal interval
+        sleeps.append(seconds)
+        if len(sleeps) == 1:
+            interval = 12.0
+            return
+        raise asyncio.CancelledError
+
+    async def emit(_quotes):
+        return None
+
+    monkeypatch.setenv("THE_ODDS_API_KEY", "test")
+    monkeypatch.setattr(sources.httpx, "AsyncClient", lambda **_kwargs: Client())
+    monkeypatch.setattr(sources.asyncio, "sleep", sleep)
+
+    try:
+        asyncio.run(sources.odds_api_poll(
+            target,
+            emit,
+            interval_seconds=lambda: interval,
+        ))
+    except asyncio.CancelledError:
+        pass
+
+    assert calls == 2
+    assert sleeps == [45.0, 12.0]
+
+
 def test_odds_poll_rechecks_switch_after_event_id_resolution(monkeypatch):
     target = event(odds_api_event_id=None)
     enabled = True
