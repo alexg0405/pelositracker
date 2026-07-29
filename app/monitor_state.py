@@ -91,15 +91,15 @@ class MonitorState:
                 )
                 row = cur.fetchone()
         if row is None:
-            return max(5.0, min(3600.0, float(default)))
+            return max(1.0, min(3600.0, float(default)))
         try:
             value = float(row[0])
         except (TypeError, ValueError):
-            return max(5.0, min(3600.0, float(default)))
-        return max(5.0, min(3600.0, value))
+            return max(1.0, min(3600.0, float(default)))
+        return max(1.0, min(3600.0, value))
 
     def set_odds_api_poll_seconds(self, seconds: float) -> None:
-        value = max(5.0, min(3600.0, float(seconds)))
+        value = max(1.0, min(3600.0, float(seconds)))
         with self._lock:
             with self._db.transaction() as cur:
                 self._db.execute(

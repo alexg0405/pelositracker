@@ -11,19 +11,130 @@ from __future__ import annotations
 
 import re
 
-_SPREAD_MARKETS = {"spread", "spreads", "handicap", "point_spread"}
-_TOTAL_MARKETS = {"total", "totals", "over_under", "over/under", "ou", "game_total"}
+FULL_GAME_SCOPE = "full_game"
+MLB_FIRST_INNING_SCOPE = "first_inning"
+MLB_FIRST_FIVE_SCOPE = "first_five_innings"
+SUPPORTED_MARKET_SCOPES = (
+    FULL_GAME_SCOPE,
+    MLB_FIRST_INNING_SCOPE,
+    MLB_FIRST_FIVE_SCOPE,
+)
+
+_SPREAD_MARKETS = {
+    "spread",
+    "spreads",
+    "handicap",
+    "point_spread",
+    "first_five_spread",
+}
+_TOTAL_MARKETS = {
+    "total",
+    "totals",
+    "over_under",
+    "over/under",
+    "ou",
+    "game_total",
+    "first_five_total",
+    "first_inning_total",
+}
+_MONEYLINE_MARKETS = {
+    "moneyline",
+    "h2h",
+    "winner",
+    "match_winner",
+    "drawable_outcome",
+    "first_five_moneyline",
+}
+
+
+def _market_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (value or "").strip().casefold()).strip("_")
+
+
+def market_scope(market: str) -> str:
+    """Return the exact regulation segment encoded by a market identity.
+
+    Period identity is part of the market key, never an execution hint. This
+    prevents a first-five quote from being compared with a full-game quote.
+    """
+    key = _market_key(market)
+    if key in {"nrfi", "yrfi"}:
+        return MLB_FIRST_INNING_SCOPE
+    if (
+        "first_five" in key
+        or "first_5" in key
+        or "1st_5" in key
+        or "1st_five" in key
+    ):
+        return MLB_FIRST_FIVE_SCOPE
+    if (
+        "first_inning" in key
+        or "1st_inning" in key
+        or "1st_1_inning" in key
+        or "1st_1_innings" in key
+    ):
+        return MLB_FIRST_INNING_SCOPE
+    return FULL_GAME_SCOPE
+
+
+def base_market_type(market: str) -> str:
+    """Collapse a scoped identity only to its line family.
+
+    The caller must keep :func:`market_scope` alongside this value whenever
+    comparing contracts.
+    """
+    key = _market_key(market).removeprefix("sports_market_type_")
+    if key in {"nrfi", "yrfi"}:
+        return "total"
+    if key in _MONEYLINE_MARKETS:
+        return "moneyline"
+    if key in _SPREAD_MARKETS:
+        return "spread"
+    if key in _TOTAL_MARKETS:
+        return "total"
+    if key.startswith(("h2h_1st_5_innings", "h2h_3_way_1st_5_innings")):
+        return "moneyline"
+    if "first_five_winner" in key:
+        return "moneyline"
+    if key.startswith("spreads_1st_5_innings") or "first_five_spread" in key:
+        return "spread"
+    if key.startswith("totals_1st_5_innings") or "first_five_total" in key:
+        return "total"
+    if key.startswith("totals_1st_1_innings") or "first_inning_run" in key:
+        return "total"
+    if key.endswith(("_team_full_time_winner", "_team_full_game_winner")):
+        return "moneyline"
+    if key.endswith("_fight_winner"):
+        return "moneyline"
+    if key.endswith("_team_full_game_spread"):
+        return "spread"
+    if key.endswith("_team_full_game_total"):
+        return "total"
+    return key or "market"
+
+
+def canonical_scoped_market(market: str) -> str:
+    """Return one engine-safe identity for supported base and MLB segments."""
+    kind = base_market_type(market)
+    scope = market_scope(market)
+    if scope == MLB_FIRST_FIVE_SCOPE and kind in {"moneyline", "spread", "total"}:
+        return f"first_five_{kind}"
+    if scope == MLB_FIRST_INNING_SCOPE and kind == "total":
+        return "first_inning_total"
+    if scope == FULL_GAME_SCOPE and kind in {"moneyline", "spread", "total"}:
+        return kind
+    return market or "market"
 
 _TRAILING_SIGNED = re.compile(r"^(.*?)\s*([+-]\d+(?:\.\d+)?)$")
 _TOTAL_LABEL = re.compile(r"^(over|under)\s+(\d+(?:\.\d+)?)$", re.IGNORECASE)
 
 
 def is_spread_market(market: str) -> bool:
-    return (market or "").strip().casefold() in _SPREAD_MARKETS
+    return base_market_type(market) == "spread"
 
 
 def is_total_market(market: str) -> bool:
-    return (market or "").strip().casefold() in _TOTAL_MARKETS
+    return base_market_type(market) == "total"
 
 
 def quote_line_side(market: str, outcome: str, home: str, away: str) -> tuple[float | None, str | None]:

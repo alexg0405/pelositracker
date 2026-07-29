@@ -109,7 +109,7 @@ class Settings:
             history_db=Path(values.get("HISTORY_DB", "history.db")),
             state_db=Path(values.get("STATE_DB", values.get("LEDGER_DB", "ledger.db"))),
             max_data_age_seconds=_float(values, "MAX_DATA_AGE_SECONDS", 120.0, minimum=1.0),
-            odds_poll_seconds=_float(values, "ODDS_POLL_SECONDS", 45.0, minimum=5.0),
+            odds_poll_seconds=_float(values, "ODDS_POLL_SECONDS", 45.0, minimum=1.0),
             confidence_threshold=_float(values, "SIGNAL_CONFIDENCE_THRESHOLD", 0.0),
             edge_threshold=_float(values, "SIGNAL_EDGE_THRESHOLD", 0.0),
             kelly_fraction=_float(values, "SIGNAL_KELLY_FRACTION", 0.25),

@@ -709,6 +709,9 @@
   const entryMarketTypeInputs = () => [
     ...document.querySelectorAll("[data-entry-market-type]")
   ];
+  const entryMarketScopeInputs = () => [
+    ...document.querySelectorAll("[data-entry-market-scope]")
+  ];
 
   function updateEngineGateAvailability() {
     const strict = document.querySelector("#us-require-engine")?.checked;
@@ -915,6 +918,25 @@
     for (const input of entryMarketTypeInputs()) {
       input.checked = selectedMarketTypes.has(input.dataset.entryMarketType);
     }
+    const selectedMarketScopes = new Set(
+      Array.isArray(policy.allowed_market_scopes)
+        ? policy.allowed_market_scopes
+        : policy.execution_mode === "live"
+          ? ["full_game"]
+          : ["full_game", "first_inning", "first_five_innings"]
+    );
+    for (const input of entryMarketScopeInputs()) {
+      input.checked = selectedMarketScopes.has(input.dataset.entryMarketScope);
+    }
+    const liveSegmentApproval = document.querySelector(
+      "#us-allow-live-segments"
+    );
+    liveSegmentApproval.checked = !!policy.allow_live_segment_markets;
+    liveSegmentApproval.disabled = policy.execution_mode !== "live";
+    liveSegmentApproval.closest("label")?.classList.toggle(
+      "is-disabled",
+      liveSegmentApproval.disabled
+    );
     updateEngineGateAvailability();
     updateAdaptiveExitAvailability();
     updateStopGuardAvailability();
@@ -1096,6 +1118,11 @@
     const lineTypeText = Array.isArray(policy.allowed_market_types)
       ? `${policy.allowed_market_types.join(" / ")} entries`
       : "moneyline / spread / total entries";
+    const scopeText = Array.isArray(policy.allowed_market_scopes)
+      ? policy.allowed_market_scopes
+        .map(value => String(value).replaceAll("_", " "))
+        .join(" / ")
+      : "full game";
     box.className = `us-trading-status${armed ? " is-armed" : ""}`;
     box.innerHTML = `
       <strong>${policy.automation_enabled ? "Automation on" : "Automation off"}</strong>
@@ -1103,7 +1130,36 @@
       <span>${esc(protectiveText)}</span>
       <span>${esc(status.last_cycle_summary || "No cycle yet.")}</span>
       <span>${esc(allocationText)}</span>
-      <span>${status.open_managed_positions || 0} open · $${Number(status.managed_exposure_usd || 0).toFixed(2)} exposure · ${esc(lineTypeText)} · ${esc(gateText)}</span>`;
+      <span>${status.open_managed_positions || 0} open · $${Number(status.managed_exposure_usd || 0).toFixed(2)} exposure · ${esc(lineTypeText)} · ${esc(scopeText)} · ${esc(gateText)}</span>`;
+    renderSegmentResearchStatus(status);
+  }
+
+  function renderSegmentResearchStatus(status) {
+    const box = document.querySelector("#us-segment-research-status");
+    if (!box) return;
+    const research = status?.segment_research || {};
+    const rows = Array.isArray(research.rows) ? research.rows : [];
+    const policy = status?.policy || {};
+    const liveLock = policy.execution_mode === "live"
+      ? policy.allow_live_segment_markets
+        ? "Live segment orders explicitly enabled."
+        : "Live segment orders locked."
+      : "Dry-run evidence collection only.";
+    const evidence = rows.length
+      ? rows.map(row => {
+          const scope = String(row.market_scope || "").replaceAll("_", " ");
+          const roi = row.after_cost_roi == null
+            ? "ROI pending"
+            : `${(Number(row.after_cost_roi) * 100).toFixed(1)}% after-cost ROI`;
+          return `${scope} ${row.market_type}: ${row.trades} trades / ${row.closed} closed / ${roi}`;
+        }).join(" · ")
+      : "No retained MLB segment simulations yet.";
+    const paidScopes = Array.isArray(status?.odds_api_market_scopes)
+      ? status.odds_api_market_scopes
+        .map(value => String(value).replaceAll("_", " "))
+        .join(", ")
+      : "full game";
+    box.innerHTML = `<strong>${esc(liveLock)}</strong><span>${esc(evidence)}</span><small>Odds feed scope now: ${esc(paidScopes)}.</small>`;
   }
 
   function venueSyncLabel(value) {
@@ -1249,7 +1305,7 @@
       return `<article class="us-position${open ? " is-open" : ""}">
         <div>
           <strong>${esc(position.event_name)}</strong>
-          <span>${esc(position.market_type)} · ${esc(position.selection)} · ${esc(position.mode)}</span>
+          <span>${esc(position.market_type)} · ${esc(String(position.market_scope || "full_game").replaceAll("_", " "))} · ${esc(position.selection)} · ${esc(position.mode)}</span>
         </div>
         <div><span>bought</span><strong>${initialQuantity.toFixed(2)} @ ${cents(position.entry_cost)}</strong></div>
         <div><span>total paid</span><strong>$${initialCost.toFixed(2)}</strong></div>
@@ -1330,8 +1386,14 @@
     const lines = Array.isArray(settings.allowed_market_types)
       ? settings.allowed_market_types.join("/")
       : "legacy";
+    const scopes = Array.isArray(settings.allowed_market_scopes)
+      ? settings.allowed_market_scopes
+        .map(value => String(value).replaceAll("_", " "))
+        .join("/")
+      : "legacy scope";
     return [
       `${lines} lines`,
+      scopes,
       settings.min_edge == null ? "" : `edge ${(Number(settings.min_edge) * 100).toFixed(1)}%`,
       settings.min_signal_quality == null ? "" : `quality ${Number(settings.min_signal_quality).toFixed(0)}`,
       settings.min_reference_sources == null ? "" : `refs ${settings.min_reference_sources}`,
@@ -1365,10 +1427,17 @@
     const lineGroups = Array.isArray(data.line_type_summary)
       ? data.line_type_summary
       : [];
+    const scopeGroups = Array.isArray(data.market_scope_summary)
+      ? data.market_scope_summary
+      : [];
     const cards = [
       {label:"Filtered total", ...summary},
       ...lineGroups.map(group => ({
         label: String(group.market_type || "line").replaceAll("_", " "),
+        ...group
+      })),
+      ...scopeGroups.map(group => ({
+        label: String(group.market_scope || "segment").replaceAll("_", " "),
         ...group
       }))
     ];
@@ -1386,7 +1455,7 @@
       ? settingsGroups.map(group => `
         <article class="us-ledger-settings-group">
           <div>
-            <strong>${esc(group.market_type)} · ${esc(group.mode)} · #${esc(group.policy_signature)}</strong>
+            <strong>${esc(group.market_type)} · ${esc(String(group.market_scope || "full_game").replaceAll("_", " "))} · ${esc(group.mode)} · #${esc(group.policy_signature)}</strong>
             <span>${Number(group.verifiable_closed || 0)} closes / ${Number(group.events || 0)} events · ${Number(group.wins || 0)}-${Number(group.losses || 0)}-${Number(group.pushes || 0)} · ${esc(pct(group.win_rate))} success</span>
           </div>
           <div>
@@ -1409,7 +1478,7 @@
             <td>${esc(row.mode)}</td>
             <td><strong class="us-ledger-result${resultClass}">${esc(row.result)}</strong></td>
             <td><strong>${esc(row.event_name)}</strong><span>${esc(row.selection)}</span></td>
-            <td>${esc(row.market_type)}</td>
+            <td>${esc(row.market_type)}<span>${esc(String(row.market_scope || "full_game").replaceAll("_", " "))}</span></td>
             <td>${esc(cents(row.entry_cost))}</td>
             <td>$${Number(row.cost_basis_usd || 0).toFixed(2)}</td>
             <td>${row.realized_net_usd == null ? "—" : esc(money(Number(row.realized_net_usd)))}</td>
@@ -2113,6 +2182,15 @@
       entryMarketTypeInputs()[0]?.focus();
       return;
     }
+    const allowedMarketScopes = entryMarketScopeInputs()
+      .filter(input => input.checked)
+      .map(input => input.dataset.entryMarketScope);
+    if (!allowedMarketScopes.length) {
+      setActionBusy(button, false);
+      statusBox.textContent = "Select at least one game segment for automatic entry.";
+      entryMarketScopeInputs()[0]?.focus();
+      return;
+    }
     const payload = {
       execution_mode: document.querySelector("#us-trading-mode").value,
       automation_enabled: document.querySelector("#us-automation-enabled").checked,
@@ -2152,6 +2230,10 @@
         .filter(input => input.checked)
         .map(input => input.dataset.engineGate),
       allowed_market_types: allowedMarketTypes,
+      allowed_market_scopes: allowedMarketScopes,
+      allow_live_segment_markets: document.querySelector(
+        "#us-allow-live-segments"
+      ).checked,
       max_total_exposure_usd: Number(document.querySelector("#us-max-exposure").value),
       minimum_cash_reserve_usd: Number(document.querySelector("#us-cash-reserve").value),
       max_position_usd: Number(document.querySelector("#us-max-position").value),
@@ -4019,7 +4101,7 @@
     if (!status) return;
     status.className = `odds-api-status ${enabled ? "is-enabled" : "is-disabled"}`;
     status.textContent = message || (enabled
-      ? `Odds API calls are ON · backend polling every ${Number(pollSeconds||45).toFixed(0)} seconds per eligible monitored event.`
+      ? `Odds API calls are ON · backend polling every ${Number(pollSeconds||45).toLocaleString(undefined, {maximumFractionDigits:1})} seconds per eligible monitored event.`
       : "Odds API calls are OFF · backend pollers are paused even when no browser is open.");
   }
 
@@ -4062,10 +4144,10 @@
     const input = document.querySelector("#odds-api-interval");
     const seconds = Number(input?.value);
     const status = document.querySelector("#odds-api-status");
-    if (!Number.isFinite(seconds) || seconds < 5 || seconds > 3600) {
+    if (!Number.isFinite(seconds) || seconds < 1 || seconds > 3600) {
       if (status) {
         status.className = "odds-api-status is-error";
-        status.textContent = "Enter an interval from 5 to 3,600 seconds.";
+        status.textContent = "Enter an interval from 1 to 3,600 seconds.";
       }
       input?.focus();
       return;
@@ -4075,7 +4157,7 @@
     button.textContent = "Applying…";
     if (status) {
       status.className = "odds-api-status";
-      status.textContent = `Applying a ${seconds.toFixed(0)}-second Odds API interval…`;
+      status.textContent = `Applying a ${seconds.toLocaleString(undefined, {maximumFractionDigits:1})}-second Odds API interval…`;
     }
     try {
       const response = await fetch("/api/config", {
@@ -4094,7 +4176,7 @@
       showOddsApiStatus(
         config.odds_api_enabled,
         config.odds_api_poll_seconds,
-        `Interval saved · paid polling will use ${Number(config.odds_api_poll_seconds).toFixed(0)} seconds per eligible monitored event without a restart.`
+        `Interval saved · paid polling will use ${Number(config.odds_api_poll_seconds).toLocaleString(undefined, {maximumFractionDigits:1})} seconds per eligible monitored event without a restart.`
       );
     } catch (error) {
       if (status) {

@@ -20,6 +20,7 @@ from app.polymarket_us_trading import (
     TradingPolicyError,
     risk_preset_fields,
 )
+from app.lines import SUPPORTED_MARKET_SCOPES
 
 
 def passing_core_gates():
@@ -164,6 +165,8 @@ def test_default_policy_is_aggressive_but_bounded_for_ten_dollar_rollout():
     assert policy.require_engine_entry is True
     assert policy.required_engine_gates == CORE_ENGINE_GATES
     assert policy.allowed_market_types == ("moneyline", "spread", "total")
+    assert policy.allowed_market_scopes == SUPPORTED_MARKET_SCOPES
+    assert policy.allow_live_segment_markets is False
     assert policy.max_total_exposure_usd == 9.50
     assert policy.minimum_cash_reserve_usd == 0.50
     assert policy.max_position_usd == 1.75
@@ -279,6 +282,8 @@ def event():
 def signal(
     clock,
     *,
+    market="moneyline",
+    outcome="Away",
     probability=0.60,
     action="PAPER_BET",
     quality=85.0,
@@ -287,8 +292,8 @@ def signal(
 ):
     return Signal(
         event_id="event-1",
-        market="moneyline",
-        outcome="Away",
+        market=market,
+        outcome=outcome,
         model_probability=probability,
         market_probability=0.40,
         edge=edge,
@@ -298,7 +303,7 @@ def signal(
         observed_at=datetime.fromtimestamp(clock(), timezone.utc),
         n_reference_sources=2,
         required_edge=0.02,
-        decision_id="decision-1",
+        decision_id=f"decision-1-{market}-{outcome}",
         engine_version="unchanged-engine",
         configuration_hash="unchanged-config",
         model_version="unchanged-model",
@@ -338,6 +343,72 @@ def us_payload(*, bid=0.39, ask=0.40, ended=False):
                 ],
             }],
         }]
+    }
+
+
+def mlb_event():
+    return Event(
+        id="event-1",
+        name="Away at Home",
+        sport="baseball",
+        league="MLB",
+        home="Home",
+        away="Away",
+        game_start="2027-01-15T00:00:00Z",
+    )
+
+
+def mlb_segment_payload(
+    *,
+    market_type="baseball_team_first_five_winner",
+    question="Will Away win the first five innings?",
+    line=None,
+    team_name="Away",
+):
+    return {
+        "events": [{
+            "id": "us-event-1",
+            "slug": "away-at-home",
+            "title": "Away at Home",
+            "start": "2027-01-15T00:00:00Z",
+            "ended": False,
+            "markets": [{
+                "id": "segment-market",
+                "slug": "away-at-home-segment",
+                "question": question,
+                "market_type": market_type,
+                "market_scope": (
+                    "first_inning"
+                    if "first_inning" in market_type
+                    else "first_five_innings"
+                ),
+                "line": line,
+                "active": True,
+                "closed": False,
+                "hidden": False,
+                "state": "OPEN",
+                "long_best_bid": 0.39,
+                "long_best_ask": 0.40,
+                "minimum_trade_quantity": 1,
+                "minimum_tick_size": 0.01,
+                "sides": [
+                    {
+                        "id": "yes",
+                        "description": "Yes",
+                        "team_name": team_name,
+                        "long": True,
+                        "tradable": True,
+                    },
+                    {
+                        "id": "no",
+                        "description": "No",
+                        "team_name": team_name,
+                        "long": False,
+                        "tradable": True,
+                    },
+                ],
+            }],
+        }],
     }
 
 
@@ -674,6 +745,193 @@ def test_dry_run_records_position_without_accessing_order_resource(tmp_path):
     assert positions[0]["entry_signal_quality"] == pytest.approx(85.0)
     assert positions[0]["entry_reference_sources"] == 2
     assert any(item["status"] == "simulated_fill" for item in trader.journal())
+
+
+@pytest.mark.parametrize(
+    ("signal_market", "signal_outcome", "venue_type", "question", "line"),
+    [
+        (
+            "first_five_moneyline",
+            "Away",
+            "baseball_team_first_five_winner",
+            "Will Away win the first five innings?",
+            None,
+        ),
+        (
+            "first_five_spread",
+            "Away +1.5",
+            "baseball_team_first_five_spread",
+            "Will Away cover +1.5 in the first five innings?",
+            1.5,
+        ),
+        (
+            "first_five_total",
+            "Over 4.5",
+            "baseball_team_first_five_total",
+            "Will there be more than 4.5 runs in the first five innings?",
+            4.5,
+        ),
+        (
+            "first_inning_total",
+            "Over 0.5",
+            "baseball_team_first_inning_run",
+            "Will there be any run in the first inning?",
+            0.5,
+        ),
+    ],
+)
+def test_dry_run_maps_and_retains_exact_mlb_segment_trades(
+    tmp_path,
+    signal_market,
+    signal_outcome,
+    venue_type,
+    question,
+    line,
+):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+    })
+
+    result = trader.run_cycle(
+        [(
+            mlb_event(),
+            [signal(
+                clock,
+                market=signal_market,
+                outcome=signal_outcome,
+            )],
+        )],
+        mlb_segment_payload(
+            market_type=venue_type,
+            question=question,
+            line=line,
+        ),
+    )
+
+    assert result["entries"] == 1
+    position = trader.positions(open_only=True)[0]
+    expected_scope = (
+        "first_inning"
+        if signal_market == "first_inning_total"
+        else "first_five_innings"
+    )
+    assert position["market_scope"] == expected_scope
+    assert position["entry_policy"]["allowed_market_scopes"] == list(
+        SUPPORTED_MARKET_SCOPES
+    )
+    trader._close_position(
+        position["id"],
+        exit_value=0.45,
+        reason="segment_test",
+        order_id=None,
+    )
+    summary = trader.segment_research_summary()
+    assert summary["trades"] == 1
+    assert summary["closed"] == 1
+    assert summary["events"] == 1
+    assert summary["rows"][0]["market_scope"] == expected_scope
+    assert summary["rows"][0]["realized_net_usd"] > 0
+    trader.close()
+
+
+def test_live_mlb_segments_require_a_separate_explicit_approval(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+    trader.configure({
+        "execution_mode": "live",
+        "allowed_market_scopes": ["full_game", "first_five_innings"],
+        "allow_live_segment_markets": False,
+    })
+    baseball = mlb_event()
+    candidate_signal = signal(
+        clock,
+        market="first_five_moneyline",
+        outcome="Away",
+    )
+    us_event = mlb_segment_payload()["events"][0]
+
+    candidate, reason = trader._map_signal(
+        baseball,
+        candidate_signal,
+        us_event,
+        1.0,
+    )
+
+    assert candidate is None
+    assert "live orders are locked" in reason
+
+    trader.configure({"allow_live_segment_markets": True})
+    candidate, reason = trader._map_signal(
+        baseball,
+        candidate_signal,
+        us_event,
+        1.0,
+    )
+
+    assert reason == ""
+    assert candidate is not None
+    assert candidate.market["market_scope"] == "first_five_innings"
+    trader.close()
+
+
+def test_dry_first_inning_trade_settles_from_official_segment_end_score(
+    tmp_path,
+):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+    })
+    baseball = mlb_event()
+    candidate_signal = signal(
+        clock,
+        market="first_inning_total",
+        outcome="Over 0.5",
+    )
+    payload = mlb_segment_payload(
+        market_type="baseball_team_first_inning_run",
+        question="Will there be any run in the first inning?",
+        line=0.5,
+    )
+    entered = trader.run_cycle(
+        [(baseball, [candidate_signal])],
+        payload,
+    )
+
+    settled = trader.run_cycle(
+        [(baseball, [candidate_signal])],
+        {"events": []},
+        segment_results={
+            baseball.id: {"first_inning": (0.0, 1.0)},
+        },
+    )
+
+    assert entered["entries"] == 1
+    assert settled["exits"] == 1
+    assert trader.positions(open_only=True) == []
+    closed = trader.positions()[0]
+    assert closed["exit_reason"] == "dry_run_segment_resolved"
+    assert closed["current_exit_value"] == pytest.approx(1.0)
+    assert closed["realized_pnl"] > 0
+    audit = next(
+        item for item in trader.journal()
+        if item["kind"] == "settlement"
+    )
+    assert audit["status"] == "simulated_segment_resolution"
+    assert audit["details"]["source"] == "official_mlb_segment_end_state"
+    trader.close()
+
+
+def test_legacy_live_policy_defaults_to_full_game_scope_only():
+    live = TradingPolicy.from_mapping({"execution_mode": "live"})
+    dry = TradingPolicy.from_mapping({"execution_mode": "dry_run"})
+
+    assert live.allowed_market_scopes == ("full_game",)
+    assert dry.allowed_market_scopes == SUPPORTED_MARKET_SCOPES
 
 
 def test_line_type_policy_blocks_disabled_lines_without_changing_signal(

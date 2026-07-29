@@ -18,6 +18,14 @@ import websockets
 
 from .http_clients import current_shared_client
 from .models import Event, GameState, Quote
+from .lines import (
+    FULL_GAME_SCOPE,
+    MLB_FIRST_FIVE_SCOPE,
+    MLB_FIRST_INNING_SCOPE,
+    base_market_type,
+    canonical_scoped_market,
+    market_scope,
+)
 from .matching import closest_start, team_match_score
 from .domain.time import parse_provider_timestamp
 from .orderbook import BookGapError, OrderBookState
@@ -40,6 +48,14 @@ _WS_CONNECT_KW = {"max_size": 1_048_576, "max_queue": 8}
 _POLYMARKET_FEE_CACHE_TTL_SECONDS = 60 * 60
 _POLYMARKET_FEE_CACHE_MAX = 20_000
 _polymarket_fee_cache: OrderedDict[str, tuple[float, float, str]] = OrderedDict()
+_MLB_PERIOD_MARKETS = {
+    MLB_FIRST_INNING_SCOPE: ("totals_1st_1_innings",),
+    MLB_FIRST_FIVE_SCOPE: (
+        "h2h_3_way_1st_5_innings",
+        "spreads_1st_5_innings",
+        "totals_1st_5_innings",
+    ),
+}
 
 
 def _provider_time(value: object) -> datetime | None:
@@ -131,14 +147,7 @@ def infer_polymarket_event(data: dict) -> dict[str, str | None]:
 
 
 def canonical_market(value: str) -> str:
-    lowered = (value or "").strip().casefold()
-    if lowered in {"h2h", "moneyline", "winner", "match_winner"}:
-        return "moneyline"
-    if lowered in {"spreads", "spread", "handicap"}:
-        return "spread"
-    if lowered in {"totals", "total", "over_under"}:
-        return "total"
-    return value or "market"
+    return canonical_scoped_market(value)
 
 
 def _format_line(value: float) -> str:
@@ -161,9 +170,10 @@ def _polymarket_outcome_labels(market_type: str, outcomes: list, line: float | N
     labels = [str(outcome).strip() for outcome in outcomes]
     if line is None:
         return labels
-    if market_type == "total":
+    kind = base_market_type(market_type)
+    if kind == "total":
         return [f"{label} {_format_line(abs(line))}" for label in labels]
-    if market_type == "spread" and labels:
+    if kind == "spread" and labels:
         # Gamma's first outcome is the team named by the spread market and
         # ``line`` is that team's handicap. The opposing outcome gets -line.
         normalized = [f"{labels[0]} {_format_signed_line(line)}"]
@@ -200,24 +210,95 @@ def _polymarket_selections(market: dict, market_type: str, outcomes: list,
     group = str(market.get("groupItemTitle") or "").strip()
     labels = [str(outcome).strip() for outcome in outcomes]
     binary = labels and all(label.casefold() in {"yes", "no"} for label in labels)
+    kind = base_market_type(market_type)
+    scope = market_scope(market_type)
 
-    # Soccer 1X2 is represented as three independent binary conditions.  The
-    # affirmative tokens map to the normal home/away/draw market.  A negative
-    # token means "any of the other outcomes", so it intentionally remains a
-    # unique condition and can never be compared to one sportsbook leg.
-    if market_type == "moneyline" and binary and group:
-        affirmative = "Draw" if group.casefold().startswith("draw") else group
+    # Outcome-specific winner products (soccer 1X2 and MLB first-five) are
+    # separate binary contracts. Only the affirmative token is equivalent to
+    # one sportsbook outcome; "No" spans every other outcome and remains unique.
+    if kind == "moneyline" and binary and (group or scope == MLB_FIRST_FIVE_SCOPE):
+        affirmative = group
+        if not affirmative:
+            winner = re.search(
+                r"will\s+(?:the\s+)?(.+?)\s+win\s+the\s+first\s+(?:five|5)",
+                question,
+                re.IGNORECASE,
+            )
+            affirmative = winner.group(1).strip() if winner else ""
+            if not affirmative and re.search(r"\bend\s+in\s+a\s+tie\b", question, re.I):
+                affirmative = "Draw"
+        if not affirmative:
+            return [(question, label) for label in labels]
+        if affirmative.casefold().startswith(("draw", "tie")):
+            affirmative = "Draw"
         return [
-            ("moneyline", affirmative)
+            (market_type, affirmative)
             if label.casefold() == "yes"
-            else ("moneyline condition", f"Not {affirmative}")
+            else (f"{market_type} condition", f"Not {affirmative}")
             for label in labels
         ]
+
+    # MLB first-five totals and the first-inning any-run contract are binary
+    # Yes/No questions. Translate only the exact "more than"/"any run" shapes to
+    # the equivalent sportsbook Over/Under line.
+    scoped_line = line
+    if scope == MLB_FIRST_INNING_SCOPE and kind == "total" and scoped_line is None:
+        scoped_line = 0.5
+    if (
+        binary
+        and kind == "total"
+        and scope in {MLB_FIRST_FIVE_SCOPE, MLB_FIRST_INNING_SCOPE}
+        and scoped_line is not None
+        and (
+            re.search(r"\bmore\s+than\b", question, re.I)
+            or re.search(r"\bany\s+run\b", question, re.I)
+            or re.search(
+                r"\brun\s+scored\s+in\s+the\s+(?:first|1st)\s+inning\b",
+                question,
+                re.I,
+            )
+        )
+    ):
+        return [
+            (
+                market_type,
+                f"{'Over' if label.casefold() == 'yes' else 'Under'} "
+                f"{_format_line(scoped_line)}",
+            )
+            for label in labels
+        ]
+
+    # A binary first-five run-line condition maps its affirmative side only.
+    # The negative token is deliberately not treated as the opposing run line.
+    if (
+        binary
+        and kind == "spread"
+        and scope == MLB_FIRST_FIVE_SCOPE
+        and line is not None
+    ):
+        cover = re.search(
+            r"will\s+(?:the\s+)?(.+?)\s+cover\s+([+-]\d+(?:\.\d+)?)",
+            question,
+            re.IGNORECASE,
+        )
+        if cover and abs(float(cover.group(2)) - line) < 1e-9:
+            affirmative = f"{cover.group(1).strip()} {_format_signed_line(line)}"
+            return [
+                (market_type, affirmative)
+                if label.casefold() == "yes"
+                else (f"{market_type} condition", f"Not {affirmative}")
+                for label in labels
+            ]
 
     # Real Gamma player props use Yes/No plus a line, while sportsbook feeds
     # use Over/Under.  Only translate an anchored ``PLAYER: STAT O/U N`` shape
     # whose printed number agrees with Gamma's numeric line.
-    if binary and line is not None and market_type not in {"moneyline", "spread", "total", "market"}:
+    if (
+        binary
+        and line is not None
+        and kind not in {"moneyline", "spread", "total"}
+        and market_type != "market"
+    ):
         match = next(
             (candidate for raw in (group, question) if raw
              and (candidate := _PROP_OU_RE.match(raw)) is not None),
@@ -236,8 +317,13 @@ def _polymarket_selections(market: dict, market_type: str, outcomes: list,
 
     expanded = _polymarket_outcome_labels(market_type, labels, line)
 
-    # Do not let first-half/period/inning mainlines borrow full-game prices.
-    if market_type in {"moneyline", "spread", "total"} and _SCOPED_MAINLINE_RE.search(question):
+    # Unknown periods remain isolated. Supported MLB scopes above have explicit
+    # identities and never borrow full-game prices.
+    if (
+        scope == FULL_GAME_SCOPE
+        and kind in {"moneyline", "spread", "total"}
+        and _SCOPED_MAINLINE_RE.search(question)
+    ):
         return [(question, label) for label in expanded]
 
     # Every unrecognized binary condition gets its own market identity.  This
@@ -662,8 +748,15 @@ def _polymarket_token_meta(data: dict) -> dict[str, dict]:
         tokens = parse_jsonish(market.get("clobTokenIds"))
         question = str(market.get("question") or market.get("groupItemTitle") or "Market")
         market_type = canonical_market(str(market.get("sportsMarketType") or question))
+        normalized_line = _to_float(market.get("line"))
+        if (
+            market_scope(market_type) == MLB_FIRST_INNING_SCOPE
+            and base_market_type(market_type) == "total"
+            and normalized_line is None
+        ):
+            normalized_line = 0.5
         selections = _polymarket_selections(
-            market, market_type, outcomes, _to_float(market.get("line"))
+            market, market_type, outcomes, normalized_line
         )
         for token, (selection_market, outcome) in zip(tokens, selections):
             token_meta[str(token)] = {
@@ -681,8 +774,8 @@ def _polymarket_token_meta(data: dict) -> dict[str, dict]:
                 "provider_event_id": str(data.get("id") or data.get("slug") or "") or None,
                 "provider_market_id": str(market.get("id") or market.get("slug") or "") or None,
                 "condition_id": str(market.get("conditionId") or "") or None,
-                "market_scope": str(market.get("marketScope") or "unknown").casefold(),
-                "line": _to_float(market.get("line")),
+                "market_scope": market_scope(selection_market),
+                "line": normalized_line,
                 "active": bool(market.get("active", True)),
                 "resolved": bool(market.get("closed", False)),
                 "restricted": bool(data.get("restricted", False) or market.get("restricted", False)),
@@ -1104,18 +1197,28 @@ def american_probability(price: float) -> float:
     return 100 / (price + 100) if price > 0 else (-price) / ((-price) + 100)
 
 
-def odds_api_request(event: Event, key: str) -> tuple[str, dict[str, str]]:
+def odds_api_request(
+    event: Event,
+    key: str,
+    *,
+    market_scopes: tuple[str, ...] = (FULL_GAME_SCOPE,),
+) -> tuple[str, dict[str, str]]:
     """Build an authenticated The Odds API V4 request without exposing the key in logs."""
     root = f"https://api.the-odds-api.com/v4/sports/{event.odds_api_sport}"
     markets = os.getenv("ODDS_MARKETS", "h2h,spreads,totals")
     if event.odds_api_event_id:
         url = f"{root}/events/{event.odds_api_event_id}/odds"
+        requested = [item.strip() for item in markets.split(",") if item.strip()]
+        if event.odds_api_sport == "baseball_mlb":
+            for scope in market_scopes:
+                requested.extend(_MLB_PERIOD_MARKETS.get(scope, ()))
         # Player props are only served by the per-event endpoint. Opt-in and
         # sport-specific (an unsupported market key makes The Odds API 422), so
         # off by default; set ODDS_PLAYER_MARKETS per sport to enable.
         props = os.getenv("ODDS_PLAYER_MARKETS", "").strip()
         if props:
-            markets = f"{markets},{props}"
+            requested.extend(item.strip() for item in props.split(",") if item.strip())
+        markets = ",".join(dict.fromkeys(requested))
     else:
         url = f"{root}/odds"
     params = {
@@ -1143,9 +1246,10 @@ def _outcome_label(market: str, outcome: dict) -> str:
     if point is None:
         return name
     point = float(point)
-    if market == "spreads":
+    kind = base_market_type(market)
+    if kind == "spread":
         return f"{name} {point:+g}"
-    if market == "totals":
+    if kind == "total":
         return f"{name} {point:g}"
     return name
 
@@ -1223,7 +1327,9 @@ def odds_api_quotes(event: Event, payload: dict | list[dict]) -> list[Quote]:
                         provider_event_id=str(game.get("id") or "") or None,
                         canonical_event_id=event.canonical_event_id,
                         provider_market_id=str(provider_key),
-                        market_scope=("player_prop" if prop else "full_game"),
+                        market_scope=(
+                            "player_prop" if prop else market_scope(market_key)
+                        ),
                         line=_to_float(outcome.get("point")),
                         outcome_id=str(outcome.get("name") or outcome_label),
                         raw_payload_hash=hashlib.sha256(
@@ -1240,6 +1346,7 @@ async def odds_api_poll(
     *,
     enabled: Callable[[], bool] | None = None,
     interval_seconds: Callable[[], float] | None = None,
+    market_scopes: Callable[[], tuple[str, ...]] | None = None,
 ):
     key = os.getenv("THE_ODDS_API_KEY")
     if not key or not event.odds_api_sport:
@@ -1253,7 +1360,7 @@ async def odds_api_poll(
             if interval_seconds is not None
             else float(os.getenv("ODDS_POLL_SECONDS", "45"))
         )
-        return max(5.0, min(3600.0, float(raw)))
+        return max(1.0, min(3600.0, float(raw)))
 
     backoff = RetryBackoff(base_seconds=5, cap_seconds=180)
     async with httpx.AsyncClient(timeout=15) as client:
@@ -1282,7 +1389,16 @@ async def odds_api_poll(
                 # followed by a new paid odds request.
                 if enabled is not None and not enabled():
                     continue
-                url, params = odds_api_request(event, key)
+                scopes = (
+                    market_scopes()
+                    if market_scopes is not None
+                    else (FULL_GAME_SCOPE,)
+                )
+                url, params = odds_api_request(
+                    event,
+                    key,
+                    market_scopes=tuple(scopes),
+                )
                 response = await client.get(url, params=params)
                 response.raise_for_status()
                 for header in ("x-requests-remaining", "x-requests-used",

@@ -106,8 +106,18 @@ ADMIN_PASSWORD=admin
 
 Polymarket public market data requires no key. The Odds API integration starts
 only when `THE_ODDS_API_KEY` is set. Its `x-requests-*` headers are retained in
-`/api/runtime`. Keep the 45-second poll within `MAX_DATA_AGE_SECONDS` and your
-provider quota.
+`/api/runtime`. The Discovery control accepts 1–3,600 seconds without a restart;
+choose an interval that stays within `MAX_DATA_AGE_SECONDS` and your provider
+quota.
+
+For MLB, the execution policy can independently select full game, first-inning
+runs, and first-five innings. First-five winner, spread, and total products
+follow the existing line-type filters. The event-specific period markets are
+requested from The Odds API only while an enabled execution lane selects them.
+Dry-run segment outcomes are retained separately by market scope. Live segment
+orders remain locked until the operator explicitly enables them in the live
+lane; this never changes the existing probability, edge, signal-quality, or
+calibration calculations.
 
 SQLite is the local default. `DATABASE_URL` selects PostgreSQL for every store.
 All stores use component-scoped, versioned migrations with checksum drift

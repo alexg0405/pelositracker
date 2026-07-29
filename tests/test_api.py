@@ -176,9 +176,16 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert 'id="odds-api-toggle"' in html
         assert 'id="odds-api-interval"' in html
         assert 'id="odds-api-interval-save"' in html
+        assert 'min="1" max="3600"' in html
         assert "odds_api_enabled" in javascript
         assert "odds_api_poll_seconds" in javascript
         assert "Apply interval" in javascript
+        assert 'data-entry-market-scope="first_inning"' in html
+        assert 'data-entry-market-scope="first_five_innings"' in html
+        assert 'id="us-allow-live-segments"' in html
+        assert "allowed_market_scopes" in javascript
+        assert "allow_live_segment_markets" in javascript
+        assert "segment_research" in javascript
         assert 'fetch("/api/config", {' in javascript
         assert "backend pollers are paused" in javascript
         assert 'id="tab-us-research"' in html
@@ -829,12 +836,12 @@ def test_odds_api_interval_updates_and_persists_without_restart(monkeypatch):
     monkeypatch.setattr(main_module, "monitor_state", monitor)
 
     response = asyncio.run(main_module.update_config(
-        main_module.ConfigIn(odds_api_poll_seconds=12.5)
+        main_module.ConfigIn(odds_api_poll_seconds=1.5)
     ))
 
-    assert response["odds_api_poll_seconds"] == 12.5
+    assert response["odds_api_poll_seconds"] == 1.5
     assert response["odds_api_enabled"] is True
-    assert monitor.values == [12.5]
+    assert monitor.values == [1.5]
 
 
 def test_event_history_api_caps_default_and_requested_page_size(monkeypatch):

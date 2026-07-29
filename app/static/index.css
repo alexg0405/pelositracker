@@ -1155,6 +1155,28 @@ button[aria-busy="true"]::before {
 }
 .us-line-type-policy input { width:auto; margin:0; }
 .us-line-type-policy .field-note { flex-basis:100%; }
+.us-line-type-policy .us-segment-live-approval {
+  flex-basis:100%;
+  padding:9px 10px;
+  border:1px solid rgba(255,194,62,.34);
+  background:rgba(255,194,62,.06);
+  color:var(--yellow);
+}
+.us-line-type-policy .us-segment-live-approval.is-disabled {
+  opacity:.58;
+}
+.us-segment-research-status {
+  display:grid;
+  flex-basis:100%;
+  gap:4px;
+  padding:10px;
+  border-left:2px solid var(--cyan);
+  color:var(--muted);
+  background:rgba(4,13,18,.62);
+}
+.us-segment-research-status strong { color:var(--text); }
+.us-segment-research-status span,
+.us-segment-research-status small { overflow-wrap:anywhere; }
 .us-policy-advisor-panel { border-left:3px solid var(--yellow); }
 .us-policy-advisor-controls {
   display:grid;

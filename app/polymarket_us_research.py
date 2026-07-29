@@ -12,6 +12,14 @@ from typing import Any, Mapping
 
 import httpx
 
+from .lines import (
+    MLB_FIRST_FIVE_SCOPE,
+    MLB_FIRST_INNING_SCOPE,
+    base_market_type,
+    canonical_scoped_market,
+    market_scope,
+)
+from .models import Event, Quote
 
 PUBLIC_BASE_URL = "https://gateway.polymarket.us"
 AUTHENTICATED_BASE_URL = "https://api.polymarket.us"
@@ -107,6 +115,18 @@ def _normalize_side(side: Mapping[str, Any]) -> dict[str, Any]:
 def _normalize_market(market: Mapping[str, Any]) -> dict[str, Any]:
     raw_sides = market.get("marketSides")
     sides = raw_sides if isinstance(raw_sides, list) else []
+    raw_market_type = (
+        market.get("sportsMarketType")
+        or market.get("sportsMarketTypeV2")
+    )
+    canonical_market = canonical_scoped_market(str(raw_market_type or ""))
+    line = _amount(market.get("line"))
+    if (
+        market_scope(canonical_market) == MLB_FIRST_INNING_SCOPE
+        and base_market_type(canonical_market) == "total"
+        and line is None
+    ):
+        line = 0.5
     return {
         "id": str(market.get("id") or ""),
         "slug": str(market.get("slug") or ""),
@@ -117,12 +137,14 @@ def _normalize_market(market: Mapping[str, Any]) -> dict[str, Any]:
             or "Market"
         ),
         "market_type": _market_type(
-            market.get("sportsMarketType") or market.get("sportsMarketTypeV2")
+            raw_market_type
         ),
         "market_type_v2": _market_type(
             market.get("sportsMarketTypeV2") or market.get("sportsMarketType")
         ),
-        "line": _amount(market.get("line")),
+        "canonical_market": canonical_market,
+        "market_scope": market_scope(canonical_market),
+        "line": line,
         "active": bool(market.get("active", True)),
         "closed": bool(market.get("closed", False)),
         "hidden": bool(market.get("hidden", False)),
@@ -200,6 +222,111 @@ def normalize_sports_events(
 
     normalized.sort(key=sort_key)
     return normalized[:max(1, min(limit, 100))]
+
+
+def public_market_quotes(
+    event: Event,
+    us_event: Mapping[str, Any],
+) -> list[Quote]:
+    """Translate exact US period books into inputs for the unchanged engine.
+
+    Public best bid/ask is sufficient to price a research candidate, but it is
+    deliberately marked as incomplete execution depth with unknown fees. The
+    auto trader still re-reads the authenticated order book before every fill.
+    """
+    now = datetime.now(timezone.utc)
+    quotes: list[Quote] = []
+    for market in us_event.get("markets", []):
+        if not isinstance(market, Mapping):
+            continue
+        canonical = str(
+            market.get("canonical_market")
+            or canonical_scoped_market(str(market.get("market_type") or ""))
+        )
+        scope = market_scope(canonical)
+        kind = base_market_type(canonical)
+        if scope not in {MLB_FIRST_INNING_SCOPE, MLB_FIRST_FIVE_SCOPE}:
+            continue
+        long_bid = _amount(market.get("long_best_bid"))
+        long_ask = _amount(market.get("long_best_ask"))
+        if (
+            long_bid is None
+            or long_ask is None
+            or not 0 < long_bid <= long_ask < 1
+        ):
+            continue
+        sides = [
+            side for side in market.get("sides", [])
+            if isinstance(side, Mapping) and side.get("tradable", True)
+        ]
+        long_side = next(
+            (side for side in sides if bool(side.get("long"))),
+            None,
+        )
+        short_side = next(
+            (side for side in sides if not bool(side.get("long"))),
+            None,
+        )
+        if long_side is None or short_side is None:
+            continue
+        line = _amount(market.get("line"))
+        if scope == MLB_FIRST_INNING_SCOPE and kind == "total" and line is None:
+            line = 0.5
+
+        selections: list[tuple[Mapping[str, Any], str, float, float]] = []
+        if kind == "moneyline" and scope == MLB_FIRST_FIVE_SCOPE:
+            team = str(long_side.get("team_name") or "").strip()
+            question = str(market.get("question") or "")
+            if not team and any(
+                word in question.casefold() for word in (" tie", "draw")
+            ):
+                team = "Draw"
+            if team:
+                selections.append((long_side, team, long_bid, long_ask))
+        elif kind == "spread" and scope == MLB_FIRST_FIVE_SCOPE and line is not None:
+            team = str(long_side.get("team_name") or "").strip()
+            if team:
+                selections.append(
+                    (long_side, f"{team} {line:+g}", long_bid, long_ask)
+                )
+        elif (
+            kind == "total"
+            and scope in {MLB_FIRST_INNING_SCOPE, MLB_FIRST_FIVE_SCOPE}
+            and line is not None
+        ):
+            selections.extend((
+                (long_side, f"Over {line:g}", long_bid, long_ask),
+                (short_side, f"Under {line:g}", 1.0 - long_ask, 1.0 - long_bid),
+            ))
+
+        for side, outcome, bid, ask in selections:
+            quotes.append(Quote(
+                event_id=event.id,
+                market=canonical,
+                outcome=outcome,
+                probability=(bid + ask) / 2.0,
+                source="Polymarket",
+                bid=bid,
+                ask=ask,
+                token_id=str(side.get("id") or "") or None,
+                market_slug=str(market.get("slug") or "") or None,
+                question=str(market.get("question") or "") or None,
+                min_order_size=_amount(market.get("minimum_trade_quantity")),
+                tick_size=_amount(market.get("minimum_tick_size")),
+                accepting_orders=True,
+                received_at=now,
+                processed_at=now,
+                depth_complete=False,
+                provider_event_id=str(us_event.get("id") or "") or None,
+                canonical_event_id=event.canonical_event_id,
+                provider_market_id=str(market.get("id") or "") or None,
+                market_scope=scope,
+                line=line,
+                outcome_id=str(side.get("id") or outcome),
+                active=bool(market.get("active", True)),
+                resolved=bool(market.get("closed", False)),
+            ))
+    return quotes
 
 
 async def fetch_public_sports_events(*, limit: int = 60) -> dict[str, Any]:

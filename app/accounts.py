@@ -24,7 +24,7 @@ from datetime import datetime
 from .database import Database
 from .entry_policy import entry_price_allowed, entry_price_blocker
 from .execution import BookLevel, simulate_buy, simulate_sell
-from .lines import is_spread_market, is_total_market, quote_line_side
+from .lines import base_market_type, is_spread_market, is_total_market, quote_line_side
 from .models import Event, Quote, Signal
 from .portfolio import Candidate, joint_kelly_stakes
 
@@ -186,13 +186,9 @@ DEFAULT_STRATEGIES = [
 
 
 def line_type(market: str) -> str:
-    m = (market or "").lower()
-    if m in _MONEYLINE:
-        return "moneyline"
-    if is_spread_market(m):
-        return "spread"
-    if is_total_market(m):
-        return "total"
+    kind = base_market_type(market)
+    if kind in {"moneyline", "spread", "total"}:
+        return kind
     return "prop"
 
 

@@ -29,7 +29,7 @@ def test_monitor_state_bounds_invalid_or_extreme_poll_intervals(tmp_path):
     state = MonitorState(str(tmp_path / "bounded-state.db"))
     try:
         state.set_odds_api_poll_seconds(1)
-        assert state.odds_api_poll_seconds() == 5
+        assert state.odds_api_poll_seconds() == 1
         state.set_odds_api_poll_seconds(9999)
         assert state.odds_api_poll_seconds() == 3600
     finally:

@@ -34,7 +34,17 @@ from .adaptive_exit_model import (
 )
 from .database import Database
 from .entry_policy import MAX_ENTRY_PRICE, MIN_ENTRY_PRICE
-from .lines import is_spread_market, is_total_market, quote_line_side
+from .lines import (
+    FULL_GAME_SCOPE,
+    MLB_FIRST_FIVE_SCOPE,
+    MLB_FIRST_INNING_SCOPE,
+    SUPPORTED_MARKET_SCOPES,
+    base_market_type,
+    is_spread_market,
+    is_total_market,
+    market_scope,
+    quote_line_side,
+)
 from .models import Event, GameState, Signal
 from .policy_advisor import (
     ADVISOR_OBJECTIVES,
@@ -43,7 +53,7 @@ from .policy_advisor import (
 )
 
 
-POLICY_VERSION = "pmus-live-risk-policy-v7-state-aware-exits"
+POLICY_VERSION = "pmus-live-risk-policy-v8-mlb-segments"
 RISK_PRESET_VERSION = "risk-presets-v2"
 _CONTROL_TOKEN_KEY = "_execution_control_token"
 RISK_PRESETS: dict[str, dict[str, Any]] = {
@@ -305,6 +315,8 @@ _MONEYLINE_MARKETS = {
 }
 SUPPORTED_ENTRY_MARKET_TYPES = ("moneyline", "spread", "total")
 SUPPORTED_ENTRY_MARKET_TYPE_SET = frozenset(SUPPORTED_ENTRY_MARKET_TYPES)
+SUPPORTED_ENTRY_MARKET_SCOPES = SUPPORTED_MARKET_SCOPES
+SUPPORTED_ENTRY_MARKET_SCOPE_SET = frozenset(SUPPORTED_ENTRY_MARKET_SCOPES)
 _WORD = re.compile(r"[a-z0-9]+")
 _SIGNED_LINE = re.compile(r"(?<!\d)([+-]\d+(?:\.\d+)?)(?!\d)")
 
@@ -468,6 +480,8 @@ class TradingPolicy:
     require_engine_entry: bool = True
     required_engine_gates: tuple[str, ...] = CORE_ENGINE_GATES
     allowed_market_types: tuple[str, ...] = SUPPORTED_ENTRY_MARKET_TYPES
+    allowed_market_scopes: tuple[str, ...] = SUPPORTED_ENTRY_MARKET_SCOPES
+    allow_live_segment_markets: bool = False
     trading_allocation_usd: float = 10.0
     risk_preset: str = "custom"
     risk_preset_version: str = RISK_PRESET_VERSION
@@ -523,6 +537,24 @@ class TradingPolicy:
                     str(market_type).strip().casefold()
                     for market_type in raw_market_types
                 )
+            )
+        if "allowed_market_scopes" in clean:
+            raw_market_scopes = clean["allowed_market_scopes"]
+            if not isinstance(raw_market_scopes, (list, tuple)):
+                raise TradingPolicyError("allowed_market_scopes must be a list")
+            clean["allowed_market_scopes"] = tuple(
+                dict.fromkeys(
+                    str(scope).strip().casefold()
+                    for scope in raw_market_scopes
+                )
+            )
+        else:
+            # Legacy dry-run policies start collecting the supported MLB
+            # segments. Legacy live policies remain full-game only.
+            clean["allowed_market_scopes"] = (
+                SUPPORTED_ENTRY_MARKET_SCOPES
+                if str(clean.get("execution_mode") or "dry_run") == "dry_run"
+                else (FULL_GAME_SCOPE,)
             )
         policy = cls(**clean)
         policy.validate()
@@ -618,6 +650,18 @@ class TradingPolicy:
         if not self.allowed_market_types:
             raise TradingPolicyError(
                 "select at least one automatic-entry line type"
+            )
+        unknown_market_scopes = (
+            set(self.allowed_market_scopes) - SUPPORTED_ENTRY_MARKET_SCOPE_SET
+        )
+        if unknown_market_scopes:
+            raise TradingPolicyError(
+                "unknown automatic-entry market segment(s): "
+                + ", ".join(sorted(unknown_market_scopes))
+            )
+        if not self.allowed_market_scopes:
+            raise TradingPolicyError(
+                "select at least one automatic-entry market segment"
             )
         if not MIN_ENTRY_PRICE < self.min_entry_price < self.max_entry_price < MAX_ENTRY_PRICE:
             raise TradingPolicyError(
@@ -739,26 +783,7 @@ def _parse_timestamp(value: Any) -> float | None:
 
 
 def _market_kind(value: Any) -> str:
-    key = str(value or "").strip().casefold()
-    key = key.removeprefix("sports_market_type_")
-    if key in _MONEYLINE_MARKETS:
-        return "moneyline"
-    # The US API's specific sportsMarketType values retain sport and scope.
-    # Only full-game/full-time variants are equivalent to the engine's base
-    # moneyline/spread/total markets; first/second-half markets must not match.
-    if key.endswith(("_team_full_time_winner", "_team_full_game_winner")):
-        return "moneyline"
-    if key.endswith("_fight_winner"):
-        return "moneyline"
-    if key.endswith("_team_full_game_spread"):
-        return "spread"
-    if key.endswith("_team_full_game_total"):
-        return "total"
-    if is_spread_market(key):
-        return "spread"
-    if is_total_market(key):
-        return "total"
-    return key
+    return base_market_type(str(value or ""))
 
 
 def _signal_probability(signal: Signal) -> float | None:
@@ -877,6 +902,57 @@ def _mlb_stop_context(
     }
 
 
+def _dry_segment_settlement_value(
+    position: Mapping[str, Any],
+    event: Event,
+    scores: tuple[float, float],
+) -> float | None:
+    """Return the exact binary payout from an official segment-end score."""
+    home_score, away_score = scores
+    kind = _market_kind(position.get("market_type"))
+    selection = str(position.get("selection") or "")
+    normalized = _words(selection)
+    if kind == "moneyline":
+        if normalized in {"draw", "tie"}:
+            won = abs(home_score - away_score) < 1e-9
+        elif _similarity(selection, event.home) >= 0.86:
+            won = home_score > away_score
+        elif _similarity(selection, event.away) >= 0.86:
+            won = away_score > home_score
+        else:
+            return None
+        return 1.0 if won else 0.0
+    if kind == "total":
+        line_values = re.findall(
+            r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)",
+            selection,
+        )
+        line = _amount(line_values[-1]) if line_values else None
+        if line is None:
+            return None
+        total = home_score + away_score
+        if normalized.startswith("over "):
+            won = total > line
+        elif normalized.startswith("under "):
+            won = total <= line
+        else:
+            return None
+        return 1.0 if won else 0.0
+    if kind == "spread":
+        line, side = quote_line_side(
+            "spread",
+            selection,
+            event.home,
+            event.away,
+        )
+        if line is None or side not in {"home", "away"}:
+            return None
+        selected_score = home_score if side == "home" else away_score
+        opponent_score = away_score if side == "home" else home_score
+        return 1.0 if selected_score + line > opponent_score else 0.0
+    return None
+
+
 def _side_description(side: Mapping[str, Any]) -> str:
     return str(side.get("description") or side.get("identifier") or "").strip()
 
@@ -916,7 +992,12 @@ def _binary_moneyline_side(
     if wanted_words == "draw":
         slug_words = _words(market.get("slug"))
         question_words = set(_words(market.get("question")).split())
-        if "draw" in slug_words.split() or "draw" in question_words:
+        if (
+            "draw" in slug_words.split()
+            or "draw" in question_words
+            or "tie" in slug_words.split()
+            or "tie" in question_words
+        ):
             return long_side, 1.0
         return None
     subject = _side_team(long_side)
@@ -956,6 +1037,14 @@ def _event_match(event: Event, us_events: Iterable[Mapping[str, Any]]) -> tuple[
     return scored[0][1], scored[0][0]
 
 
+def match_us_event(
+    event: Event,
+    us_events: Iterable[Mapping[str, Any]],
+) -> tuple[dict, float] | None:
+    """Public fail-closed event matcher shared by analysis and execution."""
+    return _event_match(event, us_events)
+
+
 def _selection_side(
     event: Event,
     signal: Signal,
@@ -969,7 +1058,11 @@ def _selection_side(
         return None
     kind = _market_kind(signal.market)
     market_kind = _market_kind(market.get("market_type"))
-    if kind != market_kind:
+    signal_scope = market_scope(signal.market)
+    venue_scope = str(
+        market.get("market_scope") or market_scope(str(market.get("market_type") or ""))
+    ).casefold()
+    if kind != market_kind or signal_scope != venue_scope:
         return None
     wanted = str(signal.outcome or "").strip()
     if kind == "total":
@@ -984,10 +1077,21 @@ def _selection_side(
             or signal_side not in {"over", "under"}
         ):
             return None
-        matches = [
-            side for side in sides
-            if _words(_side_description(side)).startswith(signal_side)
-        ]
+        descriptions = {_words(_side_description(side)) for side in sides}
+        if (
+            venue_scope in {MLB_FIRST_INNING_SCOPE, MLB_FIRST_FIVE_SCOPE}
+            and descriptions == {"yes", "no"}
+        ):
+            want_long = signal_side == "over"
+            matches = [
+                side for side in sides
+                if bool(side.get("long")) == want_long
+            ]
+        else:
+            matches = [
+                side for side in sides
+                if _words(_side_description(side)).startswith(signal_side)
+            ]
         return (matches[0], 1.0) if len(matches) == 1 else None
     if kind == "spread":
         signal_line, signal_side = quote_line_side(
@@ -996,10 +1100,25 @@ def _selection_side(
         if signal_line is None or signal_side not in {"home", "away"}:
             return None
         wanted_team = event.home if signal_side == "home" else event.away
+        descriptions = {_words(_side_description(side)) for side in sides}
+        binary_segment = (
+            venue_scope == MLB_FIRST_FIVE_SCOPE
+            and descriptions == {"yes", "no"}
+        )
+        market_line = _amount(market.get("line"))
         matches = []
         for side in sides:
             side_line = _side_line(side)
             team_score = _similarity(wanted_team, _side_team(side))
+            if (
+                binary_segment
+                and side.get("long")
+                and market_line is not None
+                and abs(market_line - signal_line) <= 1e-6
+                and team_score >= 0.86
+            ):
+                matches.append((team_score, side))
+                continue
             if (
                 side_line is not None
                 and abs(side_line - signal_line) <= 1e-6
@@ -1363,6 +1482,23 @@ class PolymarketUSAutoTrader:
                     },
                 },
             )
+            self._db.migrate_columns(
+                "polymarket_us_live_trading",
+                10,
+                {
+                    "live_managed_positions": {
+                        "market_scope": "TEXT",
+                    },
+                },
+            )
+            with self._db.transaction() as cur:
+                self._db.execute(
+                    cur,
+                    """UPDATE live_managed_positions
+                       SET market_scope=%s
+                       WHERE market_scope IS NULL OR market_scope=''""",
+                    (FULL_GAME_SCOPE,),
+                )
         self._adaptive_exit = AdaptiveExitModel(path, clock=clock)
         self._control_token = ""
         self._policy = self._load_policy()
@@ -1986,6 +2122,80 @@ class PolymarketUSAutoTrader:
                 and self.is_armed()
             ),
             "server_time": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        }
+
+    def segment_research_summary(self) -> dict[str, Any]:
+        """Summarize retained dry-run evidence for exact MLB period markets.
+
+        This is an execution-outcome report, not a fitted prediction. It keeps
+        first-inning and first-five evidence visibly separate from full-game
+        trades so live segment approval can be based on auditable dry-run data.
+        """
+        positions = [
+            row
+            for row in self.positions(include_hidden=True)
+            if str(row.get("mode") or "") == "dry_run"
+            and str(row.get("market_scope") or FULL_GAME_SCOPE)
+            != FULL_GAME_SCOPE
+        ]
+        buckets: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for row in positions:
+            scope = str(row.get("market_scope") or FULL_GAME_SCOPE)
+            kind = _market_kind(row.get("market_type"))
+            buckets.setdefault((scope, kind), []).append(row)
+
+        rows = []
+        for (scope, kind), trades in sorted(buckets.items()):
+            closed = [
+                trade for trade in trades
+                if str(trade.get("status") or "") != "open"
+                and trade.get("realized_pnl") is not None
+            ]
+            wins = sum(float(trade["realized_pnl"]) > 1e-9 for trade in closed)
+            losses = sum(float(trade["realized_pnl"]) < -1e-9 for trade in closed)
+            pushes = len(closed) - wins - losses
+            realized = sum(float(trade["realized_pnl"]) for trade in closed)
+            settled_cost = sum(
+                float(trade.get("initial_cost_basis") or trade.get("cost_basis") or 0)
+                for trade in closed
+            )
+            rows.append({
+                "market_scope": scope,
+                "market_type": kind,
+                "trades": len(trades),
+                "events": len({
+                    str(trade.get("event_id") or "")
+                    for trade in trades
+                    if trade.get("event_id")
+                }),
+                "open": sum(
+                    str(trade.get("status") or "") == "open"
+                    for trade in trades
+                ),
+                "closed": len(closed),
+                "wins": wins,
+                "losses": losses,
+                "pushes": pushes,
+                "win_rate": wins / (wins + losses) if wins + losses else None,
+                "realized_net_usd": round(realized, 4),
+                "after_cost_roi": (
+                    realized / settled_cost if settled_cost > 0 else None
+                ),
+            })
+        return {
+            "mode": "dry_run",
+            "trades": sum(row["trades"] for row in rows),
+            "events": len({
+                str(position.get("event_id") or "")
+                for position in positions
+                if position.get("event_id")
+            }),
+            "closed": sum(row["closed"] for row in rows),
+            "rows": rows,
+            "note": (
+                "Execution outcomes only; segment rows do not alter the existing "
+                "probability, edge, signal-quality, or calibration calculations."
+            ),
         }
 
     def journal(self, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -2803,6 +3013,9 @@ class PolymarketUSAutoTrader:
                 "event_name": position.get("event_name"),
                 "market_slug": position.get("market_slug"),
                 "market_type": canonical_market,
+                "market_scope": str(
+                    position.get("market_scope") or FULL_GAME_SCOPE
+                ),
                 "selection": position.get("selection"),
                 "quantity": round(float(position.get("initial_quantity") or 0), 6),
                 "entry_cost": round(float(position.get("entry_cost") or 0), 6),
@@ -2886,8 +3099,17 @@ class PolymarketUSAutoTrader:
                     **aggregate(rows),
                 })
 
+        scope_groups = []
+        for scope in SUPPORTED_ENTRY_MARKET_SCOPES:
+            rows = [row for row in matching if row["market_scope"] == scope]
+            if rows:
+                scope_groups.append({
+                    "market_scope": scope,
+                    **aggregate(rows),
+                })
+
         settings_buckets: dict[
-            tuple[str, str, str],
+            tuple[str, str, str, str],
             list[dict[str, Any]],
         ] = {}
         for row in matching:
@@ -2896,15 +3118,22 @@ class PolymarketUSAutoTrader:
             key = (
                 str(row["mode"]),
                 str(row["market_type"]),
+                str(row["market_scope"]),
                 str(row["policy_signature"]),
             )
             settings_buckets.setdefault(key, []).append(row)
         settings_groups = []
-        for (group_mode, kind, signature), rows in settings_buckets.items():
+        for (
+            group_mode,
+            kind,
+            scope,
+            signature,
+        ), rows in settings_buckets.items():
             policy = rows[0].get("entry_policy")
             settings_groups.append({
                 "mode": group_mode,
                 "market_type": kind,
+                "market_scope": scope,
                 "policy_signature": signature,
                 "settings_available": isinstance(policy, Mapping),
                 "settings": (
@@ -2913,6 +3142,8 @@ class PolymarketUSAutoTrader:
                         for key in (
                             "risk_preset",
                             "allowed_market_types",
+                            "allowed_market_scopes",
+                            "allow_live_segment_markets",
                             "min_edge",
                             "min_signal_quality",
                             "min_reference_sources",
@@ -2969,6 +3200,7 @@ class PolymarketUSAutoTrader:
             },
             "summary": aggregate(matching),
             "line_type_summary": type_groups,
+            "market_scope_summary": scope_groups,
             "settings_groups": settings_groups[:200],
             "total_matching_rows": len(matching),
             "rows_truncated": len(matching) > limit,
@@ -2983,6 +3215,7 @@ class PolymarketUSAutoTrader:
                     """SELECT id,event_id,mode,opened_ts,closed_ts,cost_basis,
                               entry_cost,realized_pnl,entry_decision_id,
                               market_slug,selection,position_side,market_type,
+                              market_scope,
                               exit_reason,
                               entry_signal_edge AS signal_edge,
                               entry_signal_quality AS signal_quality,
@@ -3968,6 +4201,10 @@ class PolymarketUSAutoTrader:
         us_payload: Mapping[str, Any],
         *,
         game_states: Mapping[str, GameState] | None = None,
+        segment_results: Mapping[
+            str,
+            Mapping[str, tuple[float, float]],
+        ] | None = None,
     ) -> dict[str, Any]:
         if not self._cycle_lock.acquire(blocking=False):
             self._last_cycle_summary = (
@@ -3984,6 +4221,7 @@ class PolymarketUSAutoTrader:
                 generation=generation,
                 control_token=control_token,
                 game_states=game_states or {},
+                segment_results=segment_results or {},
             )
         finally:
             self._cycle_lock.release()
@@ -3996,6 +4234,10 @@ class PolymarketUSAutoTrader:
         generation: int,
         control_token: str,
         game_states: Mapping[str, GameState],
+        segment_results: Mapping[
+            str,
+            Mapping[str, tuple[float, float]],
+        ],
     ) -> dict[str, Any]:
         now = self._clock()
         self._last_cycle_at = now
@@ -4107,6 +4349,7 @@ class PolymarketUSAutoTrader:
             generation=generation,
             control_token=control_token,
             game_states=game_states,
+            segment_results=segment_results,
         )
         placed = 0
         venue_checks = 0
@@ -4227,6 +4470,8 @@ class PolymarketUSAutoTrader:
             "require_engine_entry": self._policy.require_engine_entry,
             "required_engine_gates": list(self._policy.required_engine_gates),
             "allowed_market_types": list(self._policy.allowed_market_types),
+            "allowed_market_scopes": list(self._policy.allowed_market_scopes),
+            "market_scope": market_scope(signal.market),
             "selected_engine_gate_results": self._selected_engine_gate_results(
                 signal
             ),
@@ -4276,6 +4521,9 @@ class PolymarketUSAutoTrader:
                 "reason": reason,
                 "us_event_slug": us_event_slug or None,
                 "signal_market": signal.market if signal else None,
+                "market_scope": (
+                    market_scope(signal.market) if signal else None
+                ),
                 "signal_outcome": signal.outcome if signal else None,
                 "signal_edge": signal.edge if signal else None,
                 "required_edge": signal.required_edge if signal else None,
@@ -4286,6 +4534,12 @@ class PolymarketUSAutoTrader:
                 "reference_sources": signal.n_reference_sources if signal else None,
                 "configured_min_reference_sources": (
                     self._policy.min_reference_sources
+                ),
+                "allowed_market_scopes": list(
+                    self._policy.allowed_market_scopes
+                ),
+                "allow_live_segment_markets": (
+                    self._policy.allow_live_segment_markets
                 ),
                 "execution_mode": self._policy.execution_mode,
                 "require_engine_entry": self._policy.require_engine_entry,
@@ -4352,10 +4606,25 @@ class PolymarketUSAutoTrader:
     ) -> tuple[MappedCandidate | None, str]:
         policy = self._policy
         market_type = _market_kind(signal.market)
+        signal_scope = market_scope(signal.market)
         if market_type not in policy.allowed_market_types:
             return None, (
                 f"{market_type or 'unknown'} lines are disabled by the "
                 "automatic-entry line-type policy"
+            )
+        if signal_scope not in policy.allowed_market_scopes:
+            return None, (
+                f"{signal_scope.replace('_', ' ')} markets are disabled by the "
+                "automatic-entry segment policy"
+            )
+        if (
+            policy.execution_mode == "live"
+            and signal_scope != FULL_GAME_SCOPE
+            and not policy.allow_live_segment_markets
+        ):
+            return None, (
+                "MLB segment live orders are locked; collect and review dry-run "
+                "segment results, then explicitly enable live segment markets"
             )
         engine_gate_blocker = self._engine_gate_blocker(signal)
         if engine_gate_blocker:
@@ -4663,6 +4932,8 @@ class PolymarketUSAutoTrader:
             "risk_preset": policy.risk_preset,
             "risk_preset_version": policy.risk_preset_version,
             "trading_allocation_usd": policy.trading_allocation_usd,
+            "market_scope": market_scope(candidate.signal.market),
+            "allow_live_segment_markets": policy.allow_live_segment_markets,
             "public_entry_cost": public_entry_cost,
             "authenticated_book_state": book_quote.state or None,
             "authenticated_best_bid": book_quote.best_bid,
@@ -4918,6 +5189,10 @@ class PolymarketUSAutoTrader:
         generation: int,
         control_token: str,
         game_states: Mapping[str, GameState],
+        segment_results: Mapping[
+            str,
+            Mapping[str, tuple[float, float]],
+        ],
     ) -> tuple[int, int, int]:
         monitored_by_id = {
             event.id: (event, list(signals)) for event, signals in monitored
@@ -4963,6 +5238,51 @@ class PolymarketUSAutoTrader:
             if not self._cycle_is_current(generation):
                 break
             market = markets.get(position["market_slug"])
+            event_context = monitored_by_id.get(str(position["event_id"]))
+            event = event_context[0] if event_context is not None else None
+            position_scope = str(
+                position.get("market_scope") or FULL_GAME_SCOPE
+            )
+            completed_scores = segment_results.get(
+                str(position["event_id"]),
+                {},
+            ).get(position_scope)
+            if (
+                position["mode"] == "dry_run"
+                and event is not None
+                and completed_scores is not None
+            ):
+                settlement = _dry_segment_settlement_value(
+                    position,
+                    event,
+                    completed_scores,
+                )
+                if settlement is not None:
+                    self._close_position(
+                        position["id"],
+                        exit_value=settlement,
+                        reason="dry_run_segment_resolved",
+                        order_id=None,
+                    )
+                    self._journal(
+                        "settlement",
+                        "simulated_segment_resolution",
+                        event_id=position["event_id"],
+                        event_name=position["event_name"],
+                        market_slug=position["market_slug"],
+                        selection=position["selection"],
+                        payload={
+                            "position_id": position["id"],
+                            "market_scope": position_scope,
+                            "home_score": completed_scores[0],
+                            "away_score": completed_scores[1],
+                            "settlement_value": settlement,
+                            "source": "official_mlb_segment_end_state",
+                        },
+                    )
+                    marked += 1
+                    exited += 1
+                    continue
             probability = (
                 self._position_probability(position, market, monitored_by_id)
                 if market is not None
@@ -5076,8 +5396,6 @@ class PolymarketUSAutoTrader:
             held_minutes = (
                 self._clock() - float(position["opened_ts"])
             ) / 60.0
-            event_context = monitored_by_id.get(str(position["event_id"]))
-            event = event_context[0] if event_context is not None else None
             if self._policy.adaptive_exit_enabled:
                 adaptive_exit = self._adaptive_exit.observe(
                     position=position,
@@ -5885,7 +6203,8 @@ class PolymarketUSAutoTrader:
                     cur,
                     """INSERT INTO live_managed_positions(
                         id,mode,status,event_id,event_name,market_slug,market_type,
-                        selection,position_side,quantity,entry_cost,entry_long_price,
+                        market_scope,selection,position_side,quantity,entry_cost,
+                        entry_long_price,
                         cost_basis,opened_ts,updated_ts,highest_exit_value,
                         current_exit_value,current_model_probability,
                         current_execution_edge,return_fraction,entry_decision_id,
@@ -5897,7 +6216,7 @@ class PolymarketUSAutoTrader:
                         entry_game_fraction_remaining,entry_event_entries_60m)
                        VALUES (%s,%s,'open',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                               %s,%s,%s,%s,%s)""",
+                               %s,%s,%s,%s,%s,%s)""",
                     (
                         position_id,
                         mode,
@@ -5905,6 +6224,7 @@ class PolymarketUSAutoTrader:
                         candidate.event.name,
                         candidate.market["slug"],
                         _market_kind(candidate.signal.market),
+                        market_scope(candidate.signal.market),
                         candidate.selection,
                         candidate.position_side,
                         quantity,

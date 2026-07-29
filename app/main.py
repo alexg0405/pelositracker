@@ -54,7 +54,11 @@ from .diagnostics import edge_health
 from .advice import market_views, position_views
 from .history import HistoryDB
 from .ledger import Ledger
-from .lines import pregame_priors
+from .lines import (
+    FULL_GAME_SCOPE,
+    SUPPORTED_MARKET_SCOPES,
+    pregame_priors,
+)
 from .gameclock import game_progress, league_rule, validate_state_transition
 from .models import Event, GameState, Quote, as_json
 from .monitor_state import MonitorState
@@ -83,11 +87,13 @@ from .polymarket_us_research import (
     credential_status as polymarket_us_credential_status,
     fetch_account_snapshot as fetch_polymarket_us_account,
     fetch_public_sports_events as fetch_polymarket_us_events,
+    public_market_quotes as polymarket_us_public_market_quotes,
 )
 from .polymarket_us_trading import (
     MAX_ARM_SECONDS,
     PolymarketUSAutoTrader,
     TradingPolicyError,
+    match_us_event,
 )
 from .approval import approval_granted, approval_instruction
 from .sport_model_lab import SportModelLab, _baseball_live_state
@@ -1009,6 +1015,117 @@ def _live_trading_snapshot() -> tuple[
         return monitored, latest_states
 
 
+def _execution_snapshot_with_us_segments(
+    snapshot: list[tuple[Event, list]],
+    us_payload: dict[str, Any],
+    trader: PolymarketUSAutoTrader,
+) -> list[tuple[Event, list]]:
+    """Evaluate US-only MLB segments through the existing Rust engine.
+
+    Polymarket.com does not consistently list every Polymarket US first-five
+    product. This supplies the US public best bid/ask as the target quote while
+    retaining the same sportsbook references and untouched engine formulas.
+    Authenticated depth, fee, and open-book checks still occur immediately
+    before either a simulated or live fill.
+    """
+    selected = {
+        scope for scope in trader.policy.allowed_market_scopes
+        if scope != FULL_GAME_SCOPE
+    }
+    if not selected:
+        return snapshot
+    us_events = [
+        event for event in us_payload.get("events", [])
+        if isinstance(event, dict) and not event.get("ended")
+    ]
+    enriched: list[tuple[Event, list]] = []
+    for event, existing_signals in snapshot:
+        identity = f"{event.sport} {event.league}".casefold()
+        if "baseball" not in identity and "mlb" not in identity:
+            enriched.append((event, existing_signals))
+            continue
+        matched = match_us_event(event, us_events)
+        if matched is None:
+            enriched.append((event, existing_signals))
+            continue
+        us_event, _score = matched
+        targets = [
+            quote
+            for quote in polymarket_us_public_market_quotes(event, us_event)
+            if quote.market_scope in selected
+        ]
+        if not targets:
+            enriched.append((event, existing_signals))
+            continue
+        references = [
+            quote for quote in store.quote_values(event.id)
+            if quote.market_scope in selected
+            and quote.source.casefold() != "polymarket"
+        ]
+        try:
+            generated = engine.evaluate(
+                event.id,
+                [*references, *targets],
+                list(store.states.get(event.id, [])),
+                event.away,
+                sport=event.sport,
+                league=event.league,
+                home_outcome=event.home,
+                pregame_spread=None,
+                pregame_total=None,
+                as_of=datetime.now(timezone.utc),
+                canonical_event_id=event.canonical_event_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not evaluate Polymarket US MLB segment quotes for %s: %s",
+                event.name,
+                exc,
+            )
+            enriched.append((event, existing_signals))
+            continue
+        replacement_keys = {
+            (signal.market.casefold(), signal.outcome.casefold())
+            for signal in generated
+        }
+        retained = [
+            signal for signal in existing_signals
+            if (signal.market.casefold(), signal.outcome.casefold())
+            not in replacement_keys
+        ]
+        enriched.append((event, [*retained, *generated]))
+    return enriched
+
+
+def _completed_mlb_segment_scores(
+    snapshot: list[tuple[Event, list]],
+) -> dict[str, dict[str, tuple[float, float]]]:
+    """Capture only official MLB ``End 1``/``End 5`` score boundaries."""
+    results: dict[str, dict[str, tuple[float, float]]] = {}
+    for event, _signals in snapshot:
+        if not is_mlb_event(event):
+            continue
+        for state in reversed(store.states.get(event.id, [])):
+            structured = (
+                state.sport_state
+                if isinstance(state.sport_state, dict)
+                else {}
+            )
+            try:
+                inning = int(structured.get("inning"))
+            except (TypeError, ValueError):
+                continue
+            half = str(structured.get("half") or "").casefold()
+            if half != "end" or inning not in {1, 5}:
+                continue
+            scope = "first_inning" if inning == 1 else "first_five_innings"
+            results.setdefault(event.id, {}).setdefault(
+                scope,
+                (float(state.home_score), float(state.away_score)),
+            )
+    return results
+
+
 async def _run_execution_trading_cycle(
     trader: PolymarketUSAutoTrader,
 ) -> dict[str, Any]:
@@ -1018,12 +1135,14 @@ async def _run_execution_trading_cycle(
             "Polymarket US execution is disabled on this deployment"
         )
     snapshot, game_states = _live_trading_snapshot()
+    segment_results = _completed_mlb_segment_scores(snapshot)
     if not trader.policy.automation_enabled:
         result = await asyncio.to_thread(
             trader.run_cycle,
             snapshot,
             {"events": []},
             game_states=game_states,
+            segment_results=segment_results,
         )
     elif not snapshot:
         result = await asyncio.to_thread(
@@ -1031,14 +1150,21 @@ async def _run_execution_trading_cycle(
             snapshot,
             {"events": []},
             game_states=game_states,
+            segment_results=segment_results,
         )
     else:
         payload = await fetch_polymarket_us_events(limit=500)
+        snapshot = _execution_snapshot_with_us_segments(
+            snapshot,
+            payload,
+            trader,
+        )
         result = await asyncio.to_thread(
             trader.run_cycle,
             snapshot,
             payload,
             game_states=game_states,
+            segment_results=segment_results,
         )
     if model_lab is not None:
         positions = await asyncio.to_thread(
@@ -1100,10 +1226,35 @@ def _pin_execution_lane(
     """Keep a workstation lane permanently assigned to one execution mode."""
     if trader.policy.execution_mode == mode:
         return
-    trader.configure({
+    values: dict[str, Any] = {
         "execution_mode": mode,
         "automation_enabled": False,
-    })
+    }
+    if mode == "live":
+        values.update({
+            "allowed_market_scopes": [FULL_GAME_SCOPE],
+            "allow_live_segment_markets": False,
+        })
+    else:
+        values["allowed_market_scopes"] = list(SUPPORTED_MARKET_SCOPES)
+    trader.configure(values)
+
+
+def _active_mlb_market_scopes() -> tuple[str, ...]:
+    """Return the exact periods selected by either execution lane.
+
+    The Odds API period products are event-specific paid markets. Only request
+    periods a saved execution policy can use; full-game odds remain available
+    for the existing engine and display.
+    """
+    selected = {FULL_GAME_SCOPE}
+    for trader in (live_trader, dry_run_trader):
+        if trader is None or not trader.policy.automation_enabled:
+            continue
+        selected.update(trader.policy.allowed_market_scopes)
+    return tuple(
+        scope for scope in SUPPORTED_MARKET_SCOPES if scope in selected
+    )
 
 
 def _start_event_feeds(event: Event) -> None:
@@ -1126,6 +1277,7 @@ def _start_event_feeds(event: Event) -> None:
                 "odds_api_poll_seconds",
                 settings.odds_poll_seconds,
             ),
+            market_scopes=_active_mlb_market_scopes,
         )))
         if settings.enable_action_network:
             group.append(asyncio.create_task(action_network_poll(event, on_quotes)))
@@ -1366,7 +1518,7 @@ class StrategyUpdateIn(BaseModel):
 class ConfigIn(BaseModel):
     auto_monitor: bool | None = None
     odds_api_enabled: bool | None = None
-    odds_api_poll_seconds: float | None = Field(default=None, ge=5, le=3600)
+    odds_api_poll_seconds: float | None = Field(default=None, ge=1, le=3600)
 
 
 class LiveTradingConfigIn(BaseModel):
@@ -1386,6 +1538,8 @@ class LiveTradingConfigIn(BaseModel):
     require_engine_entry: bool | None = None
     required_engine_gates: list[str] | None = None
     allowed_market_types: list[str] | None = None
+    allowed_market_scopes: list[str] | None = None
+    allow_live_segment_markets: bool | None = None
     trading_allocation_usd: float | None = None
     risk_preset: str | None = None
     max_total_exposure_usd: float | None = None
@@ -1879,6 +2033,11 @@ async def _decorate_execution_status(
     """Attach lane identity and both scheduler summaries to an action result."""
     status["lane"] = lane or trader.policy.execution_mode
     status["lanes"] = await _execution_lane_summaries()
+    research_trader = dry_run_trader or trader
+    status["segment_research"] = await asyncio.to_thread(
+        research_trader.segment_research_summary
+    )
+    status["odds_api_market_scopes"] = list(_active_mlb_market_scopes())
     return status
 
 

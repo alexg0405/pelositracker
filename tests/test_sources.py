@@ -35,6 +35,38 @@ def test_event_request_uses_event_odds_endpoint():
     assert url.endswith("/events/game-123/odds")
 
 
+def test_mlb_event_request_adds_only_selected_exact_period_markets():
+    target = event(
+        sport="baseball",
+        odds_api_sport="baseball_mlb",
+        odds_api_event_id="mlb-123",
+    )
+
+    _, full_game = odds_api_request(target, "secret")
+    _, first_five = odds_api_request(
+        target,
+        "secret",
+        market_scopes=("full_game", "first_five_innings"),
+    )
+    _, all_periods = odds_api_request(
+        target,
+        "secret",
+        market_scopes=("full_game", "first_inning", "first_five_innings"),
+    )
+
+    assert full_game["markets"] == "h2h,spreads,totals"
+    assert "totals_1st_1_innings" not in first_five["markets"]
+    assert set(first_five["markets"].split(",")) == {
+        "h2h",
+        "spreads",
+        "totals",
+        "h2h_3_way_1st_5_innings",
+        "spreads_1st_5_innings",
+        "totals_1st_5_innings",
+    }
+    assert "totals_1st_1_innings" in all_periods["markets"].split(",")
+
+
 def test_quotes_filter_matchup_and_keep_line_points():
     target = event()
     payload = [
@@ -66,6 +98,52 @@ def test_quotes_filter_matchup_and_keep_line_points():
     ]
     assert all(quote.source == "Example Book" for quote in quotes)
     assert [quote.market for quote in quotes] == ["moneyline", "spread", "total"]
+
+
+def test_mlb_period_quotes_keep_segment_identity_separate_from_full_game():
+    target = event(
+        sport="baseball",
+        home="Home",
+        away="Away",
+        odds_api_sport="baseball_mlb",
+        odds_api_event_id="mlb-123",
+    )
+    payload = {
+        "id": "mlb-123",
+        "home_team": "Home",
+        "away_team": "Away",
+        "bookmakers": [{
+            "key": "book",
+            "title": "Book",
+            "markets": [
+                {
+                    "key": "h2h_3_way_1st_5_innings",
+                    "outcomes": [{"name": "Away", "price": 120}],
+                },
+                {
+                    "key": "spreads_1st_5_innings",
+                    "outcomes": [{"name": "Home", "point": -0.5, "price": -110}],
+                },
+                {
+                    "key": "totals_1st_5_innings",
+                    "outcomes": [{"name": "Over", "point": 4.5, "price": -105}],
+                },
+                {
+                    "key": "totals_1st_1_innings",
+                    "outcomes": [{"name": "Under", "point": 0.5, "price": 105}],
+                },
+            ],
+        }],
+    }
+
+    quotes = odds_api_quotes(target, payload)
+
+    assert [(quote.market, quote.outcome, quote.market_scope) for quote in quotes] == [
+        ("first_five_moneyline", "Away", "first_five_innings"),
+        ("first_five_spread", "Home -0.5", "first_five_innings"),
+        ("first_five_total", "Over 4.5", "first_five_innings"),
+        ("first_inning_total", "Under 0.5", "first_inning"),
+    ]
 
 
 def test_full_mobile_polymarket_link_resolves_to_event_slug():
@@ -108,6 +186,27 @@ def test_polymarket_line_metadata_matches_sportsbook_selection_labels():
     assert meta["spread-away"]["outcome"] == "Boston Celtics +1.5"
     assert meta["total-over"]["outcome"] == "Over 221.5"
     assert meta["total-under"]["outcome"] == "Under 221.5"
+
+
+def test_global_nrfi_contract_maps_to_exact_first_inning_total():
+    payload = {"markets": [{
+        "active": True,
+        "closed": False,
+        "enableOrderBook": True,
+        "acceptingOrders": True,
+        "sportsMarketType": "nrfi",
+        "question": "Will there be a run scored in the first inning?: Away vs. Home",
+        "groupItemTitle": "NRFI",
+        "outcomes": '["Yes", "No"]',
+        "clobTokenIds": '["yrfi", "nrfi"]',
+    }]}
+
+    meta = _polymarket_token_meta(payload)
+
+    assert meta["yrfi"]["market"] == "first_inning_total"
+    assert meta["yrfi"]["outcome"] == "Over 0.5"
+    assert meta["yrfi"]["market_scope"] == "first_inning"
+    assert meta["nrfi"]["outcome"] == "Under 0.5"
 
 
 def test_archived_polymarket_lines_are_not_part_of_the_live_universe():

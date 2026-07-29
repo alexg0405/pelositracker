@@ -7,7 +7,9 @@ from app.polymarket_us_research import (
     _account_snapshot_sync,
     credential_status,
     normalize_sports_events,
+    public_market_quotes,
 )
+from app.models import Event
 from app.settings import Settings
 
 
@@ -140,6 +142,93 @@ def test_normalize_preserves_binary_soccer_selection_identity():
     assert market["market_type_v2"] == "drawable_outcome"
     assert market["sides"][0]["description"] == "Yes"
     assert market["sides"][0]["team_name"] == "San Jose Earthquakes"
+
+
+def test_normalize_preserves_exact_mlb_first_five_and_first_inning_identity():
+    payload = {
+        "events": [{
+            "id": "mlb-game",
+            "slug": "away-at-home",
+            "title": "Away at Home",
+            "category": "sports",
+            "markets": [
+                {
+                    "id": "f5",
+                    "slug": "away-wins-f5",
+                    "question": "Away wins F5",
+                    "active": True,
+                    "closed": False,
+                    "sportsMarketType": "baseball_team_first_five_winner",
+                    "marketSides": [],
+                },
+                {
+                    "id": "f1",
+                    "slug": "run-first-inning",
+                    "question": "Any run in first inning?",
+                    "active": True,
+                    "closed": False,
+                    "sportsMarketType": "baseball_team_first_inning_run",
+                    "marketSides": [],
+                },
+            ],
+        }],
+    }
+
+    markets = normalize_sports_events(payload)[0]["markets"]
+
+    assert markets[0]["canonical_market"] == "first_five_moneyline"
+    assert markets[0]["market_scope"] == "first_five_innings"
+    assert markets[1]["canonical_market"] == "first_inning_total"
+    assert markets[1]["market_scope"] == "first_inning"
+    assert markets[1]["line"] == pytest.approx(0.5)
+
+
+def test_public_us_segment_books_become_scoped_engine_target_quotes():
+    target = Event(
+        id="tracked",
+        name="Away at Home",
+        sport="baseball",
+        league="MLB",
+        home="Home",
+        away="Away",
+    )
+    us_event = {
+        "id": "us-game",
+        "markets": [
+            {
+                "id": "f5-total",
+                "slug": "f5-total-4-5",
+                "question": "More than 4.5 runs in F5?",
+                "canonical_market": "first_five_total",
+                "market_scope": "first_five_innings",
+                "line": 4.5,
+                "active": True,
+                "closed": False,
+                "long_best_bid": 0.42,
+                "long_best_ask": 0.44,
+                "minimum_trade_quantity": 1,
+                "minimum_tick_size": 0.01,
+                "sides": [
+                    {"id": "yes", "description": "Yes", "long": True, "tradable": True},
+                    {"id": "no", "description": "No", "long": False, "tradable": True},
+                ],
+            },
+        ],
+    }
+
+    quotes = public_market_quotes(target, us_event)
+
+    assert [(quote.market, quote.outcome) for quote in quotes] == [
+        ("first_five_total", "Over 4.5"),
+        ("first_five_total", "Under 4.5"),
+    ]
+    assert quotes[0].source == "Polymarket"
+    assert quotes[0].bid == pytest.approx(0.42)
+    assert quotes[0].ask == pytest.approx(0.44)
+    assert quotes[1].bid == pytest.approx(0.56)
+    assert quotes[1].ask == pytest.approx(0.58)
+    assert all(quote.depth_complete is False for quote in quotes)
+    assert all(quote.market_scope == "first_five_innings" for quote in quotes)
 
 
 def test_account_snapshot_uses_read_only_resources(monkeypatch):

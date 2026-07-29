@@ -64,6 +64,61 @@ def test_single_source_has_no_independent_reference():
     assert any("no independent fair" in reason for reason in result[0].reasons)
 
 
+def test_first_five_us_target_uses_unchanged_leave_one_out_engine_math():
+    engine = _SignalEngine(
+        confidence_threshold=0,
+        edge_threshold=0,
+        max_age_seconds=120,
+    )
+    quotes = [
+        Quote(
+            "e", "first_five_total", "Over 4.5", .43, "Polymarket", NOW,
+            bid=.42, ask=.44, market_scope="first_five_innings", line=4.5,
+            token_id="us-yes",
+        ),
+        Quote(
+            "e", "first_five_total", "Under 4.5", .57, "Polymarket", NOW,
+            bid=.56, ask=.58, market_scope="first_five_innings", line=4.5,
+            token_id="us-no",
+        ),
+        Quote(
+            "e", "first_five_total", "Over 4.5", .60, "Book A", NOW,
+            market_scope="first_five_innings", line=4.5,
+        ),
+        Quote(
+            "e", "first_five_total", "Under 4.5", .40, "Book A", NOW,
+            market_scope="first_five_innings", line=4.5,
+        ),
+        Quote(
+            "e", "first_five_total", "Over 4.5", .62, "Book B", NOW,
+            market_scope="first_five_innings", line=4.5,
+        ),
+        Quote(
+            "e", "first_five_total", "Under 4.5", .38, "Book B", NOW,
+            market_scope="first_five_innings", line=4.5,
+        ),
+    ]
+
+    result = engine.evaluate(
+        "e",
+        quotes,
+        [],
+        away_outcome="Away",
+        home_outcome="Home",
+        sport="baseball",
+        league="MLB",
+        as_of=NOW,
+    )
+    over = next(signal for signal in result if signal.outcome == "Over 4.5")
+
+    assert over.market == "first_five_total"
+    assert over.quote_source == "Polymarket"
+    assert over.market_probability == pytest.approx(.44)
+    assert over.model_probability == pytest.approx(.61, abs=.02)
+    assert over.edge > .15
+    assert over.n_reference_sources == 2
+
+
 def test_soft_book_lagging_consensus_is_display_only_without_fill_depth():
     """A price gap is not actionable when expected paper dollars are unknown."""
     engine = SignalEngine(confidence_threshold=50, edge_threshold=.02)
