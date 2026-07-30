@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import secrets
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Iterable, Literal, Mapping
 
 from fastapi import (
     Depends,
@@ -724,16 +724,73 @@ def _tennis_final_scores(event: Event) -> tuple[float, float] | None:
     return float(sets_home), float(sets_away)
 
 
-def _settle_scores(event: Event, states: list) -> tuple[float, float]:
-    """The ``(home, away)`` scores to grade an event by. Tennis is graded by set
-    count (see :func:`_tennis_final_scores`); every other sport uses the final
-    live score directly."""
+def _settlement_context(
+    event: Event,
+    states: list[GameState],
+) -> tuple[float, float, GameState | None, str]:
+    """Choose one provenance-checked terminal result.
+
+    MLB observation features deliberately prefer the official structured
+    linescore. Settlement must use the same orientation. A generic terminal
+    packet can arrive a few milliseconds later and its unnamed score string
+    is not sufficient evidence that its first number is the registered home
+    team; mixing those two sources previously inverted research labels.
+    """
     if _is_tennis(event):
         tennis = _tennis_final_scores(event)
         if tennis is not None:
-            return tennis
+            return tennis[0], tennis[1], states[-1] if states else None, (
+                "trusted_terminal_state"
+            )
+    if is_mlb_event(event):
+        official = next(
+            (
+                state
+                for state in reversed(states)
+                if isinstance(state.sport_state, dict)
+                and str(state.sport_state.get("schema") or "").startswith(
+                    "mlb-linescore-"
+                )
+                and state.home_team_id
+                and state.away_team_id
+                and (
+                    state.ended
+                    or str(state.status or "").casefold()
+                    in {
+                        "final",
+                        "ended",
+                        "complete",
+                        "completed",
+                        "finished",
+                    }
+                )
+            ),
+            None,
+        )
+        if official is not None:
+            return (
+                float(official.home_score),
+                float(official.away_score),
+                official,
+                "official_mlb_state",
+            )
+    if not states:
+        return 0.0, 0.0, None, "unverified_terminal_state"
     state = states[-1]
-    return state.home_score, state.away_score
+    source = (
+        "trusted_terminal_state"
+        if not state.quarantined
+        and bool(state.home_team_id)
+        and bool(state.away_team_id)
+        else "unverified_terminal_state"
+    )
+    return float(state.home_score), float(state.away_score), state, source
+
+
+def _settle_scores(event: Event, states: list) -> tuple[float, float]:
+    """Compatibility wrapper for account and replay grading tests."""
+    home_score, away_score, _, _ = _settlement_context(event, states)
+    return home_score, away_score
 
 
 def recompute(event_id: str, *, as_of: datetime) -> list:
@@ -928,8 +985,16 @@ async def finalize_event(event_id: str, *, canceled: bool = False) -> None:
         # The close mark is the last valid observation recorded before the
         # terminal gate closed. Never synthesize a fresh consensus after suspension.
         # Tennis grades by set count, not games-in-a-set (see _settle_scores).
-        settle_home, settle_away = (
-            _settle_scores(event, states) if (event and states) else (0.0, 0.0))
+        (
+            settle_home,
+            settle_away,
+            settlement_state,
+            settlement_source,
+        ) = (
+            _settlement_context(event, states)
+            if event is not None
+            else (0.0, 0.0, None, "unverified_terminal_state")
+        )
         winners = _winner_labels(event, settle_home, settle_away) \
             if (event and states and not canceled) else set()
 
@@ -941,7 +1006,23 @@ async def finalize_event(event_id: str, *, canceled: bool = False) -> None:
                     account_book.void_event(event_id)
                 if model_lab is not None and event is not None:
                     model_lab.settle_event(
-                        event, settle_home, settle_away, canceled=True
+                        event,
+                        settle_home,
+                        settle_away,
+                        canceled=True,
+                        settlement_source=settlement_source,
+                        settlement_details={
+                            "state_source": (
+                                settlement_state.source
+                                if settlement_state is not None
+                                else None
+                            ),
+                            "state_schema_version": (
+                                settlement_state.state_schema_version
+                                if settlement_state is not None
+                                else None
+                            ),
+                        },
                     )
                 return
             if ledger is not None:
@@ -952,10 +1033,36 @@ async def finalize_event(event_id: str, *, canceled: bool = False) -> None:
                 account_book.settle(event, settle_home, settle_away)
             if history_db is not None and event is not None:
                 prior = _pregame.get(event_id, {})
-                final_state = states[-1] if states else None
-                history_db.log_outcome(event, prior.get("spread"), prior.get("total"), final_state)
+                history_db.log_outcome(
+                    event,
+                    prior.get("spread"),
+                    prior.get("total"),
+                    settlement_state,
+                )
             if model_lab is not None and event is not None and states:
-                model_lab.settle_event(event, settle_home, settle_away)
+                model_lab.settle_event(
+                    event,
+                    settle_home,
+                    settle_away,
+                    settlement_source=settlement_source,
+                    settlement_details={
+                        "state_source": (
+                            settlement_state.source
+                            if settlement_state is not None
+                            else None
+                        ),
+                        "state_schema_version": (
+                            settlement_state.state_schema_version
+                            if settlement_state is not None
+                            else None
+                        ),
+                        "provider_event_id": (
+                            settlement_state.provider_event_id
+                            if settlement_state is not None
+                            else None
+                        ),
+                    },
+                )
 
         await asyncio.to_thread(_writes)
         if monitor_state is not None:
@@ -1326,11 +1433,20 @@ async def lifespan(_: FastAPI):
         )
         dry_run_trader = (
             PolymarketUSAutoTrader(
-                str(settings.polymarket_us_dry_run_db),
+                (
+                    None
+                    if settings.database_url and not settings.workstation_mode
+                    else str(settings.polymarket_us_dry_run_db)
+                ),
                 key_id=settings.polymarket_us_key_id,
                 secret_key=settings.polymarket_us_secret_key,
+                database_namespace=(
+                    "polymarket_us_dry_run"
+                    if settings.database_url and not settings.workstation_mode
+                    else None
+                ),
             )
-            if settings.workstation_mode and live_trader is not None
+            if live_trader is not None
             else None
         )
         if dry_run_trader is not None:
@@ -1559,13 +1675,15 @@ class LiveTradingConfigIn(BaseModel):
     min_book_shares: float | None = None
     min_hold_minutes: float | None = None
     profit_target: float | None = None
+    minimum_locked_profit: float | None = None
     trailing_drawdown: float | None = None
     stop_loss: float | None = None
     exit_edge: float | None = None
-    cycle_seconds: int | None = None
+    cycle_seconds: float | None = None
     candidate_cooldown_seconds: int | None = None
     max_entries_per_event_per_hour: int | None = None
     min_mlb_fraction_remaining: float | None = None
+    line_execution_profiles: list[dict[str, Any]] | None = None
 
 
 class LiveTradingArmIn(BaseModel):
@@ -1601,7 +1719,7 @@ class RiskSessionResetIn(BaseModel):
 class PolicyAdviceIn(BaseModel):
     objective: Literal["protect_profit", "balanced", "more_trades"] = "balanced"
     target_trades_per_hour: float = Field(default=4.0, ge=0.25, le=30)
-    analysis_mode: Literal["dry_run", "live"] | None = None
+    analysis_mode: Literal["dry_run", "live", "combined"] | None = None
     lookback_days: Literal[0, 7, 30, 90, 180, 365] = 0
     market_types: list[Literal["moneyline", "spread", "total"]] = Field(
         default_factory=lambda: ["moneyline", "spread", "total"]
@@ -1981,22 +2099,139 @@ def _require_live_trader() -> PolymarketUSAutoTrader:
 def _require_execution_lane(
     lane: Literal["live", "dry_run"] | None = None,
 ) -> PolymarketUSAutoTrader:
-    """Return one isolated local automation lane.
+    """Return one isolated automation lane.
 
     Omitting ``lane`` preserves the original single-trader API behavior for
-    existing clients and deployments. The workstation UI always names a lane.
+    existing clients and deployments. The dashboard UI always names a lane.
     """
     if lane == "dry_run":
         if dry_run_trader is None:
-            if settings.workstation_mode:
-                raise HTTPException(
-                    409,
-                    "The isolated dry-run lane is unavailable; restart the "
-                    "local workstation.",
-                )
-            return _require_live_trader()
+            raise HTTPException(
+                409,
+                "The isolated dry-run lane is unavailable; restart the "
+                "application.",
+            )
         return dry_run_trader
     return _require_live_trader()
+
+
+def _execution_data_sources(
+    mode: Literal["all", "combined", "live", "dry_run"],
+) -> list[tuple[str, PolymarketUSAutoTrader]]:
+    requested = {"live", "dry_run"} if mode in {"all", "combined"} else {mode}
+    available = {
+        "live": live_trader,
+        "dry_run": dry_run_trader,
+    }
+    sources = [
+        (lane, trader)
+        for lane, trader in available.items()
+        if lane in requested and trader is not None
+    ]
+    if not sources:
+        raise HTTPException(
+            409,
+            "No retained execution store is available for the requested mode.",
+        )
+    return sources
+
+
+def _deduplicate_evidence_rows(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    kind: Literal["position", "closed_trade", "opportunity"],
+) -> list[dict[str, Any]]:
+    retained: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for source in rows:
+        row = dict(source)
+        mode = str(row.get("mode") or "")
+        if kind in {"position", "closed_trade"}:
+            key = (
+                mode,
+                str(row.get("id") or ""),
+                float(row.get("opened_ts") or 0.0)
+                if kind == "closed_trade"
+                else str(row.get("opened_at") or ""),
+            )
+        else:
+            key = (
+                mode,
+                str(row.get("decision_id") or ""),
+                str(row.get("event_id") or ""),
+                str(row.get("market_slug") or ""),
+                str(row.get("position_side") or row.get("selection") or ""),
+                float(row.get("observed_ts") or 0.0),
+            )
+        retained.setdefault(key, row)
+    return list(retained.values())
+
+
+async def _advisor_datasets(
+    mode: Literal["combined", "live", "dry_run"],
+) -> dict[str, Any]:
+    sources = _execution_data_sources(mode)
+    datasets = await asyncio.gather(*(
+        asyncio.to_thread(trader.advisor_dataset, source_lane=lane)
+        for lane, trader in sources
+    ))
+    closed_trades = _deduplicate_evidence_rows(
+        (
+            row
+            for dataset in datasets
+            for row in dataset["closed_trades"]
+        ),
+        kind="closed_trade",
+    )
+    opportunities = _deduplicate_evidence_rows(
+        (
+            row
+            for dataset in datasets
+            for row in dataset["opportunities"]
+        ),
+        kind="opportunity",
+    )
+    positions = _deduplicate_evidence_rows(
+        (
+            row
+            for dataset in datasets
+            for row in dataset["positions"]
+        ),
+        kind="position",
+    )
+    return {
+        "closed_trades": closed_trades,
+        "opportunities": opportunities,
+        "positions": positions,
+        "sources": [dict(dataset["summary"]) for dataset in datasets],
+    }
+
+
+async def _performance_dataset(
+    mode: Literal["combined", "live", "dry_run"],
+) -> dict[str, Any]:
+    sources = _execution_data_sources(mode)
+    position_groups = await asyncio.gather(*(
+        asyncio.to_thread(trader.positions, include_hidden=True)
+        for _lane, trader in sources
+    ))
+    positions = _deduplicate_evidence_rows(
+        (
+            position
+            for group in position_groups
+            for position in group
+        ),
+        kind="position",
+    )
+    return {
+        "positions": positions,
+        "sources": [
+            {
+                "lane": lane,
+                "retained_positions": len(group),
+            }
+            for (lane, _trader), group in zip(sources, position_groups)
+        ],
+    }
 
 
 async def _execution_lane_summaries() -> dict[str, dict[str, Any]]:
@@ -2454,13 +2689,24 @@ async def polymarket_us_trading_performance_ledger(
     lane: Literal["live", "dry_run"] | None = None,
 ):
     try:
+        dataset_mode: Literal["combined", "live", "dry_run"] = (
+            "combined" if mode == "all" else mode
+        )
+        dataset = await _performance_dataset(dataset_mode)
+        renderer = (
+            _require_execution_lane("dry_run")
+            if mode == "dry_run"
+            else _require_live_trader()
+        )
         ledger_view = await asyncio.to_thread(
-            _require_execution_lane(lane).performance_ledger,
+            renderer.performance_ledger,
             mode=mode,
             market_type=market_type,
             result=result,
             query=query,
             limit=limit,
+            source_positions=dataset["positions"],
+            data_sources=dataset["sources"],
         )
     except TradingPolicyError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -2520,12 +2766,9 @@ async def polymarket_us_trading_performance_ledger(
 
 
 async def _policy_advisor_model_evidence(
-    trader: PolymarketUSAutoTrader,
+    positions: Iterable[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    positions = await asyncio.to_thread(
-        trader.positions,
-        include_hidden=True,
-    )
+    positions = [dict(position) for position in positions]
     decision_ids = [
         str(position["entry_decision_id"])
         for position in positions
@@ -2560,16 +2803,26 @@ async def polymarket_us_trading_policy_advice(
     lane: Literal["live", "dry_run"] | None = None,
 ):
     trader = _require_execution_lane(lane)
+    analysis_mode = (
+        payload.analysis_mode
+        or str(trader.policy.execution_mode)
+    )
     try:
-        model_evidence = await _policy_advisor_model_evidence(trader)
+        dataset = await _advisor_datasets(analysis_mode)
+        model_evidence = await _policy_advisor_model_evidence(
+            dataset["positions"]
+        )
         return await asyncio.to_thread(
             trader.policy_advice,
             objective=payload.objective,
             target_trades_per_hour=payload.target_trades_per_hour,
             model_evidence=model_evidence,
-            analysis_mode=payload.analysis_mode,
+            analysis_mode=analysis_mode,
             lookback_days=payload.lookback_days,
             market_types=payload.market_types,
+            closed_trades=dataset["closed_trades"],
+            opportunities=dataset["opportunities"],
+            data_sources=dataset["sources"],
         )
     except TradingPolicyError as exc:
         raise HTTPException(409, str(exc)) from exc
@@ -2610,8 +2863,12 @@ async def polymarket_us_trading_policy_sessions(
 async def polymarket_us_trading_model_readiness(
     lane: Literal["live", "dry_run"] | None = None,
 ):
+    requested_lane: Literal["live", "dry_run"] = (
+        "dry_run" if lane == "dry_run" else "live"
+    )
+    dataset = await _advisor_datasets(requested_lane)
     return await _policy_advisor_model_evidence(
-        _require_execution_lane(lane)
+        dataset["positions"]
     )
 
 
@@ -2743,7 +3000,14 @@ async def import_research_data(bundle: UploadFile = File(...)):
         return await asyncio.to_thread(
             merge_research_bundle,
             bundle.file,
-            trader=trader,
+            traders={
+                "live": trader,
+                **(
+                    {"dry_run": dry_run_trader}
+                    if dry_run_trader is not None
+                    else {}
+                ),
+            },
             model_lab=lab,
         )
     except ResearchBundleError as exc:

@@ -136,6 +136,18 @@ existing `DATABASE_URL` for persistent execution history, and retain
 `WEB_CONCURRENCY=1`. Source deployment alone cannot arm live orders: automation
 defaults off, execution defaults to dry-run, every restart disarms the
 process-local live latch, and live arming requires the exact confirmation phrase.
+Hosted dry-run and live automation use separate schedulers and policies. When
+PostgreSQL is configured, simulated execution is isolated in the
+`polymarket_us_dry_run` schema while existing live execution remains in the
+default schema, so both lanes can run at the same time without overwriting one
+another. The analysis-cycle control accepts 1-300 seconds and re-evaluates the
+latest retained state; it does not independently call The Odds API.
+
+The performance datasheet aggregates the retained live and dry-run stores when
+its execution filter is set to **Dry run + live**. The settings advisor also
+offers an explicit all-data comparison with per-lane sample counts. Combined
+live/simulated evidence is exploratory only and cannot one-click validate a live
+policy; live-only validation is still required before supported application.
 
 The authenticated **Account connection** panel can also verify and use a
 Polymarket US key pasted from a phone. That key is held only in server-process
@@ -152,18 +164,29 @@ the Polymarket US status panel explicitly reports hosted SQLite as ephemeral.
 The hosted Model Lab and managed-trade journal use the same PostgreSQL database
 with component-scoped migrations.
 
-To merge the existing workstation evidence after deployment:
+To create one aggregated hosted evidence store after deployment:
 
-1. Open **Polymarket US Research → Model lab → Merge local and hosted research
+1. Open **Polymarket US Research → Model lab → Synchronize local and hosted research
    evidence** on the local workstation.
 2. Download the compressed evidence archive.
 3. Open the same panel on the hosted site and upload that archive once.
 
 The merge is checksum-validated and idempotent. It carries closed managed
 trades, settings-at-entry, journal evidence, labeled adaptive-exit observations,
-and Model Lab observations/targets/candidates. It excludes every credential,
-cookie, environment value, order, open position, and execution control. Reusing
-the same archive is safe: existing hosted primary-key rows are preserved.
+and Model Lab observations/targets/candidates. Live and dry-run batches retain
+their original lane, so simulated evidence cannot contaminate the live store.
+It excludes every credential, cookie, environment value, order, open position,
+and execution control. Reusing the same archive is safe: existing destination
+primary-key rows are preserved.
+
+After that one-time upload, a dry-run lane started from a phone keeps running
+inside the hosted worker even after the page is closed and writes directly to
+the durable PostgreSQL dry-run schema. The website's combined datasheet and
+advisor can immediately analyze those new hosted rows alongside the imported
+local evidence. To refresh the workstation's local copy later, perform the same
+transfer in reverse: export from the hosted site and merge the archive locally.
+This deliberate archive exchange avoids exposing the production database to a
+home machine or placing research databases in Git.
 
 ## Registering an event
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_EVEN
 from difflib import SequenceMatcher
 import hashlib
 import json
@@ -40,8 +41,6 @@ from .lines import (
     MLB_FIRST_INNING_SCOPE,
     SUPPORTED_MARKET_SCOPES,
     base_market_type,
-    is_spread_market,
-    is_total_market,
     market_scope,
     quote_line_side,
 )
@@ -53,8 +52,9 @@ from .policy_advisor import (
 )
 
 
-POLICY_VERSION = "pmus-live-risk-policy-v8-mlb-segments"
+POLICY_VERSION = "pmus-live-risk-policy-v10-line-stage-profiles"
 RISK_PRESET_VERSION = "risk-presets-v2"
+POLYMARKET_US_TAKER_FEE_COEFFICIENT = Decimal("0.05")
 _CONTROL_TOKEN_KEY = "_execution_control_token"
 RISK_PRESETS: dict[str, dict[str, Any]] = {
     "cautious": {
@@ -77,6 +77,7 @@ RISK_PRESETS: dict[str, dict[str, Any]] = {
         "min_book_shares": 10.0,
         "min_hold_minutes": 20.0,
         "profit_target": 0.15,
+        "minimum_locked_profit": 0.04,
         "trailing_drawdown": 0.04,
         "stop_loss": 0.12,
         "exit_edge": 0.01,
@@ -110,6 +111,7 @@ RISK_PRESETS: dict[str, dict[str, Any]] = {
         "min_book_shares": 5.0,
         "min_hold_minutes": 15.0,
         "profit_target": 0.12,
+        "minimum_locked_profit": 0.03,
         "trailing_drawdown": 0.04,
         "stop_loss": 0.16,
         "exit_edge": 0.0,
@@ -143,6 +145,7 @@ RISK_PRESETS: dict[str, dict[str, Any]] = {
         "min_book_shares": 3.0,
         "min_hold_minutes": 10.0,
         "profit_target": 0.10,
+        "minimum_locked_profit": 0.02,
         "trailing_drawdown": 0.05,
         "stop_loss": 0.22,
         "exit_edge": 0.0,
@@ -176,6 +179,7 @@ RISK_PRESETS: dict[str, dict[str, Any]] = {
         "min_book_shares": 1.0,
         "min_hold_minutes": 5.0,
         "profit_target": 0.08,
+        "minimum_locked_profit": 0.01,
         "trailing_drawdown": 0.06,
         "stop_loss": 0.28,
         "exit_edge": -0.01,
@@ -424,6 +428,103 @@ class TradingExecutionError(RuntimeError):
     """A bounded venue or execution failure."""
 
 
+LINE_EXECUTION_PROFILE_FIELDS = frozenset({
+    "min_edge",
+    "max_edge",
+    "min_signal_quality",
+    "min_reference_sources",
+    "min_entry_price",
+    "max_entry_price",
+    "max_spread",
+    "min_book_shares",
+    "min_hold_minutes",
+    "profit_target",
+    "minimum_locked_profit",
+    "trailing_drawdown",
+    "stop_loss",
+    "exit_edge",
+    "min_mlb_fraction_remaining",
+})
+LINE_EXECUTION_PROFILE_STAGES = frozenset({
+    "all",
+    "early",
+    "middle",
+    "late",
+})
+
+
+def _execution_game_stage(fraction_remaining: float | None) -> str | None:
+    if fraction_remaining is None:
+        return None
+    if fraction_remaining >= 0.50:
+        return "early"
+    if fraction_remaining >= 0.25:
+        return "middle"
+    return "late"
+
+
+def _normalize_line_execution_profiles(
+    value: Any,
+) -> tuple[dict[str, Any], ...]:
+    if value in (None, (), []):
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise TradingPolicyError("line_execution_profiles must be a list")
+    normalized: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw in value:
+        if not isinstance(raw, Mapping):
+            raise TradingPolicyError(
+                "each line execution profile must be an object"
+            )
+        market_type = _market_kind(str(raw.get("market_type") or ""))
+        stage = str(raw.get("game_stage") or "all").strip().casefold()
+        if market_type not in SUPPORTED_ENTRY_MARKET_TYPE_SET:
+            raise TradingPolicyError(
+                "line execution profile market_type must be moneyline, spread, or total"
+            )
+        if stage not in LINE_EXECUTION_PROFILE_STAGES:
+            raise TradingPolicyError(
+                "line execution profile game_stage must be all, early, middle, or late"
+            )
+        key = (market_type, stage)
+        if key in seen:
+            raise TradingPolicyError(
+                f"duplicate line execution profile: {market_type}/{stage}"
+            )
+        seen.add(key)
+        overrides = raw.get("overrides") or {}
+        if not isinstance(overrides, Mapping):
+            raise TradingPolicyError(
+                "line execution profile overrides must be an object"
+            )
+        unknown = set(overrides) - LINE_EXECUTION_PROFILE_FIELDS
+        if unknown:
+            raise TradingPolicyError(
+                "unsupported line execution override(s): "
+                + ", ".join(sorted(str(field) for field in unknown))
+            )
+        clean_overrides: dict[str, Any] = {}
+        for field_name, raw_value in overrides.items():
+            try:
+                clean_overrides[str(field_name)] = (
+                    int(raw_value)
+                    if field_name == "min_reference_sources"
+                    else float(raw_value)
+                )
+            except (TypeError, ValueError) as exc:
+                raise TradingPolicyError(
+                    f"{market_type}/{stage} {field_name} must be numeric"
+                ) from exc
+        normalized.append({
+            "market_type": market_type,
+            "game_stage": stage,
+            "enabled": bool(raw.get("enabled", True)),
+            "overrides": clean_overrides,
+        })
+    return tuple(normalized)
+
+
 def risk_preset_fields(name: str, allocation: float) -> dict[str, Any]:
     """Return deterministic execution limits for one operator-selected risk style."""
     if name not in RISK_PRESETS:
@@ -502,13 +603,15 @@ class TradingPolicy:
     min_book_shares: float = 3.0
     min_hold_minutes: float = 10.0
     profit_target: float = 0.10
+    minimum_locked_profit: float = 0.02
     trailing_drawdown: float = 0.04
     stop_loss: float = 0.20
     exit_edge: float = 0.0
-    cycle_seconds: int = 30
+    cycle_seconds: float = 30.0
     candidate_cooldown_seconds: int = 300
     max_entries_per_event_per_hour: int = 3
     min_mlb_fraction_remaining: float = 0.0
+    line_execution_profiles: tuple[dict[str, Any], ...] = ()
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> "TradingPolicy":
@@ -556,9 +659,57 @@ class TradingPolicy:
                 if str(clean.get("execution_mode") or "dry_run") == "dry_run"
                 else (FULL_GAME_SCOPE,)
             )
+        clean["line_execution_profiles"] = _normalize_line_execution_profiles(
+            clean.get("line_execution_profiles")
+        )
         policy = cls(**clean)
         policy.validate()
         return policy
+
+    def execution_policy_for(
+        self,
+        market_type: str,
+        fraction_remaining: float | None,
+    ) -> tuple["TradingPolicy" | None, str]:
+        """Resolve an auditable line/stage overlay around existing metrics."""
+        kind = _market_kind(market_type)
+        stage = _execution_game_stage(fraction_remaining)
+        selected: list[dict[str, Any]] = []
+        for wanted_stage in ("all", stage):
+            if wanted_stage is None:
+                continue
+            match = next(
+                (
+                    profile
+                    for profile in self.line_execution_profiles
+                    if profile["market_type"] == kind
+                    and profile["game_stage"] == wanted_stage
+                ),
+                None,
+            )
+            if match is not None:
+                selected.append(match)
+        profile_key = (
+            "+".join(
+                f"{profile['market_type']}/{profile['game_stage']}"
+                for profile in selected
+            )
+            or "global"
+        )
+        if any(not profile.get("enabled", True) for profile in selected):
+            return None, profile_key
+        overrides: dict[str, Any] = {}
+        for profile in selected:
+            overrides.update(profile.get("overrides") or {})
+        if not overrides:
+            return self, profile_key
+        effective = replace(
+            self,
+            line_execution_profiles=(),
+            **overrides,
+        )
+        effective.validate()
+        return effective, profile_key
 
     def validate(self) -> None:
         if self.execution_mode not in {"dry_run", "live"}:
@@ -681,18 +832,36 @@ class TradingPolicy:
             raise TradingPolicyError("max_spread must be between zero and one")
         if self.min_book_shares <= 0 or self.min_hold_minutes < 0:
             raise TradingPolicyError("book shares must be positive and hold time non-negative")
-        for name in ("profit_target", "trailing_drawdown", "stop_loss"):
+        for name in (
+            "profit_target",
+            "minimum_locked_profit",
+            "trailing_drawdown",
+            "stop_loss",
+        ):
             value = getattr(self, name)
-            if not 0 < value < 1:
+            if not 0 <= value < 1 or (
+                name != "minimum_locked_profit" and value == 0
+            ):
                 raise TradingPolicyError(f"{name} must be between zero and one")
+        if self.minimum_locked_profit >= self.profit_target:
+            raise TradingPolicyError(
+                "minimum locked profit must be smaller than the profit target"
+            )
         if not -1 < self.exit_edge < 1:
             raise TradingPolicyError("exit_edge must be between -1 and 1")
-        if not 10 <= self.cycle_seconds <= 300:
-            raise TradingPolicyError("cycle_seconds must be between 10 and 300")
+        if (
+            not math.isfinite(self.cycle_seconds)
+            or not 1 <= self.cycle_seconds <= 300
+        ):
+            raise TradingPolicyError("cycle_seconds must be between 1 and 300")
         if self.candidate_cooldown_seconds < self.cycle_seconds:
             raise TradingPolicyError(
                 "candidate_cooldown_seconds cannot be shorter than the cycle"
             )
+        if self.line_execution_profiles:
+            for market_type in SUPPORTED_ENTRY_MARKET_TYPES:
+                for fraction in (None, 0.75, 0.375, 0.10):
+                    self.execution_policy_for(market_type, fraction)
 
 
 def _policy_fingerprint(policy: TradingPolicy | Mapping[str, Any]) -> str:
@@ -721,6 +890,8 @@ class MappedCandidate:
     book_shares: float
     execution_edge: float
     mapping_score: float
+    execution_policy: TradingPolicy
+    execution_profile_key: str = "global"
     game_fraction_remaining: float | None = None
     event_entries_60m: int = 1
 
@@ -1324,6 +1495,29 @@ def _order_fill(
     return shares, (notional / shares if shares > 0 else fallback_price), fees
 
 
+def _estimated_taker_fee(
+    *,
+    quantity: float,
+    contract_price: float,
+) -> float:
+    """Return the current exchange taker-fee estimate, rounded per order.
+
+    Protective exits cross the authenticated book with an immediately fillable
+    FOK limit, so they are taker executions. Polymarket US publishes the
+    symmetric formula ``0.05 * contracts * p * (1-p)`` and rounds the order fee
+    to the nearest cent using banker's rounding.
+    """
+    if quantity <= 0 or not 0 < contract_price < 1:
+        return 0.0
+    fee = (
+        POLYMARKET_US_TAKER_FEE_COEFFICIENT
+        * Decimal(str(quantity))
+        * Decimal(str(contract_price))
+        * (Decimal("1") - Decimal(str(contract_price)))
+    )
+    return float(fee.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN))
+
+
 def _preview_fee_per_share(
     preview: Mapping[str, Any],
     *,
@@ -1354,11 +1548,13 @@ class PolymarketUSAutoTrader:
         secret_key: str,
         client_factory: Callable[..., Any] | None = None,
         clock: Callable[[], float] = _now,
+        database_namespace: str | None = None,
     ):
         self._db = Database.open(
             path,
             sqlite_envs=("POLYMARKET_US_TRADING_DB",),
             sqlite_default=path or "polymarket-us-trading.db",
+            postgres_schema=database_namespace,
         )
         self.path = self._db.target
         self._lock = threading.RLock()
@@ -1499,7 +1695,23 @@ class PolymarketUSAutoTrader:
                        WHERE market_scope IS NULL OR market_scope=''""",
                     (FULL_GAME_SCOPE,),
                 )
-        self._adaptive_exit = AdaptiveExitModel(path, clock=clock)
+            self._db.migrate_columns(
+                "polymarket_us_live_trading",
+                11,
+                {
+                    "live_managed_positions": {
+                        "profit_floor_missed_ts": "DOUBLE PRECISION",
+                        "profit_floor_missed_count": "INTEGER",
+                        "profit_floor_low_exit_value": "DOUBLE PRECISION",
+                        "profit_guard_payload": "TEXT",
+                    },
+                },
+            )
+        self._adaptive_exit = AdaptiveExitModel(
+            path,
+            clock=clock,
+            database_namespace=database_namespace,
+        )
         self._control_token = ""
         self._policy = self._load_policy()
         self._backfill_position_entry_context()
@@ -2247,6 +2459,7 @@ class PolymarketUSAutoTrader:
         for row in rows:
             adaptive_payload = row.pop("adaptive_exit_payload", None)
             stop_guard_payload = row.pop("stop_guard_payload", None)
+            profit_guard_payload = row.pop("profit_guard_payload", None)
             entry_policy_payload = row.pop("entry_policy_json", None)
             try:
                 row["adaptive_exit"] = (
@@ -2261,6 +2474,13 @@ class PolymarketUSAutoTrader:
                 )
             except (TypeError, json.JSONDecodeError):
                 row["stop_guard"] = None
+            try:
+                row["profit_guard"] = (
+                    json.loads(profit_guard_payload)
+                    if profit_guard_payload else None
+                )
+            except (TypeError, json.JSONDecodeError):
+                row["profit_guard"] = None
             try:
                 row["entry_policy"] = (
                     json.loads(entry_policy_payload)
@@ -2290,6 +2510,9 @@ class PolymarketUSAutoTrader:
             row["stop_observation_count"] = int(
                 row.get("stop_observation_count") or 0
             )
+            row["profit_floor_missed_count"] = int(
+                row.get("profit_floor_missed_count") or 0
+            )
             for key in ("opened_ts", "updated_ts", "closed_ts"):
                 value = row.get(key)
                 row[key.removesuffix("_ts") + "_at"] = (
@@ -2302,6 +2525,7 @@ class PolymarketUSAutoTrader:
                 "profit_lock_armed_ts",
                 "profit_target_observed_ts",
                 "stop_triggered_ts",
+                "profit_floor_missed_ts",
             ):
                 value = row.get(key)
                 row[key.removesuffix("_ts") + "_at"] = (
@@ -2310,6 +2534,19 @@ class PolymarketUSAutoTrader:
                     else None
                 )
         return rows
+
+    def _position_execution_policy(
+        self,
+        position: Mapping[str, Any],
+    ) -> TradingPolicy:
+        """Use the effective policy captured at entry for position management."""
+        payload = position.get("entry_policy")
+        if isinstance(payload, Mapping):
+            try:
+                return TradingPolicy.from_mapping(payload)
+            except TradingPolicyError:
+                pass
+        return self._policy
 
     def clear_adaptive_exit_history(
         self,
@@ -2928,6 +3165,8 @@ class PolymarketUSAutoTrader:
         result: str = "all",
         query: str = "",
         limit: int = 2_000,
+        source_positions: Iterable[Mapping[str, Any]] | None = None,
+        data_sources: Iterable[Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Return an auditable, filterable view of managed execution outcomes.
 
@@ -2971,7 +3210,11 @@ class PolymarketUSAutoTrader:
                 return "loss"
             return "push"
 
-        positions = self.positions(include_hidden=True)
+        positions = (
+            [dict(position) for position in source_positions]
+            if source_positions is not None
+            else self.positions(include_hidden=True)
+        )
         matching: list[dict[str, Any]] = []
         for position in positions:
             canonical_market = _market_kind(position.get("market_type"))
@@ -3198,6 +3441,9 @@ class PolymarketUSAutoTrader:
                     "counts together; a high rate from a small group is weak evidence."
                 ),
             },
+            "data_sources": [
+                dict(source) for source in (data_sources or ())
+            ],
             "summary": aggregate(matching),
             "line_type_summary": type_groups,
             "market_scope_summary": scope_groups,
@@ -3286,6 +3532,37 @@ class PolymarketUSAutoTrader:
             )
         return list(opportunities.values())
 
+    def advisor_dataset(self, *, source_lane: str) -> dict[str, Any]:
+        """Return the retained inputs the policy advisor is allowed to use.
+
+        The caller may combine independent live and simulated stores. This
+        method deliberately returns only managed outcomes and logged entry
+        opportunities; unlabeled quote history is not converted into profit
+        evidence.
+        """
+        closed_trades = self._advisor_closed_trades()
+        opportunities = self._advisor_opportunities()
+        positions = self.positions(include_hidden=True)
+        return {
+            "source_lane": source_lane,
+            "backend": self._db.backend,
+            "closed_trades": closed_trades,
+            "opportunities": opportunities,
+            "positions": positions,
+            "summary": {
+                "lane": source_lane,
+                "backend": self._db.backend,
+                "retained_positions": len(positions),
+                "closed_trades": len(closed_trades),
+                "opportunity_observations": len(opportunities),
+                "independent_events": len({
+                    str(row.get("event_id") or "")
+                    for row in closed_trades
+                    if row.get("event_id")
+                }),
+            },
+        }
+
     def policy_sessions(self, *, limit: int = 20) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 100))
         with self._lock:
@@ -3348,6 +3625,9 @@ class PolymarketUSAutoTrader:
         analysis_mode: str | None = None,
         lookback_days: int = 0,
         market_types: Iterable[str] | None = None,
+        closed_trades: Iterable[Mapping[str, Any]] | None = None,
+        opportunities: Iterable[Mapping[str, Any]] | None = None,
+        data_sources: Iterable[Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         self._refresh_policy_authority()
         source_policy = asdict(self._policy)
@@ -3363,20 +3643,28 @@ class PolymarketUSAutoTrader:
             )
         )
         allowed_market_types = set(requested_market_types)
-        closed_trades = [
+        advisor_closed_trades = [
             row
-            for row in self._advisor_closed_trades()
+            for row in (
+                closed_trades
+                if closed_trades is not None
+                else self._advisor_closed_trades()
+            )
             if _market_kind(row.get("market_type")) in allowed_market_types
         ]
-        opportunities = [
+        advisor_opportunities = [
             row
-            for row in self._advisor_opportunities()
+            for row in (
+                opportunities
+                if opportunities is not None
+                else self._advisor_opportunities()
+            )
             if _market_kind(row.get("market_type")) in allowed_market_types
         ]
         try:
             recommendation = recommend_policy(
-                closed_trades=closed_trades,
-                opportunities=opportunities,
+                closed_trades=advisor_closed_trades,
+                opportunities=advisor_opportunities,
                 current_policy=source_policy,
                 objective=objective,
                 target_trades_per_hour=float(target_trades_per_hour),
@@ -3388,6 +3676,9 @@ class PolymarketUSAutoTrader:
         except ValueError as exc:
             raise TradingPolicyError(str(exc)) from exc
         recommendation["evidence"]["source_policy_hash"] = source_policy_hash
+        recommendation["evidence"]["data_sources"] = [
+            dict(source) for source in (data_sources or ())
+        ]
         recommendation["source_policy_hash"] = source_policy_hash
         advice_id = str(uuid4())
         created_ts = self._clock()
@@ -4481,11 +4772,19 @@ class PolymarketUSAutoTrader:
             "us_execution_edge": None,
         }
         if candidate is not None:
+            effective = candidate.execution_policy
             item.update(
                 us_event_slug=str(candidate.us_event.get("slug") or "") or None,
                 us_market_slug=str(candidate.market.get("slug") or "") or None,
                 us_entry_cost=candidate.entry_cost,
                 us_execution_edge=candidate.execution_edge,
+                execution_profile=candidate.execution_profile_key,
+                configured_min_edge=effective.min_edge,
+                configured_max_edge=effective.max_edge,
+                configured_min_quality=effective.min_signal_quality,
+                configured_min_reference_sources=(
+                    effective.min_reference_sources
+                ),
             )
         return item
 
@@ -4604,27 +4903,36 @@ class PolymarketUSAutoTrader:
         *,
         game_state: GameState | None = None,
     ) -> tuple[MappedCandidate | None, str]:
-        policy = self._policy
+        global_policy = self._policy
         market_type = _market_kind(signal.market)
         signal_scope = market_scope(signal.market)
-        if market_type not in policy.allowed_market_types:
+        if market_type not in global_policy.allowed_market_types:
             return None, (
                 f"{market_type or 'unknown'} lines are disabled by the "
                 "automatic-entry line-type policy"
             )
-        if signal_scope not in policy.allowed_market_scopes:
+        if signal_scope not in global_policy.allowed_market_scopes:
             return None, (
                 f"{signal_scope.replace('_', ' ')} markets are disabled by the "
                 "automatic-entry segment policy"
             )
         if (
-            policy.execution_mode == "live"
+            global_policy.execution_mode == "live"
             and signal_scope != FULL_GAME_SCOPE
-            and not policy.allow_live_segment_markets
+            and not global_policy.allow_live_segment_markets
         ):
             return None, (
                 "MLB segment live orders are locked; collect and review dry-run "
                 "segment results, then explicitly enable live segment markets"
+            )
+        game_fraction = _baseball_fraction_remaining(event, game_state)
+        policy, profile_key = global_policy.execution_policy_for(
+            market_type,
+            game_fraction,
+        )
+        if policy is None:
+            return None, (
+                f"{profile_key} is disabled by the line-specific execution policy"
             )
         engine_gate_blocker = self._engine_gate_blocker(signal)
         if engine_gate_blocker:
@@ -4718,7 +5026,6 @@ class PolymarketUSAutoTrader:
                 f"US execution edge {execution_edge * 100:+.1f}c exceeds "
                 f"the configured {policy.max_edge * 100:+.1f}c ceiling"
             )
-        game_fraction = _baseball_fraction_remaining(event, game_state)
         if policy.min_mlb_fraction_remaining > 0:
             identity = f"{event.sport} {event.league}".casefold()
             if "baseball" in identity or "mlb" in identity:
@@ -4750,6 +5057,8 @@ class PolymarketUSAutoTrader:
             book_shares=0.0,
             execution_edge=execution_edge,
             mapping_score=min(event_score, selection_score),
+            execution_policy=policy,
+            execution_profile_key=profile_key,
             game_fraction_remaining=game_fraction,
         ), ""
 
@@ -4774,7 +5083,7 @@ class PolymarketUSAutoTrader:
                 "a managed position is already open",
                 {},
             )
-        policy = self._policy
+        policy = candidate.execution_policy
         public_entry_cost = candidate.entry_cost
         open_positions = self.positions(open_only=True)
         total_exposure = sum(float(row["cost_basis"]) for row in open_positions)
@@ -4965,6 +5274,7 @@ class PolymarketUSAutoTrader:
             "configured_min_mlb_fraction_remaining": (
                 policy.min_mlb_fraction_remaining
             ),
+            "execution_profile": candidate.execution_profile_key,
         }
         if reasons:
             self._journal_candidate(
@@ -5079,7 +5389,7 @@ class PolymarketUSAutoTrader:
                     },
                 )
                 fee_adjusted_edge = candidate.execution_edge - (preview_fee or 0.0)
-                required = max(self._policy.min_edge, candidate.signal.required_edge)
+                required = max(policy.min_edge, candidate.signal.required_edge)
                 if fee_adjusted_edge < required:
                     self._journal_candidate(
                         candidate,
@@ -5237,6 +5547,7 @@ class PolymarketUSAutoTrader:
         for position in open_positions:
             if not self._cycle_is_current(generation):
                 break
+            position_policy = self._position_execution_policy(position)
             market = markets.get(position["market_slug"])
             event_context = monitored_by_id.get(str(position["event_id"]))
             event = event_context[0] if event_context is not None else None
@@ -5291,6 +5602,8 @@ class PolymarketUSAutoTrader:
             quantity = float(position["quantity"])
             exit_depth: float | None = None
             quote_source = "public_us_snapshot"
+            gross_exit_value: float | None = None
+            estimated_exit_fee = 0.0
             if position["mode"] == "live":
                 book = authenticated_books.get(str(position["market_slug"]))
                 size_quote = _size_aware_exit_quote(
@@ -5337,6 +5650,18 @@ class PolymarketUSAutoTrader:
                         },
                     )
                     continue
+                gross_exit_value = exit_value
+                estimated_exit_fee = _estimated_taker_fee(
+                    quantity=quantity,
+                    contract_price=exit_long_price,
+                )
+                # The entry cost already includes its actual execution fee.
+                # Compare it with a conservative fee-adjusted executable exit,
+                # not the visually greener raw bid.
+                exit_value = max(
+                    0.0,
+                    gross_exit_value - estimated_exit_fee / quantity,
+                )
                 entry_quote = _executable_book_quote(
                     book,
                     str(position["position_side"]),
@@ -5390,6 +5715,7 @@ class PolymarketUSAutoTrader:
                     if probability is not None
                     else None
                 )
+                gross_exit_value = exit_value
             entry_cost = float(position["entry_cost"])
             return_fraction = exit_value / entry_cost - 1.0
             peak = max(float(position["highest_exit_value"]), exit_value)
@@ -5413,20 +5739,20 @@ class PolymarketUSAutoTrader:
                     maximum_tightening=(
                         self._policy.adaptive_exit_max_tightening
                     ),
-                    profit_target=self._policy.profit_target,
-                    trailing_drawdown=self._policy.trailing_drawdown,
-                    exit_edge=self._policy.exit_edge,
-                    stop_loss=self._policy.stop_loss,
+                    profit_target=position_policy.profit_target,
+                    trailing_drawdown=position_policy.trailing_drawdown,
+                    exit_edge=position_policy.exit_edge,
+                    stop_loss=position_policy.stop_loss,
                 )
             else:
                 adaptive_exit = self._adaptive_exit.base_decision(
                     profile=self._policy.adaptive_exit_profile,
                     reason="adaptive MLB exit learning is disabled",
                     applicable=False,
-                    profit_target=self._policy.profit_target,
-                    trailing_drawdown=self._policy.trailing_drawdown,
-                    exit_edge=self._policy.exit_edge,
-                    stop_loss=self._policy.stop_loss,
+                    profit_target=position_policy.profit_target,
+                    trailing_drawdown=position_policy.trailing_drawdown,
+                    exit_edge=position_policy.exit_edge,
+                    stop_loss=position_policy.stop_loss,
                 )
             (
                 stop_reason,
@@ -5442,6 +5768,7 @@ class PolymarketUSAutoTrader:
                 current_edge=current_edge,
                 return_fraction=return_fraction,
                 adaptive_exit=adaptive_exit,
+                policy=position_policy,
             )
             prior_lock = position.get("profit_lock_armed_ts") is not None
             target_hit = (
@@ -5492,7 +5819,7 @@ class PolymarketUSAutoTrader:
                 target_hit
                 and (
                     target_count >= PROFIT_TARGET_CONFIRMATION_READINGS
-                    or held_minutes >= self._policy.min_hold_minutes
+                    or held_minutes >= position_policy.min_hold_minutes
                 )
             )
             profit_lock_armed = prior_lock or target_confirmed
@@ -5500,6 +5827,56 @@ class PolymarketUSAutoTrader:
                 self._clock()
                 if profit_lock_armed and not prior_lock
                 else None
+            )
+            profit_guard = self._profit_guard_decision(
+                position,
+                exit_value=exit_value,
+                peak=peak,
+                current_edge=current_edge,
+                profit_lock_armed=profit_lock_armed,
+                adaptive_exit=adaptive_exit,
+                policy=position_policy,
+            )
+            prior_floor_missed_ts = position.get(
+                "profit_floor_missed_ts"
+            )
+            prior_floor_missed_count = int(
+                position.get("profit_floor_missed_count") or 0
+            )
+            prior_floor_low = _amount(
+                position.get("profit_floor_low_exit_value")
+            )
+            if profit_guard["blocked"]:
+                profit_floor_missed_ts = (
+                    prior_floor_missed_ts or self._clock()
+                )
+                profit_floor_missed_count = (
+                    prior_floor_missed_count + 1
+                )
+                profit_floor_low_exit_value = min(
+                    exit_value,
+                    (
+                        prior_floor_low
+                        if prior_floor_low is not None
+                        else exit_value
+                    ),
+                )
+            else:
+                profit_floor_missed_ts = prior_floor_missed_ts
+                profit_floor_missed_count = prior_floor_missed_count
+                profit_floor_low_exit_value = prior_floor_low
+                if (
+                    prior_floor_missed_count
+                    and profit_guard["floor_satisfied"]
+                ):
+                    profit_guard["status"] = "recovered_above_floor"
+                    profit_guard["reason"] = (
+                        "executable value recovered above the protected "
+                        "fee-adjusted profit floor"
+                    )
+            profit_guard["missed_count"] = profit_floor_missed_count
+            profit_guard["lowest_value_while_missed"] = (
+                profit_floor_low_exit_value
             )
             self._update_mark(
                 position["id"],
@@ -5526,6 +5903,14 @@ class PolymarketUSAutoTrader:
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
+                profit_floor_missed_ts=profit_floor_missed_ts,
+                profit_floor_missed_count=profit_floor_missed_count,
+                profit_floor_low_exit_value=profit_floor_low_exit_value,
+                profit_guard_payload=json.dumps(
+                    profit_guard,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
             )
             marked += 1
             self._journal(
@@ -5538,6 +5923,9 @@ class PolymarketUSAutoTrader:
                 payload={
                     "position_id": position["id"],
                     "exit_value": exit_value,
+                    "gross_exit_value": gross_exit_value,
+                    "estimated_exit_fee": estimated_exit_fee,
+                    "fee_adjusted_exit_value": exit_value,
                     "highest_exit_value": peak,
                     "return_fraction": return_fraction,
                     "execution_edge": current_edge,
@@ -5560,6 +5948,7 @@ class PolymarketUSAutoTrader:
                     ),
                     "adaptive_exit": adaptive_exit.payload(),
                     "stop_guard": stop_guard,
+                    "profit_guard": profit_guard,
                     "held_minutes": held_minutes,
                     "venue_sync_status": position.get("venue_sync_status"),
                 },
@@ -5572,6 +5961,8 @@ class PolymarketUSAutoTrader:
                 profit_lock_armed=profit_lock_armed,
                 adaptive_exit=adaptive_exit,
                 stop_reason=stop_reason,
+                profit_guard=profit_guard,
+                policy=position_policy,
             )
             if (
                 reason
@@ -5619,6 +6010,7 @@ class PolymarketUSAutoTrader:
                         order_long_price=exit_long_price,
                         reason=reason,
                         protective=True,
+                        policy=position_policy,
                     )
                 )
         shadow_marks = self._mark_exit_recoveries(markets, game_states)
@@ -5712,9 +6104,10 @@ class PolymarketUSAutoTrader:
         current_edge: float | None,
         return_fraction: float,
         adaptive_exit: AdaptiveExitDecision,
+        policy: TradingPolicy | None = None,
     ) -> tuple[str | None, dict[str, Any], float | None, int, float | None]:
         """Confirm an ordinary MLB stop while preserving a catastrophic bound."""
-        policy = self._policy
+        policy = policy or self._policy
         prior_trigger = _amount(position.get("stop_triggered_ts"))
         prior_count = int(position.get("stop_observation_count") or 0)
         prior_low = _amount(position.get("stop_low_exit_value"))
@@ -5914,6 +6307,107 @@ class PolymarketUSAutoTrader:
             low,
         )
 
+    def _profit_guard_decision(
+        self,
+        position: Mapping[str, Any],
+        *,
+        exit_value: float,
+        peak: float,
+        current_edge: float | None,
+        profit_lock_armed: bool,
+        adaptive_exit: AdaptiveExitDecision | None,
+        policy: TradingPolicy | None = None,
+    ) -> dict[str, Any]:
+        """Prevent an ordinary profit exit from chasing a gap below its floor.
+
+        The floor applies only to trailing/edge-decay profit exits. A hard stop
+        or a material model reversal remains authoritative and may realize a
+        loss. ``exit_value`` is already the estimated fee-adjusted executable
+        value for live positions.
+        """
+        policy = policy or self._policy
+        effective_exit_edge = (
+            adaptive_exit.effective_exit_edge
+            if adaptive_exit is not None
+            else policy.exit_edge
+        )
+        effective_trailing = (
+            adaptive_exit.effective_trailing_drawdown
+            if adaptive_exit is not None
+            else policy.trailing_drawdown
+        )
+        edge_decay = (
+            current_edge is not None
+            and current_edge <= effective_exit_edge
+        )
+        trailing_pullback = (
+            peak > 0
+            and exit_value <= peak * (1.0 - effective_trailing)
+        )
+        triggered = bool(
+            profit_lock_armed
+            and (edge_decay or trailing_pullback)
+        )
+        entry_cost = float(position["entry_cost"])
+        floor_value = entry_cost * (
+            1.0 + policy.minimum_locked_profit
+        )
+        floor_satisfied = exit_value + 1e-12 >= floor_value
+        material_reversal = (
+            current_edge is not None
+            and current_edge <= -max(0.03, policy.min_edge)
+        )
+        material_reversal_override = bool(
+            triggered
+            and material_reversal
+            and not floor_satisfied
+        )
+        blocked = bool(
+            triggered
+            and not floor_satisfied
+            and not material_reversal_override
+        )
+        if blocked:
+            status = "profit_floor_missed_holding"
+            reason = (
+                "profit protection triggered after the executable market "
+                "gapped below the configured fee-adjusted floor; ordinary "
+                "profit selling is paused until recovery, a hard stop, or a "
+                "material model reversal"
+            )
+        elif material_reversal_override:
+            status = "material_reversal_override"
+            reason = (
+                "the protected floor cannot override a material model reversal"
+            )
+        elif triggered:
+            status = "profit_exit_eligible"
+            reason = "profit exit remains above the protected floor"
+        elif profit_lock_armed:
+            status = "armed"
+            reason = "profit protection is armed; no exit trigger is active"
+        else:
+            status = "inactive"
+            reason = "profit protection has not armed"
+        return {
+            "status": status,
+            "reason": reason,
+            "blocked": blocked,
+            "profit_lock_armed": profit_lock_armed,
+            "profit_exit_triggered": triggered,
+            "edge_decay_triggered": edge_decay,
+            "trailing_pullback_triggered": trailing_pullback,
+            "material_reversal": material_reversal,
+            "material_reversal_override": material_reversal_override,
+            "entry_cost": entry_cost,
+            "fee_adjusted_exit_value": exit_value,
+            "highest_fee_adjusted_exit_value": peak,
+            "minimum_locked_profit": policy.minimum_locked_profit,
+            "protected_floor_value": floor_value,
+            "floor_satisfied": floor_satisfied,
+            "hard_stops_unchanged": True,
+        }
+
     def _exit_reason(
         self,
         position: Mapping[str, Any],
@@ -5924,8 +6418,10 @@ class PolymarketUSAutoTrader:
         profit_lock_armed: bool = False,
         adaptive_exit: AdaptiveExitDecision | None = None,
         stop_reason: str | None = None,
+        profit_guard: Mapping[str, Any] | None = None,
+        policy: TradingPolicy | None = None,
     ) -> str | None:
-        policy = self._policy
+        policy = policy or self._policy
         effective_exit_edge = (
             adaptive_exit.effective_exit_edge
             if adaptive_exit is not None
@@ -5952,6 +6448,10 @@ class PolymarketUSAutoTrader:
         if (
             profit_lock_armed
             and (edge_invalid or trailing)
+            and not bool((profit_guard or {}).get("blocked"))
+            and not bool(
+                (profit_guard or {}).get("material_reversal_override")
+            )
         ):
             return "profit_lock_after_edge_decay" if edge_invalid else "trailing_profit_lock"
         if current_edge is not None and current_edge <= -max(0.03, policy.min_edge):
@@ -5967,8 +6467,37 @@ class PolymarketUSAutoTrader:
         order_long_price: float,
         reason: str,
         protective: bool = False,
+        policy: TradingPolicy | None = None,
     ) -> bool:
+        policy = policy or self._position_execution_policy(position)
         quantity = float(position["quantity"])
+        profit_exit = reason in {
+            "trailing_profit_lock",
+            "profit_lock_after_edge_decay",
+        }
+        protected_floor_value = float(position["entry_cost"]) * (
+            1.0 + policy.minimum_locked_profit
+        )
+        if profit_exit and exit_value + 1e-12 < protected_floor_value:
+            self._journal(
+                "exit",
+                "profit_floor_blocked",
+                event_id=position["event_id"],
+                event_name=position["event_name"],
+                market_slug=position["market_slug"],
+                selection=position["selection"],
+                payload={
+                    "position_id": position["id"],
+                    "reason": reason,
+                    "fee_adjusted_exit_value": exit_value,
+                    "protected_floor_value": protected_floor_value,
+                    "minimum_locked_profit": (
+                        policy.minimum_locked_profit
+                    ),
+                    "hard_stops_unchanged": True,
+                },
+            )
+            return False
         candidate_key = ":".join((
             str(position["event_id"]),
             str(position["market_slug"]),
@@ -5983,7 +6512,7 @@ class PolymarketUSAutoTrader:
                 exit_value=exit_value,
                 reason=reason,
                 horizon_seconds=int(
-                    self._policy.post_exit_tracking_minutes * 60
+                    policy.post_exit_tracking_minutes * 60
                 ),
             )
             self._journal(
@@ -6031,6 +6560,35 @@ class PolymarketUSAutoTrader:
             if position["position_side"] == "long"
             else "ORDER_INTENT_SELL_SHORT"
         )
+        if profit_exit:
+            # Preserve the floor across the preview/create network gap too.
+            # Iterate because the taker fee is rounded per complete order and
+            # depends on the contract price.
+            minimum_raw_exit = protected_floor_value
+            for _ in range(4):
+                contract_price = (
+                    minimum_raw_exit
+                    if position["position_side"] == "long"
+                    else 1.0 - minimum_raw_exit
+                )
+                fee_per_share = _estimated_taker_fee(
+                    quantity=quantity,
+                    contract_price=contract_price,
+                ) / quantity
+                minimum_raw_exit = min(
+                    0.99,
+                    protected_floor_value + fee_per_share,
+                )
+            floor_long_price = (
+                minimum_raw_exit
+                if position["position_side"] == "long"
+                else 1.0 - minimum_raw_exit
+            )
+            order_long_price = (
+                max(order_long_price, floor_long_price)
+                if position["position_side"] == "long"
+                else min(order_long_price, floor_long_price)
+            )
         order = {
             "marketSlug": position["market_slug"],
             "intent": intent,
@@ -6055,6 +6613,13 @@ class PolymarketUSAutoTrader:
                     payload={
                         "position_id": position["id"],
                         "reason": reason,
+                        "protected_floor_value": (
+                            protected_floor_value
+                            if profit_exit else None
+                        ),
+                        "floor_protected_limit_price": (
+                            order_long_price if profit_exit else None
+                        ),
                         "preview": self._safe_payload(preview),
                     },
                 )
@@ -6103,7 +6668,7 @@ class PolymarketUSAutoTrader:
             exit_value=fill_value,
             reason=reason,
             horizon_seconds=int(
-                self._policy.post_exit_tracking_minutes * 60
+                policy.post_exit_tracking_minutes * 60
             ),
         )
         if order_id:
@@ -6189,7 +6754,10 @@ class PolymarketUSAutoTrader:
         now = self._clock()
         policy_session_id = self._current_policy_session()
         entry_policy_json = json.dumps(
-            asdict(self._policy),
+            {
+                **asdict(candidate.execution_policy),
+                "execution_profile_key": candidate.execution_profile_key,
+            },
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -6304,6 +6872,10 @@ class PolymarketUSAutoTrader:
         stop_observation_count: int = 0,
         stop_low_exit_value: float | None = None,
         stop_guard_payload: str | None = None,
+        profit_floor_missed_ts: float | None = None,
+        profit_floor_missed_count: int = 0,
+        profit_floor_low_exit_value: float | None = None,
+        profit_guard_payload: str | None = None,
     ) -> None:
         with self._lock:
             with self._db.transaction() as cur:
@@ -6324,7 +6896,11 @@ class PolymarketUSAutoTrader:
                        stop_triggered_ts=%s,
                        stop_observation_count=%s,
                        stop_low_exit_value=%s,
-                       stop_guard_payload=%s
+                       stop_guard_payload=%s,
+                       profit_floor_missed_ts=%s,
+                       profit_floor_missed_count=%s,
+                       profit_floor_low_exit_value=%s,
+                       profit_guard_payload=%s
                        WHERE id=%s AND status='open'""",
                     (
                         self._clock(), peak, exit_value, probability, edge,
@@ -6337,6 +6913,10 @@ class PolymarketUSAutoTrader:
                         stop_observation_count,
                         stop_low_exit_value,
                         stop_guard_payload,
+                        profit_floor_missed_ts,
+                        profit_floor_missed_count,
+                        profit_floor_low_exit_value,
+                        profit_guard_payload,
                         position_id,
                     ),
                 )

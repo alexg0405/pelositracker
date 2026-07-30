@@ -86,3 +86,30 @@ def test_linescore_parser_fails_closed_when_half_or_score_is_missing():
             "teams": {"home": {"runs": 1}, "away": {"runs": 0}},
         },
     ) is None
+
+
+def test_linescore_parser_marks_an_official_final_as_terminal():
+    event = _event()
+    game = _game(824135, "2027-07-28T23:05:00Z")
+    game["status"] = {
+        "abstractGameState": "Final",
+        "detailedState": "Final",
+    }
+
+    state = game_state_from_linescore(
+        event,
+        game,
+        {
+            "currentInning": 9,
+            "inningState": "End",
+            "scheduledInnings": 9,
+            "teams": {"home": {"runs": 5}, "away": {"runs": 2}},
+        },
+    )
+
+    assert state is not None
+    assert state.status == "final"
+    assert state.ended is True
+    assert state.live is False
+    assert state.sport_state["ended"] is True
+    assert state.sport_state["official_game_status"] == "final"

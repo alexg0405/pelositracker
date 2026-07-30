@@ -18,6 +18,7 @@ from app.polymarket_us_trading import (
     RISK_SESSION_RESET_PHRASE,
     TradingPolicy,
     TradingPolicyError,
+    _estimated_taker_fee,
     risk_preset_fields,
 )
 from app.lines import SUPPORTED_MARKET_SCOPES
@@ -61,6 +62,24 @@ class FakeOrders:
 
     def cancel(self, order_id, params):
         self.canceled.append((order_id, params))
+
+
+class FirstExitDoesNotFillOrders(FakeOrders):
+    """Fill the entry, then emulate a disappearing first cash-out quote."""
+
+    def create(self, params):
+        self.created.append(params)
+        order_id = f"order-{len(self.created)}"
+        if len(self.created) == 2:
+            return {"id": order_id, "executions": []}
+        return {
+            "id": order_id,
+            "executions": [{
+                "lastShares": str(params["quantity"]),
+                "lastPx": params["price"],
+                "type": "EXECUTION_TYPE_FILL",
+            }],
+        }
 
 
 class FakeClient:
@@ -186,8 +205,98 @@ def test_default_policy_is_aggressive_but_bounded_for_ten_dollar_rollout():
     assert policy.min_book_shares == 3.0
     assert policy.min_hold_minutes == 10.0
     assert policy.profit_target == 0.10
+    assert policy.minimum_locked_profit == 0.02
     assert policy.trailing_drawdown == 0.04
     assert policy.stop_loss == 0.20
+
+
+def test_analysis_cycle_can_match_fast_monitoring_without_api_polling():
+    policy = TradingPolicy.from_mapping(
+        {
+            "cycle_seconds": 1.5,
+            "candidate_cooldown_seconds": 10,
+        }
+    )
+    assert policy.cycle_seconds == pytest.approx(1.5)
+
+    with pytest.raises(TradingPolicyError, match="between 1 and 300"):
+        TradingPolicy.from_mapping(
+            {
+                "cycle_seconds": 0.5,
+            }
+        )
+
+
+def test_line_execution_profiles_overlay_global_values_by_game_stage():
+    policy = TradingPolicy.from_mapping({
+        "min_edge": 0.04,
+        "profit_target": 0.10,
+        "minimum_locked_profit": 0.02,
+        "line_execution_profiles": [
+            {
+                "market_type": "moneyline",
+                "game_stage": "all",
+                "overrides": {
+                    "min_edge": 0.06,
+                    "profit_target": 0.08,
+                },
+            },
+            {
+                "market_type": "moneyline",
+                "game_stage": "late",
+                "overrides": {
+                    "min_edge": 0.09,
+                    "minimum_locked_profit": 0.03,
+                },
+            },
+            {
+                "market_type": "spread",
+                "game_stage": "middle",
+                "enabled": False,
+            },
+        ],
+    })
+
+    early, early_key = policy.execution_policy_for("moneyline", 0.70)
+    late, late_key = policy.execution_policy_for("moneyline", 0.10)
+    disabled, disabled_key = policy.execution_policy_for("spread", 0.40)
+    total, total_key = policy.execution_policy_for("total", 0.10)
+
+    assert early is not None
+    assert early.min_edge == pytest.approx(0.06)
+    assert early.profit_target == pytest.approx(0.08)
+    assert early.minimum_locked_profit == pytest.approx(0.02)
+    assert early_key == "moneyline/all"
+    assert late is not None
+    assert late.min_edge == pytest.approx(0.09)
+    assert late.profit_target == pytest.approx(0.08)
+    assert late.minimum_locked_profit == pytest.approx(0.03)
+    assert late_key == "moneyline/all+moneyline/late"
+    assert disabled is None
+    assert disabled_key == "spread/middle"
+    assert total is policy
+    assert total_key == "global"
+
+
+def test_line_execution_profiles_reject_invalid_merged_limits():
+    with pytest.raises(
+        TradingPolicyError,
+        match="minimum locked profit must be smaller",
+    ):
+        TradingPolicy.from_mapping({
+            "line_execution_profiles": [
+                {
+                    "market_type": "total",
+                    "game_stage": "all",
+                    "overrides": {"profit_target": 0.04},
+                },
+                {
+                    "market_type": "total",
+                    "game_stage": "late",
+                    "overrides": {"minimum_locked_profit": 0.05},
+                },
+            ],
+        })
 
 
 def test_policy_accepts_decimal_limits_and_rejects_unknown_engine_gates():
@@ -199,6 +308,7 @@ def test_policy_accepts_decimal_limits_and_rejects_unknown_engine_gates():
         "min_hold_minutes": 7.5,
         "min_book_shares": 2.25,
         "profit_target": 0.0875,
+        "minimum_locked_profit": 0.025,
         "trailing_drawdown": 0.0325,
         "stop_loss": 0.175,
         "adaptive_exit_enabled": True,
@@ -220,6 +330,7 @@ def test_policy_accepts_decimal_limits_and_rejects_unknown_engine_gates():
     assert policy.min_signal_quality == pytest.approx(61.25)
     assert policy.min_hold_minutes == pytest.approx(7.5)
     assert policy.min_book_shares == pytest.approx(2.25)
+    assert policy.minimum_locked_profit == pytest.approx(0.025)
     assert policy.adaptive_exit_enabled is True
     assert policy.adaptive_exit_profile == "balanced"
     assert policy.adaptive_exit_horizon_minutes == pytest.approx(2.5)
@@ -244,6 +355,29 @@ def test_policy_accepts_decimal_limits_and_rejects_unknown_engine_gates():
         TradingPolicy.from_mapping({"allowed_market_types": []})
     with pytest.raises(TradingPolicyError, match="minimum edge < maximum"):
         TradingPolicy.from_mapping({"min_edge": 0.10, "max_edge": 0.10})
+    with pytest.raises(
+        TradingPolicyError,
+        match="minimum locked profit.*smaller",
+    ):
+        TradingPolicy.from_mapping({
+            "profit_target": 0.05,
+            "minimum_locked_profit": 0.05,
+        })
+
+
+def test_live_taker_fee_estimate_uses_current_symmetric_rounded_formula():
+    assert _estimated_taker_fee(
+        quantity=2,
+        contract_price=0.28,
+    ) == pytest.approx(0.02)
+    assert _estimated_taker_fee(
+        quantity=1,
+        contract_price=0.445,
+    ) == pytest.approx(0.01)
+    assert _estimated_taker_fee(
+        quantity=0,
+        contract_price=0.50,
+    ) == 0
 
 
 def test_named_risk_preset_derives_bounded_limits_from_one_hard_allocation():
@@ -1103,6 +1237,40 @@ def test_performance_ledger_filters_and_attributes_entry_settings(tmp_path):
     assert trader.performance_ledger(
         market_type="spread"
     )["summary"]["trades"] == 0
+
+
+def test_performance_ledger_can_aggregate_independent_execution_stores(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+    })
+    trader.run_cycle([(event(), [signal(clock)])], us_payload())
+    dry_position = trader.positions(open_only=True)[0]
+    live_position = {
+        **dry_position,
+        "id": "independent-live-position",
+        "mode": "live",
+        "event_id": "independent-live-event",
+        "event_name": "Live Away at Live Home",
+    }
+
+    ledger = trader.performance_ledger(
+        mode="all",
+        source_positions=[dry_position, live_position],
+        data_sources=[
+            {"lane": "dry_run", "retained_positions": 1},
+            {"lane": "live", "retained_positions": 1},
+        ],
+    )
+
+    assert ledger["summary"]["trades"] == 2
+    assert {row["mode"] for row in ledger["rows"]} == {"dry_run", "live"}
+    assert ledger["data_sources"] == [
+        {"lane": "dry_run", "retained_positions": 1},
+        {"lane": "live", "retained_positions": 1},
+    ]
 
 
 def test_policy_advisor_is_reactive_auditable_and_explicitly_applied(
@@ -1997,6 +2165,93 @@ def test_live_cashout_uses_the_executable_long_bid_for_a_long_position(tmp_path)
     assert trader.positions(open_only=True) == []
 
 
+def test_failed_live_profit_exit_never_chases_the_next_quote_below_floor(
+    tmp_path,
+):
+    clock = Clock()
+    orders = FirstExitDoesNotFillOrders()
+    book = {
+        "marketData": {
+            "offers": [{"qty": "100", "px": {"value": 0.40}}],
+            "bids": [{"qty": "100", "px": {"value": 0.39}}],
+            "state": "MARKET_STATE_OPEN",
+        }
+    }
+    trader = make_trader(tmp_path, clock, orders, book=book)
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "live",
+        "auto_cashout": True,
+        "min_hold_minutes": 10,
+        "profit_target": 0.10,
+        "minimum_locked_profit": 0.02,
+        "trailing_drawdown": 0.04,
+    })
+    trader.arm(ARM_PHRASE)
+    trader.run_cycle([(event(), [signal(clock)])], us_payload())
+
+    for bid in (0.47, 0.48):
+        clock.value += 15
+        book["marketData"]["bids"] = [
+            {"qty": "100", "px": {"value": bid}}
+        ]
+        book["marketData"]["offers"] = [
+            {"qty": "100", "px": {"value": bid + 0.01}}
+        ]
+        trader.run_cycle(
+            [(event(), [signal(clock, probability=0.70)])],
+            us_payload(bid=bid, ask=bid + 0.01),
+        )
+
+    assert trader.positions(open_only=True)[0]["profit_lock_armed_at"] is not None
+
+    # A profitable pullback triggers an FOK attempt. The fake venue reports no
+    # fill, reproducing a quote that disappears between preview and create.
+    clock.value += 15
+    book["marketData"]["bids"] = [
+        {"qty": "100", "px": {"value": 0.44}}
+    ]
+    book["marketData"]["offers"] = [
+        {"qty": "100", "px": {"value": 0.45}}
+    ]
+    trader.run_cycle(
+        [(event(), [signal(clock, probability=0.70)])],
+        us_payload(bid=0.44, ask=0.45),
+    )
+    assert len(orders.created) == 2
+    assert trader.positions(open_only=True)
+
+    # The next book is below the fee-adjusted retained-profit floor. The
+    # workstation must hold instead of submitting a loss-making chase order.
+    clock.value += 15
+    book["marketData"]["bids"] = [
+        {"qty": "100", "px": {"value": 0.39}}
+    ]
+    book["marketData"]["offers"] = [
+        {"qty": "100", "px": {"value": 0.40}}
+    ]
+    trader.run_cycle(
+        [(event(), [signal(clock, probability=0.70)])],
+        us_payload(bid=0.39, ask=0.40),
+    )
+
+    assert len(orders.created) == 2
+    held = trader.positions(open_only=True)[0]
+    assert held["profit_guard"]["status"] == "profit_floor_missed_holding"
+    latest_mark = next(
+        item
+        for item in trader.journal()
+        if item["kind"] == "mark"
+        and item["details"].get("profit_guard", {}).get("blocked")
+    )
+    assert latest_mark["details"]["gross_exit_value"] == pytest.approx(0.39)
+    assert latest_mark["details"]["estimated_exit_fee"] > 0
+    assert (
+        latest_mark["details"]["fee_adjusted_exit_value"]
+        < latest_mark["details"]["profit_guard"]["protected_floor_value"]
+    )
+
+
 def test_profit_lock_stays_armed_until_a_material_pullback(tmp_path):
     clock = Clock()
     trader = make_trader(tmp_path, clock, fail_on_orders=True)
@@ -2072,6 +2327,113 @@ def test_two_target_readings_arm_and_protect_before_fallback_hold_expires(tmp_pa
         - datetime.fromisoformat(closed["opened_at"])
     ).total_seconds() / 60
     assert held_minutes < 10
+
+
+def test_profit_lock_does_not_chase_a_gap_below_the_protected_floor(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+        "auto_cashout": True,
+        "min_hold_minutes": 10,
+        "profit_target": 0.10,
+        "minimum_locked_profit": 0.02,
+        "trailing_drawdown": 0.04,
+    })
+    trader.run_cycle([(event(), [signal(clock)])], us_payload())
+
+    # Two executable target readings arm protection before the fallback timer.
+    clock.value += 120
+    trader.run_cycle(
+        [(event(), [signal(clock, probability=0.70)])],
+        us_payload(bid=0.45, ask=0.46),
+    )
+    clock.value += 15
+    trader.run_cycle(
+        [(event(), [signal(clock, probability=0.70)])],
+        us_payload(bid=0.46, ask=0.47),
+    )
+
+    # The next quote gaps through both the trailing trigger and the retained
+    # profit floor. This is not a hard stop or material model reversal, so the
+    # profit exit must not convert a formerly green position into a loss.
+    clock.value += 15
+    trader.run_cycle(
+        [(event(), [signal(clock, probability=0.70)])],
+        us_payload(bid=0.39, ask=0.40),
+    )
+
+    held = trader.positions(open_only=True)
+    assert len(held) == 1
+    assert held[0]["profit_guard"]["status"] == "profit_floor_missed_holding"
+    assert held[0]["profit_guard"]["protected_floor_value"] == pytest.approx(
+        0.408
+    )
+    assert held[0]["profit_floor_missed_count"] == 1
+    assert held[0]["realized_pnl"] is None
+
+    # A later quote recovers above the protected floor while the pullback
+    # remains active. The ordinary profit exit can now complete positively.
+    clock.value += 15
+    trader.run_cycle(
+        [(event(), [signal(clock, probability=0.70)])],
+        us_payload(bid=0.42, ask=0.43),
+    )
+
+    assert trader.positions(open_only=True) == []
+    closed = trader.positions()[0]
+    assert closed["exit_reason"] == "trailing_profit_lock"
+    assert closed["realized_pnl"] > 0
+
+
+def test_material_model_reversal_can_override_the_protected_profit_floor(
+    tmp_path,
+):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+        "auto_cashout": True,
+        "min_hold_minutes": 10,
+        "profit_target": 0.10,
+        "minimum_locked_profit": 0.02,
+        "trailing_drawdown": 0.04,
+        "stop_loss": 0.50,
+    })
+    trader.run_cycle([(event(), [signal(clock)])], us_payload())
+
+    clock.value += 120
+    trader.run_cycle(
+        [(event(), [signal(clock, probability=0.70)])],
+        us_payload(bid=0.45, ask=0.46),
+    )
+    clock.value += 15
+    trader.run_cycle(
+        [(event(), [signal(clock, probability=0.70)])],
+        us_payload(bid=0.46, ask=0.47),
+    )
+
+    # The authenticated entry quote is 43c while the model is now at 35c:
+    # -8c is a material reversal, so safety is allowed to override the floor.
+    clock.value += 15
+    trader.run_cycle(
+        [(event(), [signal(clock, probability=0.35)])],
+        us_payload(bid=0.39, ask=0.43),
+    )
+
+    assert trader.positions(open_only=True) == []
+    closed = trader.positions()[0]
+    assert closed["exit_reason"] == "model_reversal"
+    mark = next(
+        item
+        for item in trader.journal()
+        if item["kind"] == "mark"
+        and item["details"].get("profit_guard", {}).get("status")
+        == "material_reversal_override"
+    )
+    assert mark["details"]["profit_guard"]["hard_stops_unchanged"] is True
 
 
 def test_hard_stop_is_not_delayed_by_minimum_profit_hold(tmp_path):

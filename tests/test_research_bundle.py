@@ -99,13 +99,13 @@ def test_research_bundle_is_secret_free_and_idempotent(tmp_path):
         with archive.open("rb") as handle:
             first = merge_research_bundle(
                 handle,
-                trader=target_trader,
+                traders={"live": target_trader},
                 model_lab=target_lab,
             )
         with archive.open("rb") as handle:
             second = merge_research_bundle(
                 handle,
-                trader=target_trader,
+                traders={"live": target_trader},
                 model_lab=target_lab,
             )
 
@@ -153,13 +153,67 @@ def test_research_bundle_rejects_tampered_checksum(tmp_path):
         with pytest.raises(ResearchBundleError, match="checksum"):
             merge_research_bundle(
                 io.BytesIO(tampered),
-                trader=target_trader,
+                traders={"live": target_trader},
                 model_lab=target_lab,
             )
     finally:
         trader.close()
         lab.close()
         target_trader.close()
+        target_lab.close()
+
+
+def test_research_bundle_preserves_live_and_dry_run_lane_identity(tmp_path):
+    source_live = _trader(tmp_path / "source-live.db")
+    source_dry = _trader(tmp_path / "source-dry.db")
+    source_lab = SportModelLab(str(tmp_path / "source-model.db"))
+    target_live = _trader(tmp_path / "target-live.db")
+    target_dry = _trader(tmp_path / "target-dry.db")
+    target_lab = SportModelLab(str(tmp_path / "target-model.db"))
+    live_id = str(uuid4())
+    dry_id = str(uuid4())
+    archive = tmp_path / "lane-evidence.ndjson.gz"
+    try:
+        _journal(source_live, row_id=live_id, payload={"lane": "live"})
+        _journal(source_dry, row_id=dry_id, payload={"lane": "dry_run"})
+        write_research_bundle(
+            archive,
+            traders={"live": source_live, "dry_run": source_dry},
+            model_lab=source_lab,
+        )
+
+        with archive.open("rb") as handle:
+            result = merge_research_bundle(
+                handle,
+                traders={"live": target_live, "dry_run": target_dry},
+                model_lab=target_lab,
+            )
+
+        assert result["accepted"]["live:live_trading_journal"] == 1
+        assert result["accepted"]["dry_run:live_trading_journal"] == 1
+        for trader, own_id, other_id in (
+            (target_live, live_id, dry_id),
+            (target_dry, dry_id, live_id),
+        ):
+            with trader._db.cursor() as cur:
+                trader._db.execute(
+                    cur,
+                    "SELECT COUNT(*) FROM live_trading_journal WHERE id=%s",
+                    (own_id,),
+                )
+                assert cur.fetchone()[0] == 1
+                trader._db.execute(
+                    cur,
+                    "SELECT COUNT(*) FROM live_trading_journal WHERE id=%s",
+                    (other_id,),
+                )
+                assert cur.fetchone()[0] == 0
+    finally:
+        source_live.close()
+        source_dry.close()
+        source_lab.close()
+        target_live.close()
+        target_dry.close()
         target_lab.close()
 
 

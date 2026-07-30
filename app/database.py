@@ -52,9 +52,22 @@ def _looks_postgres(value: str) -> bool:
 class Database:
     """A connection plus the few dialect operations used by the app stores."""
 
-    def __init__(self, target: str, backend: str):
+    def __init__(
+        self,
+        target: str,
+        backend: str,
+        *,
+        postgres_schema: str | None = None,
+    ):
         self.target = target
         self.backend = backend
+        if postgres_schema is not None and not _SAFE_IDENTIFIER.fullmatch(
+            postgres_schema
+        ):
+            raise ValueError("unsafe PostgreSQL schema name")
+        if postgres_schema is not None and backend != "postgres":
+            raise ValueError("PostgreSQL schemas require a PostgreSQL database")
+        self.postgres_schema = postgres_schema
         if backend == "postgres":
             if psycopg2 is None:  # pragma: no cover - only on incomplete installs
                 raise RuntimeError("psycopg2 is required when DATABASE_URL is configured")
@@ -85,17 +98,27 @@ class Database:
         *,
         sqlite_envs: Sequence[str],
         sqlite_default: str,
+        postgres_schema: str | None = None,
     ) -> "Database":
         # An explicit constructor argument is intentionally authoritative so
         # tests and maintenance tools can select an isolated SQLite file even
         # on a machine that also has DATABASE_URL configured.
         if explicit_path is not None:
             target = os.fspath(explicit_path)
-            return cls(target, "postgres" if _looks_postgres(target) else "sqlite")
+            backend = "postgres" if _looks_postgres(target) else "sqlite"
+            return cls(
+                target,
+                backend,
+                postgres_schema=postgres_schema if backend == "postgres" else None,
+            )
 
         database_url = os.getenv("DATABASE_URL")
         if database_url:
-            return cls(database_url, "postgres")
+            return cls(
+                database_url,
+                "postgres",
+                postgres_schema=postgres_schema,
+            )
 
         target = next((os.getenv(name) for name in sqlite_envs if os.getenv(name)), sqlite_default)
         return cls(os.fspath(target), "sqlite")
@@ -241,6 +264,16 @@ class Database:
     def _connect_postgres(self):
         connection = psycopg2.connect(self.target, **_KEEPALIVES)
         connection.autocommit = False
+        if self.postgres_schema:
+            # The live and simulated execution lanes need independent mutable
+            # policies and ledgers while still using one durable DATABASE_URL.
+            # A validated, fixed schema name keeps those stores isolated without
+            # duplicating every trading table or weakening SQL identifier safety.
+            schema = self.postgres_schema
+            with connection.cursor() as cur:
+                cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+                cur.execute(f'SET search_path TO "{schema}"')
+            connection.commit()
         return connection
 
     def _reconnect(self) -> None:

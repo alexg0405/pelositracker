@@ -35,7 +35,9 @@ def enabled_live_trading(monkeypatch, tmp_path):
         "settings",
         replace(
             main_module.settings,
+            workstation_mode=False,
             enable_polymarket_us_trading=True,
+            database_url="",
             polymarket_us_trading_db=trading_db,
             polymarket_us_dry_run_db=dry_run_db,
         ),
@@ -127,6 +129,16 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "Both lanes may run at the same time" in html
         assert "function tradingApi" in javascript
         assert "switchTradingLane" in javascript
+        assert 'id="us-lane-coordination-status"' in html
+        assert 'id="us-policy-save-status"' in html
+        assert "showPolicySaveNotice" in javascript
+        assert "policyErrorTarget" in javascript
+        assert '<option value="combined" selected>' in html
+        assert "Analyze all retained data" in html
+        assert "us-policy-advisor-sources" in javascript
+        assert 'id="us-cycle-seconds"' in html
+        assert 'min="1" max="300" step="0.5"' in html
+        assert "does not make a separate Odds API request" in html
         assert "data-cashout-toggle" in javascript
         assert 'id="discover-monitor-selected"' in html
         assert "selectedDiscoverSlugs" in javascript
@@ -198,6 +210,8 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "/api/polymarket-us/trading/status" in javascript
         assert "/api/polymarket-us/trading/sync" in javascript
         assert "/api/polymarket-us/trading/config" in javascript
+        assert 'id="us-lane-automation-toggle"' in html
+        assert "will continue server-side after this page closes" in javascript
         assert "/api/polymarket-us/trading/adaptive-exit/history" in javascript
         assert "/api/polymarket-us/trading/arm" in javascript
         assert "/api/polymarket-us/trading/emergency-stop" in javascript
@@ -214,6 +228,10 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert '<option value="14400">4 hours</option>' in html
         assert "updateArmDurationLabel" in javascript
         assert "one-cent gain alone never triggers an exit" in html.casefold()
+        assert 'id="us-min-locked-profit"' in html
+        assert "minimum_locked_profit" in javascript
+        assert "fee-adjusted cash-out" in javascript
+        assert "profit protection" in javascript
         assert "usTradingFormDirty" in javascript
         assert "requestEpoch !== usTradingHydrationEpoch" in javascript
         assert "Save execution policy · unsaved" in javascript
@@ -302,6 +320,9 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert 'id="us-ledger-market-type"' in html
         assert 'id="us-ledger-export"' in html
         assert "/api/polymarket-us/trading/performance-ledger" in javascript
+        assert 'data-label="Opened"' in javascript
+        assert "Synchronize local and hosted research evidence" in html
+        assert "live and dry-run rows keep their source lane" in javascript.casefold()
 
 
 def test_workstation_exposes_only_bounded_polymarket_us_trading_routes():
@@ -375,6 +396,7 @@ def test_live_trading_api_defaults_disarmed_and_rejects_unsafe_policy(
                 "stop_grace_minutes": 2.5,
                 "catastrophic_stop_multiplier": 1.8,
                 "post_exit_tracking_minutes": 45,
+                "minimum_locked_profit": 0.025,
             })
             assert configured.status_code == 200
             status = configured.json()
@@ -390,6 +412,9 @@ def test_live_trading_api_defaults_disarmed_and_rejects_unsafe_policy(
             assert status["policy"]["volatility_stop_enabled"] is True
             assert status["policy"]["stop_confirmation_readings"] == 4
             assert status["policy"]["post_exit_tracking_minutes"] == 45
+            assert status["policy"]["minimum_locked_profit"] == pytest.approx(
+                0.025
+            )
             assert status["adaptive_exit"]["observations"] == 0
             assert status["restart_behavior"] == "always_disarmed"
 
@@ -470,7 +495,7 @@ def test_live_and_dry_run_lanes_keep_independent_policies_and_controls(
                     "execution_mode": "dry_run",
                     "automation_enabled": True,
                     "min_edge": 0.071,
-                    "cycle_seconds": 31,
+                    "cycle_seconds": 2.5,
                 },
             )
             dry = client.put(
@@ -480,7 +505,7 @@ def test_live_and_dry_run_lanes_keep_independent_policies_and_controls(
                     "execution_mode": "live",
                     "automation_enabled": True,
                     "min_edge": 0.012,
-                    "cycle_seconds": 11,
+                    "cycle_seconds": 1.5,
                 },
             )
             assert live.status_code == 200
@@ -497,9 +522,9 @@ def test_live_and_dry_run_lanes_keep_independent_policies_and_controls(
                 params={"lane": "dry_run"},
             ).json()
             assert live_status["policy"]["min_edge"] == pytest.approx(0.071)
-            assert live_status["policy"]["cycle_seconds"] == 31
+            assert live_status["policy"]["cycle_seconds"] == pytest.approx(2.5)
             assert dry_status["policy"]["min_edge"] == pytest.approx(0.012)
-            assert dry_status["policy"]["cycle_seconds"] == 11
+            assert dry_status["policy"]["cycle_seconds"] == pytest.approx(1.5)
             assert set(dry_status["lanes"]) == {"live", "dry_run"}
 
             stopped_dry = client.post(
@@ -637,11 +662,43 @@ def test_policy_advisor_api_reports_model_readiness_and_applies_explicitly(
             assert advice["apply_allowed"] is False
             assert len(advice["source_policy_hash"]) == 64
 
+            combined = client.post(
+                "/api/polymarket-us/trading/policy-advisor/recommend",
+                params={"lane": "live"},
+                json={
+                    "objective": "balanced",
+                    "target_trades_per_hour": 4,
+                    "analysis_mode": "combined",
+                    "lookback_days": 0,
+                    "market_types": ["moneyline", "spread", "total"],
+                },
+            )
+            assert combined.status_code == 200
+            combined_advice = combined.json()
+            assert combined_advice["scope"]["analysis_mode"] == "combined"
+            assert {
+                source["lane"]
+                for source in combined_advice["evidence"]["data_sources"]
+            } == {"live", "dry_run"}
+            assert combined_advice["apply_allowed"] is False
+            assert "simulated and live" in combined_advice["evidence"][
+                "execution_domain_warning"
+            ]
+
+            ledger = client.get(
+                "/api/polymarket-us/trading/performance-ledger",
+                params={"mode": "all"},
+            )
+            assert ledger.status_code == 200
+            assert {
+                source["lane"] for source in ledger.json()["data_sources"]
+            } == {"live", "dry_run"}
+
             history = client.get(
                 "/api/polymarket-us/trading/policy-advisor/history"
             )
             assert history.status_code == 200
-            assert history.json()[0]["id"] == advice["id"]
+            assert history.json()[0]["id"] == combined_advice["id"]
             sessions = client.get(
                 "/api/polymarket-us/trading/policy-advisor/sessions"
             )

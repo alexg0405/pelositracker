@@ -89,22 +89,26 @@ Recommended rollout:
    **Spread / run line**, and/or **Game total**. Disabled types remain visible
    and calculated elsewhere, but the execution sidecar rejects them before
    contract mapping or an order attempt. At least one type must remain selected.
-4. Turn on automatic analysis, save the dry-run policy, and inspect that lane's
+4. Optionally add line/game-stage execution profiles. A line's all-stage
+   profile inherits from the global controls; an early, middle, or late profile
+   refines it when explicit MLB state is available. Profiles change only
+   execution thresholds, are journaled, and are frozen into each new position.
+5. Turn on automatic analysis, save the dry-run policy, and inspect that lane's
    journal for mappings, rejections, simulated fills, marks, and logical exits.
-5. Only after reviewing that evidence, switch to the **Live lane**, configure
+6. Only after reviewing that evidence, switch to the **Live lane**, configure
    and save its separate limits, choose 30 minutes to 4 hours, check the
    approval box, and arm the workstation. The dry-run lane keeps running with
    its own settings unless you stop it.
-6. Use **Disarm** to close the live-order latch. **Stop automation now** affects
+7. Use **Disarm** to close the live-order latch. **Stop automation now** affects
    only the lane currently selected; on the live lane it also requests
    cancellation of this workstation's managed open orders.
-7. **Stop automation + wipe dry-run trades now** is an executive reset: it
+8. **Stop automation + wipe dry-run trades now** is an executive reset: it
    immediately invalidates an in-progress analysis cycle, turns automation off,
    and deletes every simulated position/history row without requesting a quote.
    Each open position also has its own control. Removing one dry-run simulation
    does not stop automation; selling one live position requires the live latch
    and a current previewed fill-or-kill exit.
-8. **Start new risk session** resets the rolling live-entry count, rolling
+9. **Start new risk session** resets the rolling live-entry count, rolling
    realized-loss entry stop, and candidate retry cooldown after an explicit
    confirmation. It preserves trades, P/L, positions, and the execution journal.
    Live execution must be disarmed first. Per-position stops, exposure, cash
@@ -149,6 +153,18 @@ high can trigger a sale as soon as the lock is confirmed. A configured hard stop
 or material model reversal remains independent. Live marks and sell limits use
 the authenticated order book across enough levels to cover the entire remaining
 quantity, rather than assuming the top quote can fill every share.
+
+The separate **minimum retained profit after protection arms** setting prevents
+an ordinary trailing or edge-decay exit from chasing a quote through a formerly
+green position and filling at a loss. Live cash-out status, return, and the
+protected floor use the fee-adjusted executable value for the complete remaining
+quantity. If a fill-or-kill profit exit misses and the next quote is below that
+floor, the position remains open and the journal records
+`profit_floor_missed_holding`; the next ordinary sell must recover above the
+floor. The live limit order itself is also bounded at the fee-adjusted floor so
+the quote cannot slip through it between preview and creation. This floor is not
+a guarantee of profit and does not disable the configured hard stop or a
+material model reversal, either of which may still realize a loss to bound risk.
 
 **Adaptive MLB cash-out research** is an opt-in local overlay around that
 unchanged probability and entry path. It records one bounded observation per
@@ -243,7 +259,8 @@ references, and cycle seconds remain whole-number settings.
 ### Trade performance datasheet
 
 The **Trade performance datasheet** reads every retained workstation-managed
-position, including cards previously cleared from the dashboard view. It can be
+position from both the canonical live store and the isolated dry-run store,
+including cards previously cleared from the dashboard view. It can be
 filtered by dry-run/live mode, moneyline/spread/total, execution result, event,
 selection, or market slug. Its success definition is deliberately narrow: a
 profitable close has positive realized after-cost P/L. Open positions do not
@@ -295,10 +312,12 @@ it, and it has no route into probability calculations or order authorization.
 
 ## Data and reproducibility
 
-Local SQLite data lives under `workstation-data/`, which is also ignored by Git.
-`polymarket-us-trading.db` contains the execution policy, managed positions and
-bounded audit journal, plus the separate adaptive-exit observation table. It
-does not contain either API credential.
+Local SQLite research data is ignored by Git. The canonical live execution
+store is `polymarket-us-trading.db`; `workstation-data/polymarket-us-dry-run.db`
+is the independent simulated-execution store. Both launchers use these same
+paths so switching launchers cannot make retained live history appear missing.
+The files contain execution policies, managed positions, bounded audit journals,
+and adaptive-exit observations. They do not contain either API credential.
 `workstation-data/model-lab.db` contains research observations and candidate
 fit reports. Set `MODEL_LAB_DB` in `.env` only if you want a different local
 path.
@@ -318,12 +337,28 @@ explicit targets, and candidate artifacts, but no API credentials. It is
 independent of the dashboard journal's retention cap and never affects the
 calculation or execution engine.
 
+## Synchronizing website and workstation evidence
+
+The Model Lab's **Synchronize local and hosted research evidence** panel is
+bidirectional. Export locally and merge on the website once to seed the durable
+hosted PostgreSQL store. Later phone-started dry runs remain server-side after
+the browser closes and are immediately included by the website's combined
+datasheet and advisor. Export from the website and merge locally whenever you
+want the workstation to include those newer remote sessions.
+
+The archive preserves live versus dry-run lane identity and merges by immutable
+evidence primary key, so repeated transfers are safe. It intentionally excludes
+open positions, orders, API credentials, cookies, environment configuration,
+and mutable execution controls. Never add the SQLite databases themselves to
+Git.
+
 ## Reactive settings advisor
 
 The local **Reactive settings advisor** creates an auditable execution-policy
 comparison whenever you request one. Choose **Protect profit**, **Balanced**, or
 **Seek more qualified trades**, enter a desired qualified-trade rate, and select
-live versus dry-run history, a lookback window, and the line types to compare.
+live, dry-run, or all retained history, a lookback window, and the line types to
+compare.
 The advisor:
 
 - attaches the exact execution-policy snapshot, source edge, signal quality,
@@ -335,12 +370,16 @@ The advisor:
   independent;
 - compares lower and upper edge bounds, signal quality, entry price, line type,
   event-entry count, same-contract cooldown, and explicit MLB game stage;
-- shows line-, edge-, quality-, price-, repeat-entry-, game-stage-, and
-  exit-reason diagnostics plus five leading candidate policies; and
+- shows execution-mode-, line-, edge-, quality-, price-, repeat-entry-,
+  game-stage-, line-by-game-stage-, and exit-reason diagnostics plus five
+  leading candidate policies; and
 - reports the fitted baseball model's shadow readiness and decision coverage.
 
-P/L comparison is scoped to the mode and line types selected in the advisor, so
-simulated outcomes are not silently combined with live-money outcomes.
+All-data analysis explicitly inventories each retained lane and may pool
+simulated and live outcomes for candidate discovery. Because those execution
+domains differ, a combined result is always exploratory and cannot one-click
+validate a live policy. Re-run a promising candidate against live-only history
+before treating it as live execution evidence.
 **Download analysis JSON** exports the complete scope, diagnostics, candidate
 frontier, and validation evidence without changing a setting.
 

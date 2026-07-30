@@ -79,6 +79,57 @@ def test_database_url_keeps_postgres_as_the_default(monkeypatch):
         database.close()
 
 
+def test_postgres_namespace_is_created_and_selected_for_isolated_lane(
+    monkeypatch,
+):
+    statements = []
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, statement):
+            statements.append(statement)
+
+    class FakeConnection:
+        autocommit = True
+
+        def cursor(self):
+            return FakeCursor()
+
+        def commit(self):
+            statements.append("COMMIT")
+
+        def close(self):
+            pass
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://example.invalid/app")
+    monkeypatch.setattr(
+        database_module.psycopg2,
+        "connect",
+        lambda *_args, **_kwargs: FakeConnection(),
+    )
+
+    database = Database.open(
+        None,
+        sqlite_envs=(),
+        sqlite_default="unused.db",
+        postgres_schema="polymarket_us_dry_run",
+    )
+    try:
+        assert database.postgres_schema == "polymarket_us_dry_run"
+        assert statements == [
+            'CREATE SCHEMA IF NOT EXISTS "polymarket_us_dry_run"',
+            'SET search_path TO "polymarket_us_dry_run"',
+            "COMMIT",
+        ]
+    finally:
+        database.close()
+
+
 def test_transaction_rolls_back_all_sqlite_writes_on_error(tmp_path):
     database = Database.open(str(tmp_path / "rollback.db"), sqlite_envs=(), sqlite_default="")
     try:

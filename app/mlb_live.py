@@ -176,6 +176,22 @@ def game_state_from_linescore(
     provider_game_id = str(game.get("gamePk") or "") or None
     home_team = ((game.get("teams") or {}).get("home") or {}).get("team") or {}
     away_team = ((game.get("teams") or {}).get("away") or {}).get("team") or {}
+    game_status = game.get("status") or {}
+    abstract_status = str(
+        game_status.get("abstractGameState") or ""
+    ).strip().casefold()
+    detailed_status = str(
+        game_status.get("detailedState") or ""
+    ).strip().casefold()
+    ended = (
+        abstract_status == "final"
+        or detailed_status
+        in {
+            "final",
+            "game over",
+            "completed early",
+        }
+    )
     state_payload = {
         "schema": MLB_STATE_SCHEMA,
         "inning": inning,
@@ -190,6 +206,10 @@ def game_state_from_linescore(
         "pitcher": _person(defense.get("pitcher")),
         "scheduled_innings": scheduled_innings,
         "official_game_id": provider_game_id,
+        "official_game_status": (
+            detailed_status or abstract_status or None
+        ),
+        "ended": ended,
     }
     state_hash = hashlib.sha256(
         json.dumps(state_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -216,7 +236,7 @@ def game_state_from_linescore(
             else event.home if batting_side == "home"
             else None
         ),
-        status="in_progress",
+        status="final" if ended else "in_progress",
         received_at=now,
         processed_at=datetime.now(timezone.utc),
         provider_event_id=provider_game_id,
@@ -227,8 +247,8 @@ def game_state_from_linescore(
         away_team_id=str(away_team.get("id") or "") or None,
         regulation_period=inning,
         overtime_number=max(0, inning - 9) or None,
-        live=True,
-        ended=False,
+        live=not ended,
+        ended=ended,
         state_hash=state_hash,
         state_schema_version=MLB_STATE_SCHEMA,
         sport_state=state_payload,
@@ -248,6 +268,7 @@ async def mlb_linescore_poll(
     game: dict | None = None
     last_hash: str | None = None
     last_resolve = 0.0
+    last_terminal_status_refresh = 0.0
     while True:
         try:
             async with _borrow_client() as client:
@@ -268,7 +289,31 @@ async def mlb_linescore_poll(
                     await asyncio.sleep(max(10.0, interval_seconds))
                     continue
                 response.raise_for_status()
-                state = game_state_from_linescore(event, game, response.json())
+                linescore = response.json()
+                # The schedule response used to resolve identity is cached for
+                # 15 minutes. Near the end of regulation, refresh that compact
+                # response so an official Final status is not hidden behind a
+                # stale In Progress value while the score itself is current.
+                # This is deliberately limited to end-of-game innings rather
+                # than adding another request to every live-state cycle.
+                try:
+                    inning = int(linescore.get("currentInning"))
+                except (AttributeError, TypeError, ValueError):
+                    inning = 0
+                inning_state = str(
+                    linescore.get("inningState") if isinstance(linescore, dict) else ""
+                ).strip().casefold()
+                if (
+                    inning >= 9
+                    and inning_state.startswith(("middle", "end"))
+                    and now_epoch - last_terminal_status_refresh >= 15.0
+                ):
+                    last_terminal_status_refresh = now_epoch
+                    refreshed = await resolve_mlb_game(event, client)
+                    if refreshed is not None:
+                        game = refreshed
+                        last_resolve = now_epoch
+                state = game_state_from_linescore(event, game, linescore)
                 if state is not None and state.state_hash != last_hash:
                     last_hash = state.state_hash
                     await emit(state)

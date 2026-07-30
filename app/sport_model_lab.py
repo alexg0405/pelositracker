@@ -27,7 +27,7 @@ from .gameclock import game_progress, league_rule
 from .models import Event, GameState, Quote, Signal
 
 
-MODEL_LAB_VERSION = "sport-model-lab-v4-mlb-residual"
+MODEL_LAB_VERSION = "sport-model-lab-v5-trusted-settlement"
 OBSERVATION_BUCKET_SECONDS = 15
 MARKET_MOVEMENT_HORIZON_SECONDS = 180
 MARKET_MOVEMENT_MAX_DELAY_SECONDS = 360
@@ -37,6 +37,14 @@ PRODUCTION_MIN_EVENTS = 200
 PRODUCTION_MIN_OBSERVATIONS = 1000
 WALK_FORWARD_MAX_FOLDS = 8
 BOOTSTRAP_DRAWS = 1000
+TRUSTED_SETTLEMENT_SOURCES = (
+    "explicit_verified_result",
+    "official_mlb_state",
+    "trusted_terminal_state",
+)
+_TRUSTED_SETTLEMENT_SQL = ",".join(
+    f"'{source}'" for source in TRUSTED_SETTLEMENT_SOURCES
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sport_model_observations (
@@ -134,10 +142,10 @@ RESEARCH_EVIDENCE_TABLES = frozenset({
 
 TARGET_DEFINITIONS = {
     "event_outcome": {
-        "version": "event-outcome-v1",
+        "version": "event-outcome-v2-trusted-settlement",
         "kind": "binary",
         "meaning": "Whether the selected moneyline outcome won at official settlement.",
-        "source": "terminal monitored game state",
+        "source": "provenance-checked terminal result",
     },
     "market_probability_change_3m": {
         "version": "market-probability-change-v1",
@@ -632,6 +640,12 @@ class SportModelLab:
                 component="sport_model_lab",
                 version=4,
             )
+            self._db.migrate_columns("sport_model_lab", 5, {
+                "sport_model_observations": {
+                    "settlement_source": "TEXT",
+                    "settlement_details_json": "TEXT",
+                },
+            })
             self._backfill_research_targets()
 
     def close(self) -> None:
@@ -1075,8 +1089,18 @@ class SportModelLab:
         away_score: float,
         *,
         canceled: bool = False,
+        settlement_source: str = "explicit_verified_result",
+        settlement_details: Mapping[str, Any] | None = None,
     ) -> int:
         settled_ts = time.time()
+        source = str(settlement_source or "").strip().casefold()
+        if not source:
+            raise ValueError("settlement_source is required")
+        details_json = json.dumps(
+            dict(settlement_details or {}),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         with self._lock:
             with self._db.transaction(dict_rows=True) as cur:
                 self._db.execute(
@@ -1098,8 +1122,17 @@ class SportModelLab:
                     self._db.execute(
                         cur,
                         """UPDATE sport_model_observations
-                           SET result_label=%s,settled_ts=%s,canceled=%s WHERE id=%s""",
-                        (label, settled_ts, int(canceled), row["id"]),
+                           SET result_label=%s,settled_ts=%s,canceled=%s,
+                               settlement_source=%s,settlement_details_json=%s
+                           WHERE id=%s""",
+                        (
+                            label,
+                            settled_ts,
+                            int(canceled),
+                            source,
+                            details_json,
+                            row["id"],
+                        ),
                     )
                     if label is not None:
                         definition = TARGET_DEFINITIONS["event_outcome"]
@@ -1110,7 +1143,12 @@ class SportModelLab:
                                 label_ts,source,target_version,metadata_json)
                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                                ON CONFLICT(observation_id,target_name,horizon_seconds)
-                               DO NOTHING""",
+                               DO UPDATE SET
+                                 label_value=excluded.label_value,
+                                 label_ts=excluded.label_ts,
+                                 source=excluded.source,
+                                 target_version=excluded.target_version,
+                                 metadata_json=excluded.metadata_json""",
                             (
                                 row["id"],
                                 "event_outcome",
@@ -1124,6 +1162,10 @@ class SportModelLab:
                                         "home_score": float(home_score),
                                         "away_score": float(away_score),
                                         "outcome_side": side,
+                                        "settlement_source": source,
+                                        "trusted_for_fit": (
+                                            source in TRUSTED_SETTLEMENT_SOURCES
+                                        ),
                                     },
                                     sort_keys=True,
                                     separators=(",", ":"),
@@ -1225,10 +1267,18 @@ class SportModelLab:
                               COUNT(DISTINCT CASE WHEN result_label IS NOT NULL
                                   THEN event_id END) settled_events,
                               SUM(CASE WHEN result_label IS NOT NULL
+                                  AND settlement_source IN ({_TRUSTED_SETTLEMENT_SQL})
+                                  THEN 1 ELSE 0 END) trusted_settled_observations,
+                              COUNT(DISTINCT CASE WHEN result_label IS NOT NULL
+                                  AND settlement_source IN ({_TRUSTED_SETTLEMENT_SQL})
+                                  THEN event_id END) trusted_settled_events,
+                              SUM(CASE WHEN result_label IS NOT NULL
+                                  AND settlement_source IN ({_TRUSTED_SETTLEMENT_SQL})
                                   AND fraction_remaining IS NOT NULL
                                   AND score_differential IS NOT NULL
                                   THEN 1 ELSE 0 END) fit_observations,
                               COUNT(DISTINCT CASE WHEN result_label IS NOT NULL
+                                  AND settlement_source IN ({_TRUSTED_SETTLEMENT_SQL})
                                   AND fraction_remaining IS NOT NULL
                                   AND score_differential IS NOT NULL
                                   THEN event_id END) fit_events,
@@ -1240,7 +1290,9 @@ class SportModelLab:
                               MAX(observed_ts) last_observed_ts
                        FROM sport_model_observations
                        WHERE canceled=0
-                       GROUP BY sport,league ORDER BY observations DESC""",
+                       GROUP BY sport,league ORDER BY observations DESC""".format(
+                           _TRUSTED_SETTLEMENT_SQL=_TRUSTED_SETTLEMENT_SQL
+                       ),
                 )
                 segments = [dict(row) for row in cur.fetchall()]
                 self._db.execute(
@@ -1521,11 +1573,22 @@ class SportModelLab:
                                                   THEN event_id END)
                                   settled_events,
                               SUM(CASE WHEN result_label IS NOT NULL
+                                       AND settlement_source IN ({_TRUSTED_SETTLEMENT_SQL})
+                                       AND canceled=0 THEN 1 ELSE 0 END)
+                                  trusted_settled_observations,
+                              COUNT(DISTINCT CASE WHEN result_label IS NOT NULL
+                                                   AND settlement_source IN ({_TRUSTED_SETTLEMENT_SQL})
+                                                   AND canceled=0
+                                                  THEN event_id END)
+                                  trusted_settled_events,
+                              SUM(CASE WHEN result_label IS NOT NULL
+                                       AND settlement_source IN ({_TRUSTED_SETTLEMENT_SQL})
                                        AND canceled=0
                                        AND fraction_remaining IS NOT NULL
                                        AND score_differential IS NOT NULL
                                        THEN 1 ELSE 0 END) fit_observations,
                               COUNT(DISTINCT CASE WHEN result_label IS NOT NULL
+                                                   AND settlement_source IN ({_TRUSTED_SETTLEMENT_SQL})
                                                    AND canceled=0
                                                    AND fraction_remaining IS NOT NULL
                                                    AND score_differential IS NOT NULL
@@ -1535,7 +1598,9 @@ class SportModelLab:
                               ,COUNT(DISTINCT CASE WHEN state_completeness>=0.75
                                                    THEN event_id END)
                                   rich_state_events
-                       FROM sport_model_observations WHERE sport=%s""",
+                       FROM sport_model_observations WHERE sport=%s""".format(
+                           _TRUSTED_SETTLEMENT_SQL=_TRUSTED_SETTLEMENT_SQL
+                       ),
                     (sport_key,),
                 )
                 segment_row = cur.fetchone()
@@ -1577,16 +1642,24 @@ class SportModelLab:
                     )
                     observation_rows = [dict(row) for row in cur.fetchall()]
 
-        candidate = next(
-            (
-                row for row in candidate_rows
-                if row["status"] not in {
-                    "insufficient_data",
-                    "blocked_missing_sport_state",
-                }
-            ),
-            None,
-        )
+        candidate = None
+        for row in candidate_rows:
+            if row["status"] in {
+                "insufficient_data",
+                "blocked_missing_sport_state",
+            }:
+                continue
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(payload, Mapping)
+                and payload.get("label_policy")
+                == "trusted_settlement_source_v1"
+            ):
+                candidate = row
+                break
         details: dict[str, Any] = {}
         if candidate is not None:
             try:
@@ -1607,8 +1680,8 @@ class SportModelLab:
             and int(walk_forward.get("test_events") or 0) >= 10
         )
         production_counts_ready = (
-            int(segment.get("settled_events") or 0) >= PRODUCTION_MIN_EVENTS
-            and int(segment.get("settled_observations") or 0)
+            int(segment.get("trusted_settled_events") or 0) >= PRODUCTION_MIN_EVENTS
+            and int(segment.get("trusted_settled_observations") or 0)
             >= PRODUCTION_MIN_OBSERVATIONS
         )
         uncertainty_ready = (
@@ -1747,6 +1820,8 @@ class SportModelLab:
                     "observed_events",
                     "settled_observations",
                     "settled_events",
+                    "trusted_settled_observations",
+                    "trusted_settled_events",
                     "fit_observations",
                     "fit_events",
                     "rich_state_observations",
@@ -1828,6 +1903,7 @@ class SportModelLab:
                     "result_label,features_json FROM sport_model_observations "
                     "WHERE sport=%s AND market=%s AND canceled=0 "
                     "AND result_label IS NOT NULL "
+                    f"AND settlement_source IN ({_TRUSTED_SETTLEMENT_SQL}) "
                     "AND fraction_remaining IS NOT NULL "
                     "AND score_differential IS NOT NULL"
                 )
@@ -1902,6 +1978,10 @@ class SportModelLab:
         payload = {
             "research_only": True,
             "promoted": False,
+            "label_policy": "trusted_settlement_source_v1",
+            "trusted_settlement_sources": list(
+                TRUSTED_SETTLEMENT_SOURCES
+            ),
             "split_policy": "chronological_event_block_80_20",
             "validation_policy": (
                 "primary chronological 80/20 holdout plus expanding-window "
@@ -2380,7 +2460,16 @@ class SportModelLab:
                    SELECT id,%s,0,result_label,settled_ts,%s,%s,%s
                    FROM sport_model_observations
                    WHERE result_label IS NOT NULL AND canceled=0
-                   ON CONFLICT(observation_id,target_name,horizon_seconds) DO NOTHING""",
+                     AND settlement_source IN ({_TRUSTED_SETTLEMENT_SQL})
+                   ON CONFLICT(observation_id,target_name,horizon_seconds)
+                   DO UPDATE SET
+                     label_value=excluded.label_value,
+                     label_ts=excluded.label_ts,
+                     source=excluded.source,
+                     target_version=excluded.target_version,
+                     metadata_json=excluded.metadata_json""".format(
+                       _TRUSTED_SETTLEMENT_SQL=_TRUSTED_SETTLEMENT_SQL
+                   ),
                 (
                     "event_outcome",
                     outcome_definition["source"],

@@ -484,8 +484,10 @@
   let usLedgerQueryTimer = null;
   let usPositionMode = "all";
   let usTradingFormDirty = false;
+  let usTradingLaneSwitching = false;
   let usTradingHydrationEpoch = 0;
   let lastRiskPresets = {};
+  let lineExecutionProfiles = [];
   let activeTradingLane = (() => {
     try {
       return window.localStorage.getItem("pelosi-trading-lane") === "live"
@@ -503,10 +505,17 @@
 
   function renderTradingLanes(status = lastUSTradingStatus) {
     const lanes = status?.lanes || {};
+    const running = [];
     for (const lane of ["dry_run", "live"]) {
       const laneStatus = lanes[lane] || {};
       const button = document.querySelector(`[data-trading-lane="${lane}"]`);
       button?.classList.toggle("is-active", lane === activeTradingLane);
+      button?.classList.toggle("is-running", !!laneStatus.automation_enabled);
+      button?.setAttribute(
+        "aria-pressed",
+        lane === activeTradingLane ? "true" : "false"
+      );
+      if (button) button.disabled = usTradingLaneSwitching;
       const summary = document.querySelector(
         lane === "live"
           ? "#us-live-lane-summary"
@@ -514,6 +523,7 @@
       );
       if (!summary) continue;
       const state = laneStatus.automation_enabled ? "RUNNING" : "STOPPED";
+      if (laneStatus.automation_enabled) running.push(lane);
       const armed = lane === "live"
         ? laneStatus.armed ? " · ARMED" : " · DISARMED"
         : "";
@@ -521,6 +531,45 @@
         `${state}${armed} · ${Number(laneStatus.open_positions || 0)} open · ` +
         `$${Number(laneStatus.managed_exposure_usd || 0).toFixed(2)} exposure`
       );
+    }
+    const coordination = document.querySelector("#us-lane-coordination-status");
+    if (coordination) {
+      coordination.classList.toggle("is-both-running", running.length === 2);
+      coordination.textContent = usTradingLaneSwitching
+        ? `Loading the ${activeTradingLane === "live" ? "live" : "dry-run"} lane policy...`
+        : running.length === 2
+          ? "Dry-run and live automation are both running independently."
+          : running.length === 1
+            ? `${running[0] === "live" ? "Live" : "Dry-run"} automation is running. The other lane remains independently stopped.`
+            : "Both automation lanes are stopped. Tap a lane to edit its saved policy.";
+    }
+    const selected = lanes[activeTradingLane] || {};
+    const quickToggle = document.querySelector("#us-lane-automation-toggle");
+    const quickTitle = document.querySelector("#us-quick-lane-title");
+    const quickStatus = document.querySelector("#us-quick-lane-status");
+    const selectedRunning = !!selected.automation_enabled;
+    const selectedLabel = activeTradingLane === "live" ? "Live" : "Dry-run";
+    if (quickTitle) quickTitle.textContent = `${selectedLabel} quick control`;
+    if (quickToggle && !quickToggle.getAttribute("aria-busy")) {
+      quickToggle.disabled = usTradingLaneSwitching;
+      quickToggle.classList.toggle("danger", selectedRunning);
+      quickToggle.classList.toggle("primary", !selectedRunning);
+      quickToggle.textContent = selectedRunning
+        ? `Stop ${selectedLabel.toLowerCase()} automation`
+        : `Start ${selectedLabel.toLowerCase()} automation`;
+    }
+    if (
+      quickStatus
+      && !["is-working", "is-success", "is-error"].some(
+        className => quickStatus.classList.contains(className)
+      )
+    ) {
+      quickStatus.className = "";
+      quickStatus.textContent = selectedRunning
+        ? `${selectedLabel} cycles are running. This control stops only that lane.`
+        : activeTradingLane === "live"
+          ? "Starts live analysis cycles only. Real orders remain impossible until the separate live latch is armed."
+          : "Starts the saved simulated policy on the server, so it keeps running after you close this page.";
     }
     const liveOnly = activeTradingLane === "live";
     const disarm = document.querySelector("#us-disarm");
@@ -537,11 +586,26 @@
         ? "Live-order controls apply only to this live lane."
         : "Switch to the live lane to arm or disarm real orders. Dry-run automation can run without arming.";
     }
+    const save = document.querySelector("#us-policy-save");
+    const run = document.querySelector("#us-run-now");
+    const laneLabel = liveOnly ? "live" : "dry-run";
+    if (save && !save.getAttribute("aria-busy")) {
+      save.textContent = usTradingFormDirty
+        ? `Save ${laneLabel} policy - unsaved`
+        : `Save ${laneLabel} policy`;
+    }
+    if (run && !run.getAttribute("aria-busy")) {
+      run.textContent = `Run ${laneLabel} cycle now`;
+    }
   }
 
   async function switchTradingLane(lane) {
     const next = lane === "live" ? "live" : "dry_run";
     const selector = document.querySelector("#us-trading-mode");
+    if (usTradingLaneSwitching) {
+      if (selector) selector.value = activeTradingLane;
+      return;
+    }
     if (next === activeTradingLane) {
       if (selector) selector.value = next;
       return;
@@ -556,6 +620,8 @@
       return;
     }
     activeTradingLane = next;
+    const quickStatus = document.querySelector("#us-quick-lane-status");
+    if (quickStatus) quickStatus.className = "";
     try {
       window.localStorage.setItem("pelosi-trading-lane", next);
     } catch {
@@ -571,8 +637,18 @@
     }
     usTradingHydrationEpoch += 1;
     setUSTradingFormDirty(false);
+    clearPolicySaveNotice();
+    invalidatePolicyAdvice(
+      `The recommendation target changed to the ${next === "live" ? "live" : "dry-run"} lane. Analyze again before previewing or applying settings.`
+    );
+    usTradingLaneSwitching = true;
     renderTradingLanes();
-    await loadUSTrading();
+    try {
+      await loadUSTrading();
+    } finally {
+      usTradingLaneSwitching = false;
+      renderTradingLanes();
+    }
   }
 
   function refreshTradingInBackground(delay = 0) {
@@ -629,9 +705,147 @@
 
   const detailMessage = body => {
     if (typeof body?.detail === "string") return body.detail;
+    if (Array.isArray(body?.detail)) {
+      return body.detail
+        .map(item => item?.msg || item?.message || JSON.stringify(item))
+        .join("; ");
+    }
     if (body?.detail) return JSON.stringify(body.detail);
     return "Request failed";
   };
+
+  const policyFieldSelectors = {
+    trading_allocation_usd: "#us-trading-allocation",
+    risk_preset: "#us-risk-preset",
+    max_total_exposure_usd: "#us-max-exposure",
+    minimum_cash_reserve_usd: "#us-cash-reserve",
+    max_position_usd: "#us-max-position",
+    max_event_exposure_usd: "#us-max-event",
+    max_daily_loss_usd: "#us-daily-loss",
+    min_edge: "#us-min-edge",
+    max_edge: "#us-max-edge",
+    min_signal_quality: "#us-min-quality",
+    min_entry_price: "#us-min-price",
+    max_entry_price: "#us-max-price",
+    min_hold_minutes: "#us-min-hold",
+    profit_target: "#us-profit-target",
+    minimum_locked_profit: "#us-min-locked-profit",
+    max_open_positions: "#us-max-open",
+    max_orders_per_hour: "#us-max-orders-hour",
+    max_entries_per_event_per_hour: "#us-max-event-entries-hour",
+    candidate_cooldown_seconds: "#us-candidate-cooldown",
+    min_mlb_fraction_remaining: "#us-min-mlb-remaining",
+    min_reference_sources: "#us-min-refs",
+    max_spread: "#us-max-spread",
+    min_book_shares: "#us-min-depth",
+    trailing_drawdown: "#us-trailing-drawdown",
+    stop_loss: "#us-stop-loss",
+    exit_edge: "#us-exit-edge",
+    cycle_seconds: "#us-cycle-seconds",
+    allowed_market_types: "#us-line-type-policy",
+    allowed_market_scopes: "#us-market-scope-policy",
+    adaptive_exit_horizon_minutes: "#us-adaptive-exit-horizon",
+    adaptive_exit_min_samples: "#us-adaptive-exit-min-samples",
+    adaptive_exit_max_tightening: "#us-adaptive-exit-max-tightening",
+    stop_confirmation_readings: "#us-stop-confirmation-readings",
+    stop_grace_minutes: "#us-stop-grace-minutes",
+    catastrophic_stop_multiplier: "#us-catastrophic-stop-multiplier",
+    post_exit_tracking_minutes: "#us-post-exit-tracking-minutes"
+  };
+
+  const policyErrorPatterns = [
+    [/maximum total exposure|max_total_exposure/i, "#us-max-exposure"],
+    [/max_position|maximum per position/i, "#us-max-position"],
+    [/max_event|maximum per event/i, "#us-max-event"],
+    [/hard trading allocation|trading_allocation/i, "#us-trading-allocation"],
+    [/entry prices|min_entry_price|max_entry_price|5c.*95c/i, "#us-min-price"],
+    [/edge filters|min_edge|max_edge/i, "#us-min-edge"],
+    [/minimum locked profit|minimum_locked_profit/i, "#us-min-locked-profit"],
+    [/cycle_seconds|analysis cycle/i, "#us-cycle-seconds"],
+    [/candidate.*cooldown/i, "#us-candidate-cooldown"],
+    [/line type|allowed_market_types/i, "#us-line-type-policy"],
+    [/market segment|allowed_market_scopes/i, "#us-market-scope-policy"],
+    [/reference source|min_reference_sources/i, "#us-min-refs"],
+    [/signal quality|min_signal_quality/i, "#us-min-quality"],
+    [/spread|max_spread/i, "#us-max-spread"],
+    [/book shares|min_book_shares/i, "#us-min-depth"]
+  ];
+
+  function policyErrorTarget(message, detail = null) {
+    if (Array.isArray(detail)) {
+      for (const item of detail) {
+        const field = Array.isArray(item?.loc) ? item.loc.at(-1) : null;
+        if (field && policyFieldSelectors[field]) {
+          return document.querySelector(policyFieldSelectors[field]);
+        }
+      }
+    }
+    const match = policyErrorPatterns.find(([pattern]) => pattern.test(message));
+    return match ? document.querySelector(match[1]) : null;
+  }
+
+  function clearPolicySaveNotice() {
+    const box = document.querySelector("#us-policy-save-status");
+    if (box) {
+      box.hidden = true;
+      box.className = "us-policy-save-status";
+      box.replaceChildren();
+    }
+    document.querySelectorAll(".is-policy-error").forEach(item => {
+      item.classList.remove("is-policy-error");
+    });
+  }
+
+  function revealPolicyTarget(target, {focus = false} = {}) {
+    if (!target) return;
+    const details = target.closest("details");
+    if (details) details.open = true;
+    const container = target.matches("fieldset")
+      ? target
+      : target.closest("label,fieldset") || target;
+    container.classList.add("is-policy-error");
+    if (focus && typeof target.focus === "function") {
+      target.focus({preventScroll:true});
+      target.scrollIntoView({
+        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+          ? "auto"
+          : "smooth",
+        block:"center"
+      });
+    }
+  }
+
+  function showPolicySaveNotice(
+    message,
+    {kind = "error", target = null, scroll = false} = {}
+  ) {
+    const box = document.querySelector("#us-policy-save-status");
+    if (!box) return;
+    clearPolicySaveNotice();
+    revealPolicyTarget(target);
+    const laneLabel = activeTradingLane === "live" ? "Live" : "Dry-run";
+    box.hidden = false;
+    box.classList.add(`is-${kind}`);
+    box.innerHTML = `
+      <strong>${esc(kind === "error" ? `${laneLabel} policy was not saved` : `${laneLabel} policy saved`)}</strong>
+      <span>${esc(message)}</span>
+      ${target ? '<button class="ghost compact-button" type="button">Go to highlighted setting</button>' : ""}`;
+    box.querySelector("button")?.addEventListener(
+      "click",
+      () => revealPolicyTarget(target, {focus:true}),
+      {once:true}
+    );
+    if (scroll) {
+      window.requestAnimationFrame(() => {
+        box.scrollIntoView({
+          behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+            ? "auto"
+            : "smooth",
+          block:"center"
+        });
+      });
+    }
+  }
 
   function setUSTradingFormDirty(dirty) {
     usTradingFormDirty = dirty;
@@ -647,8 +861,10 @@
 
   document.querySelector("#us-trading-form")?.addEventListener("input", event => {
     if (event.target?.id === "us-trading-mode") return;
+    if (event.target?.closest(".is-policy-error")) clearPolicySaveNotice();
     usTradingHydrationEpoch += 1;
     setUSTradingFormDirty(true);
+    renderTradingLanes();
     invalidatePolicyAdvice(
       "Execution controls were edited. Save them, then analyze again before applying suggested filters."
     );
@@ -665,6 +881,77 @@
     event => {
       const button = event.target.closest("[data-trading-lane]");
       if (button) void switchTradingLane(button.dataset.tradingLane);
+    }
+  );
+
+  document.querySelector("#us-lane-automation-toggle")?.addEventListener(
+    "click",
+    async event => {
+      const button = event.currentTarget;
+      const status = document.querySelector("#us-quick-lane-status");
+      const laneStatus = lastUSTradingStatus?.lanes?.[activeTradingLane] || {};
+      const running = !!laneStatus.automation_enabled;
+      const laneLabel = activeTradingLane === "live" ? "live" : "dry-run";
+      if (
+        !running
+        && activeTradingLane === "live"
+        && !window.confirm(
+          "Start live analysis cycles? This does not arm real orders; the separate live-order approval and timer remain required."
+        )
+      ) return;
+      setActionBusy(
+        button,
+        true,
+        running ? `Stopping ${laneLabel}...` : `Starting ${laneLabel}...`
+      );
+      if (status) {
+        status.className = "is-working";
+        status.textContent = running
+          ? `Stopping only the ${laneLabel} lane and waiting for its active cycle to acknowledge...`
+          : `Starting the saved ${laneLabel} policy on the server...`;
+      }
+      const requestEpoch = ++usTradingHydrationEpoch;
+      try {
+        const response = running
+          ? await fetch(
+              tradingApi("/api/polymarket-us/trading/stop"),
+              {method:"POST"}
+            )
+          : await fetch(
+              tradingApi("/api/polymarket-us/trading/config"),
+              {
+                method:"PUT",
+                headers:{"content-type":"application/json"},
+                body:JSON.stringify({automation_enabled:true})
+              }
+            );
+        const body = await response.json().catch(()=>({}));
+        if (!response.ok) throw new Error(detailMessage(body));
+        if (requestEpoch === usTradingHydrationEpoch) {
+          cacheUSExecutionStatus(body);
+          renderTradingStatus(body);
+        }
+        if (status) {
+          status.className = "is-success";
+          status.textContent = running
+            ? `${laneLabel === "live" ? "Live" : "Dry-run"} automation stopped. The other lane was not changed.`
+            : `${laneLabel === "live" ? "Live" : "Dry-run"} automation started and will continue server-side after this page closes.`;
+        }
+        await loadUSTrading();
+      } catch (error) {
+        if (status) {
+          status.className = "is-error";
+          status.textContent = error.message || `Could not update ${laneLabel} automation`;
+        }
+      } finally {
+        setActionBusy(button, false);
+        renderTradingLanes();
+        window.setTimeout(() => {
+          if (!status || !status.classList.contains("is-success")) return;
+          status.className = "";
+          renderTradingLanes();
+        }, 5000);
+      }
     }
   );
 
@@ -789,6 +1076,7 @@
         "#us-min-price": derived.min_entry_price,
         "#us-max-price": derived.max_entry_price,
         "#us-profit-target": derived.profit_target,
+        "#us-min-locked-profit": derived.minimum_locked_profit,
         "#us-max-spread": derived.max_spread,
         "#us-trailing-drawdown": derived.trailing_drawdown,
         "#us-stop-loss": derived.stop_loss,
@@ -826,6 +1114,155 @@
     }
   });
 
+  const lineProfileInputs = () => [
+    ...document.querySelectorAll("[data-profile-field]")
+  ];
+
+  function selectedLineProfileKey() {
+    return {
+      market_type:document.querySelector("#us-profile-market")?.value || "moneyline",
+      game_stage:document.querySelector("#us-profile-stage")?.value || "all"
+    };
+  }
+
+  function loadSelectedLineProfile() {
+    const key = selectedLineProfileKey();
+    const profile = lineExecutionProfiles.find(item =>
+      item.market_type === key.market_type && item.game_stage === key.game_stage
+    );
+    const overrides = profile?.overrides || {};
+    const enabled = document.querySelector("#us-profile-enabled");
+    if (enabled) enabled.checked = profile?.enabled !== false;
+    for (const input of lineProfileInputs()) {
+      const value = overrides[input.dataset.profileField];
+      input.value = value == null
+        ? ""
+        : input.hasAttribute("data-profile-percent")
+          ? Number(value) * 100
+          : value;
+    }
+  }
+
+  function renderLineExecutionProfiles() {
+    const body = document.querySelector("#us-line-profile-list");
+    if (!body) return;
+    if (!lineExecutionProfiles.length) {
+      body.textContent = (
+        "No line-specific profiles saved. Global settings apply to every line."
+      );
+      return;
+    }
+    const labels = {
+      min_edge:"edge floor",
+      max_edge:"edge ceiling",
+      min_signal_quality:"quality",
+      min_reference_sources:"references",
+      min_entry_price:"price floor",
+      max_entry_price:"price ceiling",
+      max_spread:"spread",
+      min_book_shares:"depth",
+      min_hold_minutes:"hold",
+      profit_target:"target",
+      minimum_locked_profit:"retained floor",
+      trailing_drawdown:"trailing",
+      stop_loss:"stop",
+      exit_edge:"reversal edge",
+      min_mlb_fraction_remaining:"game remaining"
+    };
+    const percents = new Set([
+      "min_edge", "max_edge", "min_entry_price", "max_entry_price",
+      "max_spread", "profit_target", "minimum_locked_profit",
+      "trailing_drawdown", "stop_loss", "exit_edge",
+      "min_mlb_fraction_remaining"
+    ]);
+    body.innerHTML = lineExecutionProfiles
+      .slice()
+      .sort((a, b) => (
+        `${a.market_type}/${a.game_stage}`
+          .localeCompare(`${b.market_type}/${b.game_stage}`)
+      ))
+      .map(profile => {
+        const settings = Object.entries(profile.overrides || {}).map(
+          ([field, value]) => (
+            `${labels[field] || field} ${
+              percents.has(field)
+                ? `${(Number(value) * 100).toFixed(1)}%`
+                : Number(value).toFixed(
+                    field === "min_reference_sources" ? 0 : 1
+                  )
+            }`
+          )
+        );
+        return `<article class="us-line-profile-chip">
+          <strong>${esc(profile.market_type)} · ${esc(profile.game_stage)}${profile.enabled === false ? " · disabled" : ""}</strong>
+          <span>${esc(settings.join(" · ") || "Uses all global values")}</span>
+        </article>`;
+      }).join("");
+  }
+
+  function saveSelectedLineProfile() {
+    const key = selectedLineProfileKey();
+    const overrides = {};
+    for (const input of lineProfileInputs()) {
+      if (input.value === "") continue;
+      const field = input.dataset.profileField;
+      const number = Number(input.value);
+      if (!Number.isFinite(number)) {
+        input.focus();
+        return;
+      }
+      overrides[field] = input.hasAttribute("data-profile-percent")
+        ? number / 100
+        : input.hasAttribute("data-profile-integer")
+          ? Math.trunc(number)
+          : number;
+    }
+    const profile = {
+      ...key,
+      enabled:document.querySelector("#us-profile-enabled")?.checked !== false,
+      overrides
+    };
+    lineExecutionProfiles = lineExecutionProfiles.filter(item => !(
+      item.market_type === key.market_type && item.game_stage === key.game_stage
+    ));
+    lineExecutionProfiles.push(profile);
+    usTradingHydrationEpoch += 1;
+    setUSTradingFormDirty(true);
+    renderLineExecutionProfiles();
+    invalidatePolicyAdvice(
+      "Line-specific execution controls changed. Save the policy before analyzing again."
+    );
+  }
+
+  function removeSelectedLineProfile() {
+    const key = selectedLineProfileKey();
+    const before = lineExecutionProfiles.length;
+    lineExecutionProfiles = lineExecutionProfiles.filter(item => !(
+      item.market_type === key.market_type && item.game_stage === key.game_stage
+    ));
+    if (lineExecutionProfiles.length === before) return;
+    loadSelectedLineProfile();
+    renderLineExecutionProfiles();
+    usTradingHydrationEpoch += 1;
+    setUSTradingFormDirty(true);
+    invalidatePolicyAdvice(
+      "Line-specific execution controls changed. Save the policy before analyzing again."
+    );
+  }
+
+  document.querySelector("#us-profile-market")?.addEventListener(
+    "change", loadSelectedLineProfile
+  );
+  document.querySelector("#us-profile-stage")?.addEventListener(
+    "change", loadSelectedLineProfile
+  );
+  document.querySelector("#us-profile-save")?.addEventListener(
+    "click", saveSelectedLineProfile
+  );
+  document.querySelector("#us-profile-remove")?.addEventListener(
+    "click", removeSelectedLineProfile
+  );
+
   function applyTradingPolicy(status, {force = false, requestEpoch = null} = {}) {
     if (
       !force
@@ -842,6 +1279,12 @@
       activeTradingLane = returnedLane;
     }
     lastRiskPresets = status?.risk_presets || lastRiskPresets;
+    lineExecutionProfiles = Array.isArray(policy.line_execution_profiles)
+      ? policy.line_execution_profiles.map(profile => ({
+          ...profile,
+          overrides:{...(profile.overrides || {})}
+        }))
+      : [];
     const values = {
       "#us-trading-mode": policy.execution_mode,
       "#us-trading-allocation": policy.trading_allocation_usd,
@@ -858,6 +1301,11 @@
       "#us-max-price": policy.max_entry_price == null ? null : policy.max_entry_price * 100,
       "#us-min-hold": policy.min_hold_minutes,
       "#us-profit-target": policy.profit_target == null ? null : policy.profit_target * 100,
+      "#us-min-locked-profit": (
+        policy.minimum_locked_profit == null
+          ? null
+          : policy.minimum_locked_profit * 100
+      ),
       "#us-max-open": policy.max_open_positions,
       "#us-max-orders-hour": policy.max_orders_per_hour,
       "#us-max-event-entries-hour": policy.max_entries_per_event_per_hour,
@@ -941,6 +1389,8 @@
     updateAdaptiveExitAvailability();
     updateStopGuardAvailability();
     updateRiskPresetUI();
+    renderLineExecutionProfiles();
+    loadSelectedLineProfile();
     renderTradingLanes(status);
     return true;
   }
@@ -1299,6 +1749,28 @@
             stopGuard.reason || ""
           ].filter(Boolean).join(" / ")
         : "";
+      const profitGuard = position.profit_guard;
+      const profitGuardLine = profitGuard
+        ? [
+            `profit protection ${String(
+              profitGuard.status || "inactive"
+            ).replaceAll("_", " ")}`,
+            profitGuard.protected_floor_value == null
+              ? ""
+              : `floor ${cents(profitGuard.protected_floor_value)}`,
+            profitGuard.fee_adjusted_exit_value == null
+              ? ""
+              : `fee-adjusted executable ${cents(
+                  profitGuard.fee_adjusted_exit_value
+                )}`,
+            Number(profitGuard.missed_count || 0) > 0
+              ? `${Number(profitGuard.missed_count)} missed-floor reading${
+                  Number(profitGuard.missed_count) === 1 ? "" : "s"
+                }`
+              : "",
+            profitGuard.reason || ""
+          ].filter(Boolean).join(" / ")
+        : "";
       const action = open
         ? `<button class="us-position-action" type="button" data-exit-position="${esc(position.id)}" data-exit-mode="${esc(position.mode)}">${position.mode === "live" ? "Sell position" : "Remove simulation"}</button>`
         : "<div></div>";
@@ -1310,7 +1782,7 @@
         <div><span>bought</span><strong>${initialQuantity.toFixed(2)} @ ${cents(position.entry_cost)}</strong></div>
         <div><span>total paid</span><strong>$${initialCost.toFixed(2)}</strong></div>
         <div><span>remaining</span><strong>${quantity.toFixed(2)} shares</strong></div>
-        <div><span>cash-out quote</span><strong>${cents(position.current_exit_value)}${cashoutValue == null ? "" : ` / $${cashoutValue.toFixed(2)}`}</strong></div>
+        <div><span>${position.mode === "live" ? "fee-adjusted cash-out" : "cash-out quote"}</span><strong>${cents(position.current_exit_value)}${cashoutValue == null ? "" : ` / $${cashoutValue.toFixed(2)}`}</strong></div>
         <div><span>return</span><strong>${esc(ret)}</strong></div>
         <div><span>${open ? "marked P/L" : "realized"}</span><strong>${open ? esc(money(markedPnl)) : esc(pnl)}</strong></div>
         <div><span>current edge</span><strong>${esc(edge)}</strong></div>
@@ -1322,6 +1794,7 @@
           ${position.exit_reason ? ` · ${esc(position.exit_reason)}` : ""}
           ${adaptiveLine ? `<span class="us-position-adaptive">${esc(adaptiveLine)}</span>` : ""}
           ${stopGuardLine ? `<span class="us-position-adaptive">${esc(stopGuardLine)}</span>` : ""}
+          ${profitGuardLine ? `<span class="us-position-adaptive">${esc(profitGuardLine)}</span>` : ""}
         </div>
       </article>`;
     }).join("");
@@ -1402,6 +1875,9 @@
         : `buy ${(Number(settings.min_entry_price) * 100).toFixed(0)}-${(Number(settings.max_entry_price) * 100).toFixed(0)}c`,
       settings.max_spread == null ? "" : `spread <=${(Number(settings.max_spread) * 100).toFixed(1)}c`,
       settings.profit_target == null ? "" : `target ${(Number(settings.profit_target) * 100).toFixed(1)}%`,
+      settings.minimum_locked_profit == null
+        ? ""
+        : `protected floor ${(Number(settings.minimum_locked_profit) * 100).toFixed(1)}%`,
       settings.stop_loss == null ? "" : `stop ${(Number(settings.stop_loss) * 100).toFixed(1)}%`
     ].filter(Boolean).join(" · ");
   }
@@ -1429,6 +1905,9 @@
       : [];
     const scopeGroups = Array.isArray(data.market_scope_summary)
       ? data.market_scope_summary
+      : [];
+    const dataSources = Array.isArray(data.data_sources)
+      ? data.data_sources
       : [];
     const cards = [
       {label:"Filtered total", ...summary},
@@ -1474,27 +1953,33 @@
             : "";
           const settings = ledgerSettingsText(row.entry_policy);
           return `<tr>
-            <td>${esc(row.opened_at ? new Date(row.opened_at).toLocaleString() : "—")}</td>
-            <td>${esc(row.mode)}</td>
-            <td><strong class="us-ledger-result${resultClass}">${esc(row.result)}</strong></td>
-            <td><strong>${esc(row.event_name)}</strong><span>${esc(row.selection)}</span></td>
-            <td>${esc(row.market_type)}<span>${esc(String(row.market_scope || "full_game").replaceAll("_", " "))}</span></td>
-            <td>${esc(cents(row.entry_cost))}</td>
-            <td>$${Number(row.cost_basis_usd || 0).toFixed(2)}</td>
-            <td>${row.realized_net_usd == null ? "—" : esc(money(Number(row.realized_net_usd)))}</td>
-            <td>${esc(signedCents(row.entry_execution_edge ?? row.entry_signal_edge))}</td>
-            <td>${row.entry_signal_quality == null ? "—" : Number(row.entry_signal_quality).toFixed(0)}</td>
-            <td><details><summary>#${esc(row.policy_signature)}</summary><span>${esc(settings)}</span></details></td>
+            <td data-label="Opened">${esc(row.opened_at ? new Date(row.opened_at).toLocaleString() : "—")}</td>
+            <td data-label="Mode">${esc(row.mode)}</td>
+            <td data-label="Result"><strong class="us-ledger-result${resultClass}">${esc(row.result)}</strong></td>
+            <td data-label="Event"><strong>${esc(row.event_name)}</strong><span>${esc(row.selection)}</span></td>
+            <td data-label="Line">${esc(row.market_type)}<span>${esc(String(row.market_scope || "full_game").replaceAll("_", " "))}</span></td>
+            <td data-label="Buy">${esc(cents(row.entry_cost))}</td>
+            <td data-label="Stake">$${Number(row.cost_basis_usd || 0).toFixed(2)}</td>
+            <td data-label="Net">${row.realized_net_usd == null ? "—" : esc(money(Number(row.realized_net_usd)))}</td>
+            <td data-label="Edge">${esc(signedCents(row.entry_execution_edge ?? row.entry_signal_edge))}</td>
+            <td data-label="Quality">${row.entry_signal_quality == null ? "—" : Number(row.entry_signal_quality).toFixed(0)}</td>
+            <td data-label="Settings"><details><summary>#${esc(row.policy_signature)}</summary><span>${esc(settings)}</span></details></td>
           </tr>`;
         }).join("")
-      : '<tr><td colspan="11">No trades match the selected filters.</td></tr>';
+      : '<tr class="us-ledger-empty"><td colspan="11">No trades match the selected filters.</td></tr>';
     const generated = data.generated_at
       ? new Date(data.generated_at).toLocaleTimeString()
       : "now";
     status.className = "refresh-status";
+    const sourceText = dataSources.length
+      ? dataSources
+        .map(source => `${String(source.lane || "store").replaceAll("_", " ")} ${Number(source.retained_positions || 0)}`)
+        .join(" / ")
+      : "current execution store";
     status.textContent = (
       `${Number(data.total_matching_rows || 0)} retained trade rows · refreshed ${generated}` +
       (data.rows_truncated ? " · screen truncated; CSV can include up to 10,000 rows" : "") +
+      ` · sources: ${sourceText}` +
       " · high rates from small samples are not reliable by themselves"
     );
   }
@@ -1616,7 +2101,7 @@
     return `<section class="us-advisor-diagnostic">
       <h3>${esc(title)}</h3>
       <div class="table-wrap"><table>
-        <thead><tr><th>Segment</th><th>Trades</th><th>Events</th><th>Net</th><th>ROI</th><th>Win rate</th></tr></thead>
+        <thead><tr><th>Segment</th><th>Trades</th><th>Events</th><th>Net</th><th>ROI</th><th>Win rate</th><th>Event CI</th></tr></thead>
         <tbody>${rows.map(row => `<tr>
           <td>${esc(row.label || "unknown")}</td>
           <td>${Number(row.trades || 0)}</td>
@@ -1624,6 +2109,9 @@
           <td>${esc(money(Number(row.net_usd || 0)))}</td>
           <td>${pct(row.turnover_roi)}</td>
           <td>${pct(row.win_rate)}</td>
+          <td>${row.event_block_bootstrap?.lower_95 == null
+            ? esc(row.support || "descriptive")
+            : `${pct(row.event_block_bootstrap.lower_95)}–${pct(row.event_block_bootstrap.upper_95)}`}</td>
         </tr>`).join("")}</tbody>
       </table></div>
     </section>`;
@@ -1709,6 +2197,9 @@
     lastPolicyAdvice = advice;
     body.classList.remove("is-stale");
     const evidence = advice.evidence || {};
+    const dataSources = Array.isArray(evidence.data_sources)
+      ? evidence.data_sources
+      : [];
     const model = advice.model_evidence || {};
     const bootstrap = evidence.event_block_bootstrap || {};
     const changes = Object.entries(advice.changes || {});
@@ -1731,13 +2222,20 @@
     const download = document.querySelector("#us-policy-advisor-download");
     if (download) download.disabled = false;
     status.className = "refresh-status";
-    status.textContent = `${String(advice.status || "research").replaceAll("_", " ")} · ${evidence.analysis_mode || "current"} mode · ${Number(evidence.eligible_closed_trades || 0)} eligible closes across ${Number(evidence.independent_events || 0)} events · model stage ${String(model.stage || "unavailable").replaceAll("_", " ")}`;
+    status.textContent = `${String(advice.status || "research").replaceAll("_", " ")} · ${evidence.analysis_mode || "current"} mode · ${Number(evidence.eligible_closed_trades || 0)} eligible closes across ${Number(evidence.independent_events || 0)} events · target ${activeTradingLane === "live" ? "live" : "dry-run"} lane · model stage ${String(model.stage || "unavailable").replaceAll("_", " ")}`;
     body.innerHTML = `
       <div class="us-policy-advisor-summary">
         <div><span>Current qualified pace</span><strong>${currentRate.toFixed(2)}/hr</strong></div>
         <div><span>Suggested qualified pace</span><strong>${suggestedRate.toFixed(2)}/hr</strong></div>
         <div><span>Suggested test ROI</span><strong>${pct(evidence.suggested_test?.turnover_roi)}</strong></div>
         <div><span>Whole-event confidence</span><strong>${bootstrap.probability_positive == null ? "not available" : `${(Number(bootstrap.probability_positive) * 100).toFixed(0)}% positive`}</strong></div>
+      </div>
+      <div class="us-policy-advisor-sources">
+        ${dataSources.length ? dataSources.map(source => `<article>
+          <span>${esc(String(source.lane || "store").replaceAll("_", " "))}</span>
+          <strong>${Number(source.closed_trades || 0)} closed / ${Number(source.independent_events || 0)} events</strong>
+          <small>${Number(source.retained_positions || 0)} retained positions / ${Number(source.opportunity_observations || 0)} logged opportunities</small>
+        </article>`).join("") : '<div class="metrics-empty">No retained execution source inventory was returned.</div>'}
       </div>
       <div class="us-policy-advisor-changes">
         ${changes.length ? changes.map(([field, values]) => `<article class="us-policy-advisor-change">
@@ -1753,17 +2251,20 @@
         ${esc(advice.validation_note || "")}
         Policy snapshot: ${esc(String(advice.source_policy_hash || "").slice(0, 12) || "unavailable")}.
         ${esc(evidence.legacy_mode_warning || "")}
+        ${esc(evidence.execution_domain_warning || "")}
         ${esc(advice.guarantee || "")}
       </div>
       <details class="advanced us-advisor-analysis" open>
         <summary>Trade-data diagnostics</summary>
         <div class="us-advisor-diagnostic-grid">
+          ${advisorDiagnosticTable("Execution modes", diagnostics.execution_modes)}
           ${advisorDiagnosticTable("Line types", diagnostics.line_types)}
           ${advisorDiagnosticTable("Edge bands", diagnostics.edge_bands)}
           ${advisorDiagnosticTable("Signal-quality bands", diagnostics.quality_bands)}
           ${advisorDiagnosticTable("Entry-price bands", diagnostics.price_bands)}
           ${advisorDiagnosticTable("Repeat entries", diagnostics.entry_repetition)}
           ${advisorDiagnosticTable("MLB game stage", diagnostics.game_stage)}
+          ${advisorDiagnosticTable("Line × MLB game stage", diagnostics.line_by_game_stage)}
           ${advisorDiagnosticTable("Exit reason", diagnostics.exit_reasons)}
         </div>
         <div class="us-policy-advisor-evidence">
@@ -1822,7 +2323,7 @@
     const status = document.querySelector("#us-policy-advisor-status");
     const objective = document.querySelector("#us-policy-advisor-objective")?.value || "balanced";
     const target = Number(document.querySelector("#us-policy-advisor-target")?.value || 4);
-    const analysisMode = document.querySelector("#us-policy-advisor-mode")?.value || "live";
+    const analysisMode = document.querySelector("#us-policy-advisor-mode")?.value || "combined";
     const lookbackDays = Number(
       document.querySelector("#us-policy-advisor-lookback")?.value || 0
     );
@@ -1870,7 +2371,17 @@
       return null;
     } finally {
       setActionBusy(button, false);
+      updatePolicyAdvisorActionLabel();
     }
+  }
+
+  function updatePolicyAdvisorActionLabel() {
+    const button = document.querySelector("#us-policy-advisor-refresh");
+    const mode = document.querySelector("#us-policy-advisor-mode")?.value;
+    if (!button || button.getAttribute("aria-busy")) return;
+    button.textContent = mode === "combined"
+      ? "Analyze all retained data"
+      : `Analyze ${mode === "dry_run" ? "dry-run" : "live"} data`;
   }
 
   function previewPolicyAdvice() {
@@ -2004,11 +2515,15 @@
   ]) {
     document.querySelectorAll(selector).forEach(input => input.addEventListener(
       "change",
-      () => invalidatePolicyAdvice(
-        "The analysis scope changed. Analyze current data again before applying."
-      )
+      () => {
+        updatePolicyAdvisorActionLabel();
+        invalidatePolicyAdvice(
+          "The analysis scope changed. Analyze current data again before applying."
+        );
+      }
     ));
   }
+  updatePolicyAdvisorActionLabel();
   document.querySelector("#us-policy-advisor-download")?.addEventListener(
     "click",
     () => {
@@ -2064,6 +2579,23 @@
             : ` ${Number(stopGuard.confirmations)}/${Number(stopGuard.required_confirmations || 0)}`
         }${stopGuard.reason ? `: ${stopGuard.reason}` : ""}`
         : "";
+      const profitGuard = details.profit_guard || {};
+      const profitGuardMetric = profitGuard.status
+        ? [
+            `profit protection ${String(
+              profitGuard.status
+            ).replaceAll("_", " ")}`,
+            profitGuard.protected_floor_value == null
+              ? ""
+              : `floor ${cents(profitGuard.protected_floor_value)}`,
+            profitGuard.fee_adjusted_exit_value == null
+              ? ""
+              : `net executable ${cents(
+                  profitGuard.fee_adjusted_exit_value
+                )}`,
+            profitGuard.reason || ""
+          ].filter(Boolean).join(": ")
+        : "";
       const metrics = [
         details.signal_edge == null ? "" : `source edge ${signedCents(details.signal_edge)}`,
         details.configured_min_edge == null ? "" : `floor ${signedCents(details.configured_min_edge)}`,
@@ -2090,10 +2622,15 @@
               Number(details.profit_target_observation_count || 0)
             )}/${Number(details.profit_target_confirmation_readings || 2)}`,
         details.estimated_cashout_value == null ? "" : `cash-out $${Number(details.estimated_cashout_value).toFixed(2)}`,
+        details.gross_exit_value == null ? "" : `gross exit ${cents(details.gross_exit_value)}`,
+        details.estimated_exit_fee == null
+          ? ""
+          : `estimated exit fee $${Number(details.estimated_exit_fee).toFixed(2)}`,
         details.exit_book_depth == null ? "" : `exit depth ${Number(details.exit_book_depth).toFixed(2)} shares`,
         details.quote_source ? `quote ${details.quote_source}` : "",
         details.venue_sync_status ? `venue ${details.venue_sync_status}` : "",
-        stopGuardMetric
+        stopGuardMetric,
+        profitGuardMetric
       ].filter(Boolean);
       return `<article class="us-journal-row">
         <div class="us-journal-time">${esc(new Date(item.created_at).toLocaleTimeString())}<span>${esc(item.kind)}</span></div>
@@ -2168,7 +2705,15 @@
   document.querySelector("#us-trading-form")?.addEventListener("submit", async event => {
     event.preventDefault();
     const form = event.currentTarget;
-    if (!form.reportValidity()) return;
+    clearPolicySaveNotice();
+    const invalid = form.querySelector(":invalid");
+    if (invalid) {
+      showPolicySaveNotice(
+        invalid.validationMessage || "Review the highlighted setting.",
+        {target:invalid, scroll:true}
+      );
+      return;
+    }
     const button = document.querySelector("#us-policy-save");
     const statusBox = document.querySelector("#us-trading-status");
     setActionBusy(button, true, "Saving policy…");
@@ -2179,7 +2724,13 @@
     if (!allowedMarketTypes.length) {
       setActionBusy(button, false);
       statusBox.textContent = "Select at least one line type for automatic entry.";
-      entryMarketTypeInputs()[0]?.focus();
+      showPolicySaveNotice(
+        "Select at least one line type for automatic entry.",
+        {
+          target:document.querySelector("#us-line-type-policy"),
+          scroll:true
+        }
+      );
       return;
     }
     const allowedMarketScopes = entryMarketScopeInputs()
@@ -2188,8 +2739,24 @@
     if (!allowedMarketScopes.length) {
       setActionBusy(button, false);
       statusBox.textContent = "Select at least one game segment for automatic entry.";
-      entryMarketScopeInputs()[0]?.focus();
+      showPolicySaveNotice(
+        "Select at least one game segment for automatic entry.",
+        {
+          target:document.querySelector("#us-market-scope-policy"),
+          scroll:true
+        }
+      );
       return;
+    }
+    const selectedProfile = selectedLineProfileKey();
+    if (
+      lineProfileInputs().some(input => input.value !== "")
+      || lineExecutionProfiles.some(item => (
+        item.market_type === selectedProfile.market_type
+        && item.game_stage === selectedProfile.game_stage
+      ))
+    ) {
+      saveSelectedLineProfile();
     }
     const payload = {
       execution_mode: document.querySelector("#us-trading-mode").value,
@@ -2234,6 +2801,7 @@
       allow_live_segment_markets: document.querySelector(
         "#us-allow-live-segments"
       ).checked,
+      line_execution_profiles:lineExecutionProfiles,
       max_total_exposure_usd: Number(document.querySelector("#us-max-exposure").value),
       minimum_cash_reserve_usd: Number(document.querySelector("#us-cash-reserve").value),
       max_position_usd: Number(document.querySelector("#us-max-position").value),
@@ -2246,6 +2814,9 @@
       max_entry_price: Number(document.querySelector("#us-max-price").value) / 100,
       min_hold_minutes: Number(document.querySelector("#us-min-hold").value),
       profit_target: Number(document.querySelector("#us-profit-target").value) / 100,
+      minimum_locked_profit: Number(
+        document.querySelector("#us-min-locked-profit").value
+      ) / 100,
       max_open_positions: Number(document.querySelector("#us-max-open").value),
       max_orders_per_hour: Number(document.querySelector("#us-max-orders-hour").value),
       max_entries_per_event_per_hour: Number(
@@ -2276,18 +2847,36 @@
         }
       );
       const body = await response.json().catch(()=>({}));
-      if (!response.ok) throw new Error(detailMessage(body));
+      if (!response.ok) {
+        const policyError = new Error(detailMessage(body));
+        policyError.policyDetail = body.detail;
+        throw policyError;
+      }
       if (saveEpoch === usTradingHydrationEpoch) {
         setUSTradingFormDirty(false);
         applyTradingPolicy(body, {force:true});
       }
       renderTradingStatus(body);
+      const laneLabel = activeTradingLane === "live" ? "Live" : "Dry-run";
+      const running = body?.policy?.automation_enabled ? "running" : "stopped";
+      showPolicySaveNotice(
+        `${laneLabel} automation is ${running}. The other lane was not changed.`,
+        {kind:"success"}
+      );
       await Promise.all([refreshUSStatus(), loadUSTrading()]);
     } catch (error) {
       statusBox.textContent = error.message || "Could not save execution policy";
+      showPolicySaveNotice(
+        error.message || "Could not save execution policy",
+        {
+          target:policyErrorTarget(error.message || "", error.policyDetail),
+          scroll:true
+        }
+      );
     } finally {
       setActionBusy(button, false);
       setUSTradingFormDirty(usTradingFormDirty);
+      renderTradingLanes();
     }
   });
 
@@ -3035,7 +3624,7 @@
       anchor.click();
       anchor.remove();
       URL.revokeObjectURL(url);
-      if (status) status.textContent = `Downloaded ${filename} (${(blob.size / 1048576).toFixed(1)} MB). Upload this file on the hosted site to merge it.`;
+      if (status) status.textContent = `Downloaded ${filename} (${(blob.size / 1048576).toFixed(1)} MB). Open the other installation and merge it there; live and dry-run rows keep their source lane.`;
     } catch (error) {
       if (status) {
         status.className = "refresh-status is-error";

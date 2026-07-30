@@ -9,6 +9,7 @@ from app.main import (
     _is_moneyline_market,
     _paper_tradeable_quotes,
     _prematch_anchor,
+    _settlement_context,
     _settle_scores,
     _state_age_seconds,
 )
@@ -120,6 +121,67 @@ def test_tennis_falls_back_to_the_live_state_when_no_score_is_cached():
 
 def test_non_tennis_settles_by_final_live_score():
     assert _settle_scores(_event(), [_state(home_score=101, away_score=99)]) == (101, 99)
+
+
+def test_mlb_model_settlement_prefers_identified_official_terminal_state():
+    event = Event(
+        "Away vs Home",
+        "baseball",
+        "Home",
+        "Away",
+        league="MLB",
+        id="mlb",
+    )
+    official = _state(
+        event_id="mlb",
+        home_score=5,
+        away_score=2,
+        status="final",
+        ended=True,
+        home_team_id="home-id",
+        away_team_id="away-id",
+        sport_state={"schema": "mlb-linescore-v1"},
+    )
+    generic = _state(
+        event_id="mlb",
+        home_score=2,
+        away_score=5,
+        status="final",
+        ended=True,
+    )
+
+    home, away, state, source = _settlement_context(
+        event,
+        [official, generic],
+    )
+
+    assert (home, away) == (5.0, 2.0)
+    assert state is official
+    assert source == "official_mlb_state"
+
+
+def test_mlb_generic_terminal_score_is_not_trusted_for_model_fitting():
+    event = Event(
+        "Away vs Home",
+        "baseball",
+        "Home",
+        "Away",
+        league="MLB",
+        id="mlb",
+    )
+    generic = _state(
+        event_id="mlb",
+        home_score=2,
+        away_score=5,
+        status="final",
+        ended=True,
+    )
+
+    home, away, state, source = _settlement_context(event, [generic])
+
+    assert (home, away) == (2.0, 5.0)
+    assert state is generic
+    assert source == "unverified_terminal_state"
 
 
 def _quote(restricted):

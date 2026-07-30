@@ -346,7 +346,7 @@
           <h2 class="title">Reactive settings advisor</h2>
           <div class="field-note">Compares realized after-cost managed trades across whole events, estimates how many logged opportunities would clear alternative execution filters, and reports the fitted sport model's shadow readiness. It does not alter probability, edge, signal quality, calibration, or engine gates.</div>
         </div>
-        <button class="ghost compact-button" id="us-policy-advisor-refresh" type="button">Analyze current data</button>
+        <button class="ghost compact-button" id="us-policy-advisor-refresh" type="button">Analyze all retained data</button>
       </div>
       <div class="us-policy-advisor-controls">
         <label>Goal
@@ -361,6 +361,7 @@
         </label>
         <label>Analyze trade mode
           <select id="us-policy-advisor-mode">
+            <option value="combined" selected>All retained live + dry-run fills</option>
             <option value="live">Live fills</option>
             <option value="dry_run">Dry-run fills</option>
           </select>
@@ -382,7 +383,7 @@
         <label><input type="checkbox" data-advisor-market-type="spread" checked> Spread / run line</label>
         <label><input type="checkbox" data-advisor-market-type="total" checked> Game total</label>
       </fieldset>
-      <div class="notice us-safety-note"><strong>Reactive, not automatic:</strong> changing the goal or requested frequency generates a new auditable comparison. A recommendation changes nothing until you explicitly apply it. Applying switches the risk style to Custom and disarms live orders so you can review and re-arm.</div>
+      <div class="notice us-safety-note"><strong>Reactive, not automatic:</strong> changing the goal or requested frequency generates a new auditable comparison. All-data mode pools live and simulated outcomes for candidate discovery but cannot one-click validate a live policy. A recommendation changes nothing until you explicitly preview or apply it.</div>
       <div id="us-policy-advisor-status" class="refresh-status" role="status" aria-live="polite">Run an analysis to compare the current policy with available trade and model evidence.</div>
       <div id="us-policy-advisor-result" class="us-policy-advisor-result">
         <div class="metrics-empty">No recommendation has been generated in this page session.</div>
@@ -413,8 +414,19 @@
         </button>
       </div>
       <div id="us-trading-status" class="us-trading-status" role="status" aria-live="polite">Loading execution policy…</div>
+      <div id="us-lane-coordination-status" class="us-lane-coordination-status" role="status" aria-live="polite">
+        Tap a lane to edit it. Dry-run and live automation are independent and can run together.
+      </div>
+      <div class="us-lane-quick-control">
+        <div>
+          <strong id="us-quick-lane-title">Dry-run quick control</strong>
+          <span id="us-quick-lane-status">Start or stop the selected lane without changing its other saved settings.</span>
+        </div>
+        <button class="primary" id="us-lane-automation-toggle" type="button">Start dry-run automation</button>
+      </div>
+      <div id="us-policy-save-status" class="us-policy-save-status" role="alert" aria-live="assertive" hidden></div>
       <form id="us-trading-form" class="us-trading-form">
-        <label>Automation lane
+        <label class="us-lane-select-field">Automation lane
           <select id="us-trading-mode">
             <option value="dry_run">Dry run / simulated fills</option>
             <option value="live">Live Polymarket US orders</option>
@@ -436,14 +448,88 @@
           <span class="field-note">Named styles derive the risk fields below; Custom leaves every field editable.</span>
         </label>
         <div id="us-risk-preset-preview" class="us-risk-preset-preview us-check-wide" aria-live="polite"></div>
-        <fieldset class="us-line-type-policy us-check-wide">
+        <fieldset id="us-line-type-policy" class="us-line-type-policy us-check-wide">
           <legend>Line types eligible for automatic entry</legend>
           <label><input type="checkbox" data-entry-market-type="moneyline"> Moneyline</label>
           <label><input type="checkbox" data-entry-market-type="spread"> Spread / run line</label>
           <label><input type="checkbox" data-entry-market-type="total"> Game total</label>
           <div class="field-note">This is an execution filter only. Disabled types are still calculated and visible elsewhere, but the auto trader will not enter them. At least one type must remain selected.</div>
         </fieldset>
-        <fieldset class="us-line-type-policy us-check-wide">
+        <details id="us-line-profile-policy" class="advanced us-check-wide us-line-profile-policy">
+          <summary>Line- and game-stage-specific execution profiles</summary>
+          <p class="field-note">Optional execution overlays around the existing probability, edge, and signal-quality calculations. An all-stage profile applies to a line everywhere; an early, middle, or late profile refines it when MLB game state is available. Blank values inherit the global setting.</p>
+          <div class="us-line-profile-key">
+            <label>Line type
+              <select id="us-profile-market">
+                <option value="moneyline">Moneyline</option>
+                <option value="spread">Spread / run line</option>
+                <option value="total">Game total</option>
+              </select>
+            </label>
+            <label>Game stage
+              <select id="us-profile-stage">
+                <option value="all">All stages / fallback</option>
+                <option value="early">Early · 50%+ remaining</option>
+                <option value="middle">Middle · 25–50% remaining</option>
+                <option value="late">Late · under 25% remaining</option>
+              </select>
+            </label>
+            <label class="us-check"><input id="us-profile-enabled" type="checkbox" checked> Allow entries for this profile</label>
+          </div>
+          <div class="us-line-profile-grid">
+            <label>Minimum edge (%)
+              <input data-profile-field="min_edge" data-profile-percent type="number" min="0" max="99" step="any" placeholder="Inherit">
+            </label>
+            <label>Maximum edge (%)
+              <input data-profile-field="max_edge" data-profile-percent type="number" min="0.1" max="100" step="any" placeholder="Inherit">
+            </label>
+            <label>Minimum signal quality
+              <input data-profile-field="min_signal_quality" type="number" min="0" max="100" step="any" placeholder="Inherit">
+            </label>
+            <label>Minimum independent references
+              <input data-profile-field="min_reference_sources" data-profile-integer type="number" min="1" step="1" placeholder="Inherit">
+            </label>
+            <label>Entry price floor (¢)
+              <input data-profile-field="min_entry_price" data-profile-percent type="number" min="5.1" max="94.8" step="any" placeholder="Inherit">
+            </label>
+            <label>Entry price ceiling (¢)
+              <input data-profile-field="max_entry_price" data-profile-percent type="number" min="5.2" max="94.9" step="any" placeholder="Inherit">
+            </label>
+            <label>Maximum spread (¢)
+              <input data-profile-field="max_spread" data-profile-percent type="number" min="0.1" max="99" step="any" placeholder="Inherit">
+            </label>
+            <label>Minimum top-of-book shares
+              <input data-profile-field="min_book_shares" type="number" min="0.01" step="any" placeholder="Inherit">
+            </label>
+            <label>Minimum hold (minutes)
+              <input data-profile-field="min_hold_minutes" type="number" min="0" step="any" placeholder="Inherit">
+            </label>
+            <label>Profit target (%)
+              <input data-profile-field="profit_target" data-profile-percent type="number" min="0.01" max="99" step="any" placeholder="Inherit">
+            </label>
+            <label>Retained-profit floor (%)
+              <input data-profile-field="minimum_locked_profit" data-profile-percent type="number" min="0" max="98.9" step="any" placeholder="Inherit">
+            </label>
+            <label>Trailing pullback (%)
+              <input data-profile-field="trailing_drawdown" data-profile-percent type="number" min="0.01" max="99" step="any" placeholder="Inherit">
+            </label>
+            <label>Stop loss (%)
+              <input data-profile-field="stop_loss" data-profile-percent type="number" min="0.01" max="99" step="any" placeholder="Inherit">
+            </label>
+            <label>Model-reversal edge (%)
+              <input data-profile-field="exit_edge" data-profile-percent type="number" min="-99" max="99" step="any" placeholder="Inherit">
+            </label>
+            <label>Minimum MLB game remaining (%)
+              <input data-profile-field="min_mlb_fraction_remaining" data-profile-percent type="number" min="0" max="100" step="any" placeholder="Inherit">
+            </label>
+          </div>
+          <div class="us-line-profile-actions">
+            <button class="ghost compact-button" id="us-profile-save" type="button">Save/update profile</button>
+            <button class="ghost compact-button" id="us-profile-remove" type="button">Remove selected profile</button>
+          </div>
+          <div id="us-line-profile-list" class="us-line-profile-list">No line-specific profiles saved. Global settings apply to every line.</div>
+        </details>
+        <fieldset id="us-market-scope-policy" class="us-line-type-policy us-check-wide">
           <legend>Game segments eligible for automatic entry</legend>
           <label><input type="checkbox" data-entry-market-scope="full_game"> Full game</label>
           <label><input type="checkbox" data-entry-market-scope="first_inning"> MLB first inning runs</label>
@@ -492,6 +578,10 @@
         </label>
         <label>Meaningful profit target (%)
           <input id="us-profit-target" data-derived-risk type="number" min="0.01" max="99" step="any" required>
+        </label>
+        <label>Minimum retained profit after protection arms (%)
+          <input id="us-min-locked-profit" data-derived-risk type="number" min="0" max="98.9" step="any" required>
+          <span class="field-note">Ordinary trailing and edge-decay exits will not chase a gap below this fee-adjusted return. Hard stops and material model reversals remain active.</span>
         </label>
           </div>
         </details>
@@ -573,7 +663,7 @@
           </div>
           <div class="us-always-enforced"><strong>Always enforced:</strong> exact Polymarket US contract mapping, open authenticated order book, hard 5c–95c price range, your price/spread/depth settings, buying power and exposure limits, and live arm/preview/fee-adjusted-edge checks.</div>
         </fieldset>
-        <div class="field-note us-check-wide">Profit exits still need a meaningful gain followed by edge decay or a trailing pullback. Ordinary MLB stops can require consecutive readings and a short game-state-aware grace period; terminal, irreversible, materially reversed, and catastrophic conditions remain immediate. A one-cent gain alone never triggers an exit.</div>
+        <div class="field-note us-check-wide">Profit exits still need a meaningful gain followed by edge decay or a trailing pullback. Once armed, an ordinary profit exit cannot chase the executable quote below the configured fee-adjusted retained-profit floor; a missed floor waits for recovery while hard stops and material model reversals remain active. A one-cent gain alone never triggers an exit.</div>
         <details class="advanced us-check-wide us-policy-advanced">
           <summary>Advanced risk and exit limits</summary>
           <div class="us-advanced-grid">
@@ -612,7 +702,8 @@
               <input id="us-exit-edge" data-derived-risk type="number" min="-99" max="99" step="any" required>
             </label>
             <label>Analysis cycle (seconds)
-              <input id="us-cycle-seconds" data-derived-risk type="number" min="10" max="300" step="1" required>
+              <input id="us-cycle-seconds" data-derived-risk type="number" min="1" max="300" step="0.5" required>
+              <span class="field-note">Re-evaluates the latest retained game and market state. It does not make a separate Odds API request, so it can match your monitoring interval.</span>
             </label>
           </div>
         </details>
@@ -734,8 +825,13 @@
       </div>
       <div class="notice us-safety-note"><strong>No silent learning:</strong> fitting creates a versioned comparison candidate with a chronological event-block test. Promotion remains a separate reviewed process and is not available from this screen.</div>
       <details class="advanced research-evidence-transfer">
-        <summary>Merge local and hosted research evidence</summary>
-        <div class="field-note">Download a secret-free archive from the local workstation, then upload that same file on the hosted site. Imports are idempotent and include closed trade outcomes, settings-at-entry, audit rows, adaptive-exit labels, and Model Lab observations. Open positions, orders, credentials, cookies, and execution controls are excluded.</div>
+        <summary>Synchronize local and hosted research evidence</summary>
+        <div class="field-note">This transfer works in both directions. To create the central hosted dataset, export once from the workstation and merge it on the website. Dry runs started later from a phone are then retained in the hosted dry-run lane. To bring those newer hosted sessions back to this computer, export from the website and merge the archive locally.</div>
+        <ol class="research-evidence-steps">
+          <li><strong>Export here</strong><span>Downloads closed trades, entry settings, audit evidence, adaptive labels, and Model Lab rows from both lanes.</span></li>
+          <li><strong>Open the other installation</strong><span>Website for local-to-hosted; workstation for hosted-to-local.</span></li>
+          <li><strong>Merge once</strong><span>Checksums and source-lane IDs make repeat imports safe. Live and dry-run evidence stay separate.</span></li>
+        </ol>
         <div class="research-evidence-actions">
           <button class="ghost compact-button" id="research-evidence-export" type="button">Download evidence archive</button>
           <input id="research-evidence-file" type="file" accept=".gz,application/gzip">

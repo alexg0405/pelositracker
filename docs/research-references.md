@@ -22,6 +22,10 @@
 - MLB Game Strategy Explorer (2016-2025 empirical state tables): <https://baseballsavant.mlb.com/game-strategy-explorer>
 - Wheatcroft, calibration rather than accuracy for sports-betting model selection: <https://doi.org/10.1016/j.mlwa.2024.100539>
 - Gupta and Ramdas, online post-hoc calibration under sequential data: <https://proceedings.mlr.press/v202/gupta23c.html>
+- Wang, Agarwal, and Dudik, event-context off-policy evaluation and SWITCH:
+  <https://proceedings.mlr.press/v70/wang17a.html>
+- Brill, Yurko, and Wyner, clustered play-level sports uncertainty and
+  event-aware resampling: <https://arxiv.org/abs/2406.16171>
 - Huber and Heumann et al., hierarchical batter/pitcher matchup models (2025 preprint): <https://arxiv.org/abs/2511.17733>
 - Kaminski and Lo, stop-loss rules under momentum and random-walk processes: <https://citeseerx.ist.psu.edu/document?doi=954a65e94b6cee2abf017650e7381aacef54f8b2&repid=rep1&type=pdf>
 - Lo and Remorov, stop-loss rules with serial correlation, regimes, and transaction costs: <https://ssrn.com/abstract=2695383>

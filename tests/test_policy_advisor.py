@@ -156,3 +156,59 @@ def test_policy_advisor_fits_upper_edge_line_type_and_repeat_filters():
     assert advice["evidence"]["event_block_bootstrap"]["lower_95"] > 0
     assert advice["diagnostics"]["line_types"]
     assert advice["candidate_frontier"]
+
+
+def test_combined_live_and_dry_run_history_is_exploratory_even_when_profitable():
+    trades = []
+    opportunities = []
+    start = 2_000_000_000.0
+    for event_number in range(30):
+        mode = "live" if event_number % 2 == 0 else "dry_run"
+        for index in range(2):
+            observed = start + event_number * 7200 + index * 180
+            row = {
+                "id": f"position-{event_number}-{index}",
+                "event_id": f"event-{event_number}",
+                "mode": mode,
+                "opened_ts": observed,
+                "closed_ts": observed + 300,
+                "cost_basis": 1.0,
+                "realized_pnl": 0.20,
+                "signal_edge": 0.08,
+                "signal_quality": 82.0,
+                "reference_sources": 2,
+                "entry_cost": 0.45,
+                "market_type": "moneyline",
+                "market_slug": f"event-{event_number}-{index}",
+                "selection": f"side-{index}",
+                "game_fraction_remaining": 0.60,
+                "exit_reason": "research",
+            }
+            trades.append(row)
+            opportunities.append({**row, "observed_ts": observed})
+    current = {
+        field: getattr(TradingPolicy(), field)
+        for field in TradingPolicy.__dataclass_fields__
+    }
+
+    advice = recommend_policy(
+        closed_trades=trades,
+        opportunities=opportunities,
+        current_policy=current,
+        objective="balanced",
+        target_trades_per_hour=4.0,
+        analysis_mode="combined",
+        market_types=("moneyline",),
+    )
+
+    assert advice["evidence"]["eligible_closed_trades"] == 60
+    assert advice["evidence"]["statistical_validation_passed"] is True
+    assert advice["validation_passed"] is False
+    assert advice["apply_allowed"] is False
+    assert advice["status"] == "exploratory_cross_lane"
+    assert {
+        row["label"] for row in advice["diagnostics"]["execution_modes"]
+    } == {"dry_run", "live"}
+    assert "cannot validate" in advice["evidence"][
+        "execution_domain_warning"
+    ]

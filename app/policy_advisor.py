@@ -16,7 +16,7 @@ import statistics
 from typing import Any, Iterable, Mapping, Sequence
 
 
-ADVISOR_VERSION = "execution-policy-advisor-v3-event-balanced"
+ADVISOR_VERSION = "execution-policy-advisor-v4-line-stage-uncertainty"
 ADVISOR_OBJECTIVES = {
     "protect_profit": {
         "label": "Protect profit",
@@ -490,10 +490,22 @@ def _category_diagnostics(
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped[str(row.get(key) or "unknown")].append(row)
-    return [
-        {"label": label, **_performance(group)}
-        for label, group in sorted(grouped.items())
-    ]
+    result = []
+    for label, group in sorted(grouped.items()):
+        performance = _performance(group)
+        bootstrap = _bootstrap(_event_roi_values(group))
+        result.append({
+            "label": label,
+            **performance,
+            "event_block_bootstrap": bootstrap,
+            "support": (
+                "directional"
+                if int(performance["events"]) >= 10
+                and int(performance["trades"]) >= 20
+                else "sparse"
+            ),
+        })
+    return result
 
 
 def _diagnostics(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -507,7 +519,21 @@ def _diagnostics(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     repeat_entries = [
         row for row in rows if int(row.get("event_entries_60m") or 1) > 1
     ]
+    line_stage_rows = []
+    for source in known_stage:
+        row = dict(source)
+        fraction = float(row["game_fraction_remaining"])
+        stage = (
+            "early"
+            if fraction >= 0.50
+            else "middle"
+            if fraction >= 0.25
+            else "late"
+        )
+        row["line_stage"] = f"{_market_type(row.get('market_type'))} / {stage}"
+        line_stage_rows.append(row)
     return {
+        "execution_modes": _category_diagnostics(rows, "mode"),
         "line_types": _category_diagnostics(rows, "market_type"),
         "edge_bands": _bucket_diagnostics(
             rows,
@@ -559,6 +585,10 @@ def _diagnostics(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
             "total": len(rows),
             "fraction": len(known_stage) / len(rows) if rows else 0.0,
         },
+        "line_by_game_stage": _category_diagnostics(
+            line_stage_rows,
+            "line_stage",
+        ),
         "exit_reasons": _category_diagnostics(rows, "exit_reason"),
     }
 
@@ -584,8 +614,13 @@ def recommend_policy(
     selected_mode = str(
         analysis_mode or current_policy.get("execution_mode") or "dry_run"
     )
-    if selected_mode not in {"dry_run", "live"}:
-        raise ValueError("analysis_mode must be dry_run or live")
+    if selected_mode not in {"dry_run", "live", "combined"}:
+        raise ValueError("analysis_mode must be dry_run, live, or combined")
+    selected_execution_modes = (
+        {"dry_run", "live"}
+        if selected_mode == "combined"
+        else {selected_mode}
+    )
     current_allowed = tuple(
         _market_type(value)
         for value in current_policy.get(
@@ -609,7 +644,7 @@ def recommend_policy(
     raw_closed = [
         dict(row)
         for row in closed_trades
-        if str(row.get("mode") or selected_mode) == selected_mode
+        if str(row.get("mode") or selected_mode) in selected_execution_modes
         and row.get("realized_pnl") is not None
         and _finite(row.get("cost_basis")) is not None
         and float(row.get("cost_basis") or 0.0) > 0
@@ -644,7 +679,7 @@ def recommend_policy(
     raw_opportunities = [
         dict(row)
         for row in opportunities
-        if str(row.get("mode") or selected_mode) == selected_mode
+        if str(row.get("mode") or selected_mode) in selected_execution_modes
         and all(
             _finite(row.get(field)) is not None
             for field in (
@@ -770,7 +805,7 @@ def recommend_policy(
     bootstrap_probability = bootstrap.get("probability_positive")
     lower_bound = bootstrap.get("lower_95")
     concentration = selected_test.get("maximum_event_stake_share")
-    validation_passed = (
+    statistical_validation_passed = (
         evidence_ready
         and test_supported
         and test_roi is not None
@@ -782,10 +817,19 @@ def recommend_policy(
         and concentration is not None
         and float(concentration) <= 0.35
     )
+    # Simulated and live fills have different execution domains. Pooled history
+    # is useful for discovering candidate filters and comparing regimes, but it
+    # must never become one-click live authorization merely because simulated
+    # fills dominate a favorable aggregate.
+    validation_passed = (
+        statistical_validation_passed and selected_mode != "combined"
+    )
     if not evidence_ready:
         status = "exploratory"
     elif not test_supported:
         status = "held_back_insufficient_later_event_test"
+    elif selected_mode == "combined" and statistical_validation_passed:
+        status = "exploratory_cross_lane"
     elif validation_passed:
         status = "evidence_backed_research"
     else:
@@ -870,6 +914,14 @@ def recommend_policy(
                 "fraction": metadata_complete / len(rows) if rows else 0.0,
             },
             "validation_passed": validation_passed,
+            "statistical_validation_passed": statistical_validation_passed,
+            "execution_domain_warning": (
+                "Combined research pools simulated and live execution outcomes. "
+                "It may suggest candidate filters, but it cannot validate a "
+                "one-click live policy; re-run the candidate on live fills only "
+                "before treating it as live evidence."
+                if selected_mode == "combined" else ""
+            ),
             "selection_bias_warning": (
                 "Historical fills come from policies that were actually used. "
                 "A looser policy cannot reveal the P/L of trades never placed."
@@ -893,6 +945,10 @@ def recommend_policy(
             "Suggested filters cleared positive later-event after-cost ROI, "
             "event concentration, and 90% whole-event bootstrap checks."
             if validation_passed
+            else "Cross-lane analysis is exploratory: dry-run and live fills "
+            "were aggregated for candidate discovery, but one-click application "
+            "is locked until the same filters validate on one execution mode."
+            if selected_mode == "combined"
             else "Diagnostic suggestion only: applying is locked until at least "
             f"{MIN_CLOSED_TRADES} complete trades across "
             f"{MIN_INDEPENDENT_EVENTS} events produce a supported positive "

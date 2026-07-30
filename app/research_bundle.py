@@ -184,13 +184,25 @@ def _read_and_validate(fileobj: BinaryIO) -> dict[str, Any]:
                 if kind != "batch":
                     raise ResearchBundleError("unsupported research bundle record")
                 table = item.get("table")
+                source = item.get("source")
                 rows = item.get("rows")
                 if (
                     not isinstance(table, str)
                     or table not in _ALL_TABLES
+                    or source not in {"live", "dry_run", "model_lab"}
                     or not isinstance(rows, list)
                 ):
                     raise ResearchBundleError("unsupported research evidence table")
+                if (
+                    table in MODEL_EVIDENCE_TABLES
+                    and source != "model_lab"
+                ) or (
+                    table in _TRADER_TABLES
+                    and source not in {"live", "dry_run"}
+                ):
+                    raise ResearchBundleError(
+                        "research evidence source does not match its table"
+                    )
                 if not rows or len(rows) > 5_000:
                     raise ResearchBundleError("invalid research evidence batch size")
                 for row in rows:
@@ -238,10 +250,10 @@ def _read_and_validate(fileobj: BinaryIO) -> dict[str, Any]:
 def merge_research_bundle(
     fileobj: BinaryIO,
     *,
-    trader: PolymarketUSAutoTrader,
+    traders: Mapping[str, PolymarketUSAutoTrader],
     model_lab: SportModelLab,
 ) -> dict[str, Any]:
-    """Validate twice, then idempotently merge evidence into the central stores."""
+    """Validate twice, then merge evidence into its original execution lane."""
     validated = _read_and_validate(fileobj)
     fileobj.seek(0)
     accepted: dict[str, int] = {}
@@ -255,11 +267,25 @@ def merge_research_bundle(
             if table in MODEL_EVIDENCE_TABLES:
                 count = model_lab.merge_research_batch(table, rows)
             else:
+                source = str(item.get("source") or "")
+                trader = traders.get(source)
+                if trader is None:
+                    raise ResearchBundleError(
+                        f"the {source or 'unknown'} execution lane is unavailable"
+                    )
                 count = trader.merge_research_batch(table, rows)
-            accepted[table] = accepted.get(table, 0) + count
+            accepted_key = (
+                table
+                if table in MODEL_EVIDENCE_TABLES
+                else f"{item['source']}:{table}"
+            )
+            accepted[accepted_key] = accepted.get(accepted_key, 0) + count
     return {
         **validated,
         "accepted": accepted,
         "accepted_rows": sum(accepted.values()),
-        "merge_policy": "primary-key idempotent; existing hosted rows are preserved",
+        "merge_policy": (
+            "source-lane primary-key idempotent; existing destination rows "
+            "are preserved"
+        ),
     }

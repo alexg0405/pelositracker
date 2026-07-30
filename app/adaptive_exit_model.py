@@ -359,11 +359,13 @@ class AdaptiveExitModel:
         path: str | None,
         *,
         clock: Callable[[], float],
+        database_namespace: str | None = None,
     ):
         self._db = Database.open(
             path,
             sqlite_envs=("POLYMARKET_US_TRADING_DB",),
             sqlite_default=path or "polymarket-us-trading.db",
+            postgres_schema=database_namespace,
         )
         self.path = self._db.target
         self._clock = clock

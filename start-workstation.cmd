@@ -32,7 +32,7 @@ set "ENABLE_POLYMARKET_US_TRADING=true"
 set "LEDGER_DB=workstation-data\ledger.db"
 set "HISTORY_DB=workstation-data\history.db"
 set "STATE_DB=workstation-data\state.db"
-set "POLYMARKET_US_TRADING_DB=workstation-data\polymarket-us-trading.db"
+set "POLYMARKET_US_TRADING_DB=polymarket-us-trading.db"
 set "POLYMARKET_US_DRY_RUN_DB=workstation-data\polymarket-us-dry-run.db"
 set "MODEL_LAB_DB=workstation-data\model-lab.db"
 set "ENABLE_MLB_LIVE_FEED=true"
@@ -46,7 +46,7 @@ echo.
 echo PelosiTracker US Research Workstation
 echo Local URL: http://127.0.0.1:8775
 echo Login: admin / admin
-echo Live trading data: workstation-data\polymarket-us-trading.db
+echo Live trading data: polymarket-us-trading.db
 echo Dry-run data: workstation-data\polymarket-us-dry-run.db
 echo Press Ctrl+C in this window to stop it.
 echo Restart this server after local Python code changes.
