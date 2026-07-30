@@ -104,7 +104,6 @@ class HistoryDB:
         )
         self.path = self._db.target
         self.backend = self._db.backend
-        self._conn = self._db.connection
         self._lock = threading.Lock()
         # The live engine still receives every websocket update. Persistence is
         # sampled separately because multi-megabyte order-book telemetry at

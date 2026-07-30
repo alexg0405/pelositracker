@@ -211,7 +211,6 @@ class Ledger:
         )
         self.path = self._db.target
         self.backend = self._db.backend
-        self._conn = self._db.connection
         self._lock = threading.Lock()
         self._last_prune = 0.0
         self._retention_seconds = _retention_seconds()

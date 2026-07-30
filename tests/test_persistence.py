@@ -1,4 +1,5 @@
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
@@ -57,11 +58,28 @@ def test_store_environment_fallbacks_use_sqlite(tmp_path, monkeypatch):
 
 
 def test_database_url_keeps_postgres_as_the_default(monkeypatch):
-    class FakeConnection:
-        autocommit = True
-
+    class FakeCursor:
         def close(self):
             pass
+
+    class FakeConnection:
+        autocommit = True
+        closed = 0
+        info = SimpleNamespace(
+            transaction_status=database_module.psycopg2.extensions.TRANSACTION_STATUS_IDLE
+        )
+
+        def cursor(self):
+            return FakeCursor()
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            self.closed = 1
 
     connection = FakeConnection()
     captured = {}
@@ -73,6 +91,8 @@ def test_database_url_keeps_postgres_as_the_default(monkeypatch):
     try:
         assert database.backend == "postgres"
         assert database.target == "postgresql://example.invalid/app"
+        with database.cursor():
+            pass
         assert connection.autocommit is False
         assert captured.get("keepalives") == 1  # idle-drop protection is configured
     finally:
@@ -94,8 +114,15 @@ def test_postgres_namespace_is_created_and_selected_for_isolated_lane(
         def execute(self, statement):
             statements.append(statement)
 
+        def close(self):
+            pass
+
     class FakeConnection:
         autocommit = True
+        closed = 0
+        info = SimpleNamespace(
+            transaction_status=database_module.psycopg2.extensions.TRANSACTION_STATUS_IDLE
+        )
 
         def cursor(self):
             return FakeCursor()
@@ -103,8 +130,11 @@ def test_postgres_namespace_is_created_and_selected_for_isolated_lane(
         def commit(self):
             statements.append("COMMIT")
 
-        def close(self):
+        def rollback(self):
             pass
+
+        def close(self):
+            self.closed = 1
 
     monkeypatch.setenv("DATABASE_URL", "postgresql://example.invalid/app")
     monkeypatch.setattr(
@@ -121,13 +151,91 @@ def test_postgres_namespace_is_created_and_selected_for_isolated_lane(
     )
     try:
         assert database.postgres_schema == "polymarket_us_dry_run"
+        with database.cursor():
+            pass
         assert statements == [
             'CREATE SCHEMA IF NOT EXISTS "polymarket_us_dry_run"',
-            'SET search_path TO "polymarket_us_dry_run"',
+            "COMMIT",
+            'SET LOCAL search_path TO "polymarket_us_dry_run"',
             "COMMIT",
         ]
     finally:
         database.close()
+
+
+def test_postgres_stores_share_one_bounded_process_pool(monkeypatch):
+    connections = []
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, _statement):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeConnection:
+        autocommit = True
+        closed = 0
+
+        def __init__(self):
+            self.close_count = 0
+            self.info = SimpleNamespace(
+                transaction_status=(
+                    database_module.psycopg2.extensions.TRANSACTION_STATUS_IDLE
+                )
+            )
+
+        def cursor(self):
+            return FakeCursor()
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            self.close_count += 1
+            self.closed = 1
+
+    def connect(*_args, **_kwargs):
+        connection = FakeConnection()
+        connections.append(connection)
+        return connection
+
+    target = "postgresql://example.invalid/shared-pool"
+    monkeypatch.setattr(database_module.psycopg2, "connect", connect)
+    stores = [
+        Database.open(target, sqlite_envs=(), sqlite_default=""),
+        Database.open(target, sqlite_envs=(), sqlite_default=""),
+        Database.open(
+            target,
+            sqlite_envs=(),
+            sqlite_default="",
+            postgres_schema="polymarket_us_dry_run",
+        ),
+    ]
+    try:
+        for store in stores:
+            with store.cursor():
+                pass
+        # Sequential work across both schemas reuses the one warm socket. The
+        # pool may grow only when transactions genuinely overlap, and is capped.
+        assert len(connections) == 1
+        assert stores[0]._postgres_pool is stores[1]._postgres_pool
+        assert stores[1]._postgres_pool is stores[2]._postgres_pool
+        stores[0].close()
+        assert connections[0].close_count == 0
+    finally:
+        for store in stores:
+            store.close()
+    assert connections[0].close_count == 1
 
 
 def test_transaction_rolls_back_all_sqlite_writes_on_error(tmp_path):

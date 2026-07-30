@@ -633,7 +633,6 @@ class AccountBook:
         )
         self.path = self._db.target
         self.backend = self._db.backend
-        self._conn = self._db.connection
         self._lock = threading.Lock()
         with self._lock:
             self._db.initialize(_SCHEMA, component="accounts", version=1)

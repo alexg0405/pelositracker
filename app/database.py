@@ -11,6 +11,7 @@ import re
 import sqlite3
 import hashlib
 import json
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
@@ -18,6 +19,7 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 try:  # SQLite-only installs should not need a PostgreSQL driver at import time.
     import psycopg2
     import psycopg2.extras
+    import psycopg2.pool
 except ImportError:  # pragma: no cover - requirements include psycopg2 in CI
     psycopg2 = None
 
@@ -40,6 +42,64 @@ _KEEPALIVES = {
     "keepalives_interval": 10,
     "keepalives_count": 5,
 }
+
+
+def _postgres_pool_size() -> int:
+    """Keep each process comfortably below small managed-session limits.
+
+    Render briefly overlaps the old and new process during a deploy. Supabase's
+    session pooler counts every client socket, so one persistent connection per
+    store can make an otherwise healthy zero-downtime deploy impossible. Two
+    process-wide connections preserve limited write concurrency while leaving
+    ample headroom under the smallest hosted pool limits.
+    """
+    try:
+        return max(1, min(int(os.getenv("POSTGRES_POOL_MAX_CONNECTIONS", "2")), 4))
+    except ValueError:
+        return 2
+
+
+class _SharedPostgresPool:
+    def __init__(self, target: str):
+        self.target = target
+        self.max_connections = _postgres_pool_size()
+        self.pool = psycopg2.pool.ThreadedConnectionPool(
+            1,
+            self.max_connections,
+            target,
+            **_KEEPALIVES,
+        )
+        self.slots = threading.BoundedSemaphore(self.max_connections)
+        self.references = 1
+
+
+_POSTGRES_POOLS: dict[str, _SharedPostgresPool] = {}
+_POSTGRES_POOLS_LOCK = threading.Lock()
+
+
+def _acquire_postgres_pool(target: str) -> _SharedPostgresPool:
+    with _POSTGRES_POOLS_LOCK:
+        shared = _POSTGRES_POOLS.get(target)
+        if shared is None:
+            shared = _SharedPostgresPool(target)
+            _POSTGRES_POOLS[target] = shared
+        else:
+            shared.references += 1
+        return shared
+
+
+def _release_postgres_pool(shared: _SharedPostgresPool) -> None:
+    close_pool = False
+    with _POSTGRES_POOLS_LOCK:
+        current = _POSTGRES_POOLS.get(shared.target)
+        if current is not shared:
+            return
+        shared.references -= 1
+        if shared.references <= 0:
+            _POSTGRES_POOLS.pop(shared.target, None)
+            close_pool = True
+    if close_pool:
+        shared.pool.closeall()
 
 
 def _looks_postgres(value: str) -> bool:
@@ -68,10 +128,18 @@ class Database:
         if postgres_schema is not None and backend != "postgres":
             raise ValueError("PostgreSQL schemas require a PostgreSQL database")
         self.postgres_schema = postgres_schema
+        self._closed = False
+        self._postgres_pool: _SharedPostgresPool | None = None
         if backend == "postgres":
             if psycopg2 is None:  # pragma: no cover - only on incomplete installs
                 raise RuntimeError("psycopg2 is required when DATABASE_URL is configured")
-            self.connection = self._connect_postgres()
+            self._postgres_pool = _acquire_postgres_pool(target)
+            try:
+                self._ensure_postgres_schema()
+            except BaseException:
+                _release_postgres_pool(self._postgres_pool)
+                self._postgres_pool = None
+                raise
         else:
             if target != ":memory:" and not target.startswith("file:"):
                 parent = Path(target).expanduser().resolve().parent
@@ -261,59 +329,107 @@ class Database:
                 "VALUES (%s,%s,%s,%s)", (component, version, checksum, time.time()),
             )
 
-    def _connect_postgres(self):
-        connection = psycopg2.connect(self.target, **_KEEPALIVES)
-        connection.autocommit = False
-        if self.postgres_schema:
-            # The live and simulated execution lanes need independent mutable
-            # policies and ledgers while still using one durable DATABASE_URL.
-            # A validated, fixed schema name keeps those stores isolated without
-            # duplicating every trading table or weakening SQL identifier safety.
-            schema = self.postgres_schema
-            with connection.cursor() as cur:
-                cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
-                cur.execute(f'SET search_path TO "{schema}"')
-            connection.commit()
-        return connection
+    @contextmanager
+    def _postgres_connection(self) -> Iterator:
+        """Borrow one process-wide PostgreSQL connection.
 
-    def _reconnect(self) -> None:
-        """Drop and reopen a dead Postgres connection so the next call succeeds."""
-        if self.backend != "postgres":
-            return
+        A semaphore makes psycopg2's non-blocking pool wait instead of raising
+        ``PoolError`` when both short transactions are busy. Broken sockets are
+        discarded so the next borrower gets a fresh managed-pooler session.
+        """
+        shared = self._postgres_pool
+        if shared is None or self._closed:
+            raise RuntimeError("database is closed")
+        if not shared.slots.acquire(timeout=30):
+            raise TimeoutError("timed out waiting for a PostgreSQL connection")
+        connection = None
+        discard = False
         try:
-            self.connection.close()
+            connection = shared.pool.getconn()
+            if getattr(connection, "closed", False):
+                shared.pool.putconn(connection, close=True)
+                connection = shared.pool.getconn()
+            connection.autocommit = False
+            yield connection
+        except _CONNECTION_ERRORS:
+            discard = True
+            raise
+        finally:
+            if connection is not None:
+                try:
+                    shared.pool.putconn(
+                        connection,
+                        close=discard or bool(getattr(connection, "closed", False)),
+                    )
+                finally:
+                    shared.slots.release()
+            else:
+                shared.slots.release()
+
+    def _ensure_postgres_schema(self) -> None:
+        if not self.postgres_schema:
+            return
+        # The live and simulated execution lanes have independent tables while
+        # sharing the same tiny process-level connection pool. Search-path
+        # selection is transaction-local below, so pooled connections can safely
+        # serve either schema without leaking lane state.
+        with self._postgres_connection() as connection:
+            try:
+                with connection.cursor() as cur:
+                    cur.execute(
+                        f'CREATE SCHEMA IF NOT EXISTS "{self.postgres_schema}"'
+                    )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def _select_postgres_schema(self, cur) -> None:
+        if self.postgres_schema:
+            cur.execute(
+                f'SET LOCAL search_path TO "{self.postgres_schema}"'
+            )
+
+    @staticmethod
+    def _safe_connection_rollback(connection) -> None:
+        try:
+            connection.rollback()
         except Exception:
             pass
-        self.connection = self._connect_postgres()
-
-    def _cursor(self, dict_rows: bool = False):
-        # Reopen first if a managed pooler dropped the idle connection, so the app
-        # recovers without a restart.
-        if self.backend == "postgres" and self.connection.closed:
-            self._reconnect()
-        if self.backend == "postgres" and dict_rows:
-            return self.connection.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        return self.connection.cursor()
-
-    def _safe_rollback(self) -> None:
-        try:
-            self.connection.rollback()
-        except Exception:
-            self._reconnect()
 
     @contextmanager
     def cursor(self, *, dict_rows: bool = False) -> Iterator:
-        cur = self._cursor(dict_rows)
+        if self.backend == "postgres":
+            with self._postgres_connection() as connection:
+                cur = (
+                    connection.cursor(cursor_factory=psycopg2.extras.DictCursor)
+                    if dict_rows
+                    else connection.cursor()
+                )
+                try:
+                    self._select_postgres_schema(cur)
+                    yield cur
+                    # psycopg starts a transaction for SELECTs too; end that
+                    # snapshot promptly so no pool slot remains idle in one.
+                    connection.commit()
+                except _CONNECTION_ERRORS:
+                    raise
+                except BaseException:
+                    self._safe_connection_rollback(connection)
+                    raise
+                finally:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+            return
+
+        cur = self.connection.cursor()
         try:
             yield cur
-            # psycopg starts a transaction for SELECTs too; end that snapshot
-            # promptly so a long-lived app connection never sits idle in one.
             self.connection.commit()
-        except _CONNECTION_ERRORS:
-            self._reconnect()  # dead socket: heal for the next call, then surface
-            raise
         except BaseException:
-            self._safe_rollback()
+            self.connection.rollback()
             raise
         finally:
             try:
@@ -323,15 +439,35 @@ class Database:
 
     @contextmanager
     def transaction(self, *, dict_rows: bool = False) -> Iterator:
-        cur = self._cursor(dict_rows)
+        if self.backend == "postgres":
+            with self._postgres_connection() as connection:
+                cur = (
+                    connection.cursor(cursor_factory=psycopg2.extras.DictCursor)
+                    if dict_rows
+                    else connection.cursor()
+                )
+                try:
+                    self._select_postgres_schema(cur)
+                    yield cur
+                    connection.commit()
+                except _CONNECTION_ERRORS:
+                    raise
+                except BaseException:
+                    self._safe_connection_rollback(connection)
+                    raise
+                finally:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+            return
+
+        cur = self.connection.cursor()
         try:
             yield cur
             self.connection.commit()
-        except _CONNECTION_ERRORS:
-            self._reconnect()
-            raise
         except BaseException:
-            self._safe_rollback()
+            self.connection.rollback()
             raise
         finally:
             try:
@@ -416,4 +552,13 @@ class Database:
         return len(values)
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self.backend == "postgres":
+            shared = self._postgres_pool
+            self._postgres_pool = None
+            if shared is not None:
+                _release_postgres_pool(shared)
+            return
         self.connection.close()

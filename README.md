@@ -121,7 +121,11 @@ calibration calculations.
 
 SQLite is the local default. `DATABASE_URL` selects PostgreSQL for every store.
 All stores use component-scoped, versioned migrations with checksum drift
-protection; the same migrations can be applied repeatedly.
+protection; the same migrations can be applied repeatedly. PostgreSQL stores
+share one bounded process-wide connection pool instead of reserving one session
+per component. `POSTGRES_POOL_MAX_CONNECTIONS` defaults to `2` and is capped at
+`4`, which preserves short-transaction concurrency without exhausting small
+managed session pools during an overlapping Render deploy.
 
 Authentication uses Argon2 password hashes and individually revocable,
 expiring sessions. State-changing requests require a double-submit CSRF token.

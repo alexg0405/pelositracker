@@ -23,6 +23,11 @@ services:
         value: production
       - key: WEB_CONCURRENCY
         value: "1"
+      # Every store shares this bounded process-wide PostgreSQL pool. Keeping
+      # it at two leaves room for Render's old/new process overlap under small
+      # Supabase session-pool limits.
+      - key: POSTGRES_POOL_MAX_CONNECTIONS
+        value: "2"
       - key: WORKSTATION_MODE
         value: "false"
       - key: ENABLE_PAPER_BOTS
