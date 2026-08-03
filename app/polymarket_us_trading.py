@@ -24,7 +24,7 @@ import math
 import re
 import threading
 import time
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from uuid import uuid4
 
 from .approval import APPROVAL_TOKEN, approval_granted, approval_instruction
@@ -52,8 +52,8 @@ from .policy_advisor import (
 )
 
 
-POLICY_VERSION = "pmus-live-risk-policy-v10-line-stage-profiles"
-RISK_PRESET_VERSION = "risk-presets-v2"
+POLICY_VERSION = "pmus-live-risk-policy-v11-entry-stability"
+RISK_PRESET_VERSION = "risk-presets-v3"
 POLYMARKET_US_TAKER_FEE_COEFFICIENT = Decimal("0.05")
 _CONTROL_TOKEN_KEY = "_execution_control_token"
 RISK_PRESETS: dict[str, dict[str, Any]] = {
@@ -70,6 +70,11 @@ RISK_PRESETS: dict[str, dict[str, Any]] = {
         "min_edge": 0.06,
         "max_edge": 0.15,
         "min_signal_quality": 75.0,
+        "max_signal_quality": 100.0,
+        "min_source_agreement": 70.0,
+        "max_signal_age_seconds": 30.0,
+        "entry_confirmation_readings": 3,
+        "max_confirmation_price_drift": 0.01,
         "min_reference_sources": 2,
         "min_entry_price": 0.15,
         "max_entry_price": 0.85,
@@ -104,6 +109,11 @@ RISK_PRESETS: dict[str, dict[str, Any]] = {
         "min_edge": 0.04,
         "max_edge": 0.20,
         "min_signal_quality": 65.0,
+        "max_signal_quality": 100.0,
+        "min_source_agreement": 55.0,
+        "max_signal_age_seconds": 45.0,
+        "entry_confirmation_readings": 2,
+        "max_confirmation_price_drift": 0.02,
         "min_reference_sources": 2,
         "min_entry_price": 0.12,
         "max_entry_price": 0.88,
@@ -138,6 +148,11 @@ RISK_PRESETS: dict[str, dict[str, Any]] = {
         "min_edge": 0.025,
         "max_edge": 0.30,
         "min_signal_quality": 55.0,
+        "max_signal_quality": 100.0,
+        "min_source_agreement": 40.0,
+        "max_signal_age_seconds": 75.0,
+        "entry_confirmation_readings": 2,
+        "max_confirmation_price_drift": 0.03,
         "min_reference_sources": 1,
         "min_entry_price": 0.10,
         "max_entry_price": 0.90,
@@ -172,6 +187,11 @@ RISK_PRESETS: dict[str, dict[str, Any]] = {
         "min_edge": 0.015,
         "max_edge": 0.40,
         "min_signal_quality": 45.0,
+        "max_signal_quality": 100.0,
+        "min_source_agreement": 0.0,
+        "max_signal_age_seconds": 120.0,
+        "entry_confirmation_readings": 1,
+        "max_confirmation_price_drift": 0.05,
         "min_reference_sources": 1,
         "min_entry_price": 0.08,
         "max_entry_price": 0.92,
@@ -323,6 +343,10 @@ SUPPORTED_ENTRY_MARKET_SCOPES = SUPPORTED_MARKET_SCOPES
 SUPPORTED_ENTRY_MARKET_SCOPE_SET = frozenset(SUPPORTED_ENTRY_MARKET_SCOPES)
 _WORD = re.compile(r"[a-z0-9]+")
 _SIGNED_LINE = re.compile(r"(?<!\d)([+-]\d+(?:\.\d+)?)(?!\d)")
+# Rejection reasons embed live numbers ("edge 4.3c is below ..."); the dedup
+# key must not, or the cooldown never suppresses anything and qualification
+# chatter floods the journal's retention budget (measured at 80% of the cap).
+_REJECTION_KEY_NUMBERS = re.compile(r"[-+]?\d+(?:\.\d+)?")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS live_trading_config (
@@ -412,11 +436,84 @@ CREATE INDEX IF NOT EXISTS idx_policy_advice_created
     ON trading_policy_advice(created_ts DESC);
 """
 
+# Off-policy evaluation needs the population the policy chose *from*, not only
+# the fills it chose. The display journal cannot carry that: it is pruned to a
+# rolling 10,000 rows, so adding candidate volume there would evict the entry
+# history the advisor already depends on. Candidate contexts therefore get their
+# own append-only table with its own, much larger retention bound.
+_CANDIDATE_LOG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS candidate_observations (
+    id TEXT PRIMARY KEY,
+    observed_ts DOUBLE PRECISION NOT NULL,
+    mode TEXT NOT NULL,
+    policy_session_id TEXT,
+    policy_fingerprint TEXT,
+    execution_profile TEXT,
+    event_id TEXT NOT NULL,
+    event_name TEXT,
+    decision_id TEXT,
+    signal_market TEXT,
+    market_type TEXT,
+    market_scope TEXT,
+    selection TEXT,
+    position_side TEXT,
+    us_event_slug TEXT,
+    market_slug TEXT,
+    state TEXT NOT NULL,
+    reason TEXT,
+    mapped INTEGER NOT NULL,
+    executable INTEGER NOT NULL,
+    entered INTEGER NOT NULL,
+    signal_edge DOUBLE PRECISION,
+    signal_quality DOUBLE PRECISION,
+    source_agreement DOUBLE PRECISION,
+    signal_age_seconds DOUBLE PRECISION,
+    reference_sources INTEGER,
+    entry_cost DOUBLE PRECISION,
+    execution_edge DOUBLE PRECISION,
+    spread DOUBLE PRECISION,
+    book_shares DOUBLE PRECISION,
+    mapping_score DOUBLE PRECISION,
+    game_fraction_remaining DOUBLE PRECISION,
+    event_entries_60m INTEGER,
+    entry_confirmation_readings INTEGER,
+    confirmation_price_drift DOUBLE PRECISION,
+    candidate_rank INTEGER,
+    competing_candidates INTEGER,
+    selection_propensity DOUBLE PRECISION,
+    propensity_source TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_candidate_observations_observed
+    ON candidate_observations(observed_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_candidate_observations_mode
+    ON candidate_observations(mode, observed_ts);
+"""
+
+# The saved policy is deterministic: given one ranked candidate list it always
+# selects the same contract. Logged propensities are therefore degenerate (1 for
+# the attempted candidate, 0 for the rest), which does NOT identify inverse
+# propensity or doubly robust estimates. The marker is written with every row so
+# a later controlled-exploration mode is distinguishable from this one, and so
+# no downstream reader can mistake deterministic logs for randomized ones.
+DETERMINISTIC_PROPENSITY_SOURCE = "deterministic_policy"
+CANDIDATE_OBSERVATION_LIMIT = 300_000
+# Evaluation states that mean an order was placed and a reward will be observed.
+_ENTERED_CANDIDATE_STATES = frozenset({"simulated_fill", "live_fill"})
+# Measured on a real cycle, per-evaluation content is a small share of the
+# status payload and every field has a consumer: the UI reads state/reason,
+# and gate results plus the cycle's policy context are the audit record of the
+# cycle that produced the evaluation, which the saved policy may since have
+# diverged from. The oversized block was the authorization matrix, which is
+# trimmed at its source instead. `last_cycle_evaluation_count` bounds-checks
+# the list without stripping it.
+_STATUS_EVALUATION_OMITTED_FIELDS: frozenset[str] = frozenset()
+
 RESEARCH_EVIDENCE_TABLES = frozenset({
     "live_trading_journal",
     "live_managed_positions",
     "trading_policy_sessions",
     "trading_policy_advice",
+    "candidate_observations",
 })
 
 
@@ -431,7 +528,13 @@ class TradingExecutionError(RuntimeError):
 LINE_EXECUTION_PROFILE_FIELDS = frozenset({
     "min_edge",
     "max_edge",
+    "fee_edge_margin",
     "min_signal_quality",
+    "max_signal_quality",
+    "min_source_agreement",
+    "max_signal_age_seconds",
+    "entry_confirmation_readings",
+    "max_confirmation_price_drift",
     "min_reference_sources",
     "min_entry_price",
     "max_entry_price",
@@ -444,6 +547,30 @@ LINE_EXECUTION_PROFILE_FIELDS = frozenset({
     "stop_loss",
     "exit_edge",
     "min_mlb_fraction_remaining",
+    # Optional per-profile capital limits. These can only tighten the lane's
+    # shared boundaries; see PROFILE_TIGHTEN_ONLY_FIELDS.
+    "max_position_usd",
+    "max_event_exposure_usd",
+    "max_entries_per_event_per_hour",
+    "max_profile_exposure_usd",
+    "max_profile_open_positions",
+    "max_profile_orders_per_hour",
+})
+# A profile may narrow how much capital one line/stage can commit, but it must
+# never widen the lane's shared allocation, exposure ceiling, or concentration
+# caps. Those stay hard boundaries, so these overrides are clamped to the lane
+# value when the effective policy is resolved.
+PROFILE_TIGHTEN_ONLY_FIELDS = frozenset({
+    "max_position_usd",
+    "max_event_exposure_usd",
+    "max_entries_per_event_per_hour",
+})
+PROFILE_INTEGER_FIELDS = frozenset({
+    "min_reference_sources",
+    "entry_confirmation_readings",
+    "max_entries_per_event_per_hour",
+    "max_profile_open_positions",
+    "max_profile_orders_per_hour",
 })
 LINE_EXECUTION_PROFILE_STAGES = frozenset({
     "all",
@@ -509,7 +636,7 @@ def _normalize_line_execution_profiles(
             try:
                 clean_overrides[str(field_name)] = (
                     int(raw_value)
-                    if field_name == "min_reference_sources"
+                    if field_name in PROFILE_INTEGER_FIELDS
                     else float(raw_value)
                 )
             except (TypeError, ValueError) as exc:
@@ -574,12 +701,18 @@ class TradingPolicy:
     adaptive_exit_min_samples: int = 30
     adaptive_exit_max_tightening: float = 0.35
     volatility_stop_enabled: bool = False
+    # When the volatility stop is on but usable MLB state is missing or stale,
+    # fall back to a bounded price-only confirmation window instead of an
+    # immediate one-quote market sell. Off by default so the change is
+    # measured in the dry lane before it alters any existing behavior.
+    stateless_stop_confirmation: bool = False
     stop_confirmation_readings: int = 3
     stop_grace_minutes: float = 2.0
     catastrophic_stop_multiplier: float = 1.75
     post_exit_tracking_minutes: float = 30.0
     require_engine_entry: bool = True
     required_engine_gates: tuple[str, ...] = CORE_ENGINE_GATES
+    global_entry_enabled: bool = True
     allowed_market_types: tuple[str, ...] = SUPPORTED_ENTRY_MARKET_TYPES
     allowed_market_scopes: tuple[str, ...] = SUPPORTED_ENTRY_MARKET_SCOPES
     allow_live_segment_markets: bool = False
@@ -594,9 +727,24 @@ class TradingPolicy:
     max_open_positions: int = 6
     max_orders_per_hour: int = 6
     min_edge: float = 0.03
+    # Multiple of the round-trip taker fee an entry must clear, on top of the
+    # flat min_edge. Zero disables it and preserves the flat floor exactly.
+    # 1.0 is break-even after fees; above 1.0 is margin over the toll.
+    fee_edge_margin: float = 0.0
     max_edge: float = 1.0
     min_signal_quality: float = 60.0
+    max_signal_quality: float = 100.0
+    min_source_agreement: float = 0.0
+    max_signal_age_seconds: float = 120.0
+    entry_confirmation_readings: int = 1
+    max_confirmation_price_drift: float = 1.0
     min_reference_sources: int = 2
+    # Optional per-line/stage capital limits. Zero means "no profile-specific
+    # cap"; the lane's shared allocation, exposure, reserve, and buying-power
+    # checks always apply on top of these.
+    max_profile_exposure_usd: float = 0.0
+    max_profile_open_positions: int = 0
+    max_profile_orders_per_hour: int = 0
     min_entry_price: float = 0.10
     max_entry_price: float = 0.90
     max_spread: float = 0.04
@@ -607,6 +755,11 @@ class TradingPolicy:
     trailing_drawdown: float = 0.04
     stop_loss: float = 0.20
     exit_edge: float = 0.0
+    # Consecutive negative-edge readings required before the model_reversal
+    # exit may sell. 1 preserves the historical single-reading behavior; the
+    # 2026-08-02 settlement grading measured 62-65% of single-reading
+    # reversal exits going on to win, on both lanes independently.
+    reversal_confirmation_readings: int = 1
     cycle_seconds: float = 30.0
     candidate_cooldown_seconds: int = 300
     max_entries_per_event_per_hour: int = 3
@@ -696,22 +849,54 @@ class TradingPolicy:
             )
             or "global"
         )
-        if any(not profile.get("enabled", True) for profile in selected):
+        # The most-specific matching profile owns authorization. This lets an
+        # enabled early/middle/late profile deliberately override a disabled
+        # all-stage fallback for the same line type.
+        authorization_profile = selected[-1] if selected else None
+        if (
+            authorization_profile is not None
+            and not authorization_profile.get("enabled", True)
+        ):
             return None, profile_key
+        if not selected:
+            if not self.global_entry_enabled:
+                return None, "global/fallback-disabled"
+            if kind not in self.allowed_market_types:
+                return None, f"global/{kind}-disabled"
+            return self, "global"
         overrides: dict[str, Any] = {}
         for profile in selected:
+            if not profile.get("enabled", True):
+                continue
             overrides.update(profile.get("overrides") or {})
         if not overrides:
             return self, profile_key
+        # A profile may only narrow the lane's capital and concentration
+        # boundaries. Clamping here rather than rejecting at save time keeps a
+        # profile usable when the lane allocation is later reduced beneath it.
+        for field_name in PROFILE_TIGHTEN_ONLY_FIELDS:
+            if field_name in overrides:
+                overrides[field_name] = min(
+                    overrides[field_name],
+                    getattr(self, field_name),
+                )
+        if "max_profile_exposure_usd" in overrides:
+            overrides["max_profile_exposure_usd"] = min(
+                overrides["max_profile_exposure_usd"],
+                self.max_total_exposure_usd,
+            )
         effective = replace(
             self,
             line_execution_profiles=(),
             **overrides,
         )
-        effective.validate()
+        # Authorization was already resolved by selecting an enabled profile.
+        # Validate its effective limits without re-applying the now-removed
+        # profile authorization.
+        effective.validate(check_authorization=False)
         return effective, profile_key
 
-    def validate(self) -> None:
+    def validate(self, *, check_authorization: bool = True) -> None:
         if self.execution_mode not in {"dry_run", "live"}:
             raise TradingPolicyError("execution_mode must be dry_run or live")
         money_fields = (
@@ -756,6 +941,10 @@ class TradingPolicy:
             raise TradingPolicyError(
                 "stop_confirmation_readings must be between 2 and 10"
             )
+        if not 1 <= self.reversal_confirmation_readings <= 10:
+            raise TradingPolicyError(
+                "reversal_confirmation_readings must be between 1 and 10"
+            )
         if not 0.5 <= self.stop_grace_minutes <= 15:
             raise TradingPolicyError(
                 "stop_grace_minutes must be between 0.5 and 15"
@@ -798,9 +987,13 @@ class TradingPolicy:
                 "unknown automatic-entry line type(s): "
                 + ", ".join(sorted(unknown_market_types))
             )
-        if not self.allowed_market_types:
+        if (
+            check_authorization
+            and self.global_entry_enabled
+            and not self.allowed_market_types
+        ):
             raise TradingPolicyError(
-                "select at least one automatic-entry line type"
+                "global entry fallback requires at least one automatic-entry line type"
             )
         unknown_market_scopes = (
             set(self.allowed_market_scopes) - SUPPORTED_ENTRY_MARKET_SCOPE_SET
@@ -818,6 +1011,11 @@ class TradingPolicy:
             raise TradingPolicyError(
                 "entry prices must stay strictly inside the established 5c–95c bounds"
             )
+        if self.fee_edge_margin != 0 and not 1.0 <= self.fee_edge_margin <= 5.0:
+            raise TradingPolicyError(
+                "fee_edge_margin must be 0 (off) or between 1.0 (break-even "
+                "after the round-trip taker fee) and 5.0"
+            )
         if not 0 <= self.min_edge < self.max_edge <= 1:
             raise TradingPolicyError(
                 "edge filters must satisfy 0 <= minimum edge < maximum edge <= 1"
@@ -826,8 +1024,42 @@ class TradingPolicy:
             raise TradingPolicyError(
                 "min_mlb_fraction_remaining must be between zero and one"
             )
-        if not 0 <= self.min_signal_quality <= 100:
-            raise TradingPolicyError("min_signal_quality must be between 0 and 100")
+        if not 0 <= self.min_signal_quality <= self.max_signal_quality <= 100:
+            raise TradingPolicyError(
+                "signal quality filters must satisfy "
+                "0 <= minimum quality <= maximum quality <= 100"
+            )
+        for field_name in (
+            "max_profile_exposure_usd",
+            "max_profile_open_positions",
+            "max_profile_orders_per_hour",
+        ):
+            value = getattr(self, field_name)
+            if not math.isfinite(float(value)) or value < 0:
+                raise TradingPolicyError(
+                    f"{field_name} must be zero (no cap) or a positive limit"
+                )
+        if self.max_profile_exposure_usd > self.max_total_exposure_usd:
+            raise TradingPolicyError(
+                "max_profile_exposure_usd cannot exceed the lane's maximum "
+                "total exposure"
+            )
+        if not 0 <= self.min_source_agreement <= 100:
+            raise TradingPolicyError(
+                "min_source_agreement must be between 0 and 100"
+            )
+        if not 1 <= self.max_signal_age_seconds <= 120:
+            raise TradingPolicyError(
+                "max_signal_age_seconds must be between 1 and 120"
+            )
+        if not 1 <= self.entry_confirmation_readings <= 10:
+            raise TradingPolicyError(
+                "entry_confirmation_readings must be between 1 and 10"
+            )
+        if not 0 <= self.max_confirmation_price_drift <= 1:
+            raise TradingPolicyError(
+                "max_confirmation_price_drift must be between 0 and 1"
+            )
         if not 0 < self.max_spread < 1:
             raise TradingPolicyError("max_spread must be between zero and one")
         if self.min_book_shares <= 0 or self.min_hold_minutes < 0:
@@ -894,6 +1126,8 @@ class MappedCandidate:
     execution_profile_key: str = "global"
     game_fraction_remaining: float | None = None
     event_entries_60m: int = 1
+    entry_confirmation_count: int = 1
+    entry_confirmation_price_drift: float = 0.0
 
     @property
     def key(self) -> str:
@@ -916,6 +1150,52 @@ class ExecutableBookQuote:
 
 def _now() -> float:
     return time.time()
+
+
+ROUND_TRIP_TAKER_FEE_RATE = float(POLYMARKET_US_TAKER_FEE_COEFFICIENT) * 2.0
+
+
+def _fee_implied_edge_floor(entry_cost: float, margin: float) -> float | None:
+    """Edge a contract must clear to survive its own round-trip taker fee.
+
+    The venue charges `coefficient * shares * p * (1-p)` in each direction, so
+    per share the round trip costs `2 * coefficient * p * (1-p)` - which is an
+    edge, in the same probability units. It peaks at 50c and falls toward both
+    extremes, so a single flat floor is simultaneously too strict on a 15c
+    contract and too permissive on a 50c one.
+
+    A margin of 1.0 is exact break-even. Returns None when disabled or when the
+    price is outside the tradable range.
+    """
+    if margin <= 0 or not 0 < entry_cost < 1:
+        return None
+    return margin * ROUND_TRIP_TAKER_FEE_RATE * entry_cost * (1.0 - entry_cost)
+
+
+def _required_execution_edge(
+    policy: "TradingPolicy",
+    signal: Signal,
+    entry_cost: float,
+) -> tuple[float, float | None]:
+    """Return the edge an entry must clear, and the fee component of it."""
+    base = max(policy.min_edge, signal.required_edge)
+    fee_floor = _fee_implied_edge_floor(entry_cost, policy.fee_edge_margin)
+    if fee_floor is None:
+        return base, None
+    return max(base, fee_floor), fee_floor
+
+
+def _signal_age_seconds(signal: Signal, now: float) -> float | None:
+    """Age of the retained signal, or None when it carries no timestamp.
+
+    Entry qualification already rejects an undated signal, so this is defensive
+    audit plumbing rather than a live gate. Recording an explicit unknown keeps
+    a future refactor from crashing the entry path or writing a fabricated age.
+    """
+    observed_at = signal.observed_at
+    if observed_at is None:
+        return None
+    return max(0.0, now - observed_at.timestamp())
 
 
 def _amount(value: Any) -> float | None:
@@ -1001,12 +1281,19 @@ def _baseball_fraction_remaining(
         return None
     normalized_half = (
         "bottom" if half in {"bottom", "bot", "b"} else
-        "top" if half in {"top", "t"} else ""
+        "top" if half in {"top", "t"} else
+        # The MLB linescore feed reports "end" between half-innings (it
+        # collapses Middle/End). Rejecting it made the stop guard stateless
+        # exactly between halves; the model lab already accepts it with the
+        # inning treated as completed.
+        "end" if half in {"end", "middle", "mid"} else ""
     )
     if not normalized_half:
         return None
-    completed_halves = (int(inning) - 1) * 2 + (
-        1 if normalized_half == "bottom" else 0
+    completed_halves = (
+        int(inning) * 2
+        if normalized_half == "end"
+        else (int(inning) - 1) * 2 + (1 if normalized_half == "bottom" else 0)
     )
     return max(0.0, min(1.0, (18 - completed_halves) / 18))
 
@@ -1122,6 +1409,63 @@ def _dry_segment_settlement_value(
         opponent_score = away_score if side == "home" else home_score
         return 1.0 if selected_score + line > opponent_score else 0.0
     return None
+
+
+# League-average run expectancy for the 24 base/out states (rest of the
+# half-inning), 2010s-era published averages. A static empirical table costs
+# zero degrees of freedom, which is what makes it usable at this sample size.
+# Shadow telemetry only: nothing reads it at decision time yet.
+_RUN_EXPECTANCY: dict[int, tuple[float, float, float]] = {
+    0: (0.48, 0.25, 0.10),   # bases empty
+    1: (0.85, 0.50, 0.22),   # 1B
+    2: (1.06, 0.64, 0.31),   # 2B
+    3: (1.37, 0.87, 0.42),   # 1B+2B
+    4: (1.30, 0.95, 0.35),   # 3B
+    5: (1.70, 1.15, 0.48),   # 1B+3B
+    6: (1.93, 1.34, 0.56),   # 2B+3B
+    7: (2.17, 1.54, 0.71),   # loaded
+}
+
+
+def _mlb_shadow_state(state: GameState | None) -> dict[str, Any] | None:
+    """Extract the in-game context the feed already carries but no rule reads.
+
+    Returns None without structured MLB state. Pure so the shadow layer can
+    be tested without a trader.
+    """
+    if state is None or not isinstance(state.sport_state, dict):
+        return None
+    structured = state.sport_state
+    def bounded(name: str, low: int, high: int) -> int | None:
+        try:
+            value = int(structured.get(name))
+        except (TypeError, ValueError):
+            return None
+        return value if low <= value <= high else None
+
+    outs = bounded("outs", 0, 2)
+    base_mask = bounded("base_mask", 0, 7)
+    run_expectancy = (
+        _RUN_EXPECTANCY[base_mask][outs]
+        if outs is not None and base_mask is not None
+        else None
+    )
+    batter = structured.get("batter") if isinstance(structured.get("batter"), Mapping) else {}
+    pitcher = structured.get("pitcher") if isinstance(structured.get("pitcher"), Mapping) else {}
+    return {
+        "inning": structured.get("inning"),
+        "half": structured.get("half"),
+        "outs": outs,
+        "base_mask": base_mask,
+        "balls": bounded("balls", 0, 4),
+        "strikes": bounded("strikes", 0, 3),
+        "run_expectancy": run_expectancy,
+        "batting_side": structured.get("batting_side"),
+        "batter_id": batter.get("id"),
+        "batter_name": batter.get("name"),
+        "pitcher_id": pitcher.get("id"),
+        "pitcher_name": pitcher.get("name"),
+    }
 
 
 def _side_description(side: Mapping[str, Any]) -> str:
@@ -1584,7 +1928,13 @@ class PolymarketUSAutoTrader:
         self._last_venue_sync_error: str | None = None
         self._last_venue_positions: tuple[dict[str, Any], ...] = ()
         self._candidate_seen: dict[str, float] = {}
+        self._candidate_confirmations: dict[str, dict[str, Any]] = {}
         self._qualification_seen: dict[str, float] = {}
+        # Shadow pitcher tracking per event: bullpen entries are the classic
+        # cash-out trigger; measured before any rule may act on them.
+        self._event_pitchers: dict[str, dict[str, Any]] = {}
+        self._candidate_log_seen: dict[str, float] = {}
+        self._candidate_log_writes = 0
         self._journal_writes = 0
         with self._lock:
             self._db.initialize(_SCHEMA, component="polymarket_us_live_trading", version=1)
@@ -1704,6 +2054,60 @@ class PolymarketUSAutoTrader:
                         "profit_floor_missed_count": "INTEGER",
                         "profit_floor_low_exit_value": "DOUBLE PRECISION",
                         "profit_guard_payload": "TEXT",
+                    },
+                },
+            )
+            self._db.migrate_columns(
+                "polymarket_us_live_trading",
+                12,
+                {
+                    "live_managed_positions": {
+                        "entry_source_agreement": "DOUBLE PRECISION",
+                        "entry_signal_age_seconds": "DOUBLE PRECISION",
+                        "entry_confirmation_count": "INTEGER",
+                        "entry_confirmation_price_drift": "DOUBLE PRECISION",
+                    },
+                },
+            )
+            self._db.initialize(
+                _CANDIDATE_LOG_SCHEMA,
+                component="polymarket_us_live_trading",
+                version=13,
+            )
+            self._db.migrate_columns(
+                "polymarket_us_live_trading",
+                14,
+                {
+                    "live_managed_positions": {
+                        "entry_spread": "DOUBLE PRECISION",
+                        "entry_book_shares": "DOUBLE PRECISION",
+                    },
+                },
+            )
+            self._db.migrate_columns(
+                "polymarket_us_live_trading",
+                15,
+                {
+                    "live_managed_positions": {
+                        # Mirror of highest_exit_value. Peak favourable
+                        # excursion already makes a tighter profit target
+                        # identifiable; retaining the adverse extreme does the
+                        # same for a tighter stop, which the July 2026 audit
+                        # identified as the dominant realized-loss source.
+                        "lowest_exit_value": "DOUBLE PRECISION",
+                    },
+                },
+            )
+            self._db.migrate_columns(
+                "polymarket_us_live_trading",
+                16,
+                {
+                    "live_managed_positions": {
+                        # Consecutive-reading state for the model-reversal
+                        # confirmation window, mirroring the stop guard's
+                        # trigger/count pair so recoveries are auditable.
+                        "reversal_triggered_ts": "DOUBLE PRECISION",
+                        "reversal_observation_count": "INTEGER",
                     },
                 },
             )
@@ -1917,6 +2321,7 @@ class PolymarketUSAutoTrader:
         self._armed_until = 0.0
         self._protective_exits_armed = False
         self._control_generation += 1
+        self._candidate_confirmations.clear()
         self._last_cycle_summary = (
             "A newer execution policy was saved by another local server. "
             "This runtime disarmed itself and adopted that saved policy."
@@ -1966,6 +2371,7 @@ class PolymarketUSAutoTrader:
         self._save_policy(policy)
         self._policy = policy
         self._control_generation += 1
+        self._candidate_confirmations.clear()
         # Any limit or mode edit closes the latch. The operator must review the
         # saved policy and explicitly re-arm it.
         self._armed_until = 0.0
@@ -2010,7 +2416,14 @@ class PolymarketUSAutoTrader:
                 )
         return session_id
 
-    def _current_policy_session(self) -> str:
+    def _open_policy_session_id(self) -> str | None:
+        """Return the open policy session without creating one.
+
+        Read-only callers must use this. `_current_policy_session` starts a
+        session as a side effect, so calling it from a status or reporting path
+        would fabricate sessions that never traded and pollute the per-session
+        trade/event ledger.
+        """
         with self._lock:
             with self._db.cursor() as cur:
                 self._db.execute(
@@ -2019,9 +2432,13 @@ class PolymarketUSAutoTrader:
                        WHERE ended_ts IS NULL ORDER BY started_ts DESC LIMIT 1""",
                 )
                 row = cur.fetchone()
-        return str(row[0]) if row is not None else self._start_policy_session(
-            "first_managed_trade"
-        )
+        return str(row[0]) if row is not None else None
+
+    def _current_policy_session(self) -> str:
+        existing = self._open_policy_session_id()
+        if existing is not None:
+            return existing
+        return self._start_policy_session("first_managed_trade")
 
     def _backfill_position_entry_context(self) -> None:
         """Recover signal fields for older positions from retained fill journals."""
@@ -2135,6 +2552,7 @@ class PolymarketUSAutoTrader:
         # authority. A second server with the same database remains disarmed.
         self._save_policy(self._policy)
         self._control_generation += 1
+        self._candidate_confirmations.clear()
         self._armed_until = self._clock() + seconds
         self._protective_exits_armed = True
         self._journal(
@@ -2153,6 +2571,7 @@ class PolymarketUSAutoTrader:
         self._armed_until = 0.0
         self._protective_exits_armed = False
         self._control_generation += 1
+        self._candidate_confirmations.clear()
         self._save_policy(self._policy)
         self._journal("safety", "disarmed", payload={"reason": reason})
         return self.status()
@@ -2164,6 +2583,7 @@ class PolymarketUSAutoTrader:
         self._armed_until = 0.0
         self._protective_exits_armed = False
         self._control_generation += 1
+        self._candidate_confirmations.clear()
         self._policy = TradingPolicy.from_mapping({
             **asdict(self._policy),
             "automation_enabled": False,
@@ -2241,6 +2661,485 @@ class PolymarketUSAutoTrader:
             **self.status(),
             "cancel_requested": canceled,
             "cancel_failures": failures,
+        }
+
+    def authorization_matrix(self) -> dict[str, Any]:
+        """Resolve what every line/stage combination is actually authorized to do.
+
+        Authorization is spread across the global fallback switch, the global
+        line-type list, and the line/stage profile overlay, with the most
+        specific matching profile winning. Reading three controls and inferring
+        the result is exactly where an operator mis-reads what is armed, so the
+        server resolves all twelve combinations explicitly and reports the
+        effective thresholds each one would execute under.
+        """
+        policy = self._policy
+        stages = (("all", None), ("early", 0.75), ("middle", 0.375), ("late", 0.10))
+        rows: list[dict[str, Any]] = []
+        for market_type in SUPPORTED_ENTRY_MARKET_TYPES:
+            for stage, fraction in stages:
+                effective, profile_key = policy.execution_policy_for(
+                    market_type,
+                    fraction,
+                )
+                authorized = effective is not None
+                if authorized:
+                    source = (
+                        "global_fallback"
+                        if profile_key == "global"
+                        else "line_profile"
+                    )
+                    blocked_reason = None
+                elif profile_key == "global/fallback-disabled":
+                    source = "unauthorized"
+                    blocked_reason = (
+                        "global fallback is off and no line profile matches"
+                    )
+                elif profile_key.startswith("global/"):
+                    source = "unauthorized"
+                    blocked_reason = (
+                        f"{market_type} is not in the global line-type list"
+                    )
+                else:
+                    source = "unauthorized"
+                    blocked_reason = (
+                        f"the {profile_key} profile is not authorized"
+                    )
+                row: dict[str, Any] = {
+                    "market_type": market_type,
+                    "game_stage": stage,
+                    "authorized": authorized,
+                    "source": source,
+                    "profile_key": profile_key,
+                    "blocked_reason": blocked_reason,
+                    "effective": None,
+                }
+                if effective is not None:
+                    values = {
+                        field: getattr(effective, field)
+                        for field in sorted(LINE_EXECUTION_PROFILE_FIELDS)
+                    }
+                    differs = {
+                        field: value
+                        for field, value in values.items()
+                        if value != getattr(policy, field)
+                    }
+                    row["inherits_global"] = not differs
+                    # Twelve identical copies of the global thresholds is the
+                    # common case and was the largest block in the status
+                    # payload. Send the resolved values only where a profile
+                    # actually changes them; the client already holds the
+                    # global policy to fall back on.
+                    row["effective"] = None if not differs else values
+                    row["overridden_fields"] = sorted(differs)
+                rows.append(row)
+        return {
+            "global_fallback_authorized": policy.global_entry_enabled,
+            "global_line_types": list(policy.allowed_market_types),
+            "allowed_market_scopes": list(policy.allowed_market_scopes),
+            "allow_live_segment_markets": policy.allow_live_segment_markets,
+            "profiles": [
+                {
+                    "market_type": profile["market_type"],
+                    "game_stage": profile["game_stage"],
+                    "authorized": bool(profile.get("enabled", True)),
+                    "overrides": dict(profile.get("overrides") or {}),
+                }
+                for profile in policy.line_execution_profiles
+            ],
+            "combinations": rows,
+            "authorized_combinations": sum(
+                1 for row in rows if row["authorized"]
+            ),
+            "any_authorized": any(row["authorized"] for row in rows),
+        }
+
+    def _entry_blockers(
+        self,
+        *,
+        open_positions: Sequence[Mapping[str, Any]],
+        exposure: float,
+        risk_session: Mapping[str, Any],
+        authorization: Mapping[str, Any],
+    ) -> list[dict[str, str]]:
+        """List every reason a new entry cannot happen right now.
+
+        These are the policy- and account-level conditions that are already
+        knowable without a venue round trip. Per-candidate reasons (price band,
+        spread, depth, edge) stay in the cycle evaluations, because they are
+        properties of a contract rather than of the lane.
+        """
+        policy = self._policy
+        blockers: list[dict[str, str]] = []
+        if not policy.automation_enabled:
+            blockers.append({
+                "code": "automation_off",
+                "detail": "automatic analysis is not running for this lane",
+            })
+        if not authorization["any_authorized"]:
+            blockers.append({
+                "code": "nothing_authorized",
+                "detail": (
+                    "no line type or line/stage profile is authorized for "
+                    "automatic entry"
+                ),
+            })
+        if policy.execution_mode == "live":
+            if not self.is_armed():
+                blockers.append({
+                    "code": "live_disarmed",
+                    "detail": (
+                        "the live-order latch is closed; arming is required "
+                        "before any live entry"
+                    ),
+                })
+            if not self.credential_status()["configured"]:
+                blockers.append({
+                    "code": "credentials_missing",
+                    "detail": "Polymarket US API credentials are not configured",
+                })
+            if self._last_venue_sync_error is not None:
+                blockers.append({
+                    "code": "venue_sync_unavailable",
+                    "detail": (
+                        "authenticated position sync is failing; live entry is "
+                        "paused to avoid account-state divergence"
+                    ),
+                })
+        if len(open_positions) >= policy.max_open_positions:
+            blockers.append({
+                "code": "max_open_positions",
+                "detail": (
+                    f"{len(open_positions)} of {policy.max_open_positions} "
+                    "managed positions are already open"
+                ),
+            })
+        if "rolling_realized_loss" in risk_session.get("active_entry_blockers", ()):
+            blockers.append({
+                "code": "daily_loss_stop",
+                "detail": (
+                    "the rolling realized-loss stop is reached; start a new "
+                    "risk session to clear it"
+                ),
+            })
+        if "hourly_live_entries" in risk_session.get("active_entry_blockers", ()):
+            blockers.append({
+                "code": "hourly_order_cap",
+                "detail": (
+                    f"{risk_session.get('orders_last_hour')} of "
+                    f"{risk_session.get('orders_limit')} hourly entries used"
+                ),
+            })
+        remaining = min(
+            policy.max_total_exposure_usd - exposure,
+            policy.trading_allocation_usd - exposure,
+        )
+        if remaining <= 0:
+            blockers.append({
+                "code": "exposure_exhausted",
+                "detail": (
+                    f"${exposure:.2f} of managed exposure leaves no room under "
+                    f"the ${policy.max_total_exposure_usd:.2f} exposure limit "
+                    f"and ${policy.trading_allocation_usd:.2f} allocation"
+                ),
+            })
+        return blockers
+
+    def _predictive_exit_recommendation(
+        self,
+        *,
+        labeled: float,
+        labeled_events: float,
+        required: float,
+        brier: float | None,
+    ) -> dict[str, Any]:
+        """Recommend the adaptive response from the overlay's own scored record.
+
+        This deliberately does not read trade P/L. The overlay answers a
+        narrower question - will the executable mark move adversely before it
+        moves favourably - and it scores its own forecasts, so its Brier value
+        against whole-event support is the evidence that belongs here. A
+        realized-return comparison could not separate the overlay's effect from
+        the entry policy that selected the trades.
+
+        A Brier score of 0.25 is what always forecasting 0.50 achieves. An
+        overlay that cannot beat that has no business tightening a live exit.
+        """
+        floor = ADAPTIVE_EXIT_PROFILES["guarded"]["cold_start_confidence"]
+        if labeled <= 0:
+            return {
+                "profile": "observe",
+                "basis": "insufficient_evidence",
+                "applyable": True,
+                "rationale": (
+                    "No labeled forecast has been scored yet. Observe-only "
+                    "records and scores the overlay without letting it move "
+                    "any exit."
+                ),
+            }
+        if labeled < required or labeled_events < 5:
+            return {
+                "profile": "observe",
+                "basis": "insufficient_evidence",
+                "applyable": True,
+                "rationale": (
+                    f"{labeled:.0f} of {required:.0f} labeled forecasts across "
+                    f"{labeled_events:.0f} of 5 events. A non-observe profile "
+                    f"would already apply up to {floor * 100:.0f}% of its "
+                    "bounded tightening from its cold-start floor, on evidence "
+                    "this thin."
+                ),
+            }
+        if brier is None:
+            return {
+                "profile": "observe",
+                "basis": "insufficient_evidence",
+                "applyable": True,
+                "rationale": (
+                    "Forecasts are labeled but no Brier score is available, so "
+                    "the overlay's accuracy cannot be checked."
+                ),
+            }
+        if brier >= 0.25:
+            return {
+                "profile": "observe",
+                "basis": "overlay_scored",
+                "applyable": True,
+                "brier_score": brier,
+                "rationale": (
+                    f"Brier {brier:.3f} is no better than always forecasting "
+                    "0.50, so the overlay has not earned the right to tighten "
+                    "an exit. Keep scoring it in observe-only."
+                ),
+            }
+        return {
+            "profile": "guarded",
+            "basis": "overlay_scored",
+            "applyable": True,
+            "brier_score": brier,
+            "rationale": (
+                f"Brier {brier:.3f} beats the 0.250 always-0.50 benchmark on "
+                f"{labeled:.0f} labeled forecasts across {labeled_events:.0f} "
+                "events. Guarded is the smallest response above observe-only; "
+                "it is not evidence for Balanced or Responsive, and it says "
+                "nothing about realized return."
+            ),
+        }
+
+    def _predictive_exit_state(
+        self,
+        adaptive_exit: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Name the adaptive-exit overlay's state instead of implying one.
+
+        The lane-level status here is a coarse readiness summary. The overlay
+        itself scores support per game-state context, so a lane reported as
+        `active` can still be in cold start for an unusual inning/score bucket.
+        Per-position detail stays on the position record.
+        """
+        policy = self._policy
+        profile_name = str(policy.adaptive_exit_profile or "observe")
+        profile_values = ADAPTIVE_EXIT_PROFILES.get(profile_name, {})
+        cold_start_confidence = float(
+            profile_values.get("cold_start_confidence") or 0.0
+        )
+        base = {
+            "profile": profile_name,
+            "cold_start_confidence": cold_start_confidence,
+            "maximum_tightening": policy.adaptive_exit_max_tightening,
+            "horizon_minutes": policy.adaptive_exit_horizon_minutes,
+            "hard_stop_unchanged": True,
+            "support_is_per_game_state": True,
+        }
+        if not policy.adaptive_exit_enabled:
+            return {
+                **base,
+                "status": "off",
+                "detail": "adaptive MLB cash-out research is turned off",
+                "can_tighten_exits": False,
+            }
+        if profile_name == "observe":
+            return {
+                **base,
+                "status": "observe_only",
+                "detail": (
+                    "forecasts are recorded and scored, but no exit threshold "
+                    "is changed"
+                ),
+                "can_tighten_exits": False,
+            }
+        labeled = _amount(adaptive_exit.get("labeled_observations")) or 0.0
+        labeled_events = _amount(adaptive_exit.get("labeled_events")) or 0.0
+        observations = _amount(adaptive_exit.get("observations")) or 0.0
+        required = float(max(5, int(policy.adaptive_exit_min_samples)))
+        if observations <= 0:
+            status = "collecting"
+            detail = (
+                "no MLB observation retained yet for this lane"
+            )
+        elif labeled <= 0:
+            status = "cold_start"
+            detail = (
+                f"{observations:.0f} observations retained but none labeled yet"
+            )
+        elif labeled < required or labeled_events < 5:
+            status = "cold_start"
+            detail = (
+                f"{labeled:.0f} of {required:.0f} labeled forecasts across "
+                f"{labeled_events:.0f} of 5 events; learned support is partial"
+            )
+        else:
+            status = "active"
+            detail = (
+                f"{labeled:.0f} labeled forecasts across {labeled_events:.0f} "
+                "events carry the estimate for well-supported game states"
+            )
+        return {
+            **base,
+            "status": status,
+            "detail": detail,
+            "recommendation": self._predictive_exit_recommendation(
+                labeled=labeled,
+                labeled_events=labeled_events,
+                required=required,
+                brier=_amount(adaptive_exit.get("brier_score")),
+            ),
+            # A non-observe profile tightens from its cold-start floor even
+            # with no labeled evidence at all. Reporting cold start as "not
+            # yet acting" would understate what is already changing exits.
+            "can_tighten_exits": True,
+            "cold_start_warning": (
+                f"the {profile_name} profile applies up to "
+                f"{cold_start_confidence * 100:.0f}% of its bounded tightening "
+                "before any labeled evidence exists"
+                if status != "active" and cold_start_confidence > 0
+                else None
+            ),
+            "observations": observations,
+            "labeled_observations": labeled,
+            "labeled_events": labeled_events,
+            "minimum_samples": required,
+            "minimum_events": 5,
+        }
+
+    def execution_state(
+        self,
+        *,
+        open_positions: Sequence[Mapping[str, Any]] | None = None,
+        exposure: float | None = None,
+        risk_session: Mapping[str, Any] | None = None,
+        adaptive_exit: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Report every execution state separately instead of one blended flag.
+
+        Callers that already loaded positions, exposure, the risk snapshot, or
+        the adaptive summary pass them in so the status endpoint does not repeat
+        those queries.
+        """
+        policy = self._policy
+        if open_positions is None:
+            open_positions = self.positions(open_only=True)
+        if exposure is None:
+            exposure = sum(
+                float(row["cost_basis"]) for row in open_positions
+            )
+        if risk_session is None:
+            risk_session = self._risk_limiter_snapshot()
+        if adaptive_exit is None:
+            adaptive_exit = self._adaptive_exit.summary()
+        credential = self.credential_status()
+        authorization = self.authorization_matrix()
+        armed = self.is_armed()
+        now = self._clock()
+        blockers = self._entry_blockers(
+            open_positions=open_positions,
+            exposure=exposure,
+            risk_session=risk_session,
+            authorization=authorization,
+        )
+        return {
+            "policy": {
+                "version": POLICY_VERSION,
+                # The UI compares this against the fingerprint of the form it
+                # is showing, so "unsaved changes" is a fact rather than a guess.
+                "saved_fingerprint": _policy_fingerprint(policy),
+                "execution_mode": policy.execution_mode,
+                "risk_preset": policy.risk_preset,
+                # Read-only: reporting state must never start a session.
+                "session_id": self._open_policy_session_id(),
+            },
+            "automation": {
+                "running": policy.automation_enabled,
+                "cycle_seconds": policy.cycle_seconds,
+                "last_cycle_at": (
+                    datetime.fromtimestamp(
+                        self._last_cycle_at, timezone.utc
+                    ).isoformat()
+                    if self._last_cycle_at
+                    else None
+                ),
+                "last_cycle_summary": self._last_cycle_summary,
+            },
+            "live_orders": {
+                "armed": armed,
+                "expires_at": (
+                    datetime.fromtimestamp(
+                        self._armed_until, timezone.utc
+                    ).isoformat()
+                    if armed
+                    else None
+                ),
+                "seconds_remaining": (
+                    max(0.0, self._armed_until - now) if armed else 0.0
+                ),
+                "restart_behavior": "always_disarmed",
+                "applies_to_lane": policy.execution_mode == "live",
+            },
+            "protective_exits": {
+                "armed": (
+                    self._protective_exits_armed
+                    and policy.automation_enabled
+                    and policy.execution_mode == "live"
+                    and policy.auto_cashout
+                ),
+                "auto_cashout_enabled": policy.auto_cashout,
+                "behavior": "armed_until_save_disarm_stop_or_restart",
+            },
+            "account": {
+                "connected": credential["configured"],
+                "credential_source": credential["credential_source"],
+                "credential_retention": credential["retention"],
+                "last_sync_at": (
+                    datetime.fromtimestamp(
+                        self._last_venue_sync_at, timezone.utc
+                    ).isoformat()
+                    if self._last_venue_sync_at
+                    else None
+                ),
+                "last_sync_error": self._last_venue_sync_error,
+            },
+            "authorization": authorization,
+            "exposure": {
+                "open_positions": len(open_positions),
+                "max_open_positions": policy.max_open_positions,
+                "managed_exposure_usd": round(exposure, 2),
+                "trading_allocation_usd": policy.trading_allocation_usd,
+                "max_total_exposure_usd": policy.max_total_exposure_usd,
+                "remaining_capacity_usd": round(
+                    max(
+                        0.0,
+                        min(
+                            policy.max_total_exposure_usd - exposure,
+                            policy.trading_allocation_usd - exposure,
+                        ),
+                    ),
+                    2,
+                ),
+                "minimum_cash_reserve_usd": policy.minimum_cash_reserve_usd,
+            },
+            "entry_blockers": blockers,
+            "entry_possible_now": not blockers,
+            "predictive_exit": self._predictive_exit_state(adaptive_exit),
         }
 
     def status(self) -> dict[str, Any]:
@@ -2322,11 +3221,28 @@ class PolymarketUSAutoTrader:
             # This is execution-layer metadata only. It lets the workstation
             # distinguish a research signal from an exactly mapped US contract
             # without writing anything back into the calculation engine.
+            #
+            # Policy-wide constants and per-signal gate detail are omitted here:
+            # they are identical on every row, are already carried once in
+            # `policy`, and remain durably auditable in the execution journal
+            # and candidate log. Repeating them made this the heaviest block in
+            # a payload the dashboard polls continuously.
             "last_cycle_evaluations": [
-                dict(item) for item in self._last_cycle_evaluations
+                {
+                    key: value for key, value in item.items()
+                    if key not in _STATUS_EVALUATION_OMITTED_FIELDS
+                }
+                for item in self._last_cycle_evaluations
             ],
+            "last_cycle_evaluation_count": len(self._last_cycle_evaluations),
             "risk_session": risk_session,
             "adaptive_exit": adaptive_exit,
+            "execution_state": self.execution_state(
+                open_positions=positions,
+                exposure=exposure,
+                risk_session=risk_session,
+                adaptive_exit=adaptive_exit,
+            ),
             "live_capable": self._policy.execution_mode == "live",
             "live_order_possible_now": (
                 self._policy.automation_enabled
@@ -2410,17 +3326,34 @@ class PolymarketUSAutoTrader:
             ),
         }
 
-    def journal(self, *, limit: int = 100) -> list[dict[str, Any]]:
+    def journal(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        kinds: Sequence[str] | None = None,
+    ) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        selected = tuple(
+            str(kind).strip() for kind in (kinds or ()) if str(kind).strip()
+        )
+        clause = ""
+        params: list[Any] = []
+        if selected:
+            clause = " WHERE kind IN (" + ",".join(["%s"] * len(selected)) + ")"
+            params.extend(selected)
+        params.extend([limit, offset])
         with self._lock:
             with self._db.cursor(dict_rows=True) as cur:
                 self._db.execute(
                     cur,
                     """SELECT id,created_ts,kind,status,event_id,event_name,
                               market_slug,selection,payload
-                       FROM live_trading_journal
-                       ORDER BY created_ts DESC LIMIT %s""",
-                    (limit,),
+                       FROM live_trading_journal"""
+                    + clause
+                    + " ORDER BY created_ts DESC LIMIT %s OFFSET %s",
+                    tuple(params),
                 )
                 rows = cur.fetchall()
         result = []
@@ -2435,6 +3368,50 @@ class PolymarketUSAutoTrader:
                 item["details"] = {}
             result.append(item)
         return result
+
+    def journal_page(
+        self,
+        *,
+        limit: int = 25,
+        offset: int = 0,
+        kinds: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """Return one page of the journal plus the counts needed to navigate it.
+
+        The dashboard polls this continuously. Returning 120 rows of full
+        payloads was the single largest response in the app - about 270 KB, of
+        which the overwhelming majority were high-volume qualification records
+        that pushed the entry and exit rows the operator actually wants off the
+        visible page.
+        """
+        selected = tuple(
+            str(kind).strip() for kind in (kinds or ()) if str(kind).strip()
+        )
+        with self._lock:
+            with self._db.cursor(dict_rows=True) as cur:
+                self._db.execute(
+                    cur,
+                    """SELECT kind, COUNT(*) AS total
+                       FROM live_trading_journal GROUP BY kind""",
+                )
+                counts = {
+                    str(row["kind"]): int(row["total"])
+                    for row in cur.fetchall()
+                }
+        total = sum(counts.values())
+        filtered_total = (
+            sum(counts.get(kind, 0) for kind in selected) if selected else total
+        )
+        items = self.journal(limit=limit, offset=offset, kinds=selected)
+        return {
+            "items": items,
+            "total": total,
+            "filtered_total": filtered_total,
+            "offset": max(0, int(offset)),
+            "limit": max(1, min(int(limit), 500)),
+            "kinds": sorted(selected),
+            "kind_counts": dict(sorted(counts.items())),
+        }
 
     def positions(
         self,
@@ -3288,6 +4265,20 @@ class PolymarketUSAutoTrader:
                     if position.get("entry_reference_sources") is not None
                     else None
                 ),
+                "entry_source_agreement": _amount(
+                    position.get("entry_source_agreement")
+                ),
+                "entry_signal_age_seconds": _amount(
+                    position.get("entry_signal_age_seconds")
+                ),
+                "entry_confirmation_count": (
+                    int(position["entry_confirmation_count"])
+                    if position.get("entry_confirmation_count") is not None
+                    else None
+                ),
+                "entry_confirmation_price_drift": _amount(
+                    position.get("entry_confirmation_price_drift")
+                ),
                 "policy_session_id": position.get("policy_session_id"),
                 "policy_signature": policy_signature,
                 "entry_policy": dict(policy) if policy is not None else None,
@@ -3384,18 +4375,28 @@ class PolymarketUSAutoTrader:
                         key: policy.get(key)
                         for key in (
                             "risk_preset",
+                            "global_entry_enabled",
                             "allowed_market_types",
                             "allowed_market_scopes",
                             "allow_live_segment_markets",
                             "min_edge",
+                            "max_edge",
                             "min_signal_quality",
+                            "max_signal_quality",
+                            "min_source_agreement",
+                            "max_signal_age_seconds",
+                            "entry_confirmation_readings",
+                            "max_confirmation_price_drift",
                             "min_reference_sources",
                             "min_entry_price",
                             "max_entry_price",
                             "max_spread",
                             "min_book_shares",
                             "profit_target",
+                            "minimum_locked_profit",
+                            "trailing_drawdown",
                             "stop_loss",
+                            "exit_edge",
                             "auto_cashout",
                             "require_engine_entry",
                             "required_engine_gates",
@@ -3470,6 +4471,21 @@ class PolymarketUSAutoTrader:
                               entry_game_fraction_remaining
                                   AS game_fraction_remaining,
                               entry_event_entries_60m AS event_entries_60m,
+                              entry_source_agreement AS source_agreement,
+                              entry_signal_age_seconds AS signal_age_seconds,
+                              entry_confirmation_count
+                                  AS entry_confirmation_readings,
+                              entry_confirmation_price_drift
+                                  AS confirmation_price_drift,
+                              -- Peak executable exit value reached before the
+                              -- actual close. This is the only retained
+                              -- excursion evidence, and it is what makes a
+                              -- tighter profit target identifiable.
+                              highest_exit_value,
+                              lowest_exit_value,
+                              quantity,
+                              entry_spread AS spread,
+                              entry_book_shares AS book_shares,
                               policy_session_id
                        FROM live_managed_positions
                        WHERE status='closed' AND realized_pnl IS NOT NULL
@@ -3477,7 +4493,82 @@ class PolymarketUSAutoTrader:
                 )
                 return [dict(row) for row in cur.fetchall()]
 
+    def _candidate_observation_opportunities(self) -> list[dict[str, Any]]:
+        """Return the logged candidate population, entered or not."""
+        with self._lock:
+            with self._db.cursor(dict_rows=True) as cur:
+                self._db.execute(
+                    cur,
+                    """SELECT observed_ts,event_id,decision_id,signal_market,
+                              market_type,market_scope,selection,position_side,
+                              market_slug,state,reason,mapped,executable,entered,
+                              mode,signal_edge,signal_quality,source_agreement,
+                              signal_age_seconds,reference_sources,entry_cost,
+                              execution_edge,spread,book_shares,
+                              game_fraction_remaining,event_entries_60m,
+                              entry_confirmation_readings,
+                              confirmation_price_drift,execution_profile,
+                              candidate_rank,competing_candidates,
+                              selection_propensity,propensity_source
+                       FROM candidate_observations
+                       WHERE mapped=1
+                       ORDER BY observed_ts""",
+                )
+                rows = [dict(row) for row in cur.fetchall()]
+        return [
+            {
+                "event_id": row.get("event_id"),
+                "observed_ts": float(row["observed_ts"]),
+                "signal_edge": _amount(row.get("signal_edge")),
+                "signal_quality": _amount(row.get("signal_quality")),
+                "source_agreement": _amount(row.get("source_agreement")),
+                "signal_age_seconds": _amount(row.get("signal_age_seconds")),
+                "entry_confirmation_readings": _amount(
+                    row.get("entry_confirmation_readings")
+                ),
+                "confirmation_price_drift": _amount(
+                    row.get("confirmation_price_drift")
+                ),
+                "reference_sources": _amount(row.get("reference_sources")),
+                "entry_cost": _amount(row.get("entry_cost")),
+                "execution_edge": _amount(row.get("execution_edge")),
+                "spread": _amount(row.get("spread")),
+                "book_shares": _amount(row.get("book_shares")),
+                "decision_id": row.get("decision_id") or None,
+                "market_slug": str(row.get("market_slug") or ""),
+                "selection": row.get("selection"),
+                "position_side": row.get("position_side"),
+                "market_type": _market_kind(row.get("signal_market")),
+                "market_scope": row.get("market_scope"),
+                "mode": row.get("mode"),
+                "game_fraction_remaining": _amount(
+                    row.get("game_fraction_remaining")
+                ),
+                "event_entries_60m": _amount(row.get("event_entries_60m")),
+                "execution_profile": row.get("execution_profile"),
+                "state": row.get("state"),
+                "rejection_reason": row.get("reason"),
+                "entered": bool(row.get("entered")),
+                "candidate_rank": row.get("candidate_rank"),
+                "competing_candidates": row.get("competing_candidates"),
+                "selection_propensity": _amount(
+                    row.get("selection_propensity")
+                ),
+                "propensity_source": row.get("propensity_source"),
+                "evidence_source": "candidate_log",
+            }
+            for row in rows
+        ]
+
     def _advisor_opportunities(self) -> list[dict[str, Any]]:
+        """Merge the candidate log with the legacy entry-only journal history.
+
+        The candidate log is the correct population, but it only exists from the
+        migration forward. Entry rows recorded before it are still real observed
+        opportunities, so they are retained and marked with their narrower
+        provenance rather than silently dropped.
+        """
+        logged = self._candidate_observation_opportunities()
         with self._lock:
             with self._db.cursor(dict_rows=True) as cur:
                 self._db.execute(
@@ -3509,6 +4600,18 @@ class PolymarketUSAutoTrader:
                     "observed_ts": float(row["created_ts"]),
                     "signal_edge": _amount(payload.get("signal_edge")),
                     "signal_quality": _amount(payload.get("signal_quality")),
+                    "source_agreement": _amount(
+                        payload.get("source_agreement")
+                    ),
+                    "signal_age_seconds": _amount(
+                        payload.get("signal_age_seconds")
+                    ),
+                    "entry_confirmation_readings": _amount(
+                        payload.get("entry_confirmation_readings")
+                    ),
+                    "confirmation_price_drift": _amount(
+                        payload.get("confirmation_price_drift")
+                    ),
                     "reference_sources": _amount(
                         payload.get("reference_sources")
                     ),
@@ -3528,33 +4631,81 @@ class PolymarketUSAutoTrader:
                     "event_entries_60m": _amount(
                         payload.get("event_entries_60m")
                     ),
+                    "state": "entry",
+                    "rejection_reason": None,
+                    "entered": True,
+                    "candidate_rank": None,
+                    "competing_candidates": None,
+                    "selection_propensity": None,
+                    "propensity_source": None,
+                    "evidence_source": "entry_journal",
                 },
             )
-        return list(opportunities.values())
+        # A contract already present in the candidate log must not be counted
+        # twice by the frequency estimate.
+        logged_keys = {
+            "|".join((
+                str(item.get("decision_id") or ""),
+                str(item.get("market_slug") or ""),
+                str(item.get("position_side") or ""),
+            ))
+            for item in logged
+        }
+        legacy = [
+            item for key, item in opportunities.items()
+            if key not in logged_keys
+        ]
+        return [*logged, *legacy]
 
     def advisor_dataset(self, *, source_lane: str) -> dict[str, Any]:
         """Return the retained inputs the policy advisor is allowed to use.
 
         The caller may combine independent live and simulated stores. This
-        method deliberately returns only managed outcomes and logged entry
+        method deliberately returns only managed outcomes and logged candidate
         opportunities; unlabeled quote history is not converted into profit
         evidence.
         """
         closed_trades = self._advisor_closed_trades()
         opportunities = self._advisor_opportunities()
         positions = self.positions(include_hidden=True)
+        logged = [
+            row for row in opportunities
+            if row.get("evidence_source") == "candidate_log"
+        ]
+        unentered = [row for row in logged if not row.get("entered")]
         return {
             "source_lane": source_lane,
             "backend": self._db.backend,
             "closed_trades": closed_trades,
             "opportunities": opportunities,
             "positions": positions,
+            "logging_contract": {
+                "candidate_log_observations": len(logged),
+                "unentered_candidate_observations": len(unentered),
+                "legacy_entry_only_observations": (
+                    len(opportunities) - len(logged)
+                ),
+                "propensity_source": DETERMINISTIC_PROPENSITY_SOURCE,
+                "randomized_exploration": False,
+                # Stated explicitly so a reader cannot mistake a richer
+                # candidate population for an identified causal design.
+                "off_policy_identified": False,
+                "note": (
+                    "Rejected candidates are now logged, so qualified-frequency "
+                    "estimates cover contracts that were never entered. The "
+                    "logging policy is still deterministic, so selection "
+                    "propensities are 0 or 1 and inverse-propensity or doubly "
+                    "robust return estimates for rejected candidates remain "
+                    "unidentified. Rejected candidates have no observed reward."
+                ),
+            },
             "summary": {
                 "lane": source_lane,
                 "backend": self._db.backend,
                 "retained_positions": len(positions),
                 "closed_trades": len(closed_trades),
                 "opportunity_observations": len(opportunities),
+                "unentered_candidate_observations": len(unentered),
                 "independent_events": len({
                     str(row.get("event_id") or "")
                     for row in closed_trades
@@ -3929,6 +5080,67 @@ class PolymarketUSAutoTrader:
             ),
         }
 
+    def reset_dry_run_performance(self, confirmation: str) -> dict[str, Any]:
+        """Start a fresh dry-run session tally without deleting anything.
+
+        The display session boundary is a journal marker; every closed
+        position, the execution journal, adaptive evidence, and the
+        performance datasheet keep the full history. This is how a night's
+        dry-run profit is read on its own without wiping the record.
+        """
+        if not approval_granted(confirmation):
+            raise TradingPolicyError(
+                approval_instruction("start a new dry-run tally session")
+            )
+        with self._lock:
+            with self._db.cursor() as cur:
+                self._db.execute(
+                    cur,
+                    """SELECT COUNT(*) FROM live_managed_positions
+                       WHERE mode='dry_run' AND status='open'""",
+                )
+                open_positions = int(cur.fetchone()[0] or 0)
+            if open_positions:
+                raise TradingPolicyError(
+                    f"{open_positions} open dry-run position"
+                    f"{'' if open_positions == 1 else 's'} remain; let them "
+                    "close (or exit them) before starting a fresh session "
+                    "tally, so the session boundary stays unambiguous"
+                )
+            previous = dict(self.performance()["modes"]["dry_run"])
+            reset_at = self._clock()
+            self._journal(
+                "performance_reset",
+                "dry_run",
+                payload={
+                    "mode": "dry_run",
+                    "reset_at": reset_at,
+                    "previous_total_positions": previous["total_positions"],
+                    "previous_wins": previous["wins"],
+                    "previous_losses": previous["losses"],
+                    "previous_pushes": previous["pushes"],
+                    "previous_total_net_usd": previous["total_net_usd"],
+                    "positions_preserved": True,
+                    "execution_journal_preserved": True,
+                    "risk_history_preserved": True,
+                    "reason": "operator_started_new_dry_run_tally_session",
+                },
+            )
+        reset_at_iso = datetime.fromtimestamp(reset_at, timezone.utc).isoformat()
+        return {
+            "mode": "dry_run",
+            "reset_at": reset_at_iso,
+            "previous": previous,
+            "positions_preserved": True,
+            "execution_journal_preserved": True,
+            "risk_history_preserved": True,
+            "summary": (
+                "Dry-run W-L-P and net display reset to zero for a new "
+                "session. Every historical position and all evidence were "
+                "preserved."
+            ),
+        }
+
     def reset_risk_session(self, confirmation: str) -> dict[str, Any]:
         """Start fresh rolling entry counters without erasing audit evidence.
 
@@ -3956,6 +5168,7 @@ class PolymarketUSAutoTrader:
         # window before recording the new boundary.
         self._control_generation += 1
         self._candidate_seen.clear()
+        self._candidate_confirmations.clear()
         self._journal(
             "risk_session_reset",
             "started",
@@ -4019,6 +5232,7 @@ class PolymarketUSAutoTrader:
         if mode == "dry_run":
             return self.clear_dry_run_history(DRY_RUN_HISTORY_CLEAR_PHRASE)
         self._control_generation += 1
+        self._candidate_confirmations.clear()
         if not self._cycle_lock.acquire(timeout=20):
             raise TradingPolicyError(
                 "the current trading cycle did not stop in time; try the sale again"
@@ -4179,6 +5393,7 @@ class PolymarketUSAutoTrader:
             str(position["market_slug"]),
             str(position["position_side"]),
         ))
+        self._candidate_confirmations.pop(candidate_key, None)
         self._candidate_seen[candidate_key] = self._clock()
 
         if position["mode"] == "dry_run":
@@ -4432,6 +5647,7 @@ class PolymarketUSAutoTrader:
                         "dry-run reset verification found remaining simulated trades"
                     )
             self._candidate_seen.clear()
+            self._candidate_confirmations.clear()
             self._qualification_seen.clear()
             self._last_cycle_evaluations = ()
             self._last_cycle_summary = (
@@ -4660,6 +5876,25 @@ class PolymarketUSAutoTrader:
                     reason="candidate is inside the configured retry cooldown",
                 )
                 continue
+            confirmed, confirmation_reason, confirmation_audit = (
+                self._entry_confirmation_ready(candidate, now=now)
+            )
+            evaluation.update(confirmation_audit)
+            if not confirmed:
+                evaluation.update(
+                    state="confirming",
+                    reason=confirmation_reason,
+                )
+                continue
+            candidate = replace(
+                candidate,
+                entry_confirmation_count=int(
+                    confirmation_audit["entry_confirmation_readings"]
+                ),
+                entry_confirmation_price_drift=float(
+                    confirmation_audit["confirmation_price_drift"]
+                ),
+            )
             if venue_checks >= 3:
                 evaluation.update(
                     state="queued",
@@ -4668,6 +5903,10 @@ class PolymarketUSAutoTrader:
                 break
             venue_checks += 1
             self._candidate_seen[candidate.key] = now
+            # An order attempt consumes the confirmation window. The cooldown
+            # recorded above already bounds how quickly this contract can be
+            # retried, so the next attempt re-earns its readings from scratch.
+            self._candidate_confirmations.pop(candidate.key, None)
             entered, state, reason, audit = self._attempt_entry(
                 candidate,
                 generation=generation,
@@ -4693,6 +5932,11 @@ class PolymarketUSAutoTrader:
                 break  # one new position per cycle prevents burst concentration
 
         self._last_cycle_evaluations = tuple(evaluations[:1_000])
+        logged_candidates = self._record_candidate_observations(
+            mapped,
+            evaluations,
+            now=now,
+        )
         self._last_cycle_summary = (
             f"Reviewed {len(monitored_list)} monitored events and {len(mapped)} "
             f"mapped selections; {placed} entry, {marked} marks, {exited} exits, "
@@ -4707,9 +5951,311 @@ class PolymarketUSAutoTrader:
             "marks": marked,
             "exits": exited,
             "post_exit_shadow_marks": shadow_marks,
+            "logged_candidates": logged_candidates,
             "summary": self._last_cycle_summary,
             "venue_sync": venue_sync,
         }
+
+    def _record_candidate_observations(
+        self,
+        mapped: Sequence[tuple[MappedCandidate, dict[str, Any]]],
+        evaluations: Sequence[dict[str, Any]],
+        *,
+        now: float,
+    ) -> int:
+        """Log the population the policy chose from, not only what it chose.
+
+        Comparing an alternative execution policy against logged behaviour needs
+        the rejected candidates too. Without them the advisor can only re-filter
+        past fills, so a looser policy can never appear to trade more than the
+        policy that produced the data.
+
+        One row per contract per candidate cooldown is deliberate. The cooldown
+        is the shortest interval at which the same contract could actually be
+        entered, so it is the correct sampling rate for a per-hour opportunity
+        estimate as well as a bound on retained volume.
+        """
+        # Observing candidates is not trading. Attribute rows to an open session
+        # when one exists, but never start one - only an actual fill does that.
+        session_id = self._open_policy_session_id()
+        fingerprint = _policy_fingerprint(self._policy)
+        mode = self._policy.execution_mode
+        cooldown = max(1.0, float(self._policy.candidate_cooldown_seconds))
+        ranks = {
+            id(evaluation): index for index, (_candidate, evaluation)
+            in enumerate(mapped)
+        }
+        candidates_by_evaluation = {
+            id(evaluation): candidate for candidate, evaluation in mapped
+        }
+        competing = len(mapped)
+        rows: list[tuple[Any, ...]] = []
+        for evaluation in evaluations:
+            candidate = candidates_by_evaluation.get(id(evaluation))
+            state = str(evaluation.get("state") or "unknown")
+            market_slug = str(evaluation.get("us_market_slug") or "")
+            key = ":".join((
+                str(evaluation.get("event_id") or ""),
+                market_slug or str(evaluation.get("market") or ""),
+                str(evaluation.get("outcome") or ""),
+            ))
+            last = self._candidate_log_seen.get(key, 0.0)
+            if now - last < cooldown:
+                continue
+            self._candidate_log_seen[key] = now
+            entered = state in _ENTERED_CANDIDATE_STATES
+            rank = ranks.get(id(evaluation))
+            rows.append((
+                str(uuid4()),
+                now,
+                mode,
+                session_id,
+                fingerprint,
+                str(evaluation.get("execution_profile") or "") or None,
+                str(evaluation.get("event_id") or ""),
+                evaluation.get("event_name"),
+                (
+                    candidate.signal.decision_id
+                    or candidate.signal.decision_hash
+                    if candidate is not None else None
+                ),
+                evaluation.get("market"),
+                _market_kind(evaluation.get("market")),
+                evaluation.get("market_scope"),
+                evaluation.get("outcome"),
+                candidate.position_side if candidate is not None else None,
+                evaluation.get("us_event_slug"),
+                market_slug or None,
+                state,
+                (str(evaluation.get("reason"))[:500]
+                 if evaluation.get("reason") else None),
+                1 if candidate is not None else 0,
+                1 if evaluation.get("us_entry_cost") is not None else 0,
+                1 if entered else 0,
+                _amount(evaluation.get("signal_edge")),
+                _amount(evaluation.get("signal_quality")),
+                _amount(evaluation.get("source_agreement")),
+                (
+                    _signal_age_seconds(candidate.signal, now)
+                    if candidate is not None else None
+                ),
+                (
+                    int(candidate.signal.n_reference_sources)
+                    if candidate is not None else None
+                ),
+                _amount(evaluation.get("us_entry_cost")),
+                _amount(evaluation.get("us_execution_edge")),
+                candidate.spread if candidate is not None else None,
+                candidate.book_shares if candidate is not None else None,
+                candidate.mapping_score if candidate is not None else None,
+                (
+                    candidate.game_fraction_remaining
+                    if candidate is not None else None
+                ),
+                (
+                    int(candidate.event_entries_60m)
+                    if candidate is not None else None
+                ),
+                (
+                    int(evaluation["entry_confirmation_readings"])
+                    if evaluation.get("entry_confirmation_readings") is not None
+                    else None
+                ),
+                _amount(evaluation.get("confirmation_price_drift")),
+                rank,
+                competing,
+                # Degenerate by construction: the saved policy is deterministic
+                # given a ranked list, so exactly one candidate has propensity 1.
+                (1.0 if entered else 0.0) if rank is not None else None,
+                DETERMINISTIC_PROPENSITY_SOURCE,
+            ))
+        if len(self._candidate_log_seen) > 20_000:
+            oldest = sorted(
+                self._candidate_log_seen,
+                key=self._candidate_log_seen.get,
+            )
+            for stale in oldest[:5_000]:
+                self._candidate_log_seen.pop(stale, None)
+        if not rows:
+            return 0
+        with self._lock:
+            with self._db.transaction() as cur:
+                for row in rows:
+                    self._db.execute(
+                        cur,
+                        """INSERT INTO candidate_observations(
+                             id,observed_ts,mode,policy_session_id,
+                             policy_fingerprint,execution_profile,event_id,
+                             event_name,decision_id,signal_market,market_type,
+                             market_scope,selection,position_side,us_event_slug,
+                             market_slug,state,reason,mapped,executable,entered,
+                             signal_edge,signal_quality,source_agreement,
+                             signal_age_seconds,reference_sources,entry_cost,
+                             execution_edge,spread,book_shares,mapping_score,
+                             game_fraction_remaining,event_entries_60m,
+                             entry_confirmation_readings,confirmation_price_drift,
+                             candidate_rank,competing_candidates,
+                             selection_propensity,propensity_source)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                                   %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                                   %s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        row,
+                    )
+        self._candidate_log_writes += len(rows)
+        if self._candidate_log_writes >= 500:
+            self._candidate_log_writes = 0
+            self._prune_candidate_observations()
+        return len(rows)
+
+    def _prune_candidate_observations(
+        self,
+        maximum: int = CANDIDATE_OBSERVATION_LIMIT,
+    ) -> None:
+        """Bound the candidate log without touching entry or exit evidence."""
+        with self._lock:
+            with self._db.cursor() as cur:
+                self._db.execute(
+                    cur,
+                    "SELECT COUNT(*) FROM candidate_observations",
+                )
+                count = int(cur.fetchone()[0] or 0)
+            excess = count - maximum
+            if excess <= 0:
+                return
+            with self._db.transaction() as cur:
+                # Three tiers, cheapest evidence first.
+                #
+                # Unmapped rows dominate volume - a signal with no tradable US
+                # contract is logged on every cooldown, and in practice that is
+                # ~99% of rows - while carrying the least information: there was
+                # never a contract to trade. They must age out before anything
+                # executable, or a busy slate silently evicts the mapped
+                # population the advisor depends on.
+                #
+                # Then unentered mapped rows. Entered rows are last because they
+                # are the only ones carrying an observed reward.
+                self._db.execute(
+                    cur,
+                    """SELECT id FROM candidate_observations
+                       WHERE entered=0
+                       ORDER BY mapped ASC, observed_ts ASC LIMIT %s""",
+                    (excess,),
+                )
+                stale = [row[0] for row in cur.fetchall()]
+                for row_id in stale:
+                    self._db.execute(
+                        cur,
+                        "DELETE FROM candidate_observations WHERE id=%s",
+                        (row_id,),
+                    )
+
+    def _entry_confirmation_ready(
+        self,
+        candidate: MappedCandidate,
+        *,
+        now: float,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        """Require distinct retained signal readings without chasing the ask."""
+        policy = candidate.execution_policy
+        required = policy.entry_confirmation_readings
+        if required <= 1:
+            self._candidate_confirmations.pop(candidate.key, None)
+            return True, "", {
+                "entry_confirmation_readings": 1,
+                "configured_entry_confirmation_readings": 1,
+                "confirmation_price_drift": 0.0,
+            }
+
+        observed_at = candidate.signal.observed_at
+        observed_ts = observed_at.timestamp() if observed_at is not None else now
+        maximum_gap = max(
+            5.0,
+            policy.cycle_seconds * 3.0,
+            policy.max_signal_age_seconds,
+        )
+        state = self._candidate_confirmations.get(candidate.key)
+        if (
+            state is None
+            or state.get("execution_profile") != candidate.execution_profile_key
+            or now - float(state.get("last_new_at") or 0.0) > maximum_gap
+        ):
+            state = {
+                "count": 1,
+                "first_entry_cost": candidate.entry_cost,
+                "last_signal_ts": observed_ts,
+                "last_new_at": now,
+                "execution_profile": candidate.execution_profile_key,
+            }
+            self._candidate_confirmations[candidate.key] = state
+        elif observed_ts > float(state.get("last_signal_ts") or 0.0) + 1e-6:
+            drift = max(
+                0.0,
+                candidate.entry_cost - float(state["first_entry_cost"]),
+            )
+            if drift > policy.max_confirmation_price_drift:
+                state = {
+                    "count": 1,
+                    "first_entry_cost": candidate.entry_cost,
+                    "last_signal_ts": observed_ts,
+                    "last_new_at": now,
+                    "execution_profile": candidate.execution_profile_key,
+                }
+                self._candidate_confirmations[candidate.key] = state
+                reason = (
+                    f"ask worsened {drift * 100:.1f}c during confirmation, "
+                    f"above the configured "
+                    f"{policy.max_confirmation_price_drift * 100:.1f}c maximum; "
+                    f"confirmation restarted at 1/{required}"
+                )
+                return False, reason, {
+                    "entry_confirmation_readings": 1,
+                    "configured_entry_confirmation_readings": required,
+                    "confirmation_price_drift": drift,
+                    "configured_max_confirmation_price_drift": (
+                        policy.max_confirmation_price_drift
+                    ),
+                }
+            state["count"] = int(state["count"]) + 1
+            state["last_signal_ts"] = observed_ts
+            state["last_new_at"] = now
+
+        count = int(state["count"])
+        drift = max(
+            0.0,
+            candidate.entry_cost - float(state["first_entry_cost"]),
+        )
+        audit = {
+            "entry_confirmation_readings": count,
+            "configured_entry_confirmation_readings": required,
+            "confirmation_price_drift": drift,
+            "configured_max_confirmation_price_drift": (
+                policy.max_confirmation_price_drift
+            ),
+        }
+        if count < required:
+            if len(self._candidate_confirmations) > 5_000:
+                oldest = sorted(
+                    self._candidate_confirmations,
+                    key=lambda key: float(
+                        self._candidate_confirmations[key].get("last_new_at")
+                        or 0.0
+                    ),
+                )
+                for stale in oldest[:1_000]:
+                    self._candidate_confirmations.pop(stale, None)
+            return False, (
+                f"qualified reading {count}/{required}; waiting for a newer "
+                "retained signal before entry"
+            ), audit
+
+        # A satisfied window is retained until an entry is actually attempted.
+        # Clearing it here discarded earned confirmations whenever the
+        # venue-check budget, the one-entry-per-cycle limit, or a transient
+        # venue failure stopped this candidate short of an order, which
+        # systematically starved lower-ranked candidates. Drift protection is
+        # unaffected: the next newer reading still re-checks the ask against
+        # the window's first observed cost.
+        return True, "", audit
 
     def _cycle_is_current(self, generation: int) -> bool:
         return (
@@ -4744,6 +6290,7 @@ class PolymarketUSAutoTrader:
     ) -> dict[str, Any]:
         item = {
             "event_id": event.id,
+            "event_name": event.name,
             "market": signal.market,
             "outcome": signal.outcome,
             "state": state,
@@ -4754,6 +6301,14 @@ class PolymarketUSAutoTrader:
             "configured_max_edge": self._policy.max_edge,
             "required_edge": signal.required_edge,
             "configured_min_quality": self._policy.min_signal_quality,
+            "configured_max_quality": self._policy.max_signal_quality,
+            "source_agreement": signal.quality_agreement,
+            "configured_min_source_agreement": (
+                self._policy.min_source_agreement
+            ),
+            "configured_max_signal_age_seconds": (
+                self._policy.max_signal_age_seconds
+            ),
             "reference_sources": signal.n_reference_sources,
             "configured_min_reference_sources": (
                 self._policy.min_reference_sources
@@ -4782,6 +6337,19 @@ class PolymarketUSAutoTrader:
                 configured_min_edge=effective.min_edge,
                 configured_max_edge=effective.max_edge,
                 configured_min_quality=effective.min_signal_quality,
+                configured_max_quality=effective.max_signal_quality,
+                configured_min_source_agreement=(
+                    effective.min_source_agreement
+                ),
+                configured_max_signal_age_seconds=(
+                    effective.max_signal_age_seconds
+                ),
+                configured_entry_confirmation_readings=(
+                    effective.entry_confirmation_readings
+                ),
+                configured_max_confirmation_price_drift=(
+                    effective.max_confirmation_price_drift
+                ),
                 configured_min_reference_sources=(
                     effective.min_reference_sources
                 ),
@@ -4800,7 +6368,7 @@ class PolymarketUSAutoTrader:
             event.id,
             signal.market if signal else "event",
             signal.outcome if signal else "",
-            reason,
+            _REJECTION_KEY_NUMBERS.sub("N", reason),
         ))
         now = self._clock()
         last = self._qualification_seen.get(key, 0.0)
@@ -4830,6 +6398,16 @@ class PolymarketUSAutoTrader:
                 "configured_max_edge": self._policy.max_edge,
                 "signal_quality": signal.confidence if signal else None,
                 "configured_min_quality": self._policy.min_signal_quality,
+                "configured_max_quality": self._policy.max_signal_quality,
+                "source_agreement": (
+                    signal.quality_agreement if signal else None
+                ),
+                "configured_min_source_agreement": (
+                    self._policy.min_source_agreement
+                ),
+                "configured_max_signal_age_seconds": (
+                    self._policy.max_signal_age_seconds
+                ),
                 "reference_sources": signal.n_reference_sources if signal else None,
                 "configured_min_reference_sources": (
                     self._policy.min_reference_sources
@@ -4906,11 +6484,6 @@ class PolymarketUSAutoTrader:
         global_policy = self._policy
         market_type = _market_kind(signal.market)
         signal_scope = market_scope(signal.market)
-        if market_type not in global_policy.allowed_market_types:
-            return None, (
-                f"{market_type or 'unknown'} lines are disabled by the "
-                "automatic-entry line-type policy"
-            )
         if signal_scope not in global_policy.allowed_market_scopes:
             return None, (
                 f"{signal_scope.replace('_', ' ')} markets are disabled by the "
@@ -4931,6 +6504,16 @@ class PolymarketUSAutoTrader:
             game_fraction,
         )
         if policy is None:
+            if profile_key == "global/fallback-disabled":
+                return None, (
+                    "global entry fallback is not authorized and no active "
+                    f"{market_type or 'unknown'} line profile matched"
+                )
+            if profile_key.startswith("global/"):
+                return None, (
+                    f"{market_type or 'unknown'} lines are disabled by the "
+                    "global automatic-entry line-type policy"
+                )
             return None, (
                 f"{profile_key} is disabled by the line-specific execution policy"
             )
@@ -4963,6 +6546,16 @@ class PolymarketUSAutoTrader:
                 f"existing signal quality {signal.confidence:.0f}/100 is below "
                 f"the configured {policy.min_signal_quality:.0f}/100 floor"
             )
+        if signal.confidence > policy.max_signal_quality:
+            return None, (
+                f"existing signal quality {signal.confidence:.0f}/100 exceeds "
+                f"the configured {policy.max_signal_quality:.0f}/100 ceiling"
+            )
+        if signal.quality_agreement < policy.min_source_agreement:
+            return None, (
+                f"source agreement {signal.quality_agreement:.0f}/100 is below "
+                f"the configured {policy.min_source_agreement:.0f}/100 floor"
+            )
         if signal.n_reference_sources < policy.min_reference_sources:
             return None, (
                 f"{signal.n_reference_sources} independent reference source "
@@ -4972,8 +6565,11 @@ class PolymarketUSAutoTrader:
         if signal.observed_at is None:
             return None, "signal timestamp is unavailable"
         age = self._clock() - signal.observed_at.timestamp()
-        if age < -5 or age > 120:
-            return None, "signal is stale or future-dated"
+        if age < -5 or age > policy.max_signal_age_seconds:
+            return None, (
+                "signal is future-dated or older than the configured "
+                f"{policy.max_signal_age_seconds:.0f}s maximum"
+            )
 
         found: list[tuple[dict[str, Any], dict[str, Any], float]] = []
         for raw_market in us_event.get("markets", []):
@@ -5009,7 +6605,9 @@ class PolymarketUSAutoTrader:
         if spread > policy.max_spread:
             return None, "US bid/ask spread is wider than the configured maximum"
         execution_edge = probability - entry_cost
-        required = max(policy.min_edge, signal.required_edge)
+        required, fee_floor = _required_execution_edge(
+            policy, signal, entry_cost
+        )
         if (
             execution_edge < required
             and (
@@ -5017,10 +6615,17 @@ class PolymarketUSAutoTrader:
                 or policy.require_engine_entry
             )
         ):
-            return None, (
+            detail = (
                 f"US execution edge {execution_edge * 100:+.1f}c is below "
                 f"the required {required * 100:+.1f}c"
             )
+            if fee_floor is not None and fee_floor >= required - 1e-12:
+                detail += (
+                    f"; at {entry_cost * 100:.0f}c the round-trip taker fee "
+                    f"alone costs {ROUND_TRIP_TAKER_FEE_RATE * entry_cost * (1 - entry_cost) * 100:.1f}c "
+                    "of edge"
+                )
+            return None, detail
         if execution_edge > policy.max_edge:
             return None, (
                 f"US execution edge {execution_edge * 100:+.1f}c exceeds "
@@ -5118,6 +6723,47 @@ class PolymarketUSAutoTrader:
             reasons.append("daily realized-loss stop reached")
         if orders_last_hour >= policy.max_orders_per_hour:
             reasons.append("hourly order limit reached")
+        if (
+            policy.max_profile_exposure_usd > 0
+            or policy.max_profile_open_positions > 0
+            or policy.max_profile_orders_per_hour > 0
+        ):
+            profile_key = candidate.execution_profile_key
+            profile_positions = [
+                row for row in open_positions
+                if self._position_profile_key(row) == profile_key
+            ]
+            profile_exposure = sum(
+                float(row["cost_basis"]) for row in profile_positions
+            )
+            if (
+                policy.max_profile_open_positions > 0
+                and len(profile_positions) >= policy.max_profile_open_positions
+            ):
+                reasons.append(
+                    f"{profile_key} already holds "
+                    f"{len(profile_positions)} of its "
+                    f"{policy.max_profile_open_positions} allowed open positions"
+                )
+            if (
+                policy.max_profile_exposure_usd > 0
+                and profile_exposure >= policy.max_profile_exposure_usd
+            ):
+                reasons.append(
+                    f"{profile_key} exposure ${profile_exposure:.2f} has "
+                    f"reached its ${policy.max_profile_exposure_usd:.2f} "
+                    "profile limit"
+                )
+            if policy.max_profile_orders_per_hour > 0:
+                profile_entries = self._profile_entries_last_hour(
+                    profile_key,
+                    policy.execution_mode,
+                )
+                if profile_entries >= policy.max_profile_orders_per_hour:
+                    reasons.append(
+                        f"{profile_key} used {profile_entries} of its "
+                        f"{policy.max_profile_orders_per_hour} hourly entries"
+                    )
         if recent_event_entries >= policy.max_entries_per_event_per_hour:
             reasons.append(
                 f"event already has {recent_event_entries} managed entries in "
@@ -5129,6 +6775,14 @@ class PolymarketUSAutoTrader:
             policy.max_total_exposure_usd - total_exposure,
             policy.max_event_exposure_usd - event_exposure,
         )
+        if policy.max_profile_exposure_usd > 0:
+            profile_remaining = policy.max_profile_exposure_usd - sum(
+                float(row["cost_basis"])
+                for row in open_positions
+                if self._position_profile_key(row)
+                == candidate.execution_profile_key
+            )
+            capacity = min(capacity, profile_remaining)
         if capacity <= 0:
             reasons.append("exposure capacity is exhausted")
 
@@ -5214,16 +6868,25 @@ class PolymarketUSAutoTrader:
                         f"exceeds the configured {policy.max_spread * 100:.1f}c "
                         "maximum"
                     )
-                required_edge = max(
-                    policy.min_edge,
-                    candidate.signal.required_edge,
+                # Re-derived against the authenticated fill price: the fee floor
+                # moves with the price actually available, not the public quote.
+                required_edge, fee_floor = _required_execution_edge(
+                    policy,
+                    candidate.signal,
+                    candidate.entry_cost,
                 )
                 if candidate.execution_edge < required_edge:
-                    reasons.append(
+                    detail = (
                         f"authenticated US execution edge "
                         f"{candidate.execution_edge * 100:+.1f}c is below the "
                         f"required {required_edge * 100:+.1f}c"
                     )
+                    if fee_floor is not None and fee_floor >= required_edge - 1e-12:
+                        detail += (
+                            " after the round-trip taker fee at "
+                            f"{candidate.entry_cost * 100:.0f}c"
+                        )
+                    reasons.append(detail)
                 if candidate.execution_edge > policy.max_edge:
                     reasons.append(
                         f"authenticated US execution edge "
@@ -5261,8 +6924,27 @@ class PolymarketUSAutoTrader:
             "configured_min_book_shares": policy.min_book_shares,
             "configured_min_edge": policy.min_edge,
             "configured_max_edge": policy.max_edge,
-            "required_edge": max(policy.min_edge, candidate.signal.required_edge),
+            "required_edge": _required_execution_edge(
+                policy, candidate.signal, candidate.entry_cost
+            )[0],
+            "fee_implied_edge_floor": _fee_implied_edge_floor(
+                candidate.entry_cost, policy.fee_edge_margin
+            ),
+            "round_trip_fee_edge_cost": _fee_implied_edge_floor(
+                candidate.entry_cost, 1.0
+            ),
+            "configured_fee_edge_margin": policy.fee_edge_margin,
             "configured_min_quality": policy.min_signal_quality,
+            "configured_max_quality": policy.max_signal_quality,
+            "source_agreement": candidate.signal.quality_agreement,
+            "configured_min_source_agreement": policy.min_source_agreement,
+            "configured_max_signal_age_seconds": policy.max_signal_age_seconds,
+            "configured_entry_confirmation_readings": (
+                policy.entry_confirmation_readings
+            ),
+            "configured_max_confirmation_price_drift": (
+                policy.max_confirmation_price_drift
+            ),
             "configured_min_reference_sources": policy.min_reference_sources,
             "buying_power": balance,
             "available_capacity_usd": max(0.0, capacity),
@@ -5719,6 +7401,13 @@ class PolymarketUSAutoTrader:
             entry_cost = float(position["entry_cost"])
             return_fraction = exit_value / entry_cost - 1.0
             peak = max(float(position["highest_exit_value"]), exit_value)
+            # Adverse extreme, seeded from entry cost so a position that only
+            # ever moved up records no adverse excursion rather than a null.
+            prior_trough = _amount(position.get("lowest_exit_value"))
+            trough = min(
+                prior_trough if prior_trough is not None else entry_cost,
+                exit_value,
+            )
             held_minutes = (
                 self._clock() - float(position["opened_ts"])
             ) / 60.0
@@ -5828,6 +7517,15 @@ class PolymarketUSAutoTrader:
                 if profit_lock_armed and not prior_lock
                 else None
             )
+            (
+                reversal_confirmed,
+                reversal_triggered_ts,
+                reversal_observation_count,
+            ) = self._reversal_confirmation(
+                position,
+                position_policy,
+                current_edge,
+            )
             profit_guard = self._profit_guard_decision(
                 position,
                 exit_value=exit_value,
@@ -5836,6 +7534,7 @@ class PolymarketUSAutoTrader:
                 profit_lock_armed=profit_lock_armed,
                 adaptive_exit=adaptive_exit,
                 policy=position_policy,
+                reversal_confirmed=reversal_confirmed,
             )
             prior_floor_missed_ts = position.get(
                 "profit_floor_missed_ts"
@@ -5882,6 +7581,7 @@ class PolymarketUSAutoTrader:
                 position["id"],
                 exit_value=exit_value,
                 peak=peak,
+                trough=trough,
                 probability=probability,
                 edge=current_edge,
                 return_fraction=return_fraction,
@@ -5903,6 +7603,8 @@ class PolymarketUSAutoTrader:
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
+                reversal_triggered_ts=reversal_triggered_ts,
+                reversal_observation_count=reversal_observation_count,
                 profit_floor_missed_ts=profit_floor_missed_ts,
                 profit_floor_missed_count=profit_floor_missed_count,
                 profit_floor_low_exit_value=profit_floor_low_exit_value,
@@ -5913,6 +7615,12 @@ class PolymarketUSAutoTrader:
                 ),
             )
             marked += 1
+            mlb_shadow = _mlb_shadow_state(
+                game_states.get(str(position["event_id"]))
+            )
+            pitcher_shadow = self._pitcher_change_shadow(event, mlb_shadow)
+            if mlb_shadow is not None and pitcher_shadow is not None:
+                mlb_shadow = {**mlb_shadow, **pitcher_shadow}
             self._journal(
                 "mark",
                 "updated",
@@ -5922,6 +7630,7 @@ class PolymarketUSAutoTrader:
                 selection=position["selection"],
                 payload={
                     "position_id": position["id"],
+                    "mlb_shadow": mlb_shadow,
                     "exit_value": exit_value,
                     "gross_exit_value": gross_exit_value,
                     "estimated_exit_fee": estimated_exit_fee,
@@ -5948,6 +7657,13 @@ class PolymarketUSAutoTrader:
                     ),
                     "adaptive_exit": adaptive_exit.payload(),
                     "stop_guard": stop_guard,
+                    "reversal_confirmation": {
+                        "confirmed": reversal_confirmed,
+                        "observations": reversal_observation_count,
+                        "required": (
+                            position_policy.reversal_confirmation_readings
+                        ),
+                    },
                     "profit_guard": profit_guard,
                     "held_minutes": held_minutes,
                     "venue_sync_status": position.get("venue_sync_status"),
@@ -5963,6 +7679,7 @@ class PolymarketUSAutoTrader:
                 stop_reason=stop_reason,
                 profit_guard=profit_guard,
                 policy=position_policy,
+                reversal_confirmed=reversal_confirmed,
             )
             if (
                 reason
@@ -6144,16 +7861,23 @@ class PolymarketUSAutoTrader:
 
         context = _mlb_stop_context(event, state, position)
         if context is None:
-            base_payload.update(
-                status="immediate",
-                reason="usable MLB inning state is unavailable",
-            )
-            return (
-                "hard_stop_loss",
-                base_payload,
-                prior_trigger,
-                prior_count,
-                min(exit_value, prior_low if prior_low is not None else exit_value),
+            # Name the exact cause: the aggregate bypass count was previously
+            # impossible to decompose into "feed down" vs "state unparseable".
+            if event is None or state is None:
+                bypass_reason = "no live MLB game state was available"
+            else:
+                bypass_reason = "MLB state lacks a usable inning or half"
+            return self._stateless_stop_decision(
+                policy=policy,
+                base_payload=base_payload,
+                bypass_reason=bypass_reason,
+                exit_value=exit_value,
+                current_edge=current_edge,
+                return_fraction=return_fraction,
+                adaptive_exit=adaptive_exit,
+                prior_trigger=prior_trigger,
+                prior_count=prior_count,
+                prior_low=prior_low,
             )
         state_age = max(
             0.0,
@@ -6162,16 +7886,17 @@ class PolymarketUSAutoTrader:
         context["state_age_seconds"] = state_age
         base_payload["game_state"] = context
         if state_age > 180.0:
-            base_payload.update(
-                status="immediate",
-                reason=f"MLB game state is stale ({state_age:.0f}s old)",
-            )
-            return (
-                "hard_stop_loss",
-                base_payload,
-                prior_trigger,
-                prior_count,
-                min(exit_value, prior_low if prior_low is not None else exit_value),
+            return self._stateless_stop_decision(
+                policy=policy,
+                base_payload=base_payload,
+                bypass_reason=f"MLB game state is stale ({state_age:.0f}s old)",
+                exit_value=exit_value,
+                current_edge=current_edge,
+                return_fraction=return_fraction,
+                adaptive_exit=adaptive_exit,
+                prior_trigger=prior_trigger,
+                prior_count=prior_count,
+                prior_low=prior_low,
             )
         if context["settled_in_favor"]:
             # A low quote conflicts with an already-cleared half-point total.
@@ -6235,6 +7960,111 @@ class PolymarketUSAutoTrader:
                 min(exit_value, prior_low if prior_low is not None else exit_value),
             )
 
+        return self._bounded_stop_confirmation(
+            policy=policy,
+            base_payload=base_payload,
+            exit_value=exit_value,
+            current_edge=current_edge,
+            adaptive_exit=adaptive_exit,
+            prior_trigger=prior_trigger,
+            prior_count=prior_count,
+            prior_low=prior_low,
+            fraction_remaining=float(context["fraction_remaining"]),
+        )
+
+    def _stateless_stop_decision(
+        self,
+        *,
+        policy: TradingPolicy,
+        base_payload: dict[str, Any],
+        bypass_reason: str,
+        exit_value: float,
+        current_edge: float | None,
+        return_fraction: float,
+        adaptive_exit: AdaptiveExitDecision,
+        prior_trigger: float | None,
+        prior_count: int,
+        prior_low: float | None,
+    ) -> tuple[str | None, dict[str, Any], float | None, int, float | None]:
+        """Decide a stop that fired without usable MLB state.
+
+        Historically this always sold immediately, which made the
+        confirmation-gated stop inert in practice: most stop hits arrive
+        without a usable inning state. With ``stateless_stop_confirmation``
+        the ordinary stop instead runs the same bounded confirmation window
+        on price alone, while catastrophic losses and material model
+        reversals still exit immediately.
+        """
+        immediate_low = min(
+            exit_value,
+            prior_low if prior_low is not None else exit_value,
+        )
+        if not policy.stateless_stop_confirmation:
+            base_payload.update(status="immediate", reason=bypass_reason)
+            return (
+                "hard_stop_loss",
+                base_payload,
+                prior_trigger,
+                prior_count,
+                immediate_low,
+            )
+        base_payload["state_unavailable_reason"] = bypass_reason
+        catastrophic_loss = min(
+            0.95,
+            policy.stop_loss * policy.catastrophic_stop_multiplier,
+        )
+        base_payload["catastrophic_stop_loss"] = catastrophic_loss
+        if return_fraction <= -catastrophic_loss:
+            base_payload.update(
+                status="immediate",
+                reason="catastrophic loss boundary reached",
+            )
+            return (
+                "catastrophic_stop_loss",
+                base_payload,
+                prior_trigger,
+                prior_count,
+                immediate_low,
+            )
+        material_reversal = -max(0.03, policy.min_edge)
+        if current_edge is not None and current_edge <= material_reversal:
+            base_payload.update(
+                status="immediate",
+                reason="current model edge materially reversed",
+                material_reversal_threshold=material_reversal,
+            )
+            return (
+                "model_reversal_stop_loss",
+                base_payload,
+                prior_trigger,
+                prior_count,
+                immediate_low,
+            )
+        return self._bounded_stop_confirmation(
+            policy=policy,
+            base_payload=base_payload,
+            exit_value=exit_value,
+            current_edge=current_edge,
+            adaptive_exit=adaptive_exit,
+            prior_trigger=prior_trigger,
+            prior_count=prior_count,
+            prior_low=prior_low,
+            fraction_remaining=None,
+        )
+
+    def _bounded_stop_confirmation(
+        self,
+        *,
+        policy: TradingPolicy,
+        base_payload: dict[str, Any],
+        exit_value: float,
+        current_edge: float | None,
+        adaptive_exit: AdaptiveExitDecision,
+        prior_trigger: float | None,
+        prior_count: int,
+        prior_low: float | None,
+        fraction_remaining: float | None,
+    ) -> tuple[str | None, dict[str, Any], float | None, int, float | None]:
         now = self._clock()
         confirmation_window = max(
             policy.stop_grace_minutes * 120.0,
@@ -6248,11 +8078,15 @@ class PolymarketUSAutoTrader:
         triggered_at = prior_trigger if consecutive else now
         confirmations = prior_count + 1 if consecutive else 1
         low = min(exit_value, prior_low if consecutive and prior_low is not None else exit_value)
-        fraction = float(context["fraction_remaining"])
         grace_minutes = policy.stop_grace_minutes
-        if fraction <= 0.12:
+        if fraction_remaining is None:
+            # Without game state the remaining-time shrink cannot run, so the
+            # price-only window is capped at one minute rather than trusting
+            # the full configured grace late in a game.
+            grace_minutes = min(grace_minutes, 1.0)
+        elif fraction_remaining <= 0.12:
             grace_minutes = min(grace_minutes, 0.5)
-        elif fraction <= 0.25:
+        elif fraction_remaining <= 0.25:
             grace_minutes = min(grace_minutes, 1.0)
         predicted = adaptive_exit.predicted_adverse_probability
         if (
@@ -6280,13 +8114,19 @@ class PolymarketUSAutoTrader:
             confirmations >= policy.stop_confirmation_readings
             and elapsed >= grace_seconds
         )
+        with_state = fraction_remaining is not None
         base_payload.update(
             status="confirmed" if confirmed else "observing_recovery",
             reason=(
                 "bounded confirmation window expired with the stop still breached"
                 if confirmed
-                else "MLB state remains live and model edge has not materially reversed"
+                else (
+                    "MLB state remains live and model edge has not materially reversed"
+                    if with_state
+                    else "price-only confirmation window is observing for recovery"
+                )
             ),
+            confirmation_basis="mlb_state" if with_state else "price_only",
             confirmations=confirmations,
             required_confirmations=policy.stop_confirmation_readings,
             triggered_at=datetime.fromtimestamp(
@@ -6307,6 +8147,91 @@ class PolymarketUSAutoTrader:
             low,
         )
 
+    def _pitcher_change_shadow(
+        self,
+        event: Event | None,
+        shadow: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Track per-event pitcher identity and flag recent bullpen changes.
+
+        Shadow telemetry: journals one row per detected change and enriches
+        mark payloads; no exit or entry rule reads it yet.
+        """
+        if event is None or not shadow:
+            return None
+        pitcher_id = shadow.get("pitcher_id")
+        if not pitcher_id:
+            return None
+        now = self._clock()
+        tracker = self._event_pitchers.get(event.id)
+        if tracker is None:
+            tracker = {
+                "pitcher_id": pitcher_id,
+                "previous_pitcher_id": None,
+                "changed_ts": None,
+            }
+            self._event_pitchers[event.id] = tracker
+        elif tracker.get("pitcher_id") != pitcher_id:
+            tracker.update(
+                previous_pitcher_id=tracker.get("pitcher_id"),
+                pitcher_id=pitcher_id,
+                changed_ts=now,
+            )
+            self._journal(
+                "shadow",
+                "pitcher_change",
+                event_id=event.id,
+                event_name=event.name,
+                payload={
+                    "previous_pitcher_id": tracker["previous_pitcher_id"],
+                    "pitcher_id": pitcher_id,
+                    "pitcher_name": shadow.get("pitcher_name"),
+                    "inning": shadow.get("inning"),
+                    "half": shadow.get("half"),
+                },
+            )
+        changed_ts = tracker.get("changed_ts")
+        seconds_since = now - changed_ts if changed_ts is not None else None
+        return {
+            "pitcher_change_recent": (
+                seconds_since is not None and seconds_since <= 180.0
+            ),
+            "seconds_since_pitcher_change": (
+                round(seconds_since, 1) if seconds_since is not None else None
+            ),
+            "previous_pitcher_id": tracker.get("previous_pitcher_id"),
+        }
+
+    def _reversal_confirmation(
+        self,
+        position: Mapping[str, Any],
+        policy: TradingPolicy,
+        current_edge: float | None,
+    ) -> tuple[bool, float | None, int]:
+        """Consecutive-reading confirmation for the model-reversal exit.
+
+        The 2026-08-02 settlement grading showed 62-65% of single-reading
+        reversal exits going on to win, on both lanes independently — the
+        same one-quote failure mode the stop guard already fixed. A recovery
+        above the threshold resets the streak; with the default of one
+        required reading this is exactly the historical behavior.
+        """
+        threshold = -max(0.03, policy.min_edge)
+        if current_edge is None or current_edge > threshold:
+            return False, None, 0
+        required = max(1, int(policy.reversal_confirmation_readings))
+        now = self._clock()
+        window = max(
+            60.0,
+            float(policy.cycle_seconds) * float(required + 2),
+        )
+        prior_ts = _amount(position.get("reversal_triggered_ts"))
+        prior_count = int(position.get("reversal_observation_count") or 0)
+        consecutive = prior_ts is not None and now - prior_ts <= window
+        triggered_at = prior_ts if consecutive else now
+        count = prior_count + 1 if consecutive else 1
+        return count >= required, triggered_at, count
+
     def _profit_guard_decision(
         self,
         position: Mapping[str, Any],
@@ -6317,6 +8242,7 @@ class PolymarketUSAutoTrader:
         profit_lock_armed: bool,
         adaptive_exit: AdaptiveExitDecision | None,
         policy: TradingPolicy | None = None,
+        reversal_confirmed: bool = False,
     ) -> dict[str, Any]:
         """Prevent an ordinary profit exit from chasing a gap below its floor.
 
@@ -6353,10 +8279,10 @@ class PolymarketUSAutoTrader:
             1.0 + policy.minimum_locked_profit
         )
         floor_satisfied = exit_value + 1e-12 >= floor_value
-        material_reversal = (
-            current_edge is not None
-            and current_edge <= -max(0.03, policy.min_edge)
-        )
+        # A material reversal must clear the same confirmation the
+        # model_reversal exit uses; a single adverse reading can no longer
+        # punch through the protected profit floor.
+        material_reversal = bool(reversal_confirmed)
         material_reversal_override = bool(
             triggered
             and material_reversal
@@ -6420,6 +8346,7 @@ class PolymarketUSAutoTrader:
         stop_reason: str | None = None,
         profit_guard: Mapping[str, Any] | None = None,
         policy: TradingPolicy | None = None,
+        reversal_confirmed: bool = False,
     ) -> str | None:
         policy = policy or self._policy
         effective_exit_edge = (
@@ -6454,7 +8381,10 @@ class PolymarketUSAutoTrader:
             )
         ):
             return "profit_lock_after_edge_decay" if edge_invalid else "trailing_profit_lock"
-        if current_edge is not None and current_edge <= -max(0.03, policy.min_edge):
+        # The reversal exit sells only after the configured number of
+        # consecutive negative-edge readings; a single adverse quote is
+        # observation, not evidence the thesis died.
+        if reversal_confirmed:
             return "model_reversal"
         return None
 
@@ -6781,10 +8711,14 @@ class PolymarketUSAutoTrader:
                         venue_mismatch_count,policy_session_id,entry_policy_json,
                         entry_signal_edge,entry_signal_quality,
                         entry_reference_sources,entry_execution_edge,
-                        entry_game_fraction_remaining,entry_event_entries_60m)
+                        entry_game_fraction_remaining,entry_event_entries_60m,
+                        entry_source_agreement,entry_signal_age_seconds,
+                        entry_confirmation_count,
+                        entry_confirmation_price_drift,
+                        entry_spread,entry_book_shares)
                        VALUES (%s,%s,'open',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                               %s,%s,%s,%s,%s,%s)""",
+                               %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (
                         position_id,
                         mode,
@@ -6825,6 +8759,15 @@ class PolymarketUSAutoTrader:
                         float(candidate.execution_edge),
                         candidate.game_fraction_remaining,
                         int(candidate.event_entries_60m),
+                        float(candidate.signal.quality_agreement),
+                        _signal_age_seconds(candidate.signal, now),
+                        int(candidate.entry_confirmation_count),
+                        float(candidate.entry_confirmation_price_drift),
+                        # Retained so spread and depth stop being frequency-only
+                        # evidence: the advisor cannot score a filter against
+                        # realized P/L unless the entry value is on the position.
+                        float(candidate.spread),
+                        float(candidate.book_shares),
                     ),
                 )
         return position_id
@@ -6839,6 +8782,32 @@ class PolymarketUSAutoTrader:
                     (candidate.market["slug"], candidate.position_side),
                 )
                 return cur.fetchone() is not None
+
+    @staticmethod
+    def _position_profile_key(position: Mapping[str, Any]) -> str:
+        """Return the line/stage profile frozen into a position at entry."""
+        payload = position.get("entry_policy")
+        if isinstance(payload, Mapping):
+            key = payload.get("execution_profile_key")
+            if key:
+                return str(key)
+        return "global"
+
+    def _profile_entries_last_hour(self, profile_key: str, mode: str) -> int:
+        """Count fills attributed to one line/stage profile in the last hour.
+
+        The profile key is read from each position's frozen entry policy rather
+        than recomputed, so a later policy edit cannot retroactively move a
+        past fill into a different profile's budget.
+        """
+        window_start = self._clock() - 3600
+        return sum(
+            1
+            for row in self.positions(include_hidden=True)
+            if str(row.get("mode") or "") == mode
+            and float(row.get("opened_ts") or 0.0) > window_start
+            and self._position_profile_key(row) == profile_key
+        )
 
     def _event_entries_last_hour(self, event_id: str, mode: str) -> int:
         """Count actual managed fills, including positions since closed."""
@@ -6859,6 +8828,7 @@ class PolymarketUSAutoTrader:
         *,
         exit_value: float,
         peak: float,
+        trough: float,
         probability: float | None,
         edge: float | None,
         return_fraction: float,
@@ -6872,6 +8842,8 @@ class PolymarketUSAutoTrader:
         stop_observation_count: int = 0,
         stop_low_exit_value: float | None = None,
         stop_guard_payload: str | None = None,
+        reversal_triggered_ts: float | None = None,
+        reversal_observation_count: int = 0,
         profit_floor_missed_ts: float | None = None,
         profit_floor_missed_count: int = 0,
         profit_floor_low_exit_value: float | None = None,
@@ -6882,7 +8854,8 @@ class PolymarketUSAutoTrader:
                 self._db.execute(
                     cur,
                     """UPDATE live_managed_positions SET updated_ts=%s,
-                       highest_exit_value=%s,current_exit_value=%s,
+                       highest_exit_value=%s,lowest_exit_value=%s,
+                       current_exit_value=%s,
                        current_model_probability=%s,current_execution_edge=%s,
                        return_fraction=%s,
                        profit_lock_armed_ts=COALESCE(
@@ -6897,13 +8870,16 @@ class PolymarketUSAutoTrader:
                        stop_observation_count=%s,
                        stop_low_exit_value=%s,
                        stop_guard_payload=%s,
+                       reversal_triggered_ts=%s,
+                       reversal_observation_count=%s,
                        profit_floor_missed_ts=%s,
                        profit_floor_missed_count=%s,
                        profit_floor_low_exit_value=%s,
                        profit_guard_payload=%s
                        WHERE id=%s AND status='open'""",
                     (
-                        self._clock(), peak, exit_value, probability, edge,
+                        self._clock(), peak, trough, exit_value,
+                        probability, edge,
                         return_fraction, profit_lock_armed_ts,
                         profit_lock_price, profit_target_observed_ts,
                         profit_target_observation_count,
@@ -6913,6 +8889,8 @@ class PolymarketUSAutoTrader:
                         stop_observation_count,
                         stop_low_exit_value,
                         stop_guard_payload,
+                        reversal_triggered_ts,
+                        reversal_observation_count,
                         profit_floor_missed_ts,
                         profit_floor_missed_count,
                         profit_floor_low_exit_value,
@@ -7100,7 +9078,18 @@ class PolymarketUSAutoTrader:
                 "signal_market": candidate.signal.market,
                 "signal_outcome": candidate.signal.outcome,
                 "signal_quality": candidate.signal.confidence,
+                "source_agreement": candidate.signal.quality_agreement,
+                "signal_age_seconds": _signal_age_seconds(
+                    candidate.signal,
+                    self._clock(),
+                ),
                 "reference_sources": candidate.signal.n_reference_sources,
+                "entry_confirmation_readings": (
+                    candidate.entry_confirmation_count
+                ),
+                "confirmation_price_drift": (
+                    candidate.entry_confirmation_price_drift
+                ),
                 "mapping_score": candidate.mapping_score,
                 "engine_action": candidate.signal.action,
                 "execution_mode": self._policy.execution_mode,
@@ -7157,24 +9146,72 @@ class PolymarketUSAutoTrader:
         if self._journal_writes % 100 == 0:
             self._prune_journal()
 
-    def _prune_journal(self, maximum: int = 10_000) -> None:
-        """Keep the decision ticker useful without allowing unbounded local data."""
+    def _prune_journal(
+        self,
+        maximum: int = 10_000,
+        *,
+        protected_ceiling: int = 100_000,
+    ) -> None:
+        """Keep the decision ticker useful without allowing unbounded local data.
+
+        Order-audit kinds are exempt from the ordinary cap, so the table can
+        exceed `maximum` once they dominate. `protected_ceiling` is the backstop
+        that keeps even those bounded: at roughly two rows per managed trade it
+        allows tens of thousands of trades before the oldest audit rows age out.
+        """
         with self._lock:
             with self._db.cursor() as cur:
                 self._db.execute(cur, "SELECT COUNT(*) FROM live_trading_journal")
                 count = int(cur.fetchone()[0] or 0)
+            if count > protected_ceiling:
+                with self._db.transaction() as cur:
+                    self._db.execute(
+                        cur,
+                        """SELECT id FROM live_trading_journal
+                           ORDER BY created_ts ASC LIMIT %s""",
+                        (count - protected_ceiling,),
+                    )
+                    for row in list(cur.fetchall()):
+                        self._db.execute(
+                            cur,
+                            "DELETE FROM live_trading_journal WHERE id=%s",
+                            (row[0],),
+                        )
+                count = protected_ceiling
             excess = count - maximum
             if excess <= 0:
                 return
             with self._db.transaction() as cur:
+                # Entry, exit, and settlement rows are the audit trail for real
+                # orders and the fallback opportunity history the advisor reads
+                # for trades that predate the candidate log. Evict rejection
+                # chatter first: mark rows carry the per-cycle exit-decision
+                # evidence (edge paths, guard payloads) that post-session
+                # replays depend on, and losing them to qualification noise
+                # cost two thirds of the 2026-08-02 reversal analysis.
+                stale: list[str] = []
                 self._db.execute(
                     cur,
                     """SELECT id FROM live_trading_journal
-                       WHERE kind NOT IN ('performance_reset','risk_session_reset')
+                       WHERE kind='qualification'
                        ORDER BY created_ts ASC LIMIT %s""",
                     (excess,),
                 )
-                stale = [row[0] for row in cur.fetchall()]
+                stale.extend(row[0] for row in cur.fetchall())
+                remaining = excess - len(stale)
+                if remaining > 0:
+                    self._db.execute(
+                        cur,
+                        """SELECT id FROM live_trading_journal
+                           WHERE kind NOT IN (
+                               'performance_reset','risk_session_reset',
+                               'entry','exit','settlement','safety',
+                               'qualification'
+                           )
+                           ORDER BY created_ts ASC LIMIT %s""",
+                        (remaining,),
+                    )
+                    stale.extend(row[0] for row in cur.fetchall())
                 for row_id in stale:
                     self._db.execute(
                         cur,

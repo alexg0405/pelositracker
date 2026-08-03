@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
+from urllib.parse import quote
 
 import httpx
 
@@ -46,6 +47,15 @@ def credential_status(key_id: str, secret_key: str) -> dict[str, Any]:
         "account_access": "read-only",
         "trading_enabled": False,
     }
+
+
+def _safe_transport_error(exc: BaseException) -> str:
+    """Describe a gateway failure without echoing a URL, body, or header."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP {exc.response.status_code}"
+    if isinstance(exc, PolymarketUSResearchError):
+        return str(exc)
+    return type(exc).__name__
 
 
 def _amount(value: Any) -> float | None:
@@ -369,6 +379,104 @@ async def fetch_public_sports_events(*, limit: int = 60) -> dict[str, Any]:
         "venue": "Polymarket US",
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "events": events[:wanted],
+    }
+
+
+async def fetch_public_sports_events_by_slugs(
+    slugs: Iterable[str],
+) -> dict[str, Any]:
+    """Fetch monitored US events directly instead of relying on list position.
+
+    The general event inventory contains hundreds of futures and unrelated
+    sports. A live game can therefore move beyond the bounded pagination window
+    used by the research browser. Monitored Polymarket event slugs are stable
+    identities, and the public gateway exposes an exact event-by-slug endpoint,
+    so execution should use that endpoint rather than infer absence from a
+    partial global list.
+
+    One slug per monitored event means one transport failure per monitored
+    event. A single transient gateway error must not deny the caller every
+    other event's prices, because the execution cycle that consumes this
+    payload also marks open positions and evaluates protective exits. Failures
+    are therefore reported per slug in ``resolution`` and the caller decides
+    whether the remaining coverage is good enough.
+    """
+    requested = tuple(dict.fromkeys(
+        str(slug or "").strip()
+        for slug in slugs
+        if str(slug or "").strip()
+    ))
+    if not requested:
+        return {
+            "source": PUBLIC_BASE_URL,
+            "venue": "Polymarket US",
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "events": [],
+            "resolution": {
+                "requested": 0,
+                "resolved": 0,
+                "not_found": (),
+                "failed": {},
+            },
+        }
+
+    semaphore = asyncio.Semaphore(8)
+
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+        async def fetch_one(slug: str) -> dict[str, Any] | None:
+            async with semaphore:
+                response = await client.get(
+                    f"{PUBLIC_BASE_URL}/v1/events/slug/{quote(slug, safe='')}"
+                )
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, Mapping):
+                raise PolymarketUSResearchError(
+                    "Polymarket US returned an invalid event-by-slug payload"
+                )
+            raw_event = payload.get("event")
+            if not isinstance(raw_event, Mapping):
+                raise PolymarketUSResearchError(
+                    "Polymarket US event-by-slug response omitted the event"
+                )
+            normalized = normalize_sports_events(
+                {"events": [raw_event]},
+                limit=1,
+            )
+            return normalized[0] if normalized else None
+
+        fetched = await asyncio.gather(
+            *(fetch_one(slug) for slug in requested),
+            return_exceptions=True,
+        )
+
+    events: list[dict[str, Any]] = []
+    not_found: list[str] = []
+    failed: dict[str, str] = {}
+    for slug, outcome in zip(requested, fetched):
+        if isinstance(outcome, BaseException):
+            failed[slug] = _safe_transport_error(outcome)
+        elif outcome is None:
+            not_found.append(slug)
+        else:
+            events.append(outcome)
+    events.sort(key=lambda event: (
+        0 if event.get("live") else 1,
+        str(event.get("start") or "9999"),
+    ))
+    return {
+        "source": PUBLIC_BASE_URL,
+        "venue": "Polymarket US",
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "events": events,
+        "resolution": {
+            "requested": len(requested),
+            "resolved": len(events),
+            "not_found": tuple(not_found),
+            "failed": failed,
+        },
     }
 
 

@@ -33,3 +33,84 @@
 Replay orders original observations by recorded time and stable row ID, stops
 conservatively at terminal timestamp ties, and passes the original tick time as
 `as_of`. It never rebases provider evidence to the replay machine's wall clock.
+
+## Execution candidate log
+
+`candidate_observations` in each Polymarket US execution store records the
+population the saved policy chose *from*, not only the contracts it entered.
+One row is written per contract per candidate cooldown — the shortest interval
+at which that contract could actually be re-entered, which makes the cooldown
+the correct sampling rate for a per-hour frequency estimate as well as a bound
+on retained volume.
+
+Each row retains the executable context (entry cost, execution edge, spread,
+book depth, mapping score), the signal context (edge, quality, source
+agreement, signal age, reference sources), the game-stage and repeat-entry
+context, the resolved `execution_profile` key, the policy session and policy
+fingerprint, and the disposition (`state`, `reason`, `mapped`, `executable`,
+`entered`).
+
+Three properties matter for anyone reading this table:
+
+1. **It is not the display journal.** `live_trading_journal` is pruned to a
+   rolling 10,000 rows; candidate contexts have their own, much larger bound and
+   age out unentered rows before entered ones, so observed-reward rows survive
+   longest.
+2. **Propensities are degenerate.** `propensity_source` is
+   `deterministic_policy`: the saved policy always selects the same contract
+   from the same ranked list, so `selection_propensity` is 1 for the attempted
+   candidate and 0 for the rest. That is recorded honestly and explicitly.
+   Inverse-propensity and doubly robust return estimates are **not** identified
+   from these logs. A future controlled-exploration mode must write a different
+   `propensity_source` so the two regimes can never be pooled by accident.
+3. **Rejected candidates have no reward.** The log fixes the *frequency*
+   question — a looser filter can now show that it would have qualified more
+   contracts — but it does not create counterfactual P/L. Nothing downstream may
+   infer the return of a trade that was never placed.
+
+The dry-run wipe deliberately leaves this table intact, matching the journal's
+existing "preserve audit data" behaviour.
+
+## Execution journal retention
+
+`live_trading_journal` is a rolling window pruned to 10,000 rows. Pruning now
+skips `entry`, `exit`, `settlement`, and `safety` rows alongside the existing
+`performance_reset` and `risk_session_reset` exemptions. Those kinds are the
+audit trail for real orders and the fallback opportunity history the advisor
+reads for trades that predate the candidate log; the high-volume `mark` and
+`qualification` chatter ages out instead.
+
+Reporting paths must not have side effects on this evidence. In particular
+`_current_policy_session()` opens a session when none exists, so status and
+reporting callers use `_open_policy_session_id()`, which returns `None` rather
+than fabricating a session that never traded. Only an actual fill, or saving a
+policy, opens one.
+
+Order-audit kinds are exempt from the ordinary cap, so the table can exceed
+10,000 rows once they dominate. A separate `protected_ceiling` backstop keeps
+even those bounded; at roughly two rows per managed trade it allows tens of
+thousands of trades before the oldest audit rows age out.
+
+### Measured cost of the previous retention order (2026-07-31)
+
+The exemption was added after measuring what the old order had already
+destroyed:
+
+| Store | Managed positions | Surviving `entry` rows | Trades with no entry row |
+|---|---:|---:|---:|
+| Live | 222 | 47 | 175 (79%) |
+| Dry run | 342 | 15 | 327 (96%) |
+
+At the time of measurement 9,171 of the live journal's 10,030 rows were
+`qualification` records. That chatter evicted the order audit trail, and the
+damage was not limited to display: `_backfill_position_entry_context` recovers
+`entry_signal_edge`, `entry_signal_quality`, and `entry_reference_sources` for
+older positions **from those entry rows**. With them gone, 61 of the 196 priced
+live closes (31%) permanently lack the signal metadata the advisor requires, so
+the usable sample is 135 trades rather than 196.
+
+The decision ledger cannot recover them either: `decision_marks` is itself
+capped and none of the 61 decision identifiers remain in it. This evidence is
+unrecoverable. The retention change prevents further loss; it cannot undo this.
+Any comparison against the July 2026 audit should treat that audit's counts as
+the larger, pre-loss sample.

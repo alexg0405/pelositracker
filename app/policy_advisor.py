@@ -16,7 +16,7 @@ import statistics
 from typing import Any, Iterable, Mapping, Sequence
 
 
-ADVISOR_VERSION = "execution-policy-advisor-v4-line-stage-uncertainty"
+ADVISOR_VERSION = "execution-policy-advisor-v5-candidate-population"
 ADVISOR_OBJECTIVES = {
     "protect_profit": {
         "label": "Protect profit",
@@ -50,6 +50,261 @@ MIN_TEST_TRADES = 8
 MIN_TEST_EVENTS = 5
 BOOTSTRAP_DRAWS = 2000
 BOOTSTRAP_CONFIDENCE = 0.90
+
+# Support thresholds for a single field's marginal evidence. These are looser
+# than the joint-grid gates above because a marginal sweep compares far fewer
+# hypotheses, but they are still stated as whole events rather than trades.
+FIELD_DIRECTIONAL_EVENTS = 10
+FIELD_DIRECTIONAL_TRADES = 20
+
+BASELINE_CHEAT_SHEET_VERSION = "baseline-cheat-sheet-v1-2026-07"
+
+# How each policy field can honestly be estimated from retained evidence.
+#
+#   grid_search     the joint optimizer already scores it against realized P/L
+#   marginal        sweep the field alone, holding the other filters fixed
+#   excursion       identifiable only from retained peak-excursion evidence,
+#                   and only in the tightening direction
+#   not_identifiable  changing it changes the price path that produced the
+#                   realized P/L, so retained outcomes cannot score it
+#
+# Whether a marginal field is *measurable* is a property of the retained data,
+# not a fixed attribute of the field: a column added by a later migration leaves
+# older trades unmeasurable, and the sweep reports that count and falls back to
+# the versioned baseline rather than scoring a biased subset.
+ENTRY_FIELD = "entry"
+EXIT_FIELD = "exit"
+PACING_FIELD = "pacing"
+ADAPTIVE_FIELD = "adaptive"
+
+POLICY_FIELD_CATALOG: tuple[dict[str, Any], ...] = (
+    {
+        "field": "min_edge", "group": ENTRY_FIELD, "mode": "grid_search",
+        "label": "Minimum edge", "unit": "fraction",
+    },
+    {
+        "field": "max_edge", "group": ENTRY_FIELD, "mode": "grid_search",
+        "label": "Maximum edge (anomaly ceiling)", "unit": "fraction",
+    },
+    {
+        "field": "min_signal_quality", "group": ENTRY_FIELD,
+        "mode": "grid_search", "label": "Minimum signal quality", "unit": "score",
+    },
+    {
+        "field": "min_reference_sources", "group": ENTRY_FIELD,
+        "mode": "grid_search", "label": "Minimum independent references",
+        "unit": "count",
+    },
+    {
+        "field": "min_entry_price", "group": ENTRY_FIELD, "mode": "grid_search",
+        "label": "Entry price floor", "unit": "fraction",
+    },
+    {
+        "field": "max_entry_price", "group": ENTRY_FIELD, "mode": "grid_search",
+        "label": "Entry price ceiling", "unit": "fraction",
+    },
+    {
+        "field": "max_signal_quality", "group": ENTRY_FIELD, "mode": "marginal",
+        "label": "Maximum signal quality", "unit": "score",
+        "row_key": "signal_quality", "direction": "upper",
+        "values": (85.0, 90.0, 95.0, 100.0),
+        "baseline": 100.0,
+        "baseline_reason": (
+            "Signal quality is a reliability score, not a win probability, and "
+            "the July 2026 audit found it was not monotonic with realized "
+            "return. Leave the ceiling open unless local evidence supports it."
+        ),
+    },
+    {
+        "field": "min_source_agreement", "group": ENTRY_FIELD, "mode": "marginal",
+        "label": "Minimum source agreement", "unit": "score",
+        "row_key": "source_agreement", "direction": "lower",
+        "values": (0.0, 40.0, 55.0, 70.0),
+        "baseline": 0.0,
+        "baseline_reason": (
+            "Source agreement was only retained from policy v11 onward, so most "
+            "closed trades cannot score it. Zero preserves existing behaviour."
+        ),
+    },
+    {
+        "field": "max_signal_age_seconds", "group": ENTRY_FIELD,
+        "mode": "marginal", "label": "Maximum retained signal age",
+        "unit": "seconds", "row_key": "signal_age_seconds", "direction": "upper",
+        "values": (15.0, 30.0, 60.0, 120.0),
+        "baseline": 120.0,
+        "baseline_reason": (
+            "120s matches the previous hard-coded staleness bound, so it is the "
+            "behaviour-preserving default until local evidence separates the "
+            "age bands."
+        ),
+    },
+    {
+        "field": "entry_confirmation_readings", "group": ENTRY_FIELD,
+        "mode": "marginal", "label": "Distinct qualifying readings",
+        "unit": "count", "row_key": "entry_confirmation_readings",
+        "direction": "lower", "values": (1, 2, 3),
+        "baseline": 2,
+        "baseline_reason": (
+            "Two readings require the signal to persist across a refresh "
+            "without materially raising latency. One reproduces the immediate "
+            "entry behaviour that produced the existing sample."
+        ),
+    },
+    {
+        "field": "max_confirmation_price_drift", "group": ENTRY_FIELD,
+        "mode": "marginal", "label": "Maximum ask drift while confirming",
+        "unit": "fraction", "row_key": "confirmation_price_drift",
+        "direction": "upper", "values": (0.01, 0.02, 0.03, 1.0),
+        "baseline": 0.02,
+        "baseline_reason": (
+            "Two cents bounds chasing a worsening ask while leaving room for "
+            "ordinary one-tick movement between readings."
+        ),
+    },
+    {
+        # Entry spread and depth are retained on the position from policy v12
+        # onward. Positions opened before that migration carry no value and are
+        # counted as unmeasurable, so this stays on the versioned baseline until
+        # enough newer trades exist to score it.
+        "field": "max_spread", "group": ENTRY_FIELD, "mode": "marginal",
+        "label": "Maximum bid/ask spread", "unit": "fraction",
+        "row_key": "spread", "direction": "upper",
+        "values": (0.02, 0.03, 0.05, 0.08),
+        "baseline": 0.05,
+        "baseline_reason": (
+            "Five cents bounds round-trip cost without excluding ordinary "
+            "in-play books. Entry spread is only retained on positions opened "
+            "after the v12 migration, so older trades cannot score it."
+        ),
+    },
+    {
+        "field": "min_book_shares", "group": ENTRY_FIELD, "mode": "marginal",
+        "label": "Minimum book depth", "unit": "shares",
+        "row_key": "book_shares", "direction": "lower",
+        "values": (5.0, 10.0, 25.0, 50.0),
+        "baseline": 10.0,
+        "baseline_reason": (
+            "Ten shares keeps a full exit plausible at workstation position "
+            "sizes. Entry depth is only retained on positions opened after the "
+            "v12 migration, so older trades cannot score it."
+        ),
+    },
+    {
+        "field": "max_entries_per_event_per_hour", "group": PACING_FIELD,
+        "mode": "grid_search", "label": "Maximum entries per event / hour",
+        "unit": "count",
+    },
+    {
+        "field": "max_orders_per_hour", "group": PACING_FIELD,
+        "mode": "grid_search", "label": "Maximum entries / hour", "unit": "count",
+    },
+    {
+        "field": "candidate_cooldown_seconds", "group": PACING_FIELD,
+        "mode": "grid_search", "label": "Candidate retry cooldown",
+        "unit": "seconds",
+    },
+    {
+        "field": "min_mlb_fraction_remaining", "group": PACING_FIELD,
+        "mode": "grid_search", "label": "Minimum MLB regulation remaining",
+        "unit": "fraction",
+    },
+    {
+        "field": "profit_target", "group": EXIT_FIELD, "mode": "excursion",
+        "label": "Meaningful profit target", "unit": "fraction",
+        "row_key": "highest_exit_value", "direction": "upper",
+        "values": (0.04, 0.06, 0.08, 0.10, 0.15),
+        "exit_families": (
+            "profit_target", "profit_lock", "trailing_profit_lock",
+            "meaningful_profit", "profit_floor_missed_holding",
+        ),
+        "baseline": 0.08,
+        "baseline_reason": (
+            "Profit locks were the best-performing exit family in the July 2026 "
+            "sample. Eight percent is inside the band that was reached often "
+            "enough to matter without demanding a rare move."
+        ),
+    },
+    {
+        "field": "minimum_locked_profit", "group": EXIT_FIELD,
+        "mode": "not_identifiable", "label": "Minimum retained profit",
+        "unit": "fraction", "baseline": 0.02,
+        "baseline_reason": (
+            "47 losing or push trades had first shown a positive mark. A small "
+            "retained floor bounds that give-back without disabling the stop."
+        ),
+    },
+    {
+        "field": "trailing_drawdown", "group": EXIT_FIELD,
+        "mode": "not_identifiable", "label": "Trailing pullback",
+        "unit": "fraction", "baseline": 0.04,
+        "baseline_reason": (
+            "Trailing locks were positive after cost in the observed sample, "
+            "but the observed pullback path depends on the trail that was "
+            "actually running."
+        ),
+    },
+    {
+        # Retained adverse excursion makes a *tighter* stop identifiable in the
+        # same way peak excursion does for a profit target. Widening a stop
+        # stays unidentifiable: a position closed at the old stop has no
+        # observed continuation.
+        "field": "stop_loss", "group": EXIT_FIELD, "mode": "excursion",
+        "label": "Stop loss", "unit": "fraction",
+        "row_key": "lowest_exit_value", "direction": "lower",
+        "values": (0.10, 0.15, 0.20, 0.25),
+        "exit_families": (
+            "stop_loss", "hard_stop", "catastrophic_stop",
+            "confirmed_stop", "volatility_stop",
+        ),
+        "baseline": 0.20,
+        "baseline_reason": (
+            "Hard stops were the dominant realized-loss source, but removing or "
+            "widening them is not supported: positions that could not recover "
+            "leave the comparison at different times. Keep the tail bounded."
+        ),
+    },
+    {
+        "field": "exit_edge", "group": EXIT_FIELD, "mode": "not_identifiable",
+        "label": "Model-reversal edge", "unit": "fraction", "baseline": 0.0,
+        "baseline_reason": (
+            "Model-reversal exits were roughly flat overall and their result "
+            "depended on line and context rather than on one threshold."
+        ),
+    },
+    {
+        "field": "min_hold_minutes", "group": EXIT_FIELD,
+        "mode": "not_identifiable", "label": "Minimum hold / fallback confirmation",
+        "unit": "minutes", "baseline": 2.0,
+        "baseline_reason": (
+            "A short fallback hold avoids reacting to a single quote without "
+            "delaying a confirmed two-reading profit lock."
+        ),
+    },
+    {
+        "field": "adaptive_exit_profile", "group": ADAPTIVE_FIELD,
+        "mode": "not_identifiable", "label": "Adaptive exit response",
+        "unit": "choice", "baseline": "observe",
+        "baseline_reason": (
+            "Guarded, Balanced, and Responsive tighten exits from a cold-start "
+            "confidence floor before any labeled evidence exists. Observe-only "
+            "scores the overlay without letting it act."
+        ),
+    },
+    {
+        "field": "stop_confirmation_readings", "group": ADAPTIVE_FIELD,
+        "mode": "not_identifiable", "label": "Stop confirmation readings",
+        "unit": "count", "baseline": 2,
+        "baseline_reason": (
+            "Requiring a second reading filters a single bad quote. Scoring it "
+            "needs the price path of trades that were stopped under a different "
+            "rule, which retained outcomes do not contain."
+        ),
+    },
+)
+
+POLICY_FIELD_CATALOG_BY_NAME = {
+    item["field"]: item for item in POLICY_FIELD_CATALOG
+}
 
 
 def _finite(value: Any) -> float | None:
@@ -508,6 +763,486 @@ def _category_diagnostics(
     return result
 
 
+def _opportunity_provenance(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Describe what the qualified-frequency estimate is actually counting.
+
+    Before candidate logging existed, "opportunities" were the fills themselves,
+    so a looser candidate policy could only ever re-filter trades that were
+    already taken and its estimated frequency was bounded by the frequency that
+    produced the data. Rows from the candidate log remove that ceiling; rows
+    from the legacy entry journal do not.
+    """
+    logged = [
+        row for row in rows
+        if str(row.get("evidence_source") or "") == "candidate_log"
+    ]
+    unentered = [row for row in logged if not row.get("entered")]
+    legacy = len(rows) - len(logged)
+    propensity_sources = sorted({
+        str(row.get("propensity_source"))
+        for row in logged
+        if row.get("propensity_source")
+    })
+    return {
+        "total_observations": len(rows),
+        "candidate_log_observations": len(logged),
+        "unentered_candidate_observations": len(unentered),
+        "legacy_entry_only_observations": legacy,
+        "propensity_sources": propensity_sources,
+        "randomized_exploration": False,
+        "off_policy_identified": False,
+        "frequency_estimate_basis": (
+            "candidate population including rejected contracts"
+            if unentered
+            else "entered contracts only"
+        ),
+        "note": (
+            "Estimated qualified-per-hour counts contracts the policy declined, "
+            "so a looser filter can now show a higher rate than the policy that "
+            "produced the data. Rejected contracts still have no observed "
+            "return, so no profit estimate is available for them."
+            if unentered
+            else "Only entered contracts are retained for this range, so the "
+            "estimated qualified-per-hour rate cannot exceed the rate of the "
+            "policy that produced the data. Collect candidate-log history "
+            "before comparing looser filters on frequency."
+        ),
+    }
+
+
+def _date_range(rows: Sequence[Mapping[str, Any]], field: str) -> dict[str, Any]:
+    stamps = [
+        value for value in (_finite(row.get(field)) for row in rows)
+        if value is not None
+    ]
+    return {
+        "first_ts": min(stamps) if stamps else None,
+        "last_ts": max(stamps) if stamps else None,
+    }
+
+
+def _support_level(performance: Mapping[str, Any]) -> str:
+    if (
+        int(performance.get("events") or 0) >= FIELD_DIRECTIONAL_EVENTS
+        and int(performance.get("trades") or 0) >= FIELD_DIRECTIONAL_TRADES
+    ):
+        return "directional"
+    if int(performance.get("trades") or 0) > 0:
+        return "sparse"
+    return "none"
+
+
+def _threshold_keeps(
+    row: Mapping[str, Any],
+    *,
+    row_key: str,
+    direction: str,
+    value: float,
+) -> bool | None:
+    """Would this candidate still qualify under one threshold value?
+
+    Returns None when the row does not carry the field at all, so a missing
+    value is never silently counted as a pass or a fail.
+    """
+    observed = _finite(row.get(row_key))
+    if observed is None:
+        return None
+    return observed <= value if direction == "upper" else observed >= value
+
+
+def _marginal_field_evidence(
+    spec: Mapping[str, Any],
+    *,
+    closed_rows: Sequence[dict[str, Any]],
+    opportunity_rows: Sequence[dict[str, Any]],
+    opportunity_hours: float,
+    test_events: set[str],
+    current_value: Any,
+) -> dict[str, Any]:
+    """Sweep one field alone, holding every other selected filter fixed.
+
+    A joint grid over every field would multiply the hypothesis count into the
+    tens of thousands and make the later-event check meaningless. A marginal
+    sweep answers the narrower, honest question: conditional on the rest of the
+    policy, what does this one threshold do to the retained sample?
+    """
+    row_key = str(spec["row_key"])
+    direction = str(spec["direction"])
+    options: list[dict[str, Any]] = []
+    for value in spec["values"]:
+        kept_opportunities = 0
+        unknown_opportunities = 0
+        for row in opportunity_rows:
+            keeps = _threshold_keeps(
+                row, row_key=row_key, direction=direction, value=float(value)
+            )
+            if keeps is None:
+                unknown_opportunities += 1
+            elif keeps:
+                kept_opportunities += 1
+        option: dict[str, Any] = {
+            "value": value,
+            "qualified_per_hour": (
+                kept_opportunities / opportunity_hours
+                if opportunity_hours > 0 else None
+            ),
+            "qualified_observations": kept_opportunities,
+            "unmeasurable_observations": unknown_opportunities,
+        }
+        kept_rows = []
+        unknown_trades = 0
+        for row in closed_rows:
+            keeps = _threshold_keeps(
+                row, row_key=row_key, direction=direction, value=float(value)
+            )
+            if keeps is None:
+                unknown_trades += 1
+            elif keeps:
+                kept_rows.append(row)
+        later = [
+            row for row in kept_rows
+            if str(row["event_id"]) in test_events
+        ]
+        performance = _performance(kept_rows)
+        option.update({
+            "all_history": performance,
+            "later_events": _performance(later),
+            "event_block_bootstrap": _bootstrap(_event_roi_values(kept_rows)),
+            "date_range": _date_range(kept_rows, "opened_ts"),
+            "support": _support_level(performance),
+            "unmeasurable_trades": unknown_trades,
+        })
+        options.append(option)
+
+    measurable = [
+        option for option in options
+        if option.get("support") == "directional"
+    ]
+    best = max(
+        measurable,
+        key=lambda option: float(
+            option["all_history"].get("turnover_roi") or -1.0
+        ),
+        default=None,
+    )
+    if best is not None:
+        basis = "observational"
+        suggested = best["value"]
+        rationale = (
+            f"Best after-cost turnover ROI among swept values on "
+            f"{best['all_history']['trades']} trades across "
+            f"{best['all_history']['events']} independent events, conditional "
+            "on the rest of the selected policy."
+        )
+    else:
+        basis = "baseline_fallback"
+        suggested = spec["baseline"]
+        rationale = spec["baseline_reason"]
+    return {
+        "basis": basis,
+        "suggested": suggested,
+        "current": current_value,
+        "options": options,
+        "rationale": rationale,
+        "scores_realized_pnl": True,
+        "measurement_note": (
+            None if best is not None else
+            "No swept value reached directional support on trades that retain "
+            "this field, so the versioned baseline is shown instead of a fitted "
+            "value. Check each option's unmeasurable_trades count: a column "
+            "added by a later migration leaves older trades unscoreable."
+        ),
+    }
+
+
+# Polymarket US publishes a symmetric taker fee of 0.05 * contracts * p * (1-p).
+# A counterfactual exit crosses the book, so it pays that fee. Restated here
+# rather than imported because the execution module imports this one.
+_TAKER_FEE_COEFFICIENT = 0.05
+
+
+def _counterfactual_exit_roi(entry_cost: float, exit_price: float) -> float:
+    """After-fee return on cost basis for a full exit at one known price."""
+    if entry_cost <= 0 or not 0 < exit_price < 1:
+        return exit_price / entry_cost - 1.0
+    fee_per_share = (
+        _TAKER_FEE_COEFFICIENT * exit_price * (1.0 - exit_price)
+    )
+    return (exit_price - fee_per_share) / entry_cost - 1.0
+
+
+def _excursion_evidence(
+    spec: Mapping[str, Any],
+    *,
+    closed_rows: Sequence[dict[str, Any]],
+    current_value: Any,
+) -> dict[str, Any]:
+    """Score an exit threshold from retained extreme-excursion evidence.
+
+    `highest_exit_value` and `lowest_exit_value` record the best and worst
+    executable marks a position reached before it actually closed. If the
+    observed path crossed a candidate threshold, an exit there was reachable at
+    a known price, so its after-fee return is identifiable.
+
+    Only the tightening direction is identifiable. A threshold looser than the
+    rule that actually ran has no observed continuation, because the position
+    was already closed. Trades whose path never crossed the candidate keep
+    their observed outcome, and trades whose actual exit was caused by a
+    *tighter* rule of the same family are excluded rather than assumed.
+    """
+    direction = str(spec["direction"])
+    exit_family = set(spec.get("exit_families") or ())
+    rows: list[dict[str, Any]] = []
+    for row in closed_rows:
+        entry_cost = _finite(row.get("entry_cost"))
+        realized = _finite(row.get("realized_pnl"))
+        basis_usd = _finite(row.get("cost_basis"))
+        extreme = _finite(row.get(str(spec["row_key"])))
+        if (
+            entry_cost is None or realized is None or basis_usd is None
+            or extreme is None or entry_cost <= 0 or basis_usd <= 0
+        ):
+            continue
+        rows.append({
+            "excursion": extreme / entry_cost - 1.0,
+            "entry_cost": entry_cost,
+            "observed_roi": realized / basis_usd,
+            "exit_reason": str(row.get("exit_reason") or ""),
+            "event_id": str(row.get("event_id") or ""),
+        })
+
+    options = []
+    for value in spec["values"]:
+        threshold = float(value)
+        crossed, untouched, ambiguous = [], [], []
+        for item in rows:
+            reaches = (
+                item["excursion"] >= threshold
+                if direction == "upper"
+                else item["excursion"] <= -threshold
+            )
+            if reaches:
+                crossed.append(item)
+            elif exit_family and item["exit_reason"] in exit_family:
+                # The actual rule of this family fired before the candidate
+                # threshold was reached, so the continuation is unobserved.
+                ambiguous.append(item)
+            else:
+                untouched.append(item)
+        exit_price = [
+            item["entry_cost"] * (
+                1.0 + threshold if direction == "upper" else 1.0 - threshold
+            )
+            for item in crossed
+        ]
+        counterfactual = [
+            _counterfactual_exit_roi(item["entry_cost"], price)
+            for item, price in zip(crossed, exit_price)
+        ]
+        identifiable = counterfactual + [
+            item["observed_roi"] for item in untouched
+        ]
+        options.append({
+            "value": value,
+            "trades_with_excursion_evidence": len(rows),
+            "crossed_threshold": len(crossed),
+            "crossed_share": len(crossed) / len(rows) if rows else None,
+            "kept_observed_outcome": len(untouched),
+            "unidentifiable_trades": len(ambiguous),
+            "counterfactual_roi_of_crossing_trades": (
+                sum(counterfactual) / len(counterfactual)
+                if counterfactual else None
+            ),
+            "observed_roi_of_crossing_trades": (
+                sum(item["observed_roi"] for item in crossed) / len(crossed)
+                if crossed else None
+            ),
+            "identifiable_mean_roi": (
+                sum(identifiable) / len(identifiable) if identifiable else None
+            ),
+            "identifiable_events": len({
+                item["event_id"] for item in crossed + untouched
+            }),
+        })
+
+    usable = [
+        option for option in options
+        if option["identifiable_mean_roi"] is not None
+        and option["unidentifiable_trades"] == 0
+        and option["identifiable_events"] >= FIELD_DIRECTIONAL_EVENTS
+        and option["trades_with_excursion_evidence"] >= FIELD_DIRECTIONAL_TRADES
+    ]
+    best = max(
+        usable,
+        key=lambda option: float(option["identifiable_mean_roi"]),
+        default=None,
+    )
+    if best is not None:
+        basis = "observational"
+        suggested = best["value"]
+        rationale = (
+            f"Best identifiable mean after-fee return across "
+            f"{best['trades_with_excursion_evidence']} trades with retained "
+            f"excursion evidence over {best['identifiable_events']} events. "
+            "Every trade either crossed this threshold at a known price or "
+            "kept its observed outcome."
+        )
+    else:
+        basis = "baseline_fallback"
+        suggested = spec["baseline"]
+        rationale = spec["baseline_reason"]
+    return {
+        "basis": basis,
+        "suggested": suggested,
+        "current": current_value,
+        "options": options,
+        "rationale": rationale,
+        "scores_realized_pnl": True,
+        "identifiable_direction": "tightening_only",
+        "measurement_note": (
+            "Marks are sampled once per cycle, so a retained extreme is a lower "
+            "bound on the true excursion and a counterfactual exit assumes a "
+            "full fill at the threshold price plus the standard taker fee. "
+            "`unidentifiable_trades` counts trades whose own exit rule of this "
+            "family fired first; when that is above zero the option has no "
+            "identifiable comparison and is not eligible to be suggested."
+        ),
+    }
+
+
+def _field_recommendations(
+    *,
+    closed_rows: Sequence[dict[str, Any]],
+    opportunity_rows: Sequence[dict[str, Any]],
+    opportunity_hours: float,
+    test_events: set[str],
+    current_policy: Mapping[str, Any],
+    grid_settings: Mapping[str, Any],
+    grid_status: str,
+    grid_train: Mapping[str, Any],
+    grid_test: Mapping[str, Any],
+    grid_bootstrap: Mapping[str, Any],
+    analysis_mode: str,
+    market_types: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Report every meaningful policy field with its actual evidence basis."""
+    date_range = _date_range(closed_rows, "opened_ts")
+    shared = {
+        "lane": analysis_mode,
+        "line_types": list(market_types),
+        # The retained sample is pooled across stages unless a line/stage
+        # profile is being fitted, so this is stated rather than implied.
+        "game_stage": "all",
+        "date_range": date_range,
+        "independent_events": len({
+            str(row["event_id"]) for row in closed_rows
+        }),
+        "trades": len(closed_rows),
+    }
+    records: list[dict[str, Any]] = []
+    for spec in POLICY_FIELD_CATALOG:
+        field = str(spec["field"])
+        current = current_policy.get(field)
+        mode = str(spec["mode"])
+        record: dict[str, Any] = {
+            **shared,
+            "field": field,
+            "label": spec["label"],
+            "group": spec["group"],
+            "unit": spec["unit"],
+            "evidence_mode": mode,
+            "current": current,
+        }
+        if mode == "grid_search":
+            suggested = grid_settings.get(field, current)
+            validated = grid_status == "evidence_backed_research"
+            record.update({
+                "suggested": suggested,
+                "basis": "validated" if validated else "observational",
+                "rationale": (
+                    "Selected by the joint optimizer and cleared the "
+                    "later-event, concentration, and whole-event bootstrap "
+                    "checks."
+                    if validated else
+                    "Selected by the joint optimizer but the later-event or "
+                    "bootstrap check did not pass, so it is diagnostic only."
+                ),
+                "training_performance": dict(grid_train),
+                "later_event_performance": dict(grid_test),
+                "event_block_bootstrap": dict(grid_bootstrap),
+                "support": _support_level(grid_test),
+                # The optimizer tunes this field, but Apply is itself gated on
+                # the later-event validation. Reporting it as "written by
+                # Apply" while Apply is locked would overstate what will
+                # actually happen, so the effective flag tracks the gate and
+                # `in_apply_set` records the static membership.
+                "in_apply_set": True,
+                "applyable": validated,
+                "scores_realized_pnl": True,
+            })
+        elif mode == "marginal":
+            evidence = _marginal_field_evidence(
+                spec,
+                closed_rows=closed_rows,
+                opportunity_rows=opportunity_rows,
+                opportunity_hours=opportunity_hours,
+                test_events=test_events,
+                current_value=current,
+            )
+            record.update(evidence)
+            record["support"] = max(
+                (
+                    str(option.get("support") or "none")
+                    for option in evidence["options"]
+                ),
+                key=lambda level: {
+                    "none": 0, "sparse": 1, "directional": 2
+                }.get(level, 0),
+                default="none",
+            )
+            record["in_apply_set"] = False
+            record["applyable"] = False
+        elif mode == "excursion":
+            evidence = _excursion_evidence(
+                spec, closed_rows=closed_rows, current_value=current
+            )
+            record.update(evidence)
+            record["support"] = (
+                "directional"
+                if evidence["basis"] == "observational"
+                else "sparse"
+            )
+            # Excursion evidence is identifiable only in the tightening
+            # direction and assumes a clean fill at the threshold, so it is
+            # reported for a deliberate decision rather than auto-applied.
+            record["in_apply_set"] = False
+            record["applyable"] = False
+        else:
+            record.update({
+                "suggested": spec["baseline"],
+                "basis": "not_identifiable",
+                "rationale": spec["baseline_reason"],
+                "support": "none",
+                "in_apply_set": False,
+                "applyable": False,
+                "scores_realized_pnl": False,
+                "measurement_note": (
+                    "Changing this value changes the price path that produced "
+                    "every retained realized P/L, so past outcomes cannot score "
+                    "it. The value shown is a versioned baseline, not a fitted "
+                    "or optimized setting."
+                ),
+            })
+        if record.get("basis") == "baseline_fallback" or (
+            record.get("basis") == "not_identifiable"
+        ):
+            record["baseline_version"] = BASELINE_CHEAT_SHEET_VERSION
+        records.append(record)
+    return records
+
+
 def _diagnostics(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     known_stage = [
         row for row in rows
@@ -884,6 +1619,28 @@ def recommend_policy(
         "suggested_policy": suggestion,
         "changes": changes,
         "candidate_frontier": frontier,
+        "field_recommendations": _field_recommendations(
+            closed_rows=rows,
+            opportunity_rows=opportunity_rows,
+            opportunity_hours=opportunity_hours,
+            test_events=test_events,
+            current_policy=current_policy,
+            grid_settings=suggestion,
+            grid_status=status,
+            grid_train=selected["train"],
+            grid_test=selected_test,
+            grid_bootstrap=bootstrap,
+            analysis_mode=selected_mode,
+            market_types=selected_markets,
+        ),
+        "baseline_cheat_sheet_version": BASELINE_CHEAT_SHEET_VERSION,
+        "field_coverage_note": (
+            "Only fields marked applyable are written by Apply. Everything else "
+            "is reported with its evidence so it can be set deliberately: a "
+            "marginal sweep is conditional on the rest of the policy, a "
+            "frequency-only field has no retained P/L at all, and an exit "
+            "control cannot be scored from outcomes its own rule produced."
+        ),
         "diagnostics": _diagnostics(rows),
         "evidence": {
             "eligible_closed_trades": len(rows),
@@ -898,6 +1655,7 @@ def recommend_policy(
             "train_events": len(train_events),
             "test_events": len(test_events),
             "opportunity_observations": len(opportunity_rows),
+            "opportunity_provenance": _opportunity_provenance(opportunity_rows),
             "opportunity_active_hours": opportunity_hours,
             "current_estimated_qualified_per_hour": current_rate,
             "suggested_estimated_qualified_per_hour": selected[
@@ -924,7 +1682,11 @@ def recommend_policy(
             ),
             "selection_bias_warning": (
                 "Historical fills come from policies that were actually used. "
-                "A looser policy cannot reveal the P/L of trades never placed."
+                "Rejected candidates are logged for frequency and context, but "
+                "they carry no observed return, so a looser policy still cannot "
+                "reveal the P/L of trades never placed. Selection propensities "
+                "are deterministic (0 or 1), so inverse-propensity and doubly "
+                "robust return estimates are not identified."
             ),
             "multiple_testing_warning": (
                 "Many candidate filters were compared. The later-event split, "

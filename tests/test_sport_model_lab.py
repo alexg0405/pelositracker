@@ -486,3 +486,44 @@ def test_mlb_state_candidate_uses_baseball_features_and_stays_research_only(
         )
     finally:
         lab.close()
+
+
+def test_insufficient_data_names_fit_ready_counts_not_settled_counts(tmp_path):
+    """A refusal must reconcile with the counts shown beside it.
+
+    The segment summary reports settled events, but fitting additionally needs
+    trusted settlement provenance and present live state. Reporting the
+    shortfall as "settled events" made a correct refusal read as a
+    contradiction of the panel above it.
+    """
+    lab = SportModelLab(str(tmp_path / "funnel-lab.db"))
+    start = datetime(2027, 1, 1, tzinfo=timezone.utc)
+    try:
+        for event_number in range(3):
+            event = _event(event_number)
+            for sample in range(5):
+                when = start + timedelta(days=event_number, seconds=sample * 30)
+                lab.record(
+                    event,
+                    [_signal(event, when, 0.58)],
+                    [],
+                    [_state(event, when, home_score=30 + sample, away_score=28 + sample)],
+                    as_of=when,
+                )
+            lab.settle_event(event, 105, 100)
+
+        result = lab.fit_candidate(sport="basketball", league="nba")
+        assert result["status"] == "insufficient_data"
+        details = result["details"]
+
+        # The message must name the quantity actually gated on.
+        assert "fit-ready" in details["reason"]
+        assert "settled events and" not in details["reason"]
+        # And expose the funnel so the shortfall can be reconciled by hand.
+        funnel = details["eligibility_funnel"]
+        assert funnel["labeled_events"] >= funnel["trusted_events"]
+        assert funnel["trusted_events"] >= funnel["fit_ready_events"]
+        assert details["fit_ready_events"] == funnel["fit_ready_events"]
+        assert details["fit_ready_observations"] == funnel["fit_ready_observations"]
+    finally:
+        lab.close()

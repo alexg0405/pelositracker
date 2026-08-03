@@ -109,6 +109,42 @@ class MonitorState:
                     ("odds_api_poll_seconds", f"{value:g}"),
                 )
 
+    def config_json(self, key: str) -> dict | None:
+        """Return a persisted JSON config object, or None when absent/invalid."""
+        with self._lock:
+            with self._db.cursor() as cur:
+                self._db.execute(
+                    cur,
+                    "SELECT value FROM monitor_config WHERE key=%s",
+                    (key,),
+                )
+                row = cur.fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(str(row[0]))
+        except (TypeError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def set_config_json(self, key: str, value: dict | None) -> None:
+        """Persist a JSON config object; None deletes the key."""
+        with self._lock:
+            with self._db.transaction() as cur:
+                if value is None:
+                    self._db.execute(
+                        cur,
+                        "DELETE FROM monitor_config WHERE key=%s",
+                        (key,),
+                    )
+                else:
+                    self._db.execute(
+                        cur,
+                        """INSERT INTO monitor_config (key, value) VALUES (%s,%s)
+                           ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value""",
+                        (key, json.dumps(value, separators=(",", ":"))),
+                    )
+
     def save_event(self, event: Event) -> None:
         payload = json.dumps(as_json(event), separators=(",", ":"))
         with self._lock:

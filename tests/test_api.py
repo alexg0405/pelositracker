@@ -145,7 +145,8 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert "Discovery remains open" in javascript
         assert "is already monitored" in javascript
         assert 'id="discover-refresh-status"' in html
-        assert "/api/discover?refresh=true" in javascript
+        assert 'refreshQuery=manual?"refresh=true":""' in javascript
+        assert "league=${encodeURIComponent(discoverLeague)}" in javascript
         assert 'id="bot-activity"' in html
         assert "data-remove-bot" in javascript
         assert 'fetch(`/api/accounts/${encodeURIComponent(name)}`' in javascript
@@ -269,7 +270,9 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert 'id="us-liquidate-form"' in html
         assert 'id="us-liquidate-confirmation" type="checkbox"' in html
         assert "I approve attempts to sell every open live position" in html
-        assert 'class="us-activity-grid section-gap"' in html
+        assert 'class="us-activity-grid section-gap research-anchor"' in html
+        assert 'id="us-dry-tally-reset"' in html
+        assert "/api/polymarket-us/trading/performance/reset-dry-run" in javascript
         assert "Stop automation + wipe dry-run trades" in html
         assert "Dry run is one atomic reset" in html
         assert 'id="us-clear-dry-history"' not in html
@@ -314,6 +317,31 @@ def test_dashboard_contains_merged_ui_behaviors():
         assert 'data-entry-market-type="spread"' in html
         assert 'data-entry-market-type="total"' in html
         assert 'id="us-max-edge"' in html
+        assert 'id="us-max-quality"' in html
+        assert 'id="us-execution-state-chips"' in html
+        assert 'id="us-execution-blockers"' in html
+        assert 'id="us-authorization-matrix"' in html
+        # Guided setup steps wrap the existing fields in document order.
+        for step in (
+            "capital", "authorization", "limits",
+            "behavior", "advanced", "review",
+        ):
+            assert f'data-policy-step="{step}"' in html
+        assert 'id="us-policy-rail"' in html
+        assert 'id="us-policy-steps"' in html
+        assert 'id="us-effective-policy-review"' in html
+        # Native validation cannot focus a control inside a hidden step, so the
+        # form opts out and the submit handler reveals the owning step instead.
+        assert 'id="us-trading-form" class="us-trading-form" novalidate' in html
+        assert "revealFieldStep" in javascript
+        assert 'data-profile-field="max_profile_exposure_usd"' in html
+        assert 'data-profile-field="max_profile_open_positions"' in html
+        assert 'data-profile-field="max_profile_orders_per_hour"' in html
+        assert 'id="us-global-entry-enabled"' in html
+        assert 'id="us-profile-copy-global"' in html
+        assert 'data-profile-field="max_signal_quality"' in html
+        assert 'data-profile-field="min_source_agreement"' in html
+        assert 'id="us-entry-confirmation-readings"' in html
         assert 'id="us-max-event-entries-hour"' in html
         assert 'id="us-candidate-cooldown"' in html
         assert 'id="us-min-mlb-remaining"' in html
@@ -349,6 +377,7 @@ def test_workstation_exposes_only_bounded_polymarket_us_trading_routes():
         "/api/polymarket-us/trading/performance",
         "/api/polymarket-us/trading/performance-ledger",
         "/api/polymarket-us/trading/performance/reset-live",
+        "/api/polymarket-us/trading/performance/reset-dry-run",
         "/api/polymarket-us/trading/policy-advisor/recommend",
         "/api/polymarket-us/trading/policy-advisor/history",
         "/api/polymarket-us/trading/policy-advisor/sessions",
@@ -392,9 +421,11 @@ def test_live_trading_api_defaults_disarmed_and_rejects_unsafe_policy(
                 "adaptive_exit_min_samples": 20,
                 "adaptive_exit_max_tightening": 0.25,
                 "volatility_stop_enabled": True,
+                "stateless_stop_confirmation": True,
                 "stop_confirmation_readings": 4,
                 "stop_grace_minutes": 2.5,
                 "catastrophic_stop_multiplier": 1.8,
+                "reversal_confirmation_readings": 5,
                 "post_exit_tracking_minutes": 45,
                 "minimum_locked_profit": 0.025,
             })
@@ -410,7 +441,12 @@ def test_live_trading_api_defaults_disarmed_and_rejects_unsafe_policy(
             assert status["policy"]["adaptive_exit_enabled"] is True
             assert status["policy"]["adaptive_exit_horizon_minutes"] == 2.5
             assert status["policy"]["volatility_stop_enabled"] is True
+            assert status["policy"]["stateless_stop_confirmation"] is True
             assert status["policy"]["stop_confirmation_readings"] == 4
+            # The UI saves through this whitelist model; a field missing here
+            # is silently dropped, which is exactly how the reversal-readings
+            # control appeared to "stick" at its old value.
+            assert status["policy"]["reversal_confirmation_readings"] == 5
             assert status["policy"]["post_exit_tracking_minutes"] == 45
             assert status["policy"]["minimum_locked_profit"] == pytest.approx(
                 0.025
@@ -1022,11 +1058,15 @@ def test_manual_discovery_refresh_bypasses_the_short_cache(monkeypatch):
         calls.append(kwargs)
         return [{"slug": "fresh", "title": "Fresh game"}]
 
+    async def fake_schedule(day=None):
+        return []
+
     monkeypatch.setattr(main_module, "polymarket_sports_events", fake_discovery)
-    main_module._discover_cache.update(
-        at=main_module.time.monotonic(),
-        data=[{"slug": "cached", "title": "Cached game"}],
-    )
+    monkeypatch.setattr(main_module, "fetch_mlb_schedule", fake_schedule)
+    main_module._discover_cache[""] = {
+        "at": main_module.time.monotonic(),
+        "data": [{"slug": "cached", "title": "Cached game"}],
+    }
     try:
         with TestClient(app) as client:
             login(client)
@@ -1036,7 +1076,7 @@ def test_manual_discovery_refresh_bypasses_the_short_cache(monkeypatch):
             assert refreshed.json()[0]["slug"] == "fresh"
             assert len(calls) == 1
     finally:
-        main_module._discover_cache.update(at=0.0, data=[])
+        main_module._discover_cache.clear()
 
 
 def test_add_event_rejects_a_missing_csrf_header():
@@ -1061,3 +1101,56 @@ def test_watch_and_dashboard_share_the_csrf_fetch_module():
         module = client.get("/static/csrf.js")
         assert module.status_code == 200
         assert "X-CSRF-Token" in module.text
+
+
+def test_live_trading_snapshot_prefers_structured_mlb_state():
+    """A sport-state-free packet arriving after the linescore poll must not
+    blank the trader's inning context for the cycle."""
+    from datetime import datetime, timezone
+
+    from app.models import GameState
+
+    event = store.add_event(Event(
+        name="Away MLB at Home MLB",
+        sport="baseball",
+        league="MLB",
+        home="Home MLB",
+        away="Away MLB",
+    ))
+    try:
+        observed = datetime.now(timezone.utc)
+
+        def state(source, sport_state):
+            return GameState(
+                event_id=event.id,
+                home_score=1,
+                away_score=1,
+                period="Top 5",
+                clock="",
+                source=source,
+                provider_timestamp=observed,
+                received_at=observed,
+                processed_at=observed,
+                status="in_progress",
+                sport_state=sport_state,
+            )
+
+        store.add_state(state(
+            "mlb-linescore",
+            {"schema": "mlb-linescore-v2", "inning": 5, "half": "top"},
+        ))
+        store.add_state(state("polymarket", None))
+
+        _, latest_states = main_module._live_trading_snapshot()
+        chosen = latest_states[event.id]
+        assert isinstance(chosen.sport_state, dict)
+        assert chosen.sport_state.get("inning") == 5
+
+        # Without any structured state the newest packet still wins.
+        with store.lock:
+            store.states[event.id].clear()
+        store.add_state(state("polymarket", None))
+        _, latest_states = main_module._live_trading_snapshot()
+        assert latest_states[event.id].sport_state is None
+    finally:
+        store.remove_event(event.id)

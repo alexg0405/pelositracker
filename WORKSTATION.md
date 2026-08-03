@@ -21,6 +21,29 @@ Then double-click `start-workstation.cmd` and open:
 The local default login is `admin` / `admin`. The server binds only to
 `127.0.0.1`, so it is not exposed to other devices.
 
+## Running it in a dedicated browser
+
+Double-click `start-workstation-app.cmd`. It starts the workstation if it is not
+already running, waits for `/api/health`, and opens
+<http://127.0.0.1:8775> as a standalone browser app using its own profile under
+`%LOCALAPPDATA%\PelosiTracker\WorkstationChromeProfile`. Chrome is preferred and
+Edge is the fallback. Your normal profiles, cookies, extensions, tabs, and
+history stay separate. It refuses to run while the port-8765 trader is up, so
+only one execution engine is ever active.
+
+**Use this if the clear, remove, sell, stop, or reset buttons appear dead.**
+Those protected actions are guarded by `window.confirm()`. If a browser has been
+told *"prevent this page from creating additional dialogs"* — a checkbox Chrome,
+Arc, Brave, and Firefox offer after a few dialogs — then `confirm()` returns
+false immediately and permanently for that origin. Every handler reads that as
+"the operator cancelled", so the button silently does nothing, with no error and
+nothing in the console. A dedicated profile starts clean. If it recurs inside
+that profile, close and reopen the app window rather than ticking the box.
+
+The profile is deliberately separate from the port-8765 trader's profile:
+cookies are not scoped by port, so a shared profile would let the two servers
+overwrite each other's login session.
+
 For the existing `start.cmd`/port 8765 trading ledger, double-click
 `start-dedicated-trader.cmd` instead. It starts that server in a visible command
 window when necessary and opens `http://127.0.0.1:8765` as a standalone Chrome
@@ -280,6 +303,106 @@ Treat the group table as descriptive evidence, not a guaranteed optimizer.
 Win rate, net, ROI, number of closed trades, and independent events need to be
 read together because a small settings group can look excellent by chance.
 
+## Per-profile capital limits
+
+A line/stage profile can optionally carry its own capital limits alongside its
+entry and exit thresholds:
+
+- **Max position size**, **max event exposure**, and **max entries per event /
+  hour** override the lane values for contracts matching that profile.
+- **Max exposure for this profile**, **max open positions for this profile**,
+  and **max entries / hour for this profile** are profile-only budgets with no
+  global counterpart. Blank means no profile cap.
+
+These can only tighten. A profile value larger than the lane's shared
+allocation, exposure ceiling, event cap, or per-event hourly cap is clamped
+back to the lane value when the effective policy is resolved, so a profile can
+never widen a shared boundary. The lane allocation, total exposure, cash
+reserve, and buying-power checks always apply on top.
+
+Profile budgets are counted using the profile key **frozen into each position
+at entry**, not recomputed from today's settings. Editing or removing a profile
+therefore never retroactively moves a past fill into a different budget.
+
+## Guided execution setup
+
+The execution policy form is presented as six steps rather than one long
+scroll: **Lane & capital**, **Authorization**, **Sizing & entry filters**,
+**Exit & adaptive behaviour**, **Advanced gates**, and **Review & save**. A
+sticky rail above the form shows the selected lane, allocation and exposure
+against their limits, whether the visible form matches the saved policy, and
+the step chips.
+
+Within step 3 the shared controls are split into **Shared lane bankroll and
+sizing** (the hard lane boundaries a profile may tighten but never widen) and
+**Shared entry filters** (the inherited defaults deciding which contracts
+qualify).
+
+The fallback hold, meaningful profit target, and minimum retained profit moved
+out of that group and into step 4 under **Profit exit thresholds**. They were
+previously filed under a heading that read "bankroll and entry limits" despite
+acting only after entry — which also meant the settings advisor's warning about
+exit controls not being scoreable from retained outcomes applied to fields
+presented as entry settings.
+
+Two behaviours worth knowing:
+
+- A step chip shows **⚠** when a field inside it fails validation, including
+  while that step is off screen.
+- Saving with an invalid field automatically switches to the step that owns it
+  and highlights it. The form opts out of native browser validation for this
+  reason: a browser cannot focus a control inside a hidden step and would
+  otherwise refuse to submit without explaining why.
+
+**Review & save** shows the resolved effect of the *saved* policy — lane,
+authorized line/stage count, allocation, exposure, predictive-exit status, and
+any current entry blockers — before you save or arm. When the form has unsaved
+edits it says so, because the summary describes what is in effect right now,
+not what is on screen.
+
+## Execution journal paging
+
+The journal is paged rather than dumped. The dashboard requests 25 rows at a
+time and shows the range and total, so what is off screen is stated rather than
+silently truncated. Filter chips above the list carry a count per kind, and the
+pager walks backwards through time.
+
+This matters because the journal is dominated by high-volume `qualification`
+records — on the live store, about 9,200 of roughly 10,000 rows. Fetching the
+first 120 rows returned about 273 KB on every refresh and showed almost nothing
+but rejections; a 25-row page is about 59 KB, and filtering to `entry` and
+`exit` surfaces the order audit trail that the chatter used to bury.
+
+## Execution state panel
+
+Under the lane selector, the workstation reports each execution state
+separately instead of blending them into one indicator: automation running,
+global fallback authorized, how many line/stage combinations are authorized,
+account connected, current exposure against its limits, and the predictive-exit
+status. The live lane additionally shows the live-order latch with its
+remaining time and whether protective exits are armed.
+
+**New entries are blocked** lists every lane-level reason nothing can enter
+right now — automation off, nothing authorized, live latch closed, missing
+credentials, venue sync failing, maximum open positions, the rolling
+realized-loss stop, the hourly entry cap, or exhausted exposure. Per-candidate
+rejections (price band, spread, depth, edge, quality) stay in the journal,
+because those are properties of a contract rather than of the lane.
+
+**Effective authorization by line and game stage** resolves all twelve
+combinations on the server and shows the thresholds each authorized one would
+actually execute under. Read this before arming: authorization is spread across
+the global fallback switch, the global line-type list, and the profile overlay,
+and the most specific matching profile wins — so an early-stage profile can be
+authorized while its own all-stage profile is not.
+
+One caution the panel states explicitly: a **cold start** predictive-exit
+status does not mean the overlay is inactive. Guarded, Balanced, and Responsive
+apply 20%, 35%, and 50% of their bounded tightening respectively before any
+labeled evidence exists. Only **Observe only** leaves every threshold
+untouched. The configured hard stop is never changed by the overlay in any
+mode.
+
 ## Sport Model Lab
 
 The local **Sport Model Lab** records one bounded moneyline observation per
@@ -410,6 +533,107 @@ the report always identifies this selection-bias limitation. Comparing many
 candidate filters can still overfit despite the chronological split and
 whole-event resampling, so the report states that limitation as well. No
 objective or settings recommendation guarantees profit.
+
+## Applying a suggestion to one line only
+
+**Line types to compare** scopes the analysis. When exactly one line type is
+selected, the result offers a second action: **Load into &lt;line&gt; profile**.
+
+That keeps the suggestion scoped to the line it was measured on. The default
+action writes the global settings, which every unprofiled line inherits — so
+applying a moneyline-derived suggestion globally would also change how spreads
+and totals are entered, on evidence that never covered them.
+
+Loading into a profile selects that line in the profile editor, keeps the game
+stage currently chosen there, fills the suggested values, authorizes the
+profile, and leaves the form unsaved for review. Existing overrides on that
+profile that the advisor does not tune are preserved.
+
+Three suggested fields are **not** copied, because they have no per-profile
+equivalent and remain lane-wide: the line-type authorization list, the hourly
+entry cap (a profile has its own separate cap), and the candidate cooldown. The
+status line names them rather than dropping them silently.
+
+## Applying exit and adaptive recommendations
+
+Exit thresholds and the adaptive overlay are two different things, and they
+apply at different scopes.
+
+**Exit thresholds are per line.** A line-scoped analysis offers **Load exit
+thresholds into &lt;line&gt; profile**, which fills profit target, stop loss,
+trailing pullback, retained-profit floor, model-reversal edge, and fallback
+hold on that profile. The status line separates them by evidence: profit target
+and stop loss are scored from retained excursion extremes, while the rest are
+versioned baselines, because changing them cannot be scored from outcomes their
+own rule produced.
+
+**The adaptive overlay is lane-wide.** No line profile can carry
+`adaptive_exit_profile`, the tightening cap, the horizon, or the stop-guard
+controls, so there is nothing to apply per line. The execution state panel
+instead shows a recommended response with an **Apply to this lane** button.
+
+That recommendation is deliberately not derived from trade P/L. The overlay
+answers a narrower question — will the executable mark move adversely before it
+moves favourably — and it scores its own forecasts, so its Brier value against
+whole-event support is the evidence that belongs to it. A realized-return
+comparison could not separate the overlay's effect from the entry policy that
+selected those trades.
+
+It recommends **observe** unless the overlay has at least the configured
+labeled-forecast minimum across five events *and* a Brier score below 0.250,
+which is what always forecasting 0.50 achieves. When it does clear that bar the
+recommendation is **guarded** — the smallest response above observe-only. There
+is no evidence path to Balanced or Responsive; choose those deliberately,
+knowing they tighten from a higher cold-start floor before any evidence exists.
+
+## Field-by-field settings evidence
+
+**Every policy field and its evidence** in the advisor lists all catalogued
+policy fields grouped as entry filters, pacing, exit controls, and adaptive
+overlay. Each row shows the current and suggested value, how much local support
+exists (trades, independent events, later-event ROI, drawdown), and — most
+importantly — what kind of evidence the suggestion rests on:
+
+- **Validated on later events** — scored by the joint optimizer and cleared the
+  later-event, concentration, and whole-event bootstrap checks. Only these are
+  written by **Apply**.
+- **Observational only** — measured against retained outcomes, but the
+  later-event or bootstrap check did not pass, or the sweep is conditional on
+  the rest of the policy.
+- **Versioned baseline (not fitted)** — local evidence is insufficient or the
+  value is not stored on retained positions. The number comes from a versioned
+  cheat sheet with a stated reason, not from a fit.
+- **Cannot be scored from retained outcomes** — exit controls. Changing a stop,
+  trail, retained-profit floor, reversal edge, or hold changes the price path
+  that produced every retained realized P/L, so past outcomes cannot score
+  them. Set these deliberately.
+
+Only the first class is applied automatically. Everything else is reported so
+it can be set on purpose, which is why a suggested value being present is not
+the same as that value being supported. `docs/backtesting-methodology.md`
+explains the identifiability reasoning per field.
+
+Profit target and stop loss are the two exit controls with partial evidence.
+Each position retains the extremes of the path it walked — the best and worst
+executable marks before it closed — so when the observed path crossed a
+candidate threshold, an exit there was reachable at a known price and its
+after-fee return is identifiable. Trades that never crossed keep their observed
+outcome.
+
+Three limits apply, and the report states each of them:
+
+- **Tightening only.** A threshold looser than the rule that actually ran has
+  no observed continuation, because the position was already closed.
+- **Pre-emption.** If a trade's own exit rule of the same family fired first,
+  it is counted as unidentifiable, and any candidate value with a non-zero
+  count cannot be suggested at all.
+- **Sampling.** Marks are taken once per cycle, so a retained extreme is a
+  lower bound on the true excursion, and the counterfactual assumes a full fill
+  at the threshold plus the standard taker fee.
+
+Neither is written by **Apply**. Adverse excursion is retained only for
+positions opened after the v15 migration, so stop-loss evidence accumulates
+from that point forward.
 
 ## Predictive-model path to live use
 

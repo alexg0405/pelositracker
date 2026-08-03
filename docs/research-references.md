@@ -31,3 +31,20 @@
 - Lo and Remorov, stop-loss rules with serial correlation, regimes, and transaction costs: <https://ssrn.com/abstract=2695383>
 - Simon, real-time sportsbook line movement and short-horizon overreaction: <https://doi.org/10.1287/mnsc.2022.00456>
 - Polymarket US order semantics and fee schedule: <https://docs.polymarket.us/concepts/orders> and <https://docs.polymarket.us/fees>
+
+## External projects
+
+Surveyed 2026-07-31; see `docs/external-project-review-2026-07-31.md` for the
+comparison matrix and the conclusion that none of them clear the bar for
+import. Listed here as reference reading only.
+
+- warproxxx/poly-maker, Polymarket CLOB maker bot (MIT; no backtester):
+  <https://github.com/warproxxx/poly-maker>
+- discountifu/polymarket-trading-bot, CLOB taker with EIP-712 signing (MIT):
+  <https://github.com/discountifu/polymarket-trading-bot>
+- Kalshi official SDK guidance, API-key venue comparable to Polymarket US:
+  <https://docs.kalshi.com/sdks/overview>
+- georgedouzas/sports-betting, model backtesting and value-bet selection (MIT):
+  <https://github.com/georgedouzas/sports-betting>
+- flumine, Betfair exchange trading framework with simulation (MIT):
+  <https://pypi.org/project/flumine/2.0.2/>

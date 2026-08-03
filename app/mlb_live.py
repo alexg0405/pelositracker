@@ -44,6 +44,65 @@ async def _borrow_client() -> AsyncIterator[httpx.AsyncClient]:
         yield client
 
 
+def parse_mlb_schedule(payload: dict) -> list[dict]:
+    """Normalize one MLB Stats API schedule payload into plain game rows.
+
+    Pure so the daily-scheduler view can be tested without the network. The
+    ``official_date`` is the US-local game date the venue keys slugs on;
+    ``gameDate``'s UTC date differs for most evening games.
+    """
+    games: list[dict] = []
+    for date_entry in payload.get("dates") or []:
+        if not isinstance(date_entry, dict):
+            continue
+        for game in date_entry.get("games") or []:
+            if not isinstance(game, dict):
+                continue
+            teams = game.get("teams") or {}
+
+            def team(side: str) -> dict:
+                value = (teams.get(side) or {}).get("team")
+                return value if isinstance(value, dict) else {}
+
+            away, home = team("away"), team("home")
+            away_name = str(away.get("name") or "").strip()
+            home_name = str(home.get("name") or "").strip()
+            if not away_name or not home_name:
+                continue
+            status = str(
+                (game.get("status") or {}).get("abstractGameState") or ""
+            ).strip().casefold()
+            games.append({
+                "game_id": game.get("gamePk"),
+                "away": away_name,
+                "home": home_name,
+                "away_abbr": str(away.get("abbreviation") or "").strip(),
+                "home_abbr": str(home.get("abbreviation") or "").strip(),
+                "start": str(game.get("gameDate") or "") or None,
+                "official_date": str(
+                    game.get("officialDate") or ""
+                ) or None,
+                # preview | live | final (MLB's abstract states, lowered)
+                "status": status or "preview",
+            })
+    return games
+
+
+async def fetch_mlb_schedule(day: str | None = None) -> list[dict]:
+    """Fetch one US-local day's MLB schedule with team abbreviations.
+
+    Without ``day`` the endpoint returns MLB's own notion of "today", which
+    matches how the league keys its game days across US time zones.
+    """
+    params: dict[str, object] = {"sportId": 1, "hydrate": "team"}
+    if day:
+        params.update(startDate=day, endDate=day)
+    async with _borrow_client() as client:
+        response = await client.get(f"{MLB_STATS_API}/schedule", params=params)
+        response.raise_for_status()
+        return parse_mlb_schedule(response.json())
+
+
 def _schedule_window(event: Event) -> tuple[str, str]:
     target = start_timestamp(event.game_start)
     center = (

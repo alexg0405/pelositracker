@@ -195,9 +195,15 @@ def test_default_policy_is_aggressive_but_bounded_for_ten_dollar_rollout():
     assert policy.max_orders_per_hour == 6
     assert policy.min_edge == 0.03
     assert policy.max_edge == 1.0
+    assert policy.global_entry_enabled is True
     assert policy.max_entries_per_event_per_hour == 3
     assert policy.min_mlb_fraction_remaining == 0.0
     assert policy.min_signal_quality == 60.0
+    assert policy.max_signal_quality == 100.0
+    assert policy.min_source_agreement == 0.0
+    assert policy.max_signal_age_seconds == 120.0
+    assert policy.entry_confirmation_readings == 1
+    assert policy.max_confirmation_price_drift == 1.0
     assert policy.min_reference_sources == 2
     assert policy.min_entry_price == 0.10
     assert policy.max_entry_price == 0.90
@@ -239,6 +245,8 @@ def test_line_execution_profiles_overlay_global_values_by_game_stage():
                 "overrides": {
                     "min_edge": 0.06,
                     "profit_target": 0.08,
+                    "max_signal_quality": 92.0,
+                    "entry_confirmation_readings": 2,
                 },
             },
             {
@@ -266,6 +274,8 @@ def test_line_execution_profiles_overlay_global_values_by_game_stage():
     assert early.min_edge == pytest.approx(0.06)
     assert early.profit_target == pytest.approx(0.08)
     assert early.minimum_locked_profit == pytest.approx(0.02)
+    assert early.max_signal_quality == pytest.approx(92.0)
+    assert early.entry_confirmation_readings == 2
     assert early_key == "moneyline/all"
     assert late is not None
     assert late.min_edge == pytest.approx(0.09)
@@ -305,6 +315,11 @@ def test_policy_accepts_decimal_limits_and_rejects_unknown_engine_gates():
         "max_position_usd": 1.23,
         "max_event_exposure_usd": 2.34,
         "min_signal_quality": 61.25,
+        "max_signal_quality": 91.75,
+        "min_source_agreement": 52.5,
+        "max_signal_age_seconds": 45.5,
+        "entry_confirmation_readings": 2,
+        "max_confirmation_price_drift": 0.0125,
         "min_hold_minutes": 7.5,
         "min_book_shares": 2.25,
         "profit_target": 0.0875,
@@ -328,6 +343,11 @@ def test_policy_accepts_decimal_limits_and_rejects_unknown_engine_gates():
     assert policy.max_total_exposure_usd == pytest.approx(9.37)
     assert policy.max_position_usd == pytest.approx(1.23)
     assert policy.min_signal_quality == pytest.approx(61.25)
+    assert policy.max_signal_quality == pytest.approx(91.75)
+    assert policy.min_source_agreement == pytest.approx(52.5)
+    assert policy.max_signal_age_seconds == pytest.approx(45.5)
+    assert policy.entry_confirmation_readings == 2
+    assert policy.max_confirmation_price_drift == pytest.approx(0.0125)
     assert policy.min_hold_minutes == pytest.approx(7.5)
     assert policy.min_book_shares == pytest.approx(2.25)
     assert policy.minimum_locked_profit == pytest.approx(0.025)
@@ -353,6 +373,11 @@ def test_policy_accepts_decimal_limits_and_rejects_unknown_engine_gates():
         TradingPolicy.from_mapping({"allowed_market_types": ["player_prop"]})
     with pytest.raises(TradingPolicyError, match="at least one"):
         TradingPolicy.from_mapping({"allowed_market_types": []})
+    with pytest.raises(TradingPolicyError, match="minimum quality"):
+        TradingPolicy.from_mapping({
+            "min_signal_quality": 80,
+            "max_signal_quality": 70,
+        })
     with pytest.raises(TradingPolicyError, match="minimum edge < maximum"):
         TradingPolicy.from_mapping({"min_edge": 0.10, "max_edge": 0.10})
     with pytest.raises(
@@ -421,6 +446,7 @@ def signal(
     probability=0.60,
     action="PAPER_BET",
     quality=85.0,
+    agreement=85.0,
     edge=0.05,
     gate_results=None,
 ):
@@ -432,6 +458,7 @@ def signal(
         market_probability=0.40,
         edge=edge,
         confidence=quality,
+        quality_agreement=agreement,
         action=action,
         reasons=[],
         observed_at=datetime.fromtimestamp(clock(), timezone.utc),
@@ -851,6 +878,641 @@ def test_state_aware_mlb_stop_treats_missing_edge_as_bounded_not_reversal(
     trader.close()
 
 
+def _stateless_stop_position(mlb):
+    return {
+        "id": "position-1",
+        "event_id": mlb.id,
+        "event_name": mlb.name,
+        "market_slug": "home-ml",
+        "market_type": "moneyline",
+        "selection": "Home MLB",
+        "position_side": "long",
+        "mode": "dry_run",
+        "quantity": 2.0,
+        "entry_cost": 0.40,
+        "stop_triggered_ts": None,
+        "stop_observation_count": 0,
+        "stop_low_exit_value": None,
+    }
+
+
+def test_missing_mlb_state_still_exits_immediately_by_default(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "volatility_stop_enabled": True,
+        "stop_loss": 0.20,
+    })
+    mlb, _ = mlb_event_and_state(clock)
+    adaptive = trader._adaptive_exit.base_decision(
+        profile="observe",
+        reason="test",
+        applicable=True,
+        profit_target=0.10,
+        trailing_drawdown=0.04,
+        exit_edge=0.0,
+        stop_loss=0.20,
+    )
+
+    reason, guard, *_ = trader._stop_guard_decision(
+        _stateless_stop_position(mlb),
+        event=mlb,
+        state=None,
+        exit_value=0.30,
+        current_edge=0.05,
+        return_fraction=-0.25,
+        adaptive_exit=adaptive,
+    )
+
+    assert reason == "hard_stop_loss"
+    assert guard["status"] == "immediate"
+    assert guard["reason"] == "no live MLB game state was available"
+    trader.close()
+
+
+def test_stateless_confirmation_bounds_the_stop_without_mlb_state(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "volatility_stop_enabled": True,
+        "stateless_stop_confirmation": True,
+        "stop_loss": 0.20,
+        "stop_confirmation_readings": 3,
+        "stop_grace_minutes": 2.0,
+        "cycle_seconds": 30,
+    })
+    mlb, _ = mlb_event_and_state(clock)
+    position = _stateless_stop_position(mlb)
+    adaptive = trader._adaptive_exit.base_decision(
+        profile="observe",
+        reason="test",
+        applicable=True,
+        profit_target=0.10,
+        trailing_drawdown=0.04,
+        exit_edge=0.0,
+        stop_loss=0.20,
+    )
+
+    reason, guard, triggered, count, low = trader._stop_guard_decision(
+        position,
+        event=mlb,
+        state=None,
+        exit_value=0.30,
+        current_edge=0.05,
+        return_fraction=-0.25,
+        adaptive_exit=adaptive,
+    )
+    assert reason is None
+    assert guard["status"] == "observing_recovery"
+    assert guard["confirmation_basis"] == "price_only"
+    assert guard["state_unavailable_reason"] == (
+        "no live MLB game state was available"
+    )
+    # The price-only window never trusts the full grace without game state.
+    assert guard["grace_seconds"] == pytest.approx(60.0)
+    assert count == 1
+
+    position.update(
+        stop_triggered_ts=triggered,
+        stop_observation_count=count,
+        stop_low_exit_value=low,
+    )
+    clock.value += 30
+    reason, guard, triggered, count, low = trader._stop_guard_decision(
+        position,
+        event=mlb,
+        state=None,
+        exit_value=0.29,
+        current_edge=0.05,
+        return_fraction=-0.275,
+        adaptive_exit=adaptive,
+    )
+    assert reason is None
+    assert count == 2
+
+    position.update(
+        stop_triggered_ts=triggered,
+        stop_observation_count=count,
+        stop_low_exit_value=low,
+    )
+    clock.value += 35
+    reason, guard, _, count, low = trader._stop_guard_decision(
+        position,
+        event=mlb,
+        state=None,
+        exit_value=0.28,
+        current_edge=0.05,
+        return_fraction=-0.30,
+        adaptive_exit=adaptive,
+    )
+    assert reason == "confirmed_stop_loss"
+    assert guard["status"] == "confirmed"
+    assert guard["confirmation_basis"] == "price_only"
+    assert count == 3
+    assert low == pytest.approx(0.28)
+    trader.close()
+
+
+def test_stateless_confirmation_keeps_catastrophic_boundary_immediate(
+    tmp_path,
+):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "volatility_stop_enabled": True,
+        "stateless_stop_confirmation": True,
+        "stop_loss": 0.20,
+        "catastrophic_stop_multiplier": 1.50,
+    })
+    mlb, _ = mlb_event_and_state(clock)
+    adaptive = trader._adaptive_exit.base_decision(
+        profile="observe",
+        reason="test",
+        applicable=True,
+        profit_target=0.10,
+        trailing_drawdown=0.04,
+        exit_edge=0.0,
+        stop_loss=0.20,
+    )
+
+    reason, guard, *_ = trader._stop_guard_decision(
+        _stateless_stop_position(mlb),
+        event=mlb,
+        state=None,
+        exit_value=0.27,
+        current_edge=0.05,
+        return_fraction=-0.325,
+        adaptive_exit=adaptive,
+    )
+
+    assert reason == "catastrophic_stop_loss"
+    assert guard["status"] == "immediate"
+    trader.close()
+
+
+def test_stateless_confirmation_exits_on_material_model_reversal(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "volatility_stop_enabled": True,
+        "stateless_stop_confirmation": True,
+        "stop_loss": 0.20,
+        "min_edge": 0.03,
+    })
+    mlb, _ = mlb_event_and_state(clock)
+    adaptive = trader._adaptive_exit.base_decision(
+        profile="observe",
+        reason="test",
+        applicable=True,
+        profit_target=0.10,
+        trailing_drawdown=0.04,
+        exit_edge=0.0,
+        stop_loss=0.20,
+    )
+
+    reason, guard, *_ = trader._stop_guard_decision(
+        _stateless_stop_position(mlb),
+        event=mlb,
+        state=None,
+        exit_value=0.30,
+        current_edge=-0.10,
+        return_fraction=-0.25,
+        adaptive_exit=adaptive,
+    )
+
+    assert reason == "model_reversal_stop_loss"
+    assert guard["status"] == "immediate"
+    trader.close()
+
+
+def test_stale_mlb_state_routes_through_the_price_only_window(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "volatility_stop_enabled": True,
+        "stateless_stop_confirmation": True,
+        "stop_loss": 0.20,
+    })
+    mlb, live_state = mlb_event_and_state(clock)
+    live_state.received_at = datetime.fromtimestamp(
+        clock() - 240, timezone.utc
+    )
+    adaptive = trader._adaptive_exit.base_decision(
+        profile="observe",
+        reason="test",
+        applicable=True,
+        profit_target=0.10,
+        trailing_drawdown=0.04,
+        exit_edge=0.0,
+        stop_loss=0.20,
+    )
+
+    reason, guard, *_ = trader._stop_guard_decision(
+        _stateless_stop_position(mlb),
+        event=mlb,
+        state=live_state,
+        exit_value=0.30,
+        current_edge=0.05,
+        return_fraction=-0.25,
+        adaptive_exit=adaptive,
+    )
+
+    assert reason is None
+    assert guard["status"] == "observing_recovery"
+    assert guard["confirmation_basis"] == "price_only"
+    assert "stale" in guard["state_unavailable_reason"]
+    trader.close()
+
+
+def test_between_inning_state_keeps_the_stop_guard_state_aware(tmp_path):
+    """The linescore feed reports "end" between half-innings; that state must
+    feed the bounded MLB window, not the stateless bypass."""
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "volatility_stop_enabled": True,
+        "stop_loss": 0.20,
+        "stop_confirmation_readings": 3,
+        "stop_grace_minutes": 2.0,
+    })
+    mlb, live_state = mlb_event_and_state(clock)
+    live_state.sport_state = {
+        "schema": "mlb-linescore-v2",
+        "inning": 5,
+        "half": "end",
+    }
+    adaptive = trader._adaptive_exit.base_decision(
+        profile="observe",
+        reason="test",
+        applicable=True,
+        profit_target=0.10,
+        trailing_drawdown=0.04,
+        exit_edge=0.0,
+        stop_loss=0.20,
+    )
+
+    reason, guard, *_ = trader._stop_guard_decision(
+        _stateless_stop_position(mlb),
+        event=mlb,
+        state=live_state,
+        exit_value=0.30,
+        current_edge=0.05,
+        return_fraction=-0.25,
+        adaptive_exit=adaptive,
+    )
+
+    assert reason is None
+    assert guard["status"] == "observing_recovery"
+    assert guard["confirmation_basis"] == "mlb_state"
+    # End of the 5th: ten of eighteen regulation halves complete.
+    assert guard["game_state"]["fraction_remaining"] == pytest.approx(8 / 18)
+    trader.close()
+
+
+def test_fraction_remaining_accepts_between_inning_halves():
+    event = Event(
+        name="Away MLB at Home MLB",
+        sport="baseball",
+        league="MLB",
+        home="Home MLB",
+        away="Away MLB",
+    )
+    observed = datetime.now(timezone.utc)
+    state = GameState(
+        event_id=event.id,
+        home_score=1,
+        away_score=1,
+        period="",
+        clock="",
+        source="test-mlb",
+        provider_timestamp=observed,
+        received_at=observed,
+        processed_at=observed,
+        status="in_progress",
+        live=True,
+        ended=False,
+        sport_state={"schema": "mlb-linescore-v2", "inning": 5, "half": "end"},
+    )
+    from app.polymarket_us_trading import _baseball_fraction_remaining
+
+    assert _baseball_fraction_remaining(event, state) == pytest.approx(8 / 18)
+    state.sport_state = {"schema": "mlb-linescore-v2", "inning": 5, "half": "middle"}
+    assert _baseball_fraction_remaining(event, state) == pytest.approx(8 / 18)
+
+
+def _shadow_game_state(event_id, clock, **overrides):
+    observed = datetime.fromtimestamp(clock(), timezone.utc)
+    sport_state = {
+        "schema": "mlb-linescore-v2",
+        "inning": 5,
+        "half": "top",
+        "outs": 0,
+        "balls": 1,
+        "strikes": 2,
+        "base_mask": 7,
+        "batting_side": "away",
+        "batter": {"id": 660271, "name": "Shohei Ohtani"},
+        "pitcher": {"id": 592789, "name": "Bullpen Arm"},
+    }
+    sport_state.update(overrides)
+    return GameState(
+        event_id=event_id,
+        home_score=2,
+        away_score=1,
+        period="Top 5",
+        clock="",
+        source="test-mlb",
+        provider_timestamp=observed,
+        received_at=observed,
+        processed_at=observed,
+        status="in_progress",
+        live=True,
+        ended=False,
+        sport_state=sport_state,
+    )
+
+
+def test_mlb_shadow_state_reads_run_expectancy_and_identities(tmp_path):
+    from app.polymarket_us_trading import _mlb_shadow_state
+
+    clock = Clock()
+    shadow = _mlb_shadow_state(_shadow_game_state("e1", clock))
+    assert shadow["run_expectancy"] == pytest.approx(2.17)  # loaded, 0 out
+    assert shadow["batter_name"] == "Shohei Ohtani"
+    assert shadow["pitcher_id"] == 592789
+    assert shadow["balls"] == 1 and shadow["strikes"] == 2
+
+    empty_two_out = _mlb_shadow_state(
+        _shadow_game_state("e1", clock, base_mask=0, outs=2)
+    )
+    assert empty_two_out["run_expectancy"] == pytest.approx(0.10)
+
+    missing_outs = _mlb_shadow_state(
+        _shadow_game_state("e1", clock, outs=None)
+    )
+    assert missing_outs["run_expectancy"] is None
+
+    state = _shadow_game_state("e1", clock)
+    state.sport_state = None
+    assert _mlb_shadow_state(state) is None
+
+
+def test_pitcher_change_shadow_flags_bullpen_entries_once(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    mlb, _ = mlb_event_and_state(clock)
+
+    first = trader._pitcher_change_shadow(
+        mlb, {"pitcher_id": 100, "pitcher_name": "Starter", "inning": 1, "half": "top"}
+    )
+    assert first["pitcher_change_recent"] is False
+    assert first["seconds_since_pitcher_change"] is None
+
+    clock.value += 60
+    same = trader._pitcher_change_shadow(
+        mlb, {"pitcher_id": 100, "pitcher_name": "Starter", "inning": 3, "half": "top"}
+    )
+    assert same["pitcher_change_recent"] is False
+
+    clock.value += 60
+    changed = trader._pitcher_change_shadow(
+        mlb, {"pitcher_id": 200, "pitcher_name": "Reliever", "inning": 6, "half": "top"}
+    )
+    assert changed["pitcher_change_recent"] is True
+    assert changed["previous_pitcher_id"] == 100
+    assert changed["seconds_since_pitcher_change"] == pytest.approx(0.0)
+    journal = [
+        item for item in trader.journal()
+        if item["kind"] == "shadow" and item["status"] == "pitcher_change"
+    ]
+    assert len(journal) == 1
+
+    clock.value += 300
+    later = trader._pitcher_change_shadow(
+        mlb, {"pitcher_id": 200, "pitcher_name": "Reliever", "inning": 7, "half": "top"}
+    )
+    assert later["pitcher_change_recent"] is False
+    trader.close()
+
+
+def test_marks_carry_the_mlb_shadow_context(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+    })
+    fixture = event()
+    trader.run_cycle([(fixture, [signal(clock)])], us_payload())
+    assert trader.positions(open_only=True)
+
+    clock.value += 60
+    trader.run_cycle(
+        [(fixture, [signal(clock)])],
+        us_payload(),
+        game_states={fixture.id: _shadow_game_state(fixture.id, clock)},
+    )
+    marks = [
+        item["details"]
+        for item in trader.journal()
+        if item["kind"] == "mark"
+    ]
+    assert marks, "expected at least one mark"
+    shadowed = [m for m in marks if m.get("mlb_shadow")]
+    assert shadowed, "mark should carry mlb_shadow when structured state exists"
+    assert shadowed[0]["mlb_shadow"]["run_expectancy"] == pytest.approx(2.17)
+    assert shadowed[0]["mlb_shadow"]["pitcher_name"] == "Bullpen Arm"
+    trader.close()
+
+
+def test_qualification_rejections_deduplicate_across_moving_numbers(tmp_path):
+    """A rejection differing only in its live numbers must not journal again
+    inside the cooldown — the chatter was measured at 80% of the retention
+    budget, evicting the mark evidence replays depend on."""
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({"candidate_cooldown_seconds": 300})
+    fixture = event()
+    sig = signal(clock)
+
+    trader._qualification_rejection(
+        fixture, sig, "existing signal edge +4.3c is below the 5.0c floor"
+    )
+    clock.value += 30
+    trader._qualification_rejection(
+        fixture, sig, "existing signal edge +4.1c is below the 5.0c floor"
+    )
+    rows = [item for item in trader.journal() if item["kind"] == "qualification"]
+    assert len(rows) == 1
+    # A genuinely different reason still journals.
+    trader._qualification_rejection(
+        fixture, sig, "US buy price is outside the configured entry bracket"
+    )
+    rows = [item for item in trader.journal() if item["kind"] == "qualification"]
+    assert len(rows) == 2
+    trader.close()
+
+
+def test_journal_prune_evicts_qualification_chatter_before_marks(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    # Oldest rows are marks; newer rows are qualification chatter. The old
+    # oldest-first prune would delete the marks; the fix must not.
+    for index in range(6):
+        clock.value += 1
+        trader._journal("mark", "updated", payload={"index": index})
+    for index in range(8):
+        clock.value += 1
+        trader._journal("qualification", "rejected", payload={"index": index})
+
+    trader._prune_journal(maximum=8)
+
+    kinds = [item["kind"] for item in trader.journal(limit=50)]
+    assert kinds.count("mark") == 6
+    assert kinds.count("qualification") == 2
+    trader.close()
+
+
+def test_reversal_confirmation_defaults_to_single_reading_behavior(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({"min_edge": 0.02})
+    position = {"reversal_triggered_ts": None, "reversal_observation_count": 0}
+
+    confirmed, triggered, count = trader._reversal_confirmation(
+        position, trader.policy, -0.05
+    )
+    assert confirmed is True
+    assert count == 1
+    # A recovered edge always resets the streak.
+    assert trader._reversal_confirmation(position, trader.policy, 0.01) == (
+        False, None, 0,
+    )
+    assert trader._reversal_confirmation(position, trader.policy, None) == (
+        False, None, 0,
+    )
+    trader.close()
+
+
+def test_reversal_confirmation_requires_consecutive_readings(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "reversal_confirmation_readings": 3,
+        "min_edge": 0.02,
+        "cycle_seconds": 30,
+    })
+    position = {"reversal_triggered_ts": None, "reversal_observation_count": 0}
+
+    confirmed, triggered, count = trader._reversal_confirmation(
+        position, trader.policy, -0.05
+    )
+    assert (confirmed, count) == (False, 1)
+    position.update(
+        reversal_triggered_ts=triggered, reversal_observation_count=count
+    )
+    clock.value += 30
+    confirmed, triggered, count = trader._reversal_confirmation(
+        position, trader.policy, -0.06
+    )
+    assert (confirmed, count) == (False, 2)
+    position.update(
+        reversal_triggered_ts=triggered, reversal_observation_count=count
+    )
+    clock.value += 30
+    confirmed, triggered, count = trader._reversal_confirmation(
+        position, trader.policy, -0.04
+    )
+    assert (confirmed, count) == (True, 3)
+
+    # A streak that went quiet past the window starts over.
+    position.update(
+        reversal_triggered_ts=triggered - 1000,
+        reversal_observation_count=2,
+    )
+    confirmed, _, count = trader._reversal_confirmation(
+        position, trader.policy, -0.05
+    )
+    assert (confirmed, count) == (False, 1)
+    trader.close()
+
+
+def test_unconfirmed_reversal_cannot_override_the_profit_floor(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "reversal_confirmation_readings": 3,
+        "minimum_locked_profit": 0.02,
+    })
+    position = {"id": "p1", "entry_cost": 0.40}
+    common = {
+        "exit_value": 0.35,  # below the protected floor
+        "peak": 0.55,
+        "current_edge": -0.10,
+        "profit_lock_armed": True,
+        "adaptive_exit": None,
+        "policy": trader.policy,
+    }
+    unconfirmed = trader._profit_guard_decision(
+        position, **common, reversal_confirmed=False
+    )
+    assert unconfirmed["blocked"] is True
+    assert unconfirmed["material_reversal_override"] is False
+    assert unconfirmed["status"] == "profit_floor_missed_holding"
+
+    confirmed = trader._profit_guard_decision(
+        position, **common, reversal_confirmed=True
+    )
+    assert confirmed["material_reversal_override"] is True
+    assert confirmed["blocked"] is False
+    trader.close()
+
+
+def test_exit_reason_sells_reversal_only_when_confirmed(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({"reversal_confirmation_readings": 3})
+    position = {"id": "p1", "entry_cost": 0.40}
+
+    held = trader._exit_reason(
+        position, 0.35, 0.41, -0.10, reversal_confirmed=False
+    )
+    assert held is None
+    sold = trader._exit_reason(
+        position, 0.35, 0.41, -0.10, reversal_confirmed=True
+    )
+    assert sold == "model_reversal"
+    trader.close()
+
+
+def test_reversal_confirmation_readings_validate_and_round_trip(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    with pytest.raises(TradingPolicyError, match="reversal_confirmation"):
+        trader.configure({"reversal_confirmation_readings": 0})
+    with pytest.raises(TradingPolicyError, match="reversal_confirmation"):
+        trader.configure({"reversal_confirmation_readings": 11})
+    trader.configure({"reversal_confirmation_readings": 3})
+    assert trader.policy.reversal_confirmation_readings == 3
+    trader.close()
+
+    reopened = make_trader(tmp_path, clock, fail_on_orders=True)
+    assert reopened.policy.reversal_confirmation_readings == 3
+    reopened.close()
+
+
+def test_stateless_stop_confirmation_round_trips_through_configure(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({"stateless_stop_confirmation": True})
+    assert trader.policy.stateless_stop_confirmation is True
+    trader.close()
+
+    reopened = make_trader(tmp_path, clock, fail_on_orders=True)
+    assert reopened.policy.stateless_stop_confirmation is True
+    reopened.close()
+
+
 def test_policy_keeps_prices_strictly_inside_existing_hard_bracket():
     with pytest.raises(TradingPolicyError, match="5c–95c"):
         TradingPolicy.from_mapping({"min_entry_price": 0.05})
@@ -1114,6 +1776,845 @@ def test_execution_edge_ceiling_filters_implausibly_large_edges(tmp_path):
     )
     assert "execution edge +20.0c exceeds" in rejection["details"]["reason"]
     assert rejection["details"]["configured_max_edge"] == pytest.approx(0.10)
+
+
+def test_line_profile_authorizes_entry_without_global_fallback(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+        "global_entry_enabled": False,
+        "allowed_market_types": ["spread"],
+        "line_execution_profiles": [{
+            "market_type": "moneyline",
+            "game_stage": "all",
+            "enabled": True,
+            "overrides": {
+                "min_edge": 0.04,
+                "max_signal_quality": 90.0,
+            },
+        }],
+    })
+
+    result = trader.run_cycle([(event(), [signal(clock)])], us_payload())
+
+    assert result["entries"] == 1
+    position = trader.positions(open_only=True)[0]
+    assert position["entry_policy"]["global_entry_enabled"] is False
+    assert position["entry_policy"]["execution_profile_key"] == "moneyline/all"
+
+
+def test_global_fallback_off_blocks_unprofiled_line(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+        "global_entry_enabled": False,
+        "allowed_market_types": [],
+        "line_execution_profiles": [],
+    })
+
+    result = trader.run_cycle([(event(), [signal(clock)])], us_payload())
+
+    assert result["entries"] == 0
+    rejection = next(
+        item for item in trader.journal()
+        if item["kind"] == "qualification"
+    )
+    assert "global entry fallback is not authorized" in rejection["details"]["reason"]
+
+
+def test_specific_profile_can_authorize_around_disabled_all_stage_profile():
+    policy = TradingPolicy.from_mapping({
+        "global_entry_enabled": False,
+        "allowed_market_types": [],
+        "line_execution_profiles": [
+            {
+                "market_type": "moneyline",
+                "game_stage": "all",
+                "enabled": False,
+                "overrides": {"min_edge": 0.12},
+            },
+            {
+                "market_type": "moneyline",
+                "game_stage": "early",
+                "enabled": True,
+                "overrides": {"min_edge": 0.04},
+            },
+        ],
+    })
+
+    early, key = policy.execution_policy_for("moneyline", 0.70)
+    late, late_key = policy.execution_policy_for("moneyline", 0.10)
+
+    assert early is not None
+    assert early.min_edge == pytest.approx(0.04)
+    assert key == "moneyline/all+moneyline/early"
+    assert late is None
+    assert late_key == "moneyline/all"
+
+
+def test_quality_band_and_source_agreement_are_execution_filters(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+        "max_signal_quality": 80.0,
+    })
+
+    too_high = trader.run_cycle(
+        [(event(), [signal(clock, quality=85.0)])],
+        us_payload(),
+    )
+    assert too_high["entries"] == 0
+    assert any(
+        "quality 85/100 exceeds" in item["details"].get("reason", "")
+        for item in trader.journal()
+        if item["kind"] == "qualification"
+    )
+
+    trader.configure({
+        "max_signal_quality": 100.0,
+        "min_source_agreement": 70.0,
+    })
+    disagreement = trader.run_cycle(
+        [(event(), [signal(clock, agreement=60.0)])],
+        us_payload(),
+    )
+    assert disagreement["entries"] == 0
+    assert any(
+        "source agreement 60/100 is below" in item["details"].get("reason", "")
+        for item in trader.journal()
+        if item["kind"] == "qualification"
+    )
+
+
+def test_entry_confirmation_requires_new_signal_and_restarts_on_price_drift(
+    tmp_path,
+):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+        "entry_confirmation_readings": 2,
+        "max_confirmation_price_drift": 0.01,
+    })
+
+    first = trader.run_cycle([(event(), [signal(clock)])], us_payload(ask=0.40))
+    same = trader.run_cycle([(event(), [signal(clock)])], us_payload(ask=0.40))
+    clock.value += 5
+    drifted = trader.run_cycle(
+        [(event(), [signal(clock)])],
+        us_payload(ask=0.43),
+    )
+    drift_reason = trader.status()["last_cycle_evaluations"][0]["reason"]
+    clock.value += 5
+    stable = trader.run_cycle(
+        [(event(), [signal(clock)])],
+        us_payload(ask=0.43),
+    )
+
+    assert first["entries"] == 0
+    assert same["entries"] == 0
+    assert drifted["entries"] == 0
+    assert "confirmation restarted" in drift_reason
+    assert stable["entries"] == 1
+
+
+def multi_market_us_payload(*, bid=0.39, ask=0.40):
+    """One US event exposing enough contracts to exhaust the venue budget."""
+    base = us_payload(bid=bid, ask=ask)
+    base["events"][0]["markets"].append({
+        "id": "market-total",
+        "slug": "away-at-home-total-8pt5",
+        "question": "Total runs",
+        "market_type": "total",
+        "line": 8.5,
+        "active": True,
+        "closed": False,
+        "hidden": False,
+        "state": "OPEN",
+        "long_best_bid": bid,
+        "long_best_ask": ask,
+        "minimum_trade_quantity": 1,
+        "minimum_tick_size": 0.01,
+        "sides": [
+            {"id": "over", "description": "Over 8.5", "long": True, "tradable": True},
+            {"id": "under", "description": "Under 8.5", "long": False, "tradable": True},
+        ],
+    })
+    return base
+
+
+def test_confirmed_entry_window_survives_the_venue_check_budget(tmp_path):
+    """A candidate deferred before its order attempt keeps its readings.
+
+    Only three candidates may consume a venue check per cycle. Discarding an
+    earned confirmation window at the moment it was satisfied — rather than
+    when an order was actually attempted — permanently starved every
+    lower-ranked candidate, because it had to re-earn every reading each cycle
+    while never reaching the front of the queue.
+    """
+    clock = Clock()
+    trader = PolymarketUSAutoTrader(
+        str(tmp_path / "trading.db"),
+        # Without credentials every attempt fails after the venue budget is
+        # consumed, so no candidate can end the loop by entering.
+        key_id="",
+        secret_key="",
+        client_factory=client_factory(FakeOrders()),
+        clock=clock,
+    )
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+        "entry_confirmation_readings": 2,
+    })
+    # Short sides cost 1 - bid, so they need a higher probability to clear the
+    # same positive execution-edge floor as the long sides.
+    wanted = (
+        ("moneyline", "Away", 0.60),
+        ("moneyline", "Home", 0.75),
+        ("total", "Over 8.5", 0.60),
+        ("total", "Under 8.5", 0.75),
+    )
+
+    def readings():
+        return [
+            signal(clock, market=market, outcome=outcome, probability=probability)
+            for market, outcome, probability in wanted
+        ]
+
+    first = trader.run_cycle([(event(), readings())], multi_market_us_payload())
+    assert first["qualified"] == 4
+    assert len(trader._candidate_confirmations) == 4
+
+    clock.value += 5
+    second = trader.run_cycle([(event(), readings())], multi_market_us_payload())
+
+    assert second["entries"] == 0
+    # Three candidates spent the venue budget and consumed their windows.
+    assert len(trader._candidate_seen) == 3
+    # The fourth was deferred before any order attempt and keeps its readings.
+    assert len(trader._candidate_confirmations) == 1
+    retained = next(iter(trader._candidate_confirmations.values()))
+    assert retained["count"] == 2
+    assert any(
+        item["state"] == "queued"
+        and "venue-check budget" in item["reason"]
+        for item in trader.status()["last_cycle_evaluations"]
+    )
+
+
+def test_candidate_log_retains_rejected_contracts_and_degenerate_propensity(
+    tmp_path,
+):
+    """Off-policy work needs the population the policy chose from.
+
+    The advisor previously derived "opportunities" from entry journal rows, so
+    the candidate population was exactly the set of fills. A looser filter could
+    only ever re-select trades that were already taken, which made its estimated
+    qualified-per-hour rate structurally incapable of exceeding the rate of the
+    policy that generated the data.
+    """
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+        "candidate_cooldown_seconds": 60,
+    })
+    wanted = (
+        ("moneyline", "Away", 0.60),
+        ("moneyline", "Home", 0.75),
+        ("total", "Over 8.5", 0.60),
+        ("total", "Under 8.5", 0.75),
+    )
+    result = trader.run_cycle(
+        [(event(), [
+            signal(clock, market=market, outcome=outcome, probability=probability)
+            for market, outcome, probability in wanted
+        ])],
+        multi_market_us_payload(),
+    )
+
+    assert result["entries"] == 1
+    assert result["logged_candidates"] == 4
+
+    logged = trader._candidate_observation_opportunities()
+    assert len(logged) == 4
+    entered = [row for row in logged if row["entered"]]
+    declined = [row for row in logged if not row["entered"]]
+    assert len(entered) == 1
+    assert len(declined) == 3
+
+    # Every logged candidate carries the executable context a filter needs.
+    for row in logged:
+        assert row["entry_cost"] is not None
+        assert row["execution_edge"] is not None
+        assert row["spread"] is not None
+        assert row["market_type"] in {"moneyline", "total"}
+        assert row["propensity_source"] == "deterministic_policy"
+        assert row["competing_candidates"] == 4
+    # Declined contracts record why, so a rejection can be audited later.
+    assert all(row["rejection_reason"] for row in declined)
+    # The saved policy is deterministic, so propensities are 0/1 - not a
+    # randomized design that would identify an off-policy return estimate.
+    assert sorted(row["selection_propensity"] for row in logged) == [
+        0.0, 0.0, 0.0, 1.0
+    ]
+
+    contract = trader.advisor_dataset(source_lane="dry_run")["logging_contract"]
+    assert contract["unentered_candidate_observations"] == 3
+    assert contract["off_policy_identified"] is False
+    assert contract["randomized_exploration"] is False
+
+    # The same contract must not be re-logged inside its candidate cooldown.
+    clock.value += 5
+    repeat = trader.run_cycle(
+        [(event(), [
+            signal(clock, market=market, outcome=outcome, probability=probability)
+            for market, outcome, probability in wanted
+        ])],
+        multi_market_us_payload(),
+    )
+    assert repeat["logged_candidates"] == 0
+    assert len(trader._candidate_observation_opportunities()) == 4
+
+
+def test_advisor_opportunities_prefer_the_candidate_log_over_entry_rows(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+        "candidate_cooldown_seconds": 60,
+    })
+    trader.run_cycle(
+        [(event(), [
+            signal(clock, market=market, outcome=outcome, probability=probability)
+            for market, outcome, probability in (
+                ("moneyline", "Away", 0.60),
+                ("total", "Over 8.5", 0.60),
+            )
+        ])],
+        multi_market_us_payload(),
+    )
+
+    opportunities = trader._advisor_opportunities()
+    sources = {row["evidence_source"] for row in opportunities}
+
+    # The entered contract exists in both the candidate log and the entry
+    # journal. It must be counted once, from the richer source.
+    assert sources == {"candidate_log"}
+    assert len(opportunities) == 2
+    assert sum(row["entered"] for row in opportunities) == 1
+
+
+def test_authorization_matrix_resolves_every_line_and_stage_combination(
+    tmp_path,
+):
+    """Authorization is spread over three controls; the server resolves it."""
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+    trader.configure({
+        "execution_mode": "dry_run",
+        "global_entry_enabled": False,
+        "allowed_market_types": [],
+        "line_execution_profiles": [
+            {
+                "market_type": "moneyline",
+                "game_stage": "all",
+                "enabled": False,
+                "overrides": {"min_edge": 0.12},
+            },
+            {
+                "market_type": "moneyline",
+                "game_stage": "early",
+                "enabled": True,
+                "overrides": {"min_edge": 0.04},
+            },
+        ],
+    })
+
+    matrix = trader.authorization_matrix()
+    by_key = {
+        (row["market_type"], row["game_stage"]): row
+        for row in matrix["combinations"]
+    }
+
+    assert matrix["global_fallback_authorized"] is False
+    assert len(matrix["combinations"]) == 12
+    # Only the explicitly authorized early moneyline profile may trade.
+    assert matrix["authorized_combinations"] == 1
+    assert matrix["any_authorized"] is True
+
+    early = by_key[("moneyline", "early")]
+    assert early["authorized"] is True
+    assert early["source"] == "line_profile"
+    assert early["effective"]["min_edge"] == pytest.approx(0.04)
+
+    # A disabled all-stage profile blocks its own stage and states why.
+    late = by_key[("moneyline", "late")]
+    assert late["authorized"] is False
+    assert late["effective"] is None
+    assert "moneyline/all" in late["blocked_reason"]
+
+    # An unprofiled line falls through to the disabled global fallback.
+    total = by_key[("total", "all")]
+    assert total["authorized"] is False
+    assert "global fallback is off" in total["blocked_reason"]
+
+
+def test_execution_state_names_each_blocker_separately(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+    trader.configure({
+        "execution_mode": "dry_run",
+        "automation_enabled": False,
+        "global_entry_enabled": False,
+        "allowed_market_types": [],
+        "line_execution_profiles": [],
+    })
+
+    state = trader.execution_state()
+    codes = {item["code"] for item in state["entry_blockers"]}
+
+    assert state["entry_possible_now"] is False
+    assert codes == {"automation_off", "nothing_authorized"}
+    assert state["automation"]["running"] is False
+    assert state["live_orders"]["armed"] is False
+    assert state["live_orders"]["applies_to_lane"] is False
+    assert state["protective_exits"]["armed"] is False
+    assert state["authorization"]["any_authorized"] is False
+    assert state["exposure"]["open_positions"] == 0
+    assert state["policy"]["saved_fingerprint"]
+
+    trader.configure({
+        "automation_enabled": True,
+        "global_entry_enabled": True,
+        "allowed_market_types": ["moneyline"],
+    })
+    cleared = trader.execution_state()
+
+    assert cleared["entry_blockers"] == []
+    assert cleared["entry_possible_now"] is True
+    # The saved policy changed, so the fingerprint the UI compares against must
+    # change with it.
+    assert (
+        cleared["policy"]["saved_fingerprint"]
+        != state["policy"]["saved_fingerprint"]
+    )
+
+
+def test_predictive_exit_state_admits_cold_start_tightening(tmp_path):
+    """Cold start is not "not acting yet" - it already moves exit thresholds."""
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+
+    trader.configure({"adaptive_exit_enabled": False})
+    assert trader.execution_state()["predictive_exit"]["status"] == "off"
+
+    trader.configure({
+        "adaptive_exit_enabled": True,
+        "adaptive_exit_profile": "observe",
+    })
+    observing = trader.execution_state()["predictive_exit"]
+    assert observing["status"] == "observe_only"
+    assert observing["can_tighten_exits"] is False
+
+    trader.configure({"adaptive_exit_profile": "responsive"})
+    responsive = trader.execution_state()["predictive_exit"]
+    assert responsive["status"] == "collecting"
+    # No labeled evidence exists, yet the responsive profile still applies half
+    # of its bounded tightening. Reporting this as inactive would mislead.
+    assert responsive["can_tighten_exits"] is True
+    assert responsive["cold_start_confidence"] == pytest.approx(0.50)
+    assert "before any labeled evidence" in responsive["cold_start_warning"]
+    assert responsive["hard_stop_unchanged"] is True
+
+
+def test_profile_capital_limits_can_only_tighten_the_lane_boundaries():
+    """A profile may narrow the lane's capital limits, never widen them."""
+    policy = TradingPolicy.from_mapping({
+        "trading_allocation_usd": 10.0,
+        "max_total_exposure_usd": 8.0,
+        "max_position_usd": 2.0,
+        "max_event_exposure_usd": 4.0,
+        "max_entries_per_event_per_hour": 3,
+        "line_execution_profiles": [
+            {
+                "market_type": "moneyline",
+                "game_stage": "all",
+                "enabled": True,
+                "overrides": {
+                    "max_position_usd": 1.0,
+                    "max_profile_exposure_usd": 3.0,
+                    "max_profile_open_positions": 2,
+                },
+            },
+            {
+                "market_type": "total",
+                "game_stage": "all",
+                "enabled": True,
+                "overrides": {
+                    # Deliberately larger than the lane allows.
+                    "max_position_usd": 25.0,
+                    "max_event_exposure_usd": 50.0,
+                    "max_entries_per_event_per_hour": 99,
+                    "max_profile_exposure_usd": 100.0,
+                },
+            },
+        ],
+    })
+
+    tighter, _ = policy.execution_policy_for("moneyline", None)
+    looser, _ = policy.execution_policy_for("total", None)
+
+    assert tighter.max_position_usd == pytest.approx(1.0)
+    assert tighter.max_profile_exposure_usd == pytest.approx(3.0)
+    assert tighter.max_profile_open_positions == 2
+    # Every attempt to widen a shared boundary is clamped back to the lane.
+    assert looser.max_position_usd == pytest.approx(2.0)
+    assert looser.max_event_exposure_usd == pytest.approx(4.0)
+    assert looser.max_entries_per_event_per_hour == 3
+    assert looser.max_profile_exposure_usd == pytest.approx(8.0)
+
+
+def test_profile_exposure_limit_blocks_further_entries_for_that_line_only(
+    tmp_path,
+):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+        "candidate_cooldown_seconds": 60,
+        "max_entries_per_event_per_hour": 9,
+        "line_execution_profiles": [{
+            "market_type": "moneyline",
+            "game_stage": "all",
+            "enabled": True,
+            "overrides": {"max_profile_open_positions": 1},
+        }],
+    })
+
+    first = trader.run_cycle(
+        [(event(), [signal(clock, market="moneyline", outcome="Away")])],
+        multi_market_us_payload(),
+    )
+    assert first["entries"] == 1
+
+    clock.value += 120
+    blocked = trader.run_cycle(
+        [(event(), [
+            signal(clock, market="moneyline", outcome="Home", probability=0.75),
+        ])],
+        multi_market_us_payload(),
+    )
+    assert blocked["entries"] == 0
+    assert any(
+        "moneyline/all already holds 1 of its 1 allowed open positions"
+        in str(item.get("reason") or "")
+        for item in trader.status()["last_cycle_evaluations"]
+    )
+
+    # The unprofiled total line keeps its own budget and is unaffected.
+    clock.value += 120
+    other_line = trader.run_cycle(
+        [(event(), [signal(clock, market="total", outcome="Over 8.5")])],
+        multi_market_us_payload(),
+    )
+    assert other_line["entries"] == 1
+
+
+def test_profile_entry_budget_uses_the_key_frozen_at_entry(tmp_path):
+    """A later policy edit must not move past fills into another budget."""
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+        "candidate_cooldown_seconds": 60,
+        "line_execution_profiles": [{
+            "market_type": "moneyline",
+            "game_stage": "all",
+            "enabled": True,
+            "overrides": {"min_edge": 0.03},
+        }],
+    })
+    trader.run_cycle(
+        [(event(), [signal(clock, market="moneyline", outcome="Away")])],
+        multi_market_us_payload(),
+    )
+    position = trader.positions(open_only=True)[0]
+
+    assert trader._position_profile_key(position) == "moneyline/all"
+    assert trader._profile_entries_last_hour("moneyline/all", "dry_run") == 1
+    assert trader._profile_entries_last_hour("global", "dry_run") == 0
+
+    # Removing the profile does not retroactively re-attribute the fill.
+    trader.configure({"line_execution_profiles": []})
+    reloaded = trader.positions(open_only=True)[0]
+    assert trader._position_profile_key(reloaded) == "moneyline/all"
+    assert trader._profile_entries_last_hour("global", "dry_run") == 0
+
+
+def test_reading_status_never_starts_a_policy_session(tmp_path):
+    """Reporting must have no side effects on the session ledger."""
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+
+    # Nothing has been saved or traded yet.
+    for _ in range(3):
+        assert trader.status()["execution_state"]["policy"]["session_id"] is None
+    assert trader.policy_sessions() == []
+
+    # Saving a policy legitimately opens a session.
+    trader.configure({"automation_enabled": True, "execution_mode": "dry_run"})
+    opened = trader.policy_sessions()
+    assert len(opened) == 1
+
+    # Polling status must report that session without ever creating another.
+    for _ in range(5):
+        assert trader.status()["execution_state"]["policy"]["session_id"] == (
+            opened[0]["id"]
+        )
+    assert len(trader.policy_sessions()) == 1
+
+    # Observing candidates is not trading either.
+    trader.run_cycle(
+        [(event(), [signal(clock, market="moneyline", outcome="Away")])],
+        us_payload(),
+    )
+    assert len(trader.policy_sessions()) == 1
+
+
+def test_status_reports_the_evaluation_count_alongside_the_list(tmp_path):
+    """The polled payload states how many evaluations it is carrying."""
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+    trader.configure({"automation_enabled": True, "execution_mode": "dry_run"})
+    trader.run_cycle(
+        [(event(), [
+            signal(clock, market=market, outcome=outcome, probability=probability)
+            for market, outcome, probability in (
+                ("moneyline", "Away", 0.60),
+                ("total", "Over 8.5", 0.60),
+            )
+        ])],
+        multi_market_us_payload(),
+    )
+
+    status = trader.status()
+
+    assert status["last_cycle_evaluation_count"] == 2
+    assert len(status["last_cycle_evaluations"]) == 2
+    # Per-candidate diagnostics and the cycle's own policy context both remain:
+    # an evaluation is the audit record of the cycle that produced it, and the
+    # saved policy may have changed since.
+    evaluation = status["last_cycle_evaluations"][0]
+    assert evaluation["state"]
+    assert "configured_min_edge" in evaluation
+    assert "required_engine_gates" in evaluation
+    assert "selected_engine_gate_results" in evaluation
+
+
+def test_authorization_matrix_sends_effective_values_only_where_they_differ(
+    tmp_path,
+):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+    trader.configure({
+        "execution_mode": "dry_run",
+        "line_execution_profiles": [{
+            "market_type": "moneyline",
+            "game_stage": "early",
+            "enabled": True,
+            "overrides": {"min_edge": 0.09},
+        }],
+    })
+
+    rows = {
+        (row["market_type"], row["game_stage"]): row
+        for row in trader.authorization_matrix()["combinations"]
+    }
+
+    inheriting = rows[("total", "all")]
+    assert inheriting["authorized"] is True
+    assert inheriting["inherits_global"] is True
+    # Twelve identical copies of the global thresholds are not transmitted.
+    assert inheriting["effective"] is None
+    assert inheriting["overridden_fields"] == []
+
+    overridden = rows[("moneyline", "early")]
+    assert overridden["inherits_global"] is False
+    assert overridden["overridden_fields"] == ["min_edge"]
+    assert overridden["effective"]["min_edge"] == pytest.approx(0.09)
+    # The resolved block is complete, not just the changed field.
+    assert overridden["effective"]["stop_loss"] == pytest.approx(
+        trader.policy.stop_loss
+    )
+
+
+def test_journal_pruning_preserves_entry_and_exit_evidence(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+    trader.configure({"execution_mode": "dry_run"})
+    for index in range(40):
+        trader._journal(
+            "mark",
+            "updated",
+            event_id="event-1",
+            payload={"index": index},
+        )
+    trader._journal("entry", "simulated_fill", event_id="event-1")
+    trader._journal("exit", "profit_lock", event_id="event-1")
+    for index in range(40):
+        trader._journal(
+            "qualification",
+            "rejected",
+            event_id="event-1",
+            payload={"index": index},
+        )
+
+    trader._prune_journal(maximum=5)
+    kinds = [item["kind"] for item in trader.journal(limit=500)]
+
+    # High-volume chatter ages out; the order audit trail does not.
+    assert "entry" in kinds
+    assert "exit" in kinds
+    assert kinds.count("mark") + kinds.count("qualification") <= 5
+
+
+def test_marks_retain_both_excursion_extremes(tmp_path):
+    """Adverse excursion is what makes a tighter stop identifiable later."""
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+        # Keep the position open so the whole path is observed.
+        "stop_loss": 0.95,
+        "profit_target": 0.95,
+        "auto_cashout": False,
+    })
+    trader.run_cycle(
+        [(event(), [signal(clock, market="moneyline", outcome="Away")])],
+        us_payload(bid=0.39, ask=0.40),
+    )
+    for bid, ask in ((0.34, 0.35), (0.30, 0.31), (0.44, 0.45)):
+        clock.value += 60
+        trader.run_cycle(
+            [(event(), [signal(clock, market="moneyline", outcome="Away")])],
+            us_payload(bid=bid, ask=ask),
+        )
+
+    with trader._db.cursor(dict_rows=True) as cur:
+        trader._db.execute(
+            cur,
+            """SELECT entry_cost,highest_exit_value,lowest_exit_value
+               FROM live_managed_positions""",
+        )
+        row = dict(cur.fetchone())
+
+    assert row["entry_cost"] == pytest.approx(0.40)
+    # The path dipped to 0.30 before recovering to 0.44, so a recovery must not
+    # erase the adverse extreme the position actually passed through.
+    assert row["highest_exit_value"] == pytest.approx(0.44)
+    assert row["lowest_exit_value"] == pytest.approx(0.30)
+
+
+def test_a_position_that_only_rises_records_no_adverse_excursion(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+        "stop_loss": 0.95,
+        "profit_target": 0.95,
+        "auto_cashout": False,
+    })
+    trader.run_cycle(
+        [(event(), [signal(clock, market="moneyline", outcome="Away")])],
+        us_payload(bid=0.39, ask=0.40),
+    )
+    clock.value += 60
+    trader.run_cycle(
+        [(event(), [signal(clock, market="moneyline", outcome="Away")])],
+        us_payload(bid=0.49, ask=0.50),
+    )
+
+    with trader._db.cursor(dict_rows=True) as cur:
+        trader._db.execute(
+            cur,
+            """SELECT entry_cost,lowest_exit_value
+               FROM live_managed_positions""",
+        )
+        row = dict(cur.fetchone())
+
+    # Seeded from entry cost, so "never went adverse" reads as a zero
+    # excursion rather than a null the advisor would have to guess about.
+    assert row["lowest_exit_value"] == pytest.approx(row["entry_cost"])
+
+
+def test_journal_page_bounds_the_response_and_reports_what_it_omits(tmp_path):
+    """Polling the whole journal was the largest response in the dashboard."""
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+    trader.configure({"execution_mode": "dry_run"})
+    for index in range(60):
+        trader._journal(
+            "qualification", "rejected", event_id="event-1",
+            payload={"index": index},
+        )
+    trader._journal("entry", "simulated_fill", event_id="event-1")
+    trader._journal("exit", "profit_lock", event_id="event-1")
+
+    page = trader.journal_page(limit=25)
+
+    assert len(page["items"]) == 25
+    # The operator can see how much is not on screen instead of a silent cut.
+    assert page["total"] == sum(page["kind_counts"].values())
+    assert page["filtered_total"] == page["total"]
+    assert page["offset"] == 0
+    assert page["kind_counts"]["qualification"] == 60
+    assert page["kind_counts"]["entry"] == 1
+    assert page["kind_counts"]["exit"] == 1
+
+    # Paging walks backwards through time without overlap.
+    first_ids = [item["id"] for item in page["items"]]
+    second = trader.journal_page(limit=25, offset=25)
+    assert second["offset"] == 25
+    assert not set(first_ids) & {item["id"] for item in second["items"]}
+
+    # Filtering surfaces the order audit trail the chatter would otherwise bury.
+    filtered = trader.journal_page(limit=25, kinds=["entry", "exit"])
+    assert filtered["filtered_total"] == 2
+    assert {item["kind"] for item in filtered["items"]} == {"entry", "exit"}
+    assert filtered["kinds"] == ["entry", "exit"]
+    # Unfiltered totals stay available so the filter is visibly a filter.
+    assert filtered["total"] == page["total"]
+    assert filtered["filtered_total"] < filtered["total"]
+
+
+def test_journal_kind_filter_rejects_nothing_and_ignores_blanks(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+    trader.configure({"execution_mode": "dry_run"})
+    trader._journal("entry", "simulated_fill", event_id="event-1")
+    unfiltered = trader.journal()
+
+    # Blank or whitespace-only filters must behave as "no filter", never as a
+    # filter that silently matches nothing.
+    assert len(trader.journal(kinds=["", "  "])) == len(unfiltered)
+    assert trader.journal_page(kinds=[])["filtered_total"] == len(unfiltered)
+    # An unknown kind is a real filter and correctly matches nothing.
+    assert trader.journal(kinds=["nonexistent-kind"]) == []
 
 
 def test_mlb_stage_filter_requires_explicit_non_late_inning_state(tmp_path):
@@ -2057,6 +3558,72 @@ def test_live_tally_reset_refuses_to_hide_an_open_position(tmp_path):
         trader.reset_live_performance(LIVE_PERFORMANCE_RESET_PHRASE)
 
     assert trader.performance()["modes"]["live"]["open_positions"] == 1
+
+
+def test_dry_run_session_tally_zeroes_display_and_preserves_everything(
+    tmp_path,
+):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+    })
+    trader.run_cycle([(event(), [signal(clock)])], us_payload())
+    position = trader.positions(open_only=True)[0]
+    trader._close_position(
+        position["id"],
+        exit_value=0.50,
+        reason="test_win",
+        order_id=None,
+    )
+    before = trader.performance()["modes"]["dry_run"]
+
+    reset = trader.reset_dry_run_performance(LIVE_PERFORMANCE_RESET_PHRASE)
+    after = trader.performance()["modes"]["dry_run"]
+
+    assert before["total_positions"] == 1
+    assert before["wins"] == 1
+    assert reset["mode"] == "dry_run"
+    assert reset["positions_preserved"] is True
+    assert after["total_positions"] == 0
+    assert after["wins"] == after["losses"] == after["pushes"] == 0
+    assert after["total_net_usd"] == 0
+    assert after["session_started_at"] == reset["reset_at"]
+    # The record is a display boundary only: the closed position survives.
+    assert len(trader.positions()) == 1
+    assert trader.positions()[0]["status"] == "closed"
+    assert any(
+        item["kind"] == "performance_reset" and item["status"] == "dry_run"
+        for item in trader.journal()
+    )
+
+    # A new dry position after the boundary counts in the fresh session.
+    clock.value += 600
+    trader.run_cycle([(event(), [signal(clock)])], us_payload())
+    fresh = trader.performance()["modes"]["dry_run"]
+    assert fresh["total_positions"] == 1
+    assert fresh["open_positions"] == 1
+    trader.close()
+
+
+def test_dry_run_session_tally_requires_approval_and_no_open_positions(
+    tmp_path,
+):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+    })
+    with pytest.raises(TradingPolicyError, match="approve"):
+        trader.reset_dry_run_performance("nope")
+
+    trader.run_cycle([(event(), [signal(clock)])], us_payload())
+    with pytest.raises(TradingPolicyError, match="open dry-run position"):
+        trader.reset_dry_run_performance(LIVE_PERFORMANCE_RESET_PHRASE)
+    assert trader.performance()["modes"]["dry_run"]["open_positions"] == 1
+    trader.close()
 
 
 def test_new_risk_session_resets_only_entry_counters_and_preserves_evidence(
@@ -3055,3 +4622,250 @@ def test_venue_http_errors_include_status_without_exposing_credentials(tmp_path)
     safe = trader._safe_error(error)
 
     assert safe == "HTTP 500 RuntimeError: request used [redacted] and [redacted]"
+
+
+def _adaptive_recommendation(trader, **kwargs):
+    return trader._predictive_exit_recommendation(**kwargs)
+
+
+def test_adaptive_recommendation_holds_at_observe_until_the_overlay_scores(
+    tmp_path,
+):
+    """The overlay must earn the right to move a live exit."""
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+
+    nothing = _adaptive_recommendation(
+        trader, labeled=0, labeled_events=0, required=30, brier=None
+    )
+    assert nothing["profile"] == "observe"
+    assert nothing["basis"] == "insufficient_evidence"
+
+    thin = _adaptive_recommendation(
+        trader, labeled=12, labeled_events=2, required=30, brier=0.10
+    )
+    # Good Brier but far too little support: a non-observe profile would
+    # already tighten from its cold-start floor on this.
+    assert thin["profile"] == "observe"
+    assert thin["basis"] == "insufficient_evidence"
+
+    unscored = _adaptive_recommendation(
+        trader, labeled=60, labeled_events=8, required=30, brier=None
+    )
+    assert unscored["profile"] == "observe"
+
+
+def test_adaptive_recommendation_requires_beating_the_always_half_benchmark(
+    tmp_path,
+):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+
+    # 0.25 is exactly what always forecasting 0.50 achieves.
+    no_better = _adaptive_recommendation(
+        trader, labeled=60, labeled_events=8, required=30, brier=0.25
+    )
+    assert no_better["profile"] == "observe"
+    assert no_better["basis"] == "overlay_scored"
+    assert "no better than always forecasting" in no_better["rationale"]
+
+    earned = _adaptive_recommendation(
+        trader, labeled=60, labeled_events=8, required=30, brier=0.18
+    )
+    # The smallest step above observe-only, never straight to responsive.
+    assert earned["profile"] == "guarded"
+    assert earned["basis"] == "overlay_scored"
+    assert earned["brier_score"] == pytest.approx(0.18)
+    assert "not evidence for Balanced or Responsive" in earned["rationale"]
+    assert "says nothing about realized return" in earned["rationale"]
+
+
+def test_execution_state_carries_the_adaptive_recommendation(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+    trader.configure({
+        "execution_mode": "dry_run",
+        "adaptive_exit_enabled": True,
+        "adaptive_exit_profile": "responsive",
+    })
+
+    predictive = trader.execution_state()["predictive_exit"]
+
+    assert predictive["recommendation"]["profile"] == "observe"
+    # The lane is running Responsive on no scored evidence, so the state must
+    # surface both the recommendation and the cold-start caveat.
+    assert predictive["cold_start_warning"]
+    assert predictive["can_tighten_exits"] is True
+
+
+def test_fee_implied_edge_floor_tracks_the_venue_fee_curve():
+    """Break-even edge is the round-trip fee, which peaks at 50c."""
+    from app.polymarket_us_trading import (
+        ROUND_TRIP_TAKER_FEE_RATE,
+        _fee_implied_edge_floor,
+    )
+
+    # Disabled and out-of-range prices contribute no floor at all.
+    assert _fee_implied_edge_floor(0.50, 0.0) is None
+    assert _fee_implied_edge_floor(0.0, 1.0) is None
+    assert _fee_implied_edge_floor(1.0, 1.0) is None
+
+    # At break-even margin the floor is exactly the round-trip fee per share.
+    at_half = _fee_implied_edge_floor(0.50, 1.0)
+    assert at_half == pytest.approx(ROUND_TRIP_TAKER_FEE_RATE * 0.25)
+    # Symmetric about 50c, and cheaper toward both extremes.
+    assert _fee_implied_edge_floor(0.20, 1.0) == pytest.approx(
+        _fee_implied_edge_floor(0.80, 1.0)
+    )
+    assert _fee_implied_edge_floor(0.20, 1.0) < at_half
+    assert _fee_implied_edge_floor(0.90, 1.0) < _fee_implied_edge_floor(0.70, 1.0)
+    # Margin scales it linearly.
+    assert _fee_implied_edge_floor(0.50, 2.0) == pytest.approx(2 * at_half)
+
+
+def test_fee_aware_gate_blocks_an_edge_that_cannot_clear_its_own_fee(tmp_path):
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    # Entry at 40c: round-trip fee costs 0.1*0.4*0.6 = 2.4c of edge.
+    # A 3c flat floor lets a 5c edge through; a 1.5x fee margin needs 3.6c.
+    trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+        "min_edge": 0.03,
+        "fee_edge_margin": 0.0,
+    })
+    permitted = trader.run_cycle(
+        [(event(), [signal(clock, probability=0.435)])],
+        us_payload(bid=0.39, ask=0.40),
+    )
+    assert permitted["entries"] == 1
+
+    clock.value += 600
+    blocked_trader = make_trader(tmp_path / "b", clock, fail_on_orders=True)
+    blocked_trader.configure({
+        "automation_enabled": True,
+        "execution_mode": "dry_run",
+        "min_edge": 0.03,
+        "fee_edge_margin": 1.5,
+    })
+    blocked = blocked_trader.run_cycle(
+        [(event(), [signal(clock, probability=0.435)])],
+        us_payload(bid=0.39, ask=0.40),
+    )
+    assert blocked["entries"] == 0
+    assert any(
+        "round-trip taker fee" in str(item.get("reason") or "")
+        for item in blocked_trader.status()["last_cycle_evaluations"]
+    )
+
+
+def _book_at(ask, bid):
+    return {
+        "marketData": {
+            "offers": [{"qty": "100", "px": {"value": ask}}],
+            "bids": [{"qty": "100", "px": {"value": bid}}],
+            "state": "MARKET_STATE_OPEN",
+        }
+    }
+
+
+def test_fee_aware_gate_is_price_dependent_not_a_flat_raise(tmp_path):
+    """The same 3.5c edge clears at a cheap price and fails at a mid price."""
+    clock = Clock()
+
+    # 20c entry: fee floor = 1.5 * 0.1 * 0.2 * 0.8 = 2.4c, under the 3.5c edge.
+    cheap = make_trader(
+        tmp_path / "cheap", clock, fail_on_orders=True,
+        book=_book_at(0.20, 0.19),
+    )
+    cheap.configure({
+        "automation_enabled": True, "execution_mode": "dry_run",
+        "min_edge": 0.03, "fee_edge_margin": 1.5,
+    })
+    assert cheap.run_cycle(
+        [(event(), [signal(clock, probability=0.235)])],
+        us_payload(bid=0.19, ask=0.20),
+    )["entries"] == 1
+
+    # 50c entry, same 3.5c edge: fee floor = 1.5 * 0.1 * 0.25 = 3.75c, over it.
+    mid = make_trader(
+        tmp_path / "mid", clock, fail_on_orders=True,
+        book=_book_at(0.50, 0.49),
+    )
+    mid.configure({
+        "automation_enabled": True, "execution_mode": "dry_run",
+        "min_edge": 0.03, "fee_edge_margin": 1.5,
+    })
+    assert mid.run_cycle(
+        [(event(), [signal(clock, probability=0.535)])],
+        us_payload(bid=0.49, ask=0.50),
+    )["entries"] == 0
+
+
+def test_fee_edge_margin_validates_and_is_profile_overridable():
+    from app.polymarket_us_trading import LINE_EXECUTION_PROFILE_FIELDS
+
+    assert "fee_edge_margin" in LINE_EXECUTION_PROFILE_FIELDS
+    assert TradingPolicy().fee_edge_margin == 0.0  # off preserves behaviour
+    with pytest.raises(TradingPolicyError, match="fee_edge_margin"):
+        TradingPolicy.from_mapping({"fee_edge_margin": 0.5})
+    with pytest.raises(TradingPolicyError, match="fee_edge_margin"):
+        TradingPolicy.from_mapping({"fee_edge_margin": 6.0})
+
+    # A line profile may set its own margin, so an expensive line can demand
+    # more headroom than a cheap one.
+    policy = TradingPolicy.from_mapping({
+        "fee_edge_margin": 1.2,
+        "line_execution_profiles": [{
+            "market_type": "spread", "game_stage": "all", "enabled": True,
+            "overrides": {"fee_edge_margin": 2.0},
+        }],
+    })
+    spread, _ = policy.execution_policy_for("spread", None)
+    moneyline, _ = policy.execution_policy_for("moneyline", None)
+    assert spread.fee_edge_margin == pytest.approx(2.0)
+    assert moneyline.fee_edge_margin == pytest.approx(1.2)
+
+
+def test_candidate_pruning_sheds_unmapped_noise_before_executable_evidence(
+    tmp_path,
+):
+    """Unmapped rows are ~99% of volume and carry the least information.
+
+    A signal with no tradable US contract is logged on every cooldown. If
+    pruning treated it the same as an executable candidate, a busy slate would
+    evict the mapped population the advisor depends on to make room for rows
+    that were never tradable.
+    """
+    clock = Clock()
+    trader = make_trader(tmp_path, clock)
+    trader.configure({"execution_mode": "dry_run"})
+
+    def insert(row_id, *, mapped, entered, ts):
+        with trader._db.transaction() as cur:
+            trader._db.execute(
+                cur,
+                """INSERT INTO candidate_observations(
+                     id,observed_ts,mode,event_id,state,reason,mapped,executable,
+                     entered,propensity_source)
+                   VALUES (%s,%s,'dry_run','event-1','x',NULL,%s,%s,%s,'deterministic_policy')""",
+                (row_id, ts, mapped, mapped, entered),
+            )
+
+    # Newest unmapped, oldest mapped: age alone would keep the wrong ones.
+    for i in range(6):
+        insert(f"unmapped-{i}", mapped=0, entered=0, ts=2000 + i)
+    for i in range(3):
+        insert(f"mapped-{i}", mapped=1, entered=0, ts=1000 + i)
+    insert("entered-0", mapped=1, entered=1, ts=900)
+
+    trader._prune_candidate_observations(maximum=4)
+
+    with trader._db.cursor(dict_rows=True) as cur:
+        trader._db.execute(cur, "SELECT id, mapped, entered FROM candidate_observations")
+        kept = {dict(r)["id"] for r in cur.fetchall()}
+
+    # Every unmapped row goes first, despite being the newest.
+    assert not any(k.startswith("unmapped-") for k in kept)
+    # The executable evidence survives, including the observed-reward row.
+    assert {"mapped-0", "mapped-1", "mapped-2", "entered-0"} == kept

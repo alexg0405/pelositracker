@@ -6,7 +6,7 @@
   <meta name="description" content="Auditable live sports-market research and controlled Polymarket US execution">
   <title>PelosiTracker Dashboard</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <link rel="stylesheet" href="/static/index.css?v=hosted-research-lobby-2">
+  <link rel="stylesheet" href="/static/index.css?v=workstation-cockpit-1">
 </head>
 <body class="research-workstation">
 <a class="skip-link" href="#main-content">Skip to dashboard</a>
@@ -34,79 +34,11 @@
   </header>
 
   <nav class="tab-carousel" id="global-tab-nav" aria-label="Primary workspace" role="tablist">
-    <button class="pill active" id="tab-lobby-button" data-tab="tab-lobby" role="tab" aria-controls="tab-lobby" aria-selected="true">Lobby</button>
+    <button class="pill active" id="tab-us-research-button" data-tab="tab-us-research" role="tab" aria-controls="tab-us-research" aria-selected="true">Polymarket US Research</button>
     <button class="pill" id="tab-live-button" data-tab="tab-live" role="tab" aria-controls="tab-live" aria-selected="false">Live Radar</button>
     <button class="pill" id="tab-discovery-button" data-tab="tab-discovery" role="tab" aria-controls="tab-discovery" aria-selected="false">Discovery</button>
-    <button class="pill" id="tab-us-research-button" data-tab="tab-us-research" role="tab" aria-controls="tab-us-research" aria-selected="false">Polymarket US Research</button>
     <button class="pill" id="bots-tab-button" data-tab="tab-bots" role="tab" aria-controls="tab-bots" aria-selected="false">Custom Bots & Metrics</button>
   </nav>
-
-  <!-- TAB 0: LOBBY (landing) -->
-  <div id="tab-lobby" class="tab-content" role="tabpanel" aria-labelledby="tab-lobby-button">
-    <div class="lb">
-      <aside class="lb-side">
-        <div class="lb-season">SEASON 3</div>
-        <div class="lb-levelcard">
-          <div class="lb-level"><span class="lb-level-num" id="lb-level">5</span><span class="lb-level-lbl">LEVEL</span></div>
-          <div class="lb-xp">
-            <div class="lb-xp-top"><span id="lb-xp-cur">67</span><span>/ 700</span></div>
-            <div class="lb-xp-bar"><i class="lb-xp-progress-10"></i></div>
-            <div class="lb-xp-next">Next reward · LVL 10 <b>&#9672; 10</b></div>
-          </div>
-        </div>
-        <div class="lb-pass">
-          <div class="lb-pass-row"><span>BATTLE PASS</span><b>TIER 4</b></div>
-          <div class="lb-xp-bar sm"><i class="lb-xp-progress-60"></i></div>
-        </div>
-        <div class="lb-daily">
-          <div class="lb-daily-h">DAILY CHALLENGES</div>
-          <div class="lb-chal"><span>Monitor 4 live events</span><span class="lb-chal-r">0 / 4 <b>&#9733; 500</b></span></div>
-          <div class="lb-chal"><span>Log a paper position</span><span class="lb-chal-r">0 / 1 <b>&#9733; 500</b></span></div>
-        </div>
-      </aside>
-
-      <section class="lb-stage">
-        <div class="lb-pods">
-          <div class="lb-pod is-ready" id="lb-pod-user">
-            <div class="lb-pod-status">READY</div>
-            <div class="lb-avatar" id="lb-avatar">AD</div>
-            <div class="lb-beam"></div>
-            <div class="lb-pod-name" id="lb-pod-name">ADMIN</div>
-          </div>
-          <div class="lb-pod is-empty">
-            <div class="lb-pod-status muted">EMPTY</div>
-            <button class="lb-add" type="button" aria-label="Invite teammate">+</button>
-            <div class="lb-beam"></div>
-            <div class="lb-pod-name muted">Invite</div>
-          </div>
-          <div class="lb-pod is-empty">
-            <div class="lb-pod-status muted">EMPTY</div>
-            <button class="lb-add" type="button" aria-label="Invite teammate">+</button>
-            <div class="lb-beam"></div>
-            <div class="lb-pod-name muted">Invite</div>
-          </div>
-        </div>
-        <div class="lb-feed"><span class="lb-feed-time">[9:32 AM]</span> <b>Party:</b> <span id="lb-feed-name">ADMIN</span> joined the party.</div>
-      </section>
-
-      <aside class="lb-right">
-        <div class="lb-mode">
-          <div class="lb-mode-new">NEW MODE AVAILABLE!</div>
-          <div class="lb-mode-name">SQUADS</div>
-          <button class="ghost lb-mode-change" type="button">&#8646; Change Mode</button>
-        </div>
-        <div class="lb-fill">
-          <span>Squad Fill</span>
-          <button class="lb-fill-toggle is-off" id="lb-fill" type="button">No Fill</button>
-        </div>
-        <button class="primary lb-ready" id="lb-ready" type="button">&#9654; READY</button>
-      </aside>
-    </div>
-    <div class="lb-bottom">
-      <span><b>Party</b> &middot; Hold to chat</span>
-      <span>Inspect Challenges &middot; News</span>
-    </div>
-  </div>
 
   <!-- TAB 1: LIVE RADAR -->
   <div id="tab-live" class="tab-content is-hidden" role="tabpanel" aria-labelledby="tab-live-button">
@@ -168,6 +100,14 @@
       </div>
       <div id="odds-api-status" class="odds-api-status" role="status" aria-live="polite">Loading Odds API status…</div>
       <div id="discover-refresh-status" class="refresh-status" role="status" aria-live="polite"></div>
+      <div id="discover-league-filter" class="carousel discover-league-filter" role="tablist" aria-label="Filter by league">
+        <button class="pill" data-league="" role="tab">All sports</button>
+        <button class="pill" data-league="mlb" role="tab">MLB</button>
+        <button class="pill" data-league="nba" role="tab">NBA</button>
+        <button class="pill" data-league="nfl" role="tab">NFL</button>
+        <button class="pill" data-league="nhl" role="tab">NHL</button>
+        <button class="pill" data-league="tennis" role="tab">Tennis</button>
+      </div>
       <input class="search-gap" id="discover-search" placeholder="Filter games…" autocomplete="off">
       <div class="discover-batch-bar">
         <div class="discover-batch-copy">
@@ -181,12 +121,23 @@
         </div>
       </div>
       <div id="discover-batch-status" class="refresh-status discover-batch-status" role="status" aria-live="polite"></div>
+      <div class="discover-batch-bar gameday-bar">
+        <div class="discover-batch-copy">
+          <strong>Game-day autopilot</strong>
+          <span>Monitors the selected games, holds Odds API polling until the first one goes live, runs the dry-run lane while games are up, and stops polling and dry automation after the last final.</span>
+        </div>
+        <div class="discover-batch-actions">
+          <button class="primary compact-button" id="gameday-plan" type="button" disabled>Plan game-day dry run</button>
+          <button class="ghost compact-button" id="gameday-cancel" type="button" hidden>Cancel autopilot</button>
+        </div>
+      </div>
+      <div id="gameday-status" class="refresh-status gameday-status" role="status" aria-live="polite"></div>
       <div id="discover-list" class="discover-list" aria-live="polite"></div>
     </div>
   </div>
 
   <!-- TAB 3: POLYMARKET US RESEARCH SIDECAR -->
-  <div id="tab-us-research" class="tab-content is-hidden" role="tabpanel" aria-labelledby="tab-us-research-button">
+  <div id="tab-us-research" class="tab-content" role="tabpanel" aria-labelledby="tab-us-research-button">
     <nav class="research-section-nav" aria-label="Polymarket US research sections">
       <span class="research-section-nav-label">Workspace map</span>
       <div class="research-section-nav-scroll">
@@ -227,6 +178,7 @@
           </div>
           <div class="us-performance-actions">
             <button class="ghost compact-button" id="us-performance-refresh" type="button">Refresh tallies</button>
+            <button class="ghost compact-button" id="us-dry-tally-reset" type="button">New dry-run session tally</button>
             <button class="ghost compact-button" id="us-live-tally-reset" type="button">Reset live tally</button>
           </div>
         </div>
@@ -234,7 +186,7 @@
         <div id="us-performance-summary" class="us-performance-summary" aria-live="polite">
           <div class="metrics-empty">No managed trade results yet.</div>
         </div>
-        <div class="us-performance-footnote">Total net = realized net + current executable cash-out value minus entry cost on priced open positions. Reset live tally starts a new display session only; it never deletes positions, journal evidence, or daily-loss safeguards.</div>
+        <div class="us-performance-footnote">Total net = realized net + current executable cash-out value minus entry cost on priced open positions. The tally buttons start a new display session only — for reading one night's dry-run profit on its own — and never delete positions, journal evidence, the datasheet, or daily-loss safeguards.</div>
       </section>
 
       <section class="panel pad us-account-panel">
@@ -414,6 +366,16 @@
         </button>
       </div>
       <div id="us-trading-status" class="us-trading-status" role="status" aria-live="polite">Loading execution policy…</div>
+      <section id="us-execution-state" class="us-execution-state" aria-label="Execution state">
+        <div id="us-execution-state-chips" class="us-execution-state-chips"></div>
+        <div id="us-execution-blockers" class="us-execution-blockers" role="status" aria-live="polite"></div>
+        <div id="us-adaptive-recommendation" class="us-adaptive-recommendation-slot" role="status" aria-live="polite"></div>
+        <details class="advanced us-authorization-matrix">
+          <summary>Effective authorization by line and game stage</summary>
+          <div class="field-note">Resolved by the server from the global fallback switch, the global line-type list, and every line/stage profile. This is what will actually execute.</div>
+          <div id="us-authorization-matrix" class="us-authorization-matrix-body"></div>
+        </details>
+      </section>
       <div id="us-lane-coordination-status" class="us-lane-coordination-status" role="status" aria-live="polite">
         Tap a lane to edit it. Dry-run and live automation are independent and can run together.
       </div>
@@ -425,7 +387,19 @@
         <button class="primary" id="us-lane-automation-toggle" type="button">Start dry-run automation</button>
       </div>
       <div id="us-policy-save-status" class="us-policy-save-status" role="alert" aria-live="assertive" hidden></div>
-      <form id="us-trading-form" class="us-trading-form">
+      <div id="us-policy-rail" class="us-policy-rail">
+        <div class="us-policy-rail-summary">
+          <strong id="us-rail-lane">Dry-run lane</strong>
+          <span id="us-rail-capital">Loading capital…</span>
+          <span id="us-rail-saved" class="us-rail-saved">Loading…</span>
+        </div>
+        <nav class="us-policy-steps" id="us-policy-steps" aria-label="Execution policy setup steps"></nav>
+      </div>
+      <!-- novalidate: the submit handler performs its own :invalid sweep and
+           reveals the owning step. Native interactive validation cannot focus
+           a control inside a hidden step and would block submit silently. -->
+      <form id="us-trading-form" class="us-trading-form" novalidate>
+        <div class="us-policy-step" data-policy-step="capital" data-step-label="1 · Lane &amp; capital">
         <label class="us-lane-select-field">Automation lane
           <select id="us-trading-mode">
             <option value="dry_run">Dry run / simulated fills</option>
@@ -448,12 +422,15 @@
           <span class="field-note">Named styles derive the risk fields below; Custom leaves every field editable.</span>
         </label>
         <div id="us-risk-preset-preview" class="us-risk-preset-preview us-check-wide" aria-live="polite"></div>
+        </div>
+        <div class="us-policy-step" data-policy-step="authorization" data-step-label="2 · Authorization" hidden>
         <fieldset id="us-line-type-policy" class="us-line-type-policy us-check-wide">
           <legend>Line types eligible for automatic entry</legend>
+          <label class="us-check us-check-wide"><input id="us-global-entry-enabled" type="checkbox"> Authorize global fallback entries</label>
           <label><input type="checkbox" data-entry-market-type="moneyline"> Moneyline</label>
           <label><input type="checkbox" data-entry-market-type="spread"> Spread / run line</label>
           <label><input type="checkbox" data-entry-market-type="total"> Game total</label>
-          <div class="field-note">This is an execution filter only. Disabled types are still calculated and visible elsewhere, but the auto trader will not enter them. At least one type must remain selected.</div>
+          <div class="field-note">When global fallback is authorized, these line types may use the global entry settings. Turn it off to block every unprofiled line. An explicitly authorized line/stage profile below can still trade independently of these global line-type choices.</div>
         </fieldset>
         <details id="us-line-profile-policy" class="advanced us-check-wide us-line-profile-policy">
           <summary>Line- and game-stage-specific execution profiles</summary>
@@ -474,7 +451,7 @@
                 <option value="late">Late · under 25% remaining</option>
               </select>
             </label>
-            <label class="us-check"><input id="us-profile-enabled" type="checkbox" checked> Allow entries for this profile</label>
+            <label class="us-check"><input id="us-profile-enabled" type="checkbox" checked> Authorize automatic entries for this profile</label>
           </div>
           <div class="us-line-profile-grid">
             <label>Minimum edge (%)
@@ -486,8 +463,41 @@
             <label>Minimum signal quality
               <input data-profile-field="min_signal_quality" type="number" min="0" max="100" step="any" placeholder="Inherit">
             </label>
+            <label>Maximum signal quality
+              <input data-profile-field="max_signal_quality" type="number" min="0" max="100" step="any" placeholder="Inherit">
+            </label>
+            <label>Minimum source agreement
+              <input data-profile-field="min_source_agreement" type="number" min="0" max="100" step="any" placeholder="Inherit">
+            </label>
+            <label>Maximum signal age (seconds)
+              <input data-profile-field="max_signal_age_seconds" type="number" min="1" max="120" step="any" placeholder="Inherit">
+            </label>
+            <label>Qualifying readings required
+              <input data-profile-field="entry_confirmation_readings" data-profile-integer type="number" min="1" max="10" step="1" placeholder="Inherit">
+            </label>
+            <label>Maximum confirmation price drift (Â¢)
+              <input data-profile-field="max_confirmation_price_drift" data-profile-percent type="number" min="0" max="100" step="any" placeholder="Inherit">
+            </label>
             <label>Minimum independent references
               <input data-profile-field="min_reference_sources" data-profile-integer type="number" min="1" step="1" placeholder="Inherit">
+            </label>
+            <label>Max position size ($)
+              <input data-profile-field="max_position_usd" type="number" min="0" step="any" placeholder="Inherit">
+            </label>
+            <label>Max event exposure ($)
+              <input data-profile-field="max_event_exposure_usd" type="number" min="0" step="any" placeholder="Inherit">
+            </label>
+            <label>Max entries per event / hour
+              <input data-profile-field="max_entries_per_event_per_hour" data-profile-integer type="number" min="1" step="1" placeholder="Inherit">
+            </label>
+            <label>Max exposure for this profile ($)
+              <input data-profile-field="max_profile_exposure_usd" type="number" min="0" step="any" placeholder="No profile cap">
+            </label>
+            <label>Max open positions for this profile
+              <input data-profile-field="max_profile_open_positions" data-profile-integer type="number" min="0" step="1" placeholder="No profile cap">
+            </label>
+            <label>Max entries / hour for this profile
+              <input data-profile-field="max_profile_orders_per_hour" data-profile-integer type="number" min="0" step="1" placeholder="No profile cap">
             </label>
             <label>Entry price floor (¢)
               <input data-profile-field="min_entry_price" data-profile-percent type="number" min="5.1" max="94.8" step="any" placeholder="Inherit">
@@ -523,8 +533,10 @@
               <input data-profile-field="min_mlb_fraction_remaining" data-profile-percent type="number" min="0" max="100" step="any" placeholder="Inherit">
             </label>
           </div>
+          <div class="field-note">Capital limits here can only tighten the lane. A larger value than the shared allocation, exposure ceiling, event cap, or per-event hourly cap is clamped back to the lane value. Blank inherits; the three profile-only caps are off when blank.</div>
           <div class="us-line-profile-actions">
-            <button class="ghost compact-button" id="us-profile-save" type="button">Save/update profile</button>
+            <button class="ghost compact-button" id="us-profile-copy-global" type="button">Copy global values into profile</button>
+            <button class="primary compact-button" id="us-profile-save" type="button">Save &amp; apply profile authorization</button>
             <button class="ghost compact-button" id="us-profile-remove" type="button">Remove selected profile</button>
           </div>
           <div id="us-line-profile-list" class="us-line-profile-list">No line-specific profiles saved. Global settings apply to every line.</div>
@@ -538,8 +550,11 @@
           <label class="us-segment-live-approval"><input id="us-allow-live-segments" type="checkbox"> Allow real orders on selected MLB segment markets after reviewing dry-run results</label>
           <div id="us-segment-research-status" class="us-segment-research-status" role="status" aria-live="polite">No retained MLB segment simulations yet.</div>
         </fieldset>
-        <details class="advanced us-check-wide us-policy-derived">
-          <summary>Derived bankroll and entry limits</summary>
+        </div>
+        <div class="us-policy-step" data-policy-step="limits" data-step-label="3 · Bankroll &amp; entry filters" hidden>
+        <details class="advanced us-check-wide us-policy-derived" open>
+          <summary>Shared lane bankroll and sizing</summary>
+          <div class="field-note">Hard boundaries for the whole lane. A line/stage profile can tighten these but never widen them.</div>
           <div class="us-advanced-grid">
         <label>Maximum total exposure ($)
           <input id="us-max-exposure" data-derived-risk type="number" min="0.01" step="0.01" required>
@@ -556,6 +571,12 @@
         <label>Daily realized-loss stop ($)
           <input id="us-daily-loss" data-derived-risk type="number" min="0" step="0.01" required>
         </label>
+          </div>
+        </details>
+        <details class="advanced us-check-wide us-policy-derived" open>
+          <summary>Shared entry filters</summary>
+          <div class="field-note">Inherited defaults for every line that has no profile override. These decide which contracts qualify; they do not change how edge or signal quality are calculated.</div>
+          <div class="us-advanced-grid">
         <label>Minimum edge (%)
           <input id="us-min-edge" data-derived-risk type="number" min="0" max="99" step="any" required>
         </label>
@@ -563,8 +584,16 @@
           <input id="us-max-edge" data-derived-risk type="number" min="0.1" max="100" step="any" required>
           <span class="field-note">Execution-side anomaly ceiling. It does not change how edge is calculated.</span>
         </label>
+        <label>Fee-aware edge margin (x round-trip fee)
+          <input id="us-fee-edge-margin" data-derived-risk type="number" min="0" max="5" step="any" required>
+          <span class="field-note">0 disables it. The round-trip taker fee costs 0.1 × p × (1−p) of edge and peaks at 50¢, so a flat minimum is too strict on cheap contracts and too loose in the middle. 1.0 is break-even after fees; 1.5 leaves margin.</span>
+        </label>
         <label>Minimum signal quality (0–100)
           <input id="us-min-quality" data-derived-risk type="number" min="0" max="100" step="any" required>
+        </label>
+        <label>Maximum signal quality (0-100)
+          <input id="us-max-quality" data-derived-risk type="number" min="0" max="100" step="any" required>
+          <span class="field-note">Execution-side anomaly ceiling. Signal quality remains a reliability score, not a win probability.</span>
         </label>
         <label>Entry price floor (¢)
           <input id="us-min-price" data-derived-risk type="number" min="5.1" max="94.8" step="any" required>
@@ -572,6 +601,14 @@
         <label>Entry price ceiling (¢)
           <input id="us-max-price" data-derived-risk type="number" min="5.2" max="94.9" step="any" required>
         </label>
+          </div>
+        </details>
+        </div>
+        <div class="us-policy-step" data-policy-step="behavior" data-step-label="4 · Exit &amp; adaptive behaviour" hidden>
+        <details class="advanced us-check-wide us-policy-derived" open>
+          <summary>Profit exit thresholds</summary>
+          <div class="field-note">These act after entry. Retained outcomes cannot score most of them, because the exit rule that was running produced the result — see the settings advisor for which ones have identifiable evidence.</div>
+          <div class="us-advanced-grid">
         <label>Fallback hold before one-reading profit confirmation (minutes)
           <input id="us-min-hold" data-derived-risk type="number" min="0" step="any" required>
           <span class="field-note">Two consecutive executable target readings arm protection immediately. This timer is only the fallback for confirming from one reading.</span>
@@ -591,6 +628,8 @@
           <legend>Adaptive MLB cash-out research</legend>
           <label class="us-check"><input id="us-adaptive-exit-enabled" type="checkbox"> Learn from live MLB game state and adapt eligible profit exits</label>
           <label class="us-check"><input id="us-volatility-stop-enabled" type="checkbox"> Protect ordinary MLB stops with bounded state-aware confirmation</label>
+          <label class="us-check"><input id="us-stateless-stop-confirmation" type="checkbox"> Keep the bounded stop when usable MLB state is missing (price-only window)</label>
+          <div class="field-note">Without this, a stop that fires while inning state is unavailable sells immediately — the dominant measured bypass. The price-only window caps grace at one minute; catastrophic losses and material model reversals still exit immediately.</div>
           <div class="field-note">The overlay now observes moneylines, run lines, and totals. It never changes probability, edge, signal quality, calibration, or entry gates. Stop confirmation can briefly hold an ordinary drawdown when the game is live and model edge has not materially reversed; the separate catastrophic boundary remains immediate.</div>
           <div class="us-adaptive-exit-grid">
             <label>Response mode
@@ -664,7 +703,9 @@
           <div class="us-always-enforced"><strong>Always enforced:</strong> exact Polymarket US contract mapping, open authenticated order book, hard 5c–95c price range, your price/spread/depth settings, buying power and exposure limits, and live arm/preview/fee-adjusted-edge checks.</div>
         </fieldset>
         <div class="field-note us-check-wide">Profit exits still need a meaningful gain followed by edge decay or a trailing pullback. Once armed, an ordinary profit exit cannot chase the executable quote below the configured fee-adjusted retained-profit floor; a missed floor waits for recovery while hard stops and material model reversals remain active. A one-cent gain alone never triggers an exit.</div>
-        <details class="advanced us-check-wide us-policy-advanced">
+        </div>
+        <div class="us-policy-step" data-policy-step="advanced" data-step-label="5 · Advanced gates" hidden>
+        <details class="advanced us-check-wide us-policy-advanced" open>
           <summary>Advanced risk and exit limits</summary>
           <div class="us-advanced-grid">
             <label>Maximum open positions
@@ -686,6 +727,21 @@
             <label>Minimum independent references
               <input id="us-min-refs" data-derived-risk type="number" min="1" step="1" required>
             </label>
+            <label>Minimum source agreement (0-100)
+              <input id="us-min-source-agreement" data-derived-risk type="number" min="0" max="100" step="any" required>
+              <span class="field-note">Uses the engine's existing cross-source agreement component; it does not recalculate consensus.</span>
+            </label>
+            <label>Maximum retained signal age (seconds)
+              <input id="us-max-signal-age" data-derived-risk type="number" min="1" max="120" step="any" required>
+            </label>
+            <label>Distinct qualifying readings required
+              <input id="us-entry-confirmation-readings" data-derived-risk type="number" min="1" max="10" step="1" required>
+              <span class="field-note">Readings must have a newer signal timestamp. One preserves immediate entry behavior.</span>
+            </label>
+            <label>Maximum ask drift while confirming (Â¢)
+              <input id="us-max-confirmation-price-drift" data-derived-risk type="number" min="0" max="100" step="any" required>
+              <span class="field-note">Restarts confirmation if the executable ask worsens beyond this amount.</span>
+            </label>
             <label>Maximum bid/ask spread (¢)
               <input id="us-max-spread" data-derived-risk type="number" min="0.1" max="99" step="any" required>
             </label>
@@ -701,12 +757,19 @@
             <label>Exit when current edge falls to (%)
               <input id="us-exit-edge" data-derived-risk type="number" min="-99" max="99" step="any" required>
             </label>
+            <label>Model-reversal confirmation readings
+              <input id="us-reversal-confirmation-readings" type="number" min="1" max="10" step="1" required>
+              <span class="field-note">Consecutive negative-edge readings before a model-reversal sale. 1 sells on a single adverse quote; the 2026-08-02 grading measured 62–65% of those sales going on to win at settlement.</span>
+            </label>
             <label>Analysis cycle (seconds)
               <input id="us-cycle-seconds" data-derived-risk type="number" min="1" max="300" step="0.5" required>
               <span class="field-note">Re-evaluates the latest retained game and market state. It does not make a separate Odds API request, so it can match your monitoring interval.</span>
             </label>
           </div>
         </details>
+        </div>
+        <div class="us-policy-step" data-policy-step="review" data-step-label="6 · Review &amp; save" hidden>
+        <div id="us-effective-policy-review" class="us-effective-policy-review us-check-wide" aria-live="polite"></div>
         <section class="us-risk-session-control us-check-wide">
           <div>
             <strong>Entry circuit breakers</strong>
@@ -723,6 +786,7 @@
           <button class="danger" id="us-emergency-stop" type="button">Stop automation now</button>
         </div>
         <div id="us-stop-status" class="us-liquidate-status us-check-wide" role="status" aria-live="assertive"></div>
+        </div>
       </form>
       <div class="us-arm-row">
         <label class="us-approval-toggle">
@@ -745,7 +809,7 @@
       <div class="notice us-safety-note"><strong>Recommended rollout:</strong> start with strict mode or the core-gates preset and run dry-run until the journal shows exact event/line mappings and exits you agree with. Selective mode changes only which existing engine gate results this execution sidecar requires; it never changes their calculations. Live mode still requires positive source edge and every authenticated US execution safeguard.</div>
     </section>
 
-    <div class="us-activity-grid section-gap" id="us-activity">
+    <div class="us-activity-grid section-gap research-anchor" id="us-activity">
       <section class="panel pad us-positions-panel">
         <div class="browse-head">
           <div>
@@ -806,6 +870,14 @@
           <div>
             <h2 class="title">Execution journal</h2>
             <div class="field-note">A running window into candidates, gate rejections, mapping decisions, previews, fills, marks, and cash-outs. Rejections include the observed value and configured threshold so you can see exactly which check failed.</div>
+          </div>
+        </div>
+        <div id="us-journal-controls" class="us-journal-controls">
+          <div id="us-journal-kinds" class="us-journal-kinds" role="group" aria-label="Journal filters"></div>
+          <div class="us-journal-pager">
+            <button class="ghost compact-button" id="us-journal-prev" type="button" disabled>Newer</button>
+            <span id="us-journal-range" aria-live="polite">Loading…</span>
+            <button class="ghost compact-button" id="us-journal-next" type="button" disabled>Older</button>
           </div>
         </div>
         <div id="us-trading-journal" class="us-trading-journal"><div class="metrics-empty">No automation decisions yet.</div></div>
@@ -980,6 +1052,6 @@
 
 
 <script src="/static/csrf.js" defer></script>
-<script src="/static/index.js?v=hosted-research-lobby-2" defer></script>
+<script src="/static/index.js?v=workstation-cockpit-1" defer></script>
 </body>
 </html>

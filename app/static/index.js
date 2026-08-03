@@ -27,7 +27,6 @@
           hashTarget.scrollIntoView({block:"start"});
         }
       };
-      if (tab === "tab-lobby") renderLobby();
       if (tab === "tab-live") renderEvents(lastEvents);
       if (tab === "tab-discovery") {
         renderBestBets();
@@ -67,34 +66,6 @@
     activatePrimaryTab(next, {resetScroll:true});
   });
 
-  // Lobby landing screen — personalized to the signed-in user.
-  function lobbyUserName() {
-    let n = window.currentUsername;
-    if (!n) { try { n = sessionStorage.getItem("pt_user"); } catch {} }
-    return (n && n.trim()) || "ADMIN";
-  }
-  function renderLobby() {
-    const up = lobbyUserName().toUpperCase();
-    const initials = (up.match(/[A-Z0-9]/g) || []).slice(0, 2).join("") || "AD";
-    const nameEl = document.getElementById("lb-pod-name");
-    const feedEl = document.getElementById("lb-feed-name");
-    const avEl = document.getElementById("lb-avatar");
-    if (nameEl) nameEl.textContent = up;
-    if (feedEl) feedEl.textContent = up;
-    if (avEl) avEl.textContent = initials;
-  }
-  const lbReady = document.getElementById("lb-ready");
-  if (lbReady) lbReady.addEventListener("click", () => {
-    const p = document.querySelector('[data-tab="tab-live"]');
-    if (p) p.click();
-  });
-  const lbFill = document.getElementById("lb-fill");
-  if (lbFill) lbFill.addEventListener("click", () => {
-    const off = lbFill.classList.toggle("is-off");
-    lbFill.textContent = off ? "No Fill" : "Fill";
-  });
-  renderLobby();
-
   // Auth & Login Logic
   document.querySelector("#login-form").addEventListener("submit", async e => {
     e.preventDefault();
@@ -112,7 +83,6 @@
       if (!r.ok) throw new Error(data.detail || "Invalid credentials");
 
       if (typedUser) { window.currentUsername = typedUser; try { sessionStorage.setItem("pt_user", typedUser); } catch {} }
-      renderLobby();
 
       const overlay = document.querySelector("#login-overlay");
       overlay.classList.add("dissolve");
@@ -724,7 +694,13 @@
     max_daily_loss_usd: "#us-daily-loss",
     min_edge: "#us-min-edge",
     max_edge: "#us-max-edge",
+    fee_edge_margin: "#us-fee-edge-margin",
     min_signal_quality: "#us-min-quality",
+    max_signal_quality: "#us-max-quality",
+    min_source_agreement: "#us-min-source-agreement",
+    max_signal_age_seconds: "#us-max-signal-age",
+    entry_confirmation_readings: "#us-entry-confirmation-readings",
+    max_confirmation_price_drift: "#us-max-confirmation-price-drift",
     min_entry_price: "#us-min-price",
     max_entry_price: "#us-max-price",
     min_hold_minutes: "#us-min-hold",
@@ -742,6 +718,7 @@
     stop_loss: "#us-stop-loss",
     exit_edge: "#us-exit-edge",
     cycle_seconds: "#us-cycle-seconds",
+    global_entry_enabled: "#us-line-type-policy",
     allowed_market_types: "#us-line-type-policy",
     allowed_market_scopes: "#us-market-scope-policy",
     adaptive_exit_horizon_minutes: "#us-adaptive-exit-horizon",
@@ -766,7 +743,12 @@
     [/line type|allowed_market_types/i, "#us-line-type-policy"],
     [/market segment|allowed_market_scopes/i, "#us-market-scope-policy"],
     [/reference source|min_reference_sources/i, "#us-min-refs"],
+    [/maximum quality|max_signal_quality/i, "#us-max-quality"],
     [/signal quality|min_signal_quality/i, "#us-min-quality"],
+    [/source agreement|min_source_agreement/i, "#us-min-source-agreement"],
+    [/signal age|max_signal_age_seconds/i, "#us-max-signal-age"],
+    [/confirmation readings|entry_confirmation_readings/i, "#us-entry-confirmation-readings"],
+    [/confirmation.*drift|max_confirmation_price_drift/i, "#us-max-confirmation-price-drift"],
     [/spread|max_spread/i, "#us-max-spread"],
     [/book shares|min_book_shares/i, "#us-min-depth"]
   ];
@@ -798,6 +780,9 @@
 
   function revealPolicyTarget(target, {focus = false} = {}) {
     if (!target) return;
+    // A highlighted setting may live in a step that is not on screen; show it
+    // before opening its details block, or the focus below cannot land.
+    revealFieldStep(target);
     const details = target.closest("details");
     if (details) details.open = true;
     const container = target.matches("fieldset")
@@ -849,6 +834,9 @@
 
   function setUSTradingFormDirty(dirty) {
     usTradingFormDirty = dirty;
+    // Single source of truth for the sticky rail, so the indicator can never
+    // disagree with the save button about whether edits are pending.
+    updateSavedIndicator();
     const form = document.querySelector("#us-trading-form");
     const button = document.querySelector("#us-policy-save");
     form?.classList.toggle("is-dirty", dirty);
@@ -1059,6 +1047,12 @@
         "#us-candidate-cooldown": derived.candidate_cooldown_seconds,
         "#us-min-refs": derived.min_reference_sources,
         "#us-min-quality": derived.min_signal_quality,
+        "#us-max-quality": derived.max_signal_quality,
+        "#us-min-source-agreement": derived.min_source_agreement,
+        "#us-max-signal-age": derived.max_signal_age_seconds,
+        "#us-entry-confirmation-readings": (
+          derived.entry_confirmation_readings
+        ),
         "#us-cycle-seconds": derived.cycle_seconds,
         "#us-min-depth": derived.min_book_shares
       };
@@ -1080,7 +1074,10 @@
         "#us-max-spread": derived.max_spread,
         "#us-trailing-drawdown": derived.trailing_drawdown,
         "#us-stop-loss": derived.stop_loss,
-        "#us-exit-edge": derived.exit_edge
+        "#us-exit-edge": derived.exit_edge,
+        "#us-max-confirmation-price-drift": (
+          derived.max_confirmation_price_drift
+        )
       };
       for (const [selector, value] of Object.entries(direct)) {
         const input = document.querySelector(selector);
@@ -1147,15 +1144,20 @@
     const body = document.querySelector("#us-line-profile-list");
     if (!body) return;
     if (!lineExecutionProfiles.length) {
-      body.textContent = (
-        "No line-specific profiles saved. Global settings apply to every line."
-      );
+      body.textContent = document.querySelector("#us-global-entry-enabled")?.checked
+        ? "No line-specific profiles saved. Authorized global settings provide the fallback."
+        : "No line-specific profiles saved. Global fallback is off, so no line is authorized.";
       return;
     }
     const labels = {
       min_edge:"edge floor",
       max_edge:"edge ceiling",
-      min_signal_quality:"quality",
+      min_signal_quality:"quality floor",
+      max_signal_quality:"quality ceiling",
+      min_source_agreement:"source agreement",
+      max_signal_age_seconds:"signal age",
+      entry_confirmation_readings:"confirmations",
+      max_confirmation_price_drift:"confirmation drift",
       min_reference_sources:"references",
       min_entry_price:"price floor",
       max_entry_price:"price ceiling",
@@ -1167,13 +1169,19 @@
       trailing_drawdown:"trailing",
       stop_loss:"stop",
       exit_edge:"reversal edge",
-      min_mlb_fraction_remaining:"game remaining"
+      min_mlb_fraction_remaining:"game remaining",
+      max_position_usd:"max position $",
+      max_event_exposure_usd:"max event $",
+      max_entries_per_event_per_hour:"entries/event/hr",
+      max_profile_exposure_usd:"profile exposure $",
+      max_profile_open_positions:"profile open",
+      max_profile_orders_per_hour:"profile entries/hr"
     };
     const percents = new Set([
       "min_edge", "max_edge", "min_entry_price", "max_entry_price",
       "max_spread", "profit_target", "minimum_locked_profit",
       "trailing_drawdown", "stop_loss", "exit_edge",
-      "min_mlb_fraction_remaining"
+      "min_mlb_fraction_remaining", "max_confirmation_price_drift"
     ]);
     body.innerHTML = lineExecutionProfiles
       .slice()
@@ -1188,13 +1196,19 @@
               percents.has(field)
                 ? `${(Number(value) * 100).toFixed(1)}%`
                 : Number(value).toFixed(
-                    field === "min_reference_sources" ? 0 : 1
+                    [
+                      "min_reference_sources",
+                      "entry_confirmation_readings",
+                      "max_entries_per_event_per_hour",
+                      "max_profile_open_positions",
+                      "max_profile_orders_per_hour"
+                    ].includes(field) ? 0 : 1
                   )
             }`
           )
         );
         return `<article class="us-line-profile-chip">
-          <strong>${esc(profile.market_type)} · ${esc(profile.game_stage)}${profile.enabled === false ? " · disabled" : ""}</strong>
+          <strong>${esc(profile.market_type)} / ${esc(profile.game_stage)} / ${profile.enabled === false ? "not authorized" : "authorized"}</strong>
           <span>${esc(settings.join(" · ") || "Uses all global values")}</span>
         </article>`;
       }).join("");
@@ -1209,7 +1223,7 @@
       const number = Number(input.value);
       if (!Number.isFinite(number)) {
         input.focus();
-        return;
+        return false;
       }
       overrides[field] = input.hasAttribute("data-profile-percent")
         ? number / 100
@@ -1232,6 +1246,43 @@
     invalidatePolicyAdvice(
       "Line-specific execution controls changed. Save the policy before analyzing again."
     );
+    return true;
+  }
+
+  function copyGlobalValuesIntoSelectedProfile() {
+    const selectors = {
+      min_edge:"#us-min-edge",
+      max_edge:"#us-max-edge",
+      min_signal_quality:"#us-min-quality",
+      max_signal_quality:"#us-max-quality",
+      min_source_agreement:"#us-min-source-agreement",
+      max_signal_age_seconds:"#us-max-signal-age",
+      entry_confirmation_readings:"#us-entry-confirmation-readings",
+      max_confirmation_price_drift:"#us-max-confirmation-price-drift",
+      min_reference_sources:"#us-min-refs",
+      min_entry_price:"#us-min-price",
+      max_entry_price:"#us-max-price",
+      max_spread:"#us-max-spread",
+      min_book_shares:"#us-min-depth",
+      min_hold_minutes:"#us-min-hold",
+      profit_target:"#us-profit-target",
+      minimum_locked_profit:"#us-min-locked-profit",
+      trailing_drawdown:"#us-trailing-drawdown",
+      stop_loss:"#us-stop-loss",
+      exit_edge:"#us-exit-edge",
+      min_mlb_fraction_remaining:"#us-min-mlb-remaining",
+      max_position_usd:"#us-max-position",
+      max_event_exposure_usd:"#us-max-event",
+      max_entries_per_event_per_hour:"#us-max-event-entries-hour"
+      // The three profile-only caps have no global counterpart, so "copy
+      // global values" deliberately leaves them blank (meaning no cap).
+    };
+    for (const input of lineProfileInputs()) {
+      const selector = selectors[input.dataset.profileField];
+      const source = selector ? document.querySelector(selector) : null;
+      if (source) input.value = source.value;
+    }
+    saveSelectedLineProfile();
   }
 
   function removeSelectedLineProfile() {
@@ -1256,11 +1307,20 @@
   document.querySelector("#us-profile-stage")?.addEventListener(
     "change", loadSelectedLineProfile
   );
-  document.querySelector("#us-profile-save")?.addEventListener(
-    "click", saveSelectedLineProfile
+  document.querySelector("#us-profile-save")?.addEventListener("click", () => {
+    if (!saveSelectedLineProfile()) return;
+    document.querySelector("#us-trading-form")?.requestSubmit(
+      document.querySelector("#us-policy-save")
+    );
+  });
+  document.querySelector("#us-profile-copy-global")?.addEventListener(
+    "click", copyGlobalValuesIntoSelectedProfile
   );
   document.querySelector("#us-profile-remove")?.addEventListener(
     "click", removeSelectedLineProfile
+  );
+  document.querySelector("#us-global-entry-enabled")?.addEventListener(
+    "change", renderLineExecutionProfiles
   );
 
   function applyTradingPolicy(status, {force = false, requestEpoch = null} = {}) {
@@ -1296,7 +1356,17 @@
       "#us-daily-loss": policy.max_daily_loss_usd,
       "#us-min-edge": policy.min_edge == null ? null : policy.min_edge * 100,
       "#us-max-edge": policy.max_edge == null ? null : policy.max_edge * 100,
+      "#us-fee-edge-margin": policy.fee_edge_margin,
       "#us-min-quality": policy.min_signal_quality,
+      "#us-max-quality": policy.max_signal_quality,
+      "#us-min-source-agreement": policy.min_source_agreement,
+      "#us-max-signal-age": policy.max_signal_age_seconds,
+      "#us-entry-confirmation-readings": policy.entry_confirmation_readings,
+      "#us-max-confirmation-price-drift": (
+        policy.max_confirmation_price_drift == null
+          ? null
+          : policy.max_confirmation_price_drift * 100
+      ),
       "#us-min-price": policy.min_entry_price == null ? null : policy.min_entry_price * 100,
       "#us-max-price": policy.max_entry_price == null ? null : policy.max_entry_price * 100,
       "#us-min-hold": policy.min_hold_minutes,
@@ -1321,6 +1391,7 @@
       "#us-trailing-drawdown": policy.trailing_drawdown == null ? null : policy.trailing_drawdown * 100,
       "#us-stop-loss": policy.stop_loss == null ? null : policy.stop_loss * 100,
       "#us-exit-edge": policy.exit_edge == null ? null : policy.exit_edge * 100,
+      "#us-reversal-confirmation-readings": policy.reversal_confirmation_readings,
       "#us-cycle-seconds": policy.cycle_seconds,
       "#us-adaptive-exit-profile": policy.adaptive_exit_profile || "observe",
       "#us-adaptive-exit-horizon": policy.adaptive_exit_horizon_minutes,
@@ -1347,7 +1418,13 @@
     document.querySelector("#us-volatility-stop-enabled").checked = (
       !!policy.volatility_stop_enabled
     );
+    document.querySelector("#us-stateless-stop-confirmation").checked = (
+      !!policy.stateless_stop_confirmation
+    );
     document.querySelector("#us-require-engine").checked = policy.require_engine_entry !== false;
+    document.querySelector("#us-global-entry-enabled").checked = (
+      policy.global_entry_enabled !== false
+    );
     const selectedGates = new Set(
       Array.isArray(policy.required_engine_gates)
         ? policy.required_engine_gates
@@ -1392,7 +1469,314 @@
     renderLineExecutionProfiles();
     loadSelectedLineProfile();
     renderTradingLanes(status);
+    renderExecutionState(status);
+    renderPolicyRail(status);
+    showPolicyStep(currentPolicyStep);
     return true;
+  }
+
+  // --- Guided setup steps -------------------------------------------------
+  // The steps wrap the existing fields in document order; no input moved, so
+  // every selector elsewhere in this file keeps working.
+  let currentPolicyStep = "capital";
+
+  function policySteps() {
+    return Array.from(
+      document.querySelectorAll("#us-trading-form [data-policy-step]")
+    );
+  }
+
+  function showPolicyStep(name, {focus = false} = {}) {
+    const steps = policySteps();
+    if (!steps.length) return;
+    const known = steps.some(step => step.dataset.policyStep === name);
+    currentPolicyStep = known ? name : steps[0].dataset.policyStep;
+    for (const step of steps) {
+      step.hidden = step.dataset.policyStep !== currentPolicyStep;
+    }
+    renderPolicyStepNav();
+    if (currentPolicyStep === "review") renderEffectivePolicyReview();
+    if (focus) {
+      document.querySelector("#us-policy-rail")?.scrollIntoView({
+        block:"start", behavior:"smooth"
+      });
+    }
+  }
+
+  function renderPolicyStepNav() {
+    const nav = document.querySelector("#us-policy-steps");
+    if (!nav) return;
+    nav.innerHTML = policySteps().map(step => {
+      const name = step.dataset.policyStep;
+      // A hidden step cannot report validity, so check its fields directly.
+      const invalid = Array.from(
+        step.querySelectorAll("input, select")
+      ).some(field => !field.disabled && !field.checkValidity());
+      return `<button type="button" data-goto-step="${esc(name)}" class="${
+        [
+          name === currentPolicyStep ? "is-current" : "",
+          invalid ? "has-invalid" : ""
+        ].filter(Boolean).join(" ")
+      }">${esc(step.dataset.stepLabel || name)}${invalid ? " ⚠" : ""}</button>`;
+    }).join("");
+  }
+
+  document.querySelector("#us-policy-steps")?.addEventListener("click", event => {
+    const target = event.target.closest("[data-goto-step]");
+    if (target) showPolicyStep(target.dataset.gotoStep);
+  });
+
+  function revealFieldStep(element) {
+    const step = element?.closest?.("[data-policy-step]");
+    if (step && step.dataset.policyStep !== currentPolicyStep) {
+      showPolicyStep(step.dataset.policyStep);
+    }
+  }
+
+  function renderPolicyRail(status) {
+    const lane = document.querySelector("#us-rail-lane");
+    const capital = document.querySelector("#us-rail-capital");
+    const saved = document.querySelector("#us-rail-saved");
+    if (!lane || !capital || !saved) return;
+    const state = status?.execution_state;
+    const policy = status?.policy || {};
+    lane.textContent = (policy.execution_mode === "live" ? "Live" : "Dry-run")
+      + " lane";
+    const exposure = state?.exposure;
+    capital.textContent = exposure
+      ? `$${Number(exposure.managed_exposure_usd || 0).toFixed(2)} of $${
+          Number(exposure.trading_allocation_usd || 0).toFixed(2)
+        } allocated · ${Number(exposure.open_positions || 0)} open · $${
+          Number(exposure.remaining_capacity_usd || 0).toFixed(2)
+        } capacity`
+      : `$${Number(policy.trading_allocation_usd || 0).toFixed(2)} allocation`;
+    updateSavedIndicator();
+  }
+
+  function updateSavedIndicator() {
+    const saved = document.querySelector("#us-rail-saved");
+    if (!saved) return;
+    if (usTradingFormDirty) {
+      saved.className = "us-rail-saved is-dirty";
+      saved.textContent = "Unsaved changes — not in effect until saved";
+    } else {
+      saved.className = "us-rail-saved is-saved";
+      saved.textContent = "Saved policy in effect";
+    }
+    renderPolicyStepNav();
+  }
+
+  function renderEffectivePolicyReview() {
+    const box = document.querySelector("#us-effective-policy-review");
+    if (!box) return;
+    const status = lastUSTradingStatus;
+    const state = status?.execution_state;
+    if (!state) {
+      box.textContent = "Save the policy to review its resolved effect.";
+      return;
+    }
+    const auth = state.authorization || {};
+    const exposure = state.exposure || {};
+    const predictive = state.predictive_exit || {};
+    const blockers = Array.isArray(state.entry_blockers)
+      ? state.entry_blockers
+      : [];
+    const rows = [
+      ["Lane", state.policy?.execution_mode === "live" ? "Live orders" : "Dry run"],
+      ["Authorized line/stage", `${Number(auth.authorized_combinations || 0)} of ${
+        (auth.combinations || []).length}`],
+      ["Global fallback", auth.global_fallback_authorized ? "authorized" : "off"],
+      ["Allocation", `$${Number(exposure.trading_allocation_usd || 0).toFixed(2)}`],
+      ["Max total exposure", `$${Number(exposure.max_total_exposure_usd || 0).toFixed(2)}`],
+      ["Cash reserve", `$${Number(exposure.minimum_cash_reserve_usd || 0).toFixed(2)}`],
+      ["Open positions", `${Number(exposure.open_positions || 0)} of ${
+        Number(exposure.max_open_positions || 0)}`],
+      ["Predictive exit", String(predictive.status || "unknown").replace(/_/g, " ")],
+      ["Automation", state.automation?.running ? "running" : "stopped"]
+    ];
+    box.innerHTML = `
+      <h4>Effective policy${usTradingFormDirty ? " (saved version — you have unsaved edits)" : ""}</h4>
+      <dl>${rows.map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${
+        esc(value)}</dd></div>`).join("")}</dl>
+      ${blockers.length
+        ? `<p class="us-cold-start-warning">Entries are currently blocked: ${
+            esc(blockers.map(item => item.detail || item.code).join("; "))}</p>`
+        : "<p>No lane-level condition is blocking a new entry.</p>"}
+      ${predictive.cold_start_warning
+        ? `<p class="us-cold-start-warning">${esc(predictive.cold_start_warning)}</p>`
+        : ""}`;
+  }
+
+  // Render the steps immediately so the form is navigable before the first
+  // status response arrives.
+  showPolicyStep(currentPolicyStep);
+
+  const EXECUTION_STATE_UNAVAILABLE =
+    "Execution state is unavailable for this lane.";
+
+  function stateChip(label, value, tone) {
+    return `<span class="us-state-chip is-${tone}">
+      <strong>${esc(label)}</strong><span>${esc(value)}</span>
+    </span>`;
+  }
+
+  function renderExecutionState(status) {
+    const chipBox = document.querySelector("#us-execution-state-chips");
+    const blockerBox = document.querySelector("#us-execution-blockers");
+    const matrixBox = document.querySelector("#us-authorization-matrix");
+    if (!chipBox || !blockerBox || !matrixBox) return;
+    const state = status?.execution_state;
+    if (!state) {
+      chipBox.textContent = EXECUTION_STATE_UNAVAILABLE;
+      blockerBox.textContent = "";
+      matrixBox.textContent = "";
+      const stale = document.querySelector("#us-adaptive-recommendation");
+      if (stale) stale.innerHTML = "";
+      return;
+    }
+    const auth = state.authorization || {};
+    const exposure = state.exposure || {};
+    const predictive = state.predictive_exit || {};
+    const live = state.live_orders || {};
+    const chips = [
+      stateChip(
+        "Automation",
+        state.automation?.running ? "running" : "stopped",
+        state.automation?.running ? "on" : "off"
+      ),
+      stateChip(
+        "Global fallback",
+        auth.global_fallback_authorized ? "authorized" : "not authorized",
+        auth.global_fallback_authorized ? "on" : "off"
+      ),
+      stateChip(
+        "Authorized line/stage",
+        `${Number(auth.authorized_combinations || 0)} of ${
+          (auth.combinations || []).length
+        }`,
+        auth.any_authorized ? "on" : "off"
+      ),
+      stateChip(
+        "Account",
+        state.account?.connected ? "connected" : "not connected",
+        state.account?.connected ? "on" : "off"
+      ),
+      stateChip(
+        "Exposure",
+        `$${Number(exposure.managed_exposure_usd || 0).toFixed(2)} of $${
+          Number(exposure.max_total_exposure_usd || 0).toFixed(2)
+        } · ${Number(exposure.open_positions || 0)}/${
+          Number(exposure.max_open_positions || 0)
+        } open`,
+        Number(exposure.remaining_capacity_usd || 0) > 0 ? "on" : "warn"
+      ),
+      stateChip(
+        "Predictive exit",
+        String(predictive.status || "unknown").replace(/_/g, " "),
+        predictive.can_tighten_exits
+          ? (predictive.status === "active" ? "on" : "warn")
+          : "off"
+      )
+    ];
+    if (live.applies_to_lane) {
+      chips.splice(1, 0, stateChip(
+        "Live latch",
+        live.armed
+          ? `armed · ${Math.round(Number(live.seconds_remaining || 0) / 60)}m left`
+          : "disarmed",
+        live.armed ? "warn" : "off"
+      ));
+      chips.splice(2, 0, stateChip(
+        "Protective exits",
+        state.protective_exits?.armed ? "armed" : "not armed",
+        state.protective_exits?.armed ? "on" : "off"
+      ));
+    }
+    chipBox.innerHTML = chips.join("");
+
+    const blockers = Array.isArray(state.entry_blockers)
+      ? state.entry_blockers
+      : [];
+    if (!blockers.length) {
+      blockerBox.className = "us-execution-blockers is-clear";
+      blockerBox.textContent = (
+        "No lane-level condition is blocking a new entry. Individual "
+        + "candidates can still be rejected on price, spread, depth, edge, or "
+        + "quality."
+      );
+    } else {
+      blockerBox.className = "us-execution-blockers is-blocked";
+      blockerBox.innerHTML = `<strong>New entries are blocked:</strong><ul>${
+        blockers.map(item => `<li>${esc(item.detail || item.code)}</li>`).join("")
+      }</ul>`;
+    }
+
+    if (predictive.cold_start_warning) {
+      blockerBox.innerHTML += `<p class="us-cold-start-warning">${
+        esc(predictive.cold_start_warning)
+      } The configured hard stop is never changed by it.</p>`;
+    }
+    // Its own region, not the entry-blocker box: an adaptive *exit*
+    // recommendation is not a reason entries are blocked, and reading one
+    // under that heading invites exactly the wrong conclusion.
+    const recBox = document.querySelector("#us-adaptive-recommendation");
+    const rec = predictive.recommendation;
+    if (recBox) {
+      if (!rec) {
+        recBox.innerHTML = "";
+      } else {
+        const current = status?.policy?.adaptive_exit_profile || "observe";
+        const matches = current === rec.profile
+          && !!status?.policy?.adaptive_exit_enabled;
+        recBox.innerHTML = `<div class="us-adaptive-recommendation">
+          <strong>Adaptive cash-out · recommended: ${esc(rec.profile)}</strong>
+          <span>Currently ${esc(
+            status?.policy?.adaptive_exit_enabled
+              ? current
+              : `${current} (overlay off)`
+          )}.</span>
+          <span>${esc(rec.rationale)}</span>
+          <span>Basis: ${esc(
+            rec.basis === "overlay_scored"
+              ? "the overlay's own scored forecasts, not realized return"
+              : "insufficient scored evidence"
+          )}. Lane-wide, so a line profile cannot carry these.</span>
+          ${matches
+            ? "<span>This lane already matches the recommendation.</span>"
+            : '<button class="ghost compact-button" id="us-apply-adaptive-recommendation" type="button">Apply to this lane</button>'}
+        </div>`;
+        document.querySelector("#us-apply-adaptive-recommendation")
+          ?.addEventListener("click", applyAdaptiveRecommendation);
+      }
+    }
+
+    const combinations = Array.isArray(auth.combinations)
+      ? auth.combinations
+      : [];
+    // `effective` is sent only where a profile actually changes a threshold;
+    // an inheriting combination resolves against the saved global policy.
+    const globalPolicy = status?.policy || {};
+    matrixBox.innerHTML = combinations.map(row => {
+      const effective = row.effective || globalPolicy;
+      const detail = row.authorized
+        ? [
+            `edge ${(Number(effective.min_edge || 0) * 100).toFixed(1)}%`,
+            `quality ${Number(effective.min_signal_quality || 0).toFixed(0)}+`,
+            `stop ${(Number(effective.stop_loss || 0) * 100).toFixed(1)}%`,
+            row.inherits_global
+              ? "global values"
+              : `${row.profile_key} overrides ${
+                  (row.overridden_fields || []).length
+                }`
+          ].join(" · ")
+        : (row.blocked_reason || "not authorized");
+      return `<article class="us-authorization-row is-${
+        row.authorized ? "authorized" : "blocked"
+      }">
+        <strong>${esc(row.market_type)} / ${esc(row.game_stage)}</strong>
+        <span>${esc(detail)}</span>
+      </article>`;
+    }).join("") || "No line/stage combination is available.";
   }
 
   function updateAdaptiveExitAvailability() {
@@ -1418,7 +1802,8 @@
     for (const selector of [
       "#us-stop-confirmation-readings",
       "#us-stop-grace-minutes",
-      "#us-catastrophic-stop-multiplier"
+      "#us-catastrophic-stop-multiplier",
+      "#us-stateless-stop-confirmation"
     ]) {
       const input = document.querySelector(selector);
       if (input) input.disabled = !enabled;
@@ -1868,7 +2253,17 @@
       `${lines} lines`,
       scopes,
       settings.min_edge == null ? "" : `edge ${(Number(settings.min_edge) * 100).toFixed(1)}%`,
-      settings.min_signal_quality == null ? "" : `quality ${Number(settings.min_signal_quality).toFixed(0)}`,
+      settings.min_signal_quality == null
+        ? ""
+        : `quality ${Number(settings.min_signal_quality).toFixed(0)}-${
+            Number(settings.max_signal_quality ?? 100).toFixed(0)
+          }`,
+      settings.min_source_agreement == null
+        ? ""
+        : `agreement ${Number(settings.min_source_agreement).toFixed(0)}+`,
+      settings.entry_confirmation_readings == null
+        ? ""
+        : `confirm ${Number(settings.entry_confirmation_readings).toFixed(0)}x`,
       settings.min_reference_sources == null ? "" : `refs ${settings.min_reference_sources}`,
       settings.min_entry_price == null || settings.max_entry_price == null
         ? ""
@@ -2190,6 +2585,91 @@
     }
   }
 
+  const ADVISOR_BASIS_LABELS = {
+    validated:"Validated on later events",
+    observational:"Observational only",
+    baseline_fallback:"Versioned baseline (not fitted)",
+    not_identifiable:"Cannot be scored from retained outcomes"
+  };
+  const ADVISOR_GROUP_LABELS = {
+    entry:"Entry filters",
+    pacing:"Pacing and repetition",
+    exit:"Exit controls",
+    adaptive:"Adaptive overlay"
+  };
+
+  function advisorFieldValue(record, value) {
+    if (value == null) return "not set";
+    if (record.unit === "fraction") return `${(Number(value) * 100).toFixed(1)}%`;
+    if (record.unit === "seconds") return `${Number(value).toFixed(0)}s`;
+    if (record.unit === "minutes") return `${Number(value).toFixed(1)} min`;
+    if (record.unit === "count" || record.unit === "shares") {
+      return String(Number(value));
+    }
+    if (record.unit === "score") return Number(value).toFixed(0);
+    return String(value);
+  }
+
+  function advisorFieldCoverage(advice) {
+    const records = Array.isArray(advice.field_recommendations)
+      ? advice.field_recommendations
+      : [];
+    if (!records.length) {
+      return '<div class="metrics-empty">No field coverage was returned.</div>';
+    }
+    const groups = new Map();
+    for (const record of records) {
+      const key = record.group || "other";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(record);
+    }
+    return [...groups.entries()].map(([group, items]) => `
+      <section class="us-advisor-field-group">
+        <h4>${esc(ADVISOR_GROUP_LABELS[group] || group)}</h4>
+        ${items.map(record => {
+          const support = record.support || "none";
+          const later = record.later_event_performance;
+          const metrics = [
+            `${Number(record.trades || 0)} trades`,
+            `${Number(record.independent_events || 0)} events`,
+            support === "none" ? "no local support" : `${esc(support)} support`
+          ];
+          if (later && later.turnover_roi != null) {
+            metrics.push(`later-event ROI ${pct(later.turnover_roi)}`);
+          }
+          if (later && later.maximum_drawdown_usd != null) {
+            metrics.push(
+              `drawdown $${Number(later.maximum_drawdown_usd).toFixed(2)}`
+            );
+          }
+          return `<article class="us-advisor-field is-${esc(record.basis)}">
+            <div class="us-advisor-field-head">
+              <strong>${esc(record.label || record.field)}</strong>
+              <span>${esc(advisorFieldValue(record, record.current))} → ${
+                esc(advisorFieldValue(record, record.suggested))
+              }</span>
+            </div>
+            <span class="us-advisor-field-basis">${
+              esc(ADVISOR_BASIS_LABELS[record.basis] || record.basis)
+            }${
+              record.applyable
+                ? " · written by Apply"
+                : record.in_apply_set
+                  ? " · Apply locked · set manually"
+                  : " · set manually"
+            }</span>
+            <small>${esc(metrics.join(" · "))}</small>
+            <small>${esc(record.rationale || "")}</small>
+            ${record.measurement_note
+              ? `<small class="us-advisor-field-caveat">${
+                  esc(record.measurement_note)
+                }</small>`
+              : ""}
+          </article>`;
+        }).join("")}
+      </section>`).join("");
+  }
+
   function renderPolicyAdvice(advice) {
     const body = document.querySelector("#us-policy-advisor-result");
     const status = document.querySelector("#us-policy-advisor-status");
@@ -2211,6 +2691,7 @@
       ? advice.candidate_frontier
       : [];
     const validationBlockers = advisorValidationBlockers(advice);
+    const scopedLine = adviceScopedLineType(advice);
     const actionLabel = !changes.length
       ? "No filter changes available"
       : advice.apply_allowed
@@ -2254,6 +2735,11 @@
         ${esc(evidence.execution_domain_warning || "")}
         ${esc(advice.guarantee || "")}
       </div>
+      <details class="advanced us-advisor-analysis">
+        <summary>Every policy field and its evidence</summary>
+        <div class="field-note">${esc(advice.field_coverage_note || "")}</div>
+        ${advisorFieldCoverage(advice)}
+      </details>
       <details class="advanced us-advisor-analysis" open>
         <summary>Trade-data diagnostics</summary>
         <div class="us-advisor-diagnostic-grid">
@@ -2286,11 +2772,24 @@
       </details>
       <div class="us-policy-advisor-actions">
         <button class="primary compact-button" id="us-policy-advisor-apply" type="button" ${changes.length ? "" : "disabled"}>${esc(actionLabel)}</button>
+        ${scopedLine ? `<button class="ghost compact-button" id="us-policy-advisor-apply-profile" type="button" ${changes.length ? "" : "disabled"}>Load entry filters into ${esc(scopedLine)} profile</button>` : ""}
+        ${scopedLine ? `<button class="ghost compact-button" id="us-policy-advisor-apply-exits" type="button">Load exit thresholds into ${esc(scopedLine)} profile</button>` : ""}
         <small>${esc(actionNote)}</small>
+        ${scopedLine
+          ? `<small>This analysis covered ${esc(scopedLine)} only. Loading it into the ${esc(scopedLine)} profile keeps the suggestion scoped to the line it was measured on, instead of changing the global settings every line inherits.</small>`
+          : `<small>Select a single line type before analyzing to load a suggestion into that line's profile instead of the global settings.</small>`}
       </div>`;
     document.querySelector("#us-policy-advisor-apply")?.addEventListener(
       "click",
       advice.apply_allowed ? applyPolicyAdvice : previewPolicyAdvice
+    );
+    document.querySelector("#us-policy-advisor-apply-profile")?.addEventListener(
+      "click",
+      previewAdviceIntoLineProfile
+    );
+    document.querySelector("#us-policy-advisor-apply-exits")?.addEventListener(
+      "click",
+      loadExitThresholdsIntoLineProfile
     );
   }
 
@@ -2382,6 +2881,159 @@
     button.textContent = mode === "combined"
       ? "Analyze all retained data"
       : `Analyze ${mode === "dry_run" ? "dry-run" : "live"} data`;
+  }
+
+  // Advisor fields that a line/stage profile can actually carry. The rest of
+  // the tunable set is lane-wide by design and has no profile equivalent, so
+  // it is reported rather than silently dropped into a per-line edit.
+  const PROFILE_APPLICABLE_ADVISOR_FIELDS = [
+    "min_edge", "max_edge", "min_signal_quality", "min_reference_sources",
+    "min_entry_price", "max_entry_price", "max_entries_per_event_per_hour",
+    "min_mlb_fraction_remaining"
+  ];
+  const LANE_WIDE_ADVISOR_FIELDS = {
+    allowed_market_types:"line-type authorization is a global control",
+    max_orders_per_hour:"hourly entry cap is lane-wide (a profile has its own separate cap)",
+    candidate_cooldown_seconds:"candidate cooldown is lane-wide"
+  };
+
+  // Exit thresholds a line profile can carry. The adaptive overlay's own
+  // controls are lane-wide and deliberately absent here.
+  const PROFILE_EXIT_FIELDS = [
+    "profit_target", "stop_loss", "trailing_drawdown",
+    "minimum_locked_profit", "exit_edge", "min_hold_minutes"
+  ];
+
+  function adviceFieldRecord(advice, field) {
+    return (advice?.field_recommendations || []).find(
+      item => item.field === field
+    ) || null;
+  }
+
+  function loadExitThresholdsIntoLineProfile() {
+    const advice = lastPolicyAdvice;
+    const line = adviceScopedLineType(advice);
+    const status = document.querySelector("#us-policy-advisor-status");
+    if (!advice || !line) return;
+
+    const marketSelect = document.querySelector("#us-profile-market");
+    const stageSelect = document.querySelector("#us-profile-stage");
+    if (!marketSelect || !stageSelect) return;
+    marketSelect.value = line;
+    loadSelectedLineProfile();
+    const stage = stageSelect.value || "all";
+
+    const measured = [];
+    const baseline = [];
+    for (const input of lineProfileInputs()) {
+      const field = input.dataset.profileField;
+      if (!PROFILE_EXIT_FIELDS.includes(field)) continue;
+      const record = adviceFieldRecord(advice, field);
+      if (!record || record.suggested == null) continue;
+      input.value = input.hasAttribute("data-profile-percent")
+        ? Number(record.suggested) * 100
+        : Number(record.suggested);
+      // An excursion-scored value and a versioned baseline are not the same
+      // kind of number; the operator is told which is which.
+      (record.basis === "observational" ? measured : baseline).push(field);
+    }
+    if (!measured.length && !baseline.length) return;
+    const enabled = document.querySelector("#us-profile-enabled");
+    if (enabled) enabled.checked = true;
+    if (!saveSelectedLineProfile()) return;
+    setUSTradingFormDirty(true);
+    showPolicyStep("authorization");
+    if (status) {
+      const pretty = list => list.map(f => f.replaceAll("_", " ")).join(", ");
+      status.className = "refresh-status";
+      status.textContent =
+        `Loaded exit thresholds into the ${line} / ${stage} profile. `
+        + (measured.length
+          ? `Scored from retained excursion evidence: ${pretty(measured)}. `
+          : "")
+        + (baseline.length
+          ? `Versioned baseline, not fitted - changing these cannot be scored `
+            + `from outcomes their own rule produced: ${pretty(baseline)}. `
+          : "")
+        + "Review and save the execution policy above.";
+    }
+  }
+
+  function applyAdaptiveRecommendation() {
+    const rec = lastUSTradingStatus?.execution_state
+      ?.predictive_exit?.recommendation;
+    const status = document.querySelector("#us-policy-advisor-status");
+    if (!rec) return;
+    const profile = document.querySelector("#us-adaptive-exit-profile");
+    const enabled = document.querySelector("#us-adaptive-exit-enabled");
+    if (!profile || !enabled) return;
+    // Observe-only still needs the overlay running: that is how it collects
+    // and scores the forecasts that would later justify a stronger response.
+    enabled.checked = true;
+    profile.value = rec.profile;
+    updateAdaptiveExitAvailability();
+    setUSTradingFormDirty(true);
+    showPolicyStep("behavior");
+    if (status) {
+      status.className = "refresh-status";
+      status.textContent =
+        `Adaptive response set to "${rec.profile}" for this lane. `
+        + `${rec.rationale} These controls are lane-wide; a line profile `
+        + "cannot carry them. Review and save the execution policy above.";
+    }
+  }
+
+  function adviceScopedLineType(advice) {
+    const scoped = advice?.scope?.market_types;
+    return Array.isArray(scoped) && scoped.length === 1 ? scoped[0] : null;
+  }
+
+  function previewAdviceIntoLineProfile() {
+    const advice = lastPolicyAdvice;
+    const suggested = advice?.suggested_policy;
+    const line = adviceScopedLineType(advice);
+    const status = document.querySelector("#us-policy-advisor-status");
+    if (!suggested || !line) return;
+
+    const marketSelect = document.querySelector("#us-profile-market");
+    const stageSelect = document.querySelector("#us-profile-stage");
+    if (!marketSelect || !stageSelect) return;
+    marketSelect.value = line;
+    // Load whatever that profile already holds so untouched overrides survive.
+    loadSelectedLineProfile();
+    const stage = stageSelect.value || "all";
+
+    const applied = [];
+    for (const input of lineProfileInputs()) {
+      const field = input.dataset.profileField;
+      if (!PROFILE_APPLICABLE_ADVISOR_FIELDS.includes(field)) continue;
+      const value = suggested[field];
+      if (value == null) continue;
+      input.value = input.hasAttribute("data-profile-percent")
+        ? Number(value) * 100
+        : Number(value);
+      applied.push(field);
+    }
+    // Authorize the profile, otherwise the values would be saved but inert.
+    const enabled = document.querySelector("#us-profile-enabled");
+    if (enabled) enabled.checked = true;
+    if (!saveSelectedLineProfile()) return;
+
+    const skipped = Object.entries(LANE_WIDE_ADVISOR_FIELDS)
+      .filter(([field]) => field in suggested)
+      .map(([, reason]) => reason);
+    setUSTradingFormDirty(true);
+    showPolicyStep("authorization");
+    if (status) {
+      status.className = "refresh-status";
+      status.textContent =
+        `Loaded ${applied.length} suggested value${applied.length === 1 ? "" : "s"} `
+        + `into the ${line} / ${stage} profile and authorized it. `
+        + `Review and save the execution policy above to apply them.`
+        + (skipped.length
+          ? ` Not copied, because these stay lane-wide: ${skipped.join("; ")}.`
+          : "");
+    }
   }
 
   function previewPolicyAdvice() {
@@ -2543,6 +3195,70 @@
     }
   );
 
+  // --- Execution journal paging -------------------------------------------
+  // The journal is polled continuously. Returning every row of a 10,000-row
+  // table made it the largest response in the dashboard, and the high-volume
+  // qualification records buried the entry/exit rows that matter.
+  const JOURNAL_PAGE_SIZE = 25;
+  let journalOffset = 0;
+  let journalKinds = [];
+  let lastJournalPage = null;
+
+  function renderJournalControls(page) {
+    const kindsBox = document.querySelector("#us-journal-kinds");
+    const range = document.querySelector("#us-journal-range");
+    const prev = document.querySelector("#us-journal-prev");
+    const next = document.querySelector("#us-journal-next");
+    if (!kindsBox || !range || !prev || !next) return;
+    const counts = page?.kind_counts || {};
+    const active = new Set(page?.kinds || []);
+    const chips = [
+      `<button type="button" data-journal-kind="" class="${
+        active.size ? "" : "is-current"
+      }">All · ${Number(page?.total || 0)}</button>`
+    ].concat(
+      Object.entries(counts)
+        .sort((a, b) => b[1] - a[1])
+        .map(([kind, count]) => `<button type="button" data-journal-kind="${
+          esc(kind)
+        }" class="${active.has(kind) ? "is-current" : ""}">${esc(kind)} · ${
+          Number(count)
+        }</button>`)
+    );
+    kindsBox.innerHTML = chips.join("");
+    const shown = (page?.items || []).length;
+    const from = shown ? Number(page.offset || 0) + 1 : 0;
+    const filtered = Number(page?.filtered_total || 0);
+    range.textContent = shown
+      ? `${from}–${from + shown - 1} of ${filtered}`
+      : `0 of ${filtered}`;
+    prev.disabled = Number(page?.offset || 0) <= 0;
+    next.disabled = Number(page?.offset || 0) + shown >= filtered;
+  }
+
+  document.querySelector("#us-journal-kinds")?.addEventListener("click", event => {
+    const target = event.target.closest("[data-journal-kind]");
+    if (!target) return;
+    const kind = target.dataset.journalKind;
+    journalKinds = kind ? [kind] : [];
+    journalOffset = 0;
+    loadUSTrading();
+  });
+  document.querySelector("#us-journal-prev")?.addEventListener("click", () => {
+    journalOffset = Math.max(0, journalOffset - JOURNAL_PAGE_SIZE);
+    loadUSTrading();
+  });
+  document.querySelector("#us-journal-next")?.addEventListener("click", () => {
+    journalOffset += JOURNAL_PAGE_SIZE;
+    loadUSTrading();
+  });
+
+  function renderTradingJournalPage(page) {
+    lastJournalPage = page;
+    renderJournalControls(page);
+    renderTradingJournal(Array.isArray(page?.items) ? page.items : []);
+  }
+
   function renderTradingJournal(items) {
     const body = document.querySelector("#us-trading-journal");
     if (!body) return;
@@ -2660,7 +3376,13 @@
       ] = await Promise.all([
         fetch(tradingApi("/api/polymarket-us/trading/status"), {cache:"no-store"}),
         fetch(tradingApi("/api/polymarket-us/trading/positions"), {cache:"no-store"}),
-        fetch(tradingApi("/api/polymarket-us/trading/journal?limit=120"), {cache:"no-store"}),
+        fetch(tradingApi(
+          `/api/polymarket-us/trading/journal?limit=${JOURNAL_PAGE_SIZE}`
+          + `&offset=${journalOffset}`
+          + (journalKinds.length
+            ? `&kinds=${encodeURIComponent(journalKinds.join(","))}`
+            : "")
+        ), {cache:"no-store"}),
         fetch(tradingApi("/api/polymarket-us/trading/performance"), {cache:"no-store"})
       ]);
       const [status, positions, journal, performance] = await Promise.all([
@@ -2689,7 +3411,7 @@
       renderVenuePositions(status);
       renderTradingPerformance(performance);
       renderManagedPositions(Array.isArray(positions) ? positions : []);
-      renderTradingJournal(Array.isArray(journal) ? journal : []);
+      renderTradingJournalPage(journal);
     } catch (error) {
       const box = document.querySelector("#us-trading-status");
       if (box) box.textContent = error.message || "Could not load automation controls";
@@ -2718,14 +3440,29 @@
     const statusBox = document.querySelector("#us-trading-status");
     setActionBusy(button, true, "Saving policy…");
     statusBox.textContent = "Validating and saving the execution policy…";
+    const selectedProfile = selectedLineProfileKey();
+    if (
+      lineProfileInputs().some(input => input.value !== "")
+      || lineExecutionProfiles.some(item => (
+        item.market_type === selectedProfile.market_type
+        && item.game_stage === selectedProfile.game_stage
+      ))
+    ) {
+      saveSelectedLineProfile();
+    }
+    const globalEntryEnabled = document.querySelector(
+      "#us-global-entry-enabled"
+    ).checked;
     const allowedMarketTypes = entryMarketTypeInputs()
       .filter(input => input.checked)
       .map(input => input.dataset.entryMarketType);
-    if (!allowedMarketTypes.length) {
+    if (globalEntryEnabled && !allowedMarketTypes.length) {
       setActionBusy(button, false);
-      statusBox.textContent = "Select at least one line type for automatic entry.";
+      statusBox.textContent = (
+        "Select a global line type or turn off global fallback authorization."
+      );
       showPolicySaveNotice(
-        "Select at least one line type for automatic entry.",
+        "Global fallback is authorized, so select at least one global line type.",
         {
           target:document.querySelector("#us-line-type-policy"),
           scroll:true
@@ -2748,16 +3485,6 @@
       );
       return;
     }
-    const selectedProfile = selectedLineProfileKey();
-    if (
-      lineProfileInputs().some(input => input.value !== "")
-      || lineExecutionProfiles.some(item => (
-        item.market_type === selectedProfile.market_type
-        && item.game_stage === selectedProfile.game_stage
-      ))
-    ) {
-      saveSelectedLineProfile();
-    }
     const payload = {
       execution_mode: document.querySelector("#us-trading-mode").value,
       automation_enabled: document.querySelector("#us-automation-enabled").checked,
@@ -2775,6 +3502,9 @@
       ) / 100,
       volatility_stop_enabled: document.querySelector(
         "#us-volatility-stop-enabled"
+      ).checked,
+      stateless_stop_confirmation: document.querySelector(
+        "#us-stateless-stop-confirmation"
       ).checked,
       stop_confirmation_readings: Number(
         document.querySelector("#us-stop-confirmation-readings").value
@@ -2796,6 +3526,7 @@
       required_engine_gates: engineGateInputs()
         .filter(input => input.checked)
         .map(input => input.dataset.engineGate),
+      global_entry_enabled: globalEntryEnabled,
       allowed_market_types: allowedMarketTypes,
       allowed_market_scopes: allowedMarketScopes,
       allow_live_segment_markets: document.querySelector(
@@ -2809,7 +3540,23 @@
       max_daily_loss_usd: Number(document.querySelector("#us-daily-loss").value),
       min_edge: Number(document.querySelector("#us-min-edge").value) / 100,
       max_edge: Number(document.querySelector("#us-max-edge").value) / 100,
+      fee_edge_margin: Number(
+        document.querySelector("#us-fee-edge-margin").value
+      ),
       min_signal_quality: Number(document.querySelector("#us-min-quality").value),
+      max_signal_quality: Number(document.querySelector("#us-max-quality").value),
+      min_source_agreement: Number(
+        document.querySelector("#us-min-source-agreement").value
+      ),
+      max_signal_age_seconds: Number(
+        document.querySelector("#us-max-signal-age").value
+      ),
+      entry_confirmation_readings: Number(
+        document.querySelector("#us-entry-confirmation-readings").value
+      ),
+      max_confirmation_price_drift: Number(
+        document.querySelector("#us-max-confirmation-price-drift").value
+      ) / 100,
       min_entry_price: Number(document.querySelector("#us-min-price").value) / 100,
       max_entry_price: Number(document.querySelector("#us-max-price").value) / 100,
       min_hold_minutes: Number(document.querySelector("#us-min-hold").value),
@@ -2834,6 +3581,9 @@
       trailing_drawdown: Number(document.querySelector("#us-trailing-drawdown").value) / 100,
       stop_loss: Number(document.querySelector("#us-stop-loss").value) / 100,
       exit_edge: Number(document.querySelector("#us-exit-edge").value) / 100,
+      reversal_confirmation_readings: Number(
+        document.querySelector("#us-reversal-confirmation-readings").value
+      ),
       cycle_seconds: Number(document.querySelector("#us-cycle-seconds").value)
     };
     const saveEpoch = ++usTradingHydrationEpoch;
@@ -3096,6 +3846,49 @@
       }
     });
   }
+
+  document.querySelector("#us-dry-tally-reset")?.addEventListener(
+    "click",
+    async event => {
+      const button = event.currentTarget;
+      const status = document.querySelector("#us-performance-action-status");
+      const openDry = Number(
+        lastTradingPerformance?.modes?.dry_run?.open_positions || 0
+      );
+      if (openDry) {
+        status.className = "us-liquidate-status is-error";
+        status.textContent = `${openDry} dry-run position${openDry === 1 ? "" : "s"} still open. Let them close (or exit them) so the session boundary stays unambiguous.`;
+        return;
+      }
+      if (!window.confirm(
+        "Start a fresh dry-run W-L-P and net display at zero for this session? Every historical position, the execution journal, and the performance datasheet remain preserved."
+      )) return;
+
+      setActionBusy(button, true, "Starting session…");
+      status.className = "us-liquidate-status is-working";
+      status.textContent = "Recording a new dry-run session boundary; no trade record is being deleted…";
+      try {
+        const response = await fetch(
+          "/api/polymarket-us/trading/performance/reset-dry-run",
+          {
+            method: "POST",
+            headers: {"content-type":"application/json"},
+            body: JSON.stringify({confirmation:APPROVAL_TOKEN})
+          }
+        );
+        const body = await response.json().catch(()=>({}));
+        if (!response.ok) throw new Error(detailMessage(body));
+        status.className = "us-liquidate-status is-success";
+        status.textContent = body.summary || "Dry-run session tally started.";
+        refreshTradingInBackground();
+      } catch (error) {
+        status.className = "us-liquidate-status is-error";
+        status.textContent = error.message || "Could not start a new dry-run session tally";
+      } finally {
+        setActionBusy(button, false);
+      }
+    }
+  );
 
   document.querySelector("#us-live-tally-reset")?.addEventListener(
     "click",
@@ -4443,8 +5236,34 @@
   function discoverStatus(game){
     if(game.status==="live")return '<span class="g-live">● LIVE</span> ';
     if(game.status==="started")return '<span class="g-started">◌ STARTED</span> ';
+    if(game.game_start){
+      const start=new Date(game.game_start);
+      if(!Number.isNaN(start.getTime())){
+        return `<span class="g-scheduled">◷ ${start.toLocaleTimeString([], {hour:"numeric",minute:"2-digit"})}</span> `;
+      }
+    }
     return "";
   }
+  let discoverLeague="mlb";
+  try{
+    const saved=localStorage.getItem("pelosi-discover-league");
+    if(saved!=null)discoverLeague=saved;
+  }catch{}
+  function renderDiscoverLeagueFilter(){
+    document.querySelectorAll("#discover-league-filter [data-league]").forEach(pill=>{
+      pill.classList.toggle("active",pill.dataset.league===discoverLeague);
+      pill.setAttribute("aria-selected",String(pill.dataset.league===discoverLeague));
+    });
+  }
+  document.querySelector("#discover-league-filter")?.addEventListener("click",event=>{
+    const pill=event.target.closest("[data-league]");
+    if(!pill||pill.dataset.league===discoverLeague)return;
+    discoverLeague=pill.dataset.league;
+    try{localStorage.setItem("pelosi-discover-league",discoverLeague);}catch{}
+    renderDiscoverLeagueFilter();
+    loadDiscover(true);
+  });
+  renderDiscoverLeagueFilter();
   function monitoredDiscoverSlugs(){
     return new Set(lastEvents.map(view=>String(view?.event?.polymarket_slug||"")).filter(Boolean));
   }
@@ -4476,6 +5295,79 @@
         ?"Adding events…"
         : count ? `Monitor ${count} selected` : "Monitor selected";
     }
+    const plan=document.querySelector("#gameday-plan");
+    if(plan){
+      plan.disabled=discoverBatchActive||gamedayPlanActive||!count;
+      plan.textContent=gamedayPlanActive
+        ?"Planning…"
+        : count ? `Plan game-day dry run (${count})` : "Plan game-day dry run";
+    }
+  }
+
+  let gamedayPlanActive=false;
+  function renderGamedayStatus(state){
+    const status=document.querySelector("#gameday-status");
+    const cancel=document.querySelector("#gameday-cancel");
+    if(!status)return;
+    if(cancel)cancel.hidden=!state?.armed;
+    if(!state||(!state.armed&&state.phase!=="completed")){
+      status.className="refresh-status gameday-status";
+      status.textContent="No game-day plan armed.";
+      return;
+    }
+    const events=Array.isArray(state.events)?state.events:[];
+    const live=events.filter(item=>item.live).length;
+    const finals=events.filter(item=>item.final).length;
+    const label=events.length===1?"game":"games";
+    if(state.phase==="waiting"){
+      status.className="refresh-status gameday-status is-working";
+      status.textContent=`Armed for ${events.length} ${label}. Waiting for first pitch — Odds API polling and dry-run automation start automatically.`;
+    }else if(state.phase==="active"){
+      status.className="refresh-status gameday-status is-success";
+      status.textContent=`Autopilot active: ${live} live / ${finals} of ${events.length} final. Polling and dry-run automation are on; everything stops after the last final.`;
+    }else{
+      status.className="refresh-status gameday-status";
+      status.textContent=`Game day complete: ${finals} of ${events.length} ${label} final. Odds API polling and dry-run automation are off.`;
+    }
+  }
+  async function loadGamedayStatus(){
+    try{
+      const response=await fetch("/api/gameday");
+      if(!response.ok)return;
+      renderGamedayStatus(await response.json());
+    }catch{}
+  }
+  async function planGamedaySelection(){
+    const slugs=[...selectedDiscoverSlugs];
+    if(!slugs.length||gamedayPlanActive)return;
+    gamedayPlanActive=true;
+    renderDiscover();
+    try{
+      await monitorSelectedDiscoverGames();
+      const response=await fetch("/api/gameday",{
+        method:"POST",
+        headers:{"content-type":"application/json"},
+        body:JSON.stringify({slugs})
+      });
+      const body=await response.json().catch(()=>({}));
+      if(!response.ok)throw new Error(body.detail||`Could not plan the game day (${response.status})`);
+      renderGamedayStatus(body);
+    }catch(error){
+      const status=document.querySelector("#gameday-status");
+      if(status){
+        status.className="refresh-status gameday-status is-error";
+        status.textContent=error.message||"Could not plan the game day.";
+      }
+    }finally{
+      gamedayPlanActive=false;
+      renderDiscover();
+    }
+  }
+  async function cancelGameday(){
+    try{
+      const response=await fetch("/api/gameday",{method:"DELETE"});
+      if(response.ok)renderGamedayStatus(await response.json());
+    }catch{}
   }
   function renderDiscover() {
     const list=document.querySelector("#discover-list");
@@ -4489,7 +5381,7 @@
       const state=isMonitored?"Monitoring":isSelected?"Selected":"Select";
       return `<label class="game discover-game${isMonitored?" is-monitored":""}${isSelected?" is-selected":""}" data-slug="${esc(g.slug)}" title="${esc(g.title)}">
         <input class="discover-game-check" type="checkbox" ${isMonitored?"checked disabled":discoverBatchActive?"disabled":""} ${isSelected?"checked":""} data-discover-select="${esc(g.slug)}" aria-label="${esc(isMonitored?`${g.title} is already monitored`:`Select ${g.title}`)}">
-        <span class="discover-game-copy"><span class="g-title">${esc(g.title)}</span><span class="g-league">${discoverStatus(g)}${esc(g.league||"sports")}${g.reference_adapter===false?' · PRICE ONLY — NO REFERENCE ADAPTER':''}</span></span>
+        <span class="discover-game-copy"><span class="g-title">${esc(g.title)}</span><span class="g-league">${discoverStatus(g)}${esc(g.league||"sports")}${g.listed===false?' · awaiting Polymarket listing':''}${g.reference_adapter===false?' · PRICE ONLY — NO REFERENCE ADAPTER':''}</span></span>
         <span class="g-add${isMonitored?" is-monitored":""}">${esc(state)}</span>
       </label>`;
     }).join(""):'<div class="discover-empty">No games match.</div>';
@@ -4497,6 +5389,7 @@
   let discoverRequest = null;
   async function loadDiscover(manual=false) {
     if (!manual && !discoveryTabVisible()) return;
+    loadGamedayStatus();
     const list=document.querySelector("#discover-list");
     const button=document.querySelector("#discover-refresh");
     const status=document.querySelector("#discover-refresh-status");
@@ -4513,7 +5406,10 @@
     }
     discoverRequest=(async()=>{
       try{
-        const r=await fetch(manual?"/api/discover?refresh=true":"/api/discover",{cache:"no-store"});
+        const leagueQuery=discoverLeague?`league=${encodeURIComponent(discoverLeague)}`:"";
+        const refreshQuery=manual?"refresh=true":"";
+        const query=[refreshQuery,leagueQuery].filter(Boolean).join("&");
+        const r=await fetch(`/api/discover${query?`?${query}`:""}`,{cache:"no-store"});
         const body=await r.json().catch(()=>null);
         if(!r.ok)throw new Error(body?.detail||`Refresh failed (${r.status})`);
         discoverGames=body||[];
@@ -4603,6 +5499,8 @@
     renderDiscover();
   });
   document.querySelector("#discover-monitor-selected").addEventListener("click",monitorSelectedDiscoverGames);
+  document.querySelector("#gameday-plan")?.addEventListener("click",planGamedaySelection);
+  document.querySelector("#gameday-cancel")?.addEventListener("click",cancelGameday);
   document.querySelector("#best-bets").addEventListener("click",e=>{const row=e.target.closest("[data-goto-event]");if(row)gotoEvent(row.dataset.gotoEvent)});
   document.querySelector("#best-bets").addEventListener("keydown",e=>{if(e.key!=="Enter"&&e.key!==" ")return;const row=e.target.closest("[data-goto-event]");if(row){e.preventDefault();gotoEvent(row.dataset.gotoEvent)}});
   document.querySelector("#discover-search").addEventListener("input",renderDiscover);
@@ -4798,11 +5696,9 @@
       return;
     }
     window.appStarted = true;
-    renderLobby();
     try {
       const savedTab = sessionStorage.getItem("pelositracker-active-tab");
       const restorableTabs = new Set([
-        "tab-lobby",
         "tab-live",
         "tab-discovery",
         "tab-us-research"
@@ -4810,9 +5706,11 @@
       const savedButton = restorableTabs.has(savedTab)
         ? document.querySelector(`[data-tab="${savedTab}"]`)
         : null;
-      if (savedButton && !savedButton.classList.contains("active")) {
-        activatePrimaryTab(savedButton);
-      }
+      // Always activate the effective tab so its loaders fire on a fresh
+      // session too, not only when restoring a different saved tab.
+      const startButton = savedButton
+        || document.querySelector(".tab-carousel .pill.active");
+      if (startButton) activatePrimaryTab(startButton);
     } catch {}
     fetch("/api/config").then(r=>r.json()).then(c=>{
       const prefix = c.workstation?.enabled ? "Local workstation · " : "";
@@ -4842,11 +5740,14 @@
       // SSE is the primary events transport. A full JSON poll is only a
       // disconnected-stream fallback, avoiding duplicate parse/render cycles.
       setInterval(()=>{if(!streamConnected)refresh()},30000);
-      setInterval(refreshMetrics,5000);
-      setInterval(refreshLeaderboard,5000);
-      setInterval(refreshBotActivity,5000);
-      setInterval(loadDiscover,60000);
-      setInterval(refreshBotGames,30000);
+      // The bots and discovery pollers only run while their tab is showing;
+      // activating a tab always refreshes it immediately, so nothing is stale
+      // on arrival and hidden tabs stop generating request noise.
+      setInterval(()=>{if(botsTabVisible())refreshMetrics()},5000);
+      setInterval(()=>{if(botsTabVisible())refreshLeaderboard()},5000);
+      setInterval(()=>{if(botsTabVisible())refreshBotActivity()},5000);
+      setInterval(()=>{if(discoveryTabVisible())loadDiscover()},60000);
+      setInterval(()=>{if(botsTabVisible())refreshBotGames()},30000);
       setInterval(()=>{if(usResearchTabVisible())loadUSEvents()},60000);
       setInterval(()=>{if(usResearchTabVisible())loadModelLab()},30000);
       setInterval(()=>{

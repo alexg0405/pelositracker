@@ -1,11 +1,16 @@
+import asyncio
+import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
+import app.polymarket_us_research as research_module
 from app.polymarket_us_research import (
     PolymarketUSResearchError,
     _account_snapshot_sync,
     credential_status,
+    fetch_public_sports_events_by_slugs,
     normalize_sports_events,
     public_market_quotes,
 )
@@ -99,6 +104,153 @@ def test_normalize_sports_events_keeps_active_us_lines_only():
         "Home -1.5",
     ]
     assert events[0]["markets"][0]["sides"][0]["team_name"] == ""
+
+
+def test_fetch_public_sports_events_by_slugs_bypasses_global_pagination(
+    monkeypatch,
+):
+    requested_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        slug = request.url.path.rsplit("/", 1)[-1]
+        return httpx.Response(
+            200,
+            json={
+                "event": {
+                    "id": f"id-{slug}",
+                    "slug": slug,
+                    "title": "New York Yankees vs. Chicago White Sox",
+                    "category": "sports",
+                    "startTime": "2026-07-30T18:10:00Z",
+                    "live": True,
+                    "ended": False,
+                    "markets": [{
+                        "id": "moneyline",
+                        "slug": f"{slug}-moneyline",
+                        "question": "Moneyline",
+                        "active": True,
+                        "closed": False,
+                        "sportsMarketType": "SPORTS_MARKET_TYPE_MONEYLINE",
+                        "marketSides": [
+                            {
+                                "id": "home",
+                                "description": "Chicago White Sox",
+                                "long": True,
+                                "tradable": True,
+                            },
+                            {
+                                "id": "away",
+                                "description": "New York Yankees",
+                                "long": False,
+                                "tradable": True,
+                            },
+                        ],
+                    }],
+                },
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+
+    def client_factory(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(research_module.httpx, "AsyncClient", client_factory)
+
+    payload = asyncio.run(fetch_public_sports_events_by_slugs([
+        "mlb-nyy-cws-2026-07-30",
+        "mlb-nyy-cws-2026-07-30",
+    ]))
+
+    assert [event["slug"] for event in payload["events"]] == [
+        "mlb-nyy-cws-2026-07-30"
+    ]
+    assert requested_urls == [
+        "https://gateway.polymarket.us/v1/events/slug/"
+        "mlb-nyy-cws-2026-07-30"
+    ]
+    assert payload["resolution"] == {
+        "requested": 1,
+        "resolved": 1,
+        "not_found": (),
+        "failed": {},
+    }
+
+
+def test_fetch_by_slugs_keeps_healthy_events_when_one_slug_fails(monkeypatch):
+    """One gateway failure must not blind the cycle that also runs exits."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        slug = request.url.path.rsplit("/", 1)[-1]
+        if slug == "mlb-broken-2026-07-30":
+            return httpx.Response(503, json={"error": "unavailable"})
+        if slug == "mlb-missing-2026-07-30":
+            return httpx.Response(404, json={"error": "not found"})
+        return httpx.Response(
+            200,
+            json={
+                "event": {
+                    "id": f"id-{slug}",
+                    "slug": slug,
+                    "title": "New York Yankees vs. Chicago White Sox",
+                    "category": "sports",
+                    "startTime": "2026-07-30T18:10:00Z",
+                    "live": True,
+                    "ended": False,
+                    "markets": [{
+                        "id": "moneyline",
+                        "slug": f"{slug}-moneyline",
+                        "question": "Moneyline",
+                        "active": True,
+                        "closed": False,
+                        "sportsMarketType": "SPORTS_MARKET_TYPE_MONEYLINE",
+                        "marketSides": [
+                            {
+                                "id": "home",
+                                "description": "Chicago White Sox",
+                                "long": True,
+                                "tradable": True,
+                            },
+                            {
+                                "id": "away",
+                                "description": "New York Yankees",
+                                "long": False,
+                                "tradable": True,
+                            },
+                        ],
+                    }],
+                },
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+
+    def client_factory(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(research_module.httpx, "AsyncClient", client_factory)
+
+    payload = asyncio.run(fetch_public_sports_events_by_slugs([
+        "mlb-healthy-2026-07-30",
+        "mlb-broken-2026-07-30",
+        "mlb-missing-2026-07-30",
+    ]))
+
+    assert [event["slug"] for event in payload["events"]] == [
+        "mlb-healthy-2026-07-30"
+    ]
+    resolution = payload["resolution"]
+    assert resolution["requested"] == 3
+    assert resolution["resolved"] == 1
+    assert resolution["not_found"] == ("mlb-missing-2026-07-30",)
+    assert resolution["failed"] == {"mlb-broken-2026-07-30": "HTTP 503"}
+    # The redacted failure summary must never carry a URL or response body.
+    assert "gateway.polymarket.us" not in json.dumps(resolution)
 
 
 def test_normalize_preserves_binary_soccer_selection_identity():

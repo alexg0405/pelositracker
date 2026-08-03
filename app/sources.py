@@ -669,14 +669,19 @@ def _game_window(games: list[dict], now: datetime,
 
 
 async def polymarket_sports_events(limit_per_league: int = 100,
-                                   live_statuses: dict[str, dict] | None = None) -> list[dict]:
+                                   live_statuses: dict[str, dict] | None = None,
+                                   leagues: list[str] | None = None) -> list[dict]:
     """List live/upcoming Polymarket sports games across leagues for discovery.
 
     Gamma can't order by real game time, so per league we pull both creation
     orderings (ascending surfaces soonest/in-progress games, descending the
     freshly-listed ones) and then sort/filter by the market's gameStartTime.
+    An explicit ``leagues`` list narrows the pull so the final ranked cap
+    applies within one league instead of letting busier sports crowd it out.
     """
-    leagues = [s.strip() for s in os.getenv("DISCOVER_LEAGUES", "").split(",") if s.strip()] \
+    leagues = [s.strip() for s in leagues or []
+               if isinstance(s, str) and s.strip()] \
+        or [s.strip() for s in os.getenv("DISCOVER_LEAGUES", "").split(",") if s.strip()] \
         or list(_DEFAULT_LEAGUES)
     async with _borrow_client(timeout=20) as client:
         async def league_events(slug: str, ascending: bool) -> list[dict]:

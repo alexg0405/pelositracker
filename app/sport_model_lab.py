@@ -1873,6 +1873,51 @@ class SportModelLab:
             },
         }
 
+    def _fit_eligibility_funnel(
+        self,
+        sport_key: str,
+        league_key: str,
+        market: str,
+    ) -> dict[str, int]:
+        """Count how settled rows narrow to fit-ready rows, stage by stage.
+
+        The segment summary reports settled counts while fitting requires
+        trusted settlement provenance and present live state. Without this
+        breakdown a refusal cannot be reconciled with the numbers beside it.
+        """
+        where = "WHERE sport=%s AND market=%s AND canceled=0"
+        params: list[Any] = [sport_key, market]
+        if league_key:
+            where += " AND league=%s"
+            params.append(league_key)
+        stages = {
+            "labeled": "AND result_label IS NOT NULL",
+            "trusted": (
+                "AND result_label IS NOT NULL "
+                f"AND settlement_source IN ({_TRUSTED_SETTLEMENT_SQL})"
+            ),
+            "fit_ready": (
+                "AND result_label IS NOT NULL "
+                f"AND settlement_source IN ({_TRUSTED_SETTLEMENT_SQL}) "
+                "AND fraction_remaining IS NOT NULL "
+                "AND score_differential IS NOT NULL"
+            ),
+        }
+        funnel: dict[str, int] = {}
+        with self._lock:
+            with self._db.cursor() as cur:
+                for name, extra in stages.items():
+                    self._db.execute(
+                        cur,
+                        "SELECT COUNT(DISTINCT event_id), COUNT(*) "
+                        f"FROM sport_model_observations {where} {extra}",
+                        tuple(params),
+                    )
+                    events, rows = cur.fetchone()
+                    funnel[f"{name}_events"] = int(events or 0)
+                    funnel[f"{name}_observations"] = int(rows or 0)
+        return funnel
+
     def fit_candidate(
         self,
         *,
@@ -1922,19 +1967,47 @@ class SportModelLab:
             len(event_order) < RESEARCH_MIN_EVENTS
             or len(raw_rows) < RESEARCH_MIN_OBSERVATIONS
         ):
+            # The gate counts fit-ready rows, which is a strict subset of the
+            # settled rows shown in the segment summary: a label also needs
+            # trusted settlement provenance and present live state. Reporting
+            # the shortfall as "settled events" made a correct refusal look
+            # like a contradiction of the counts displayed beside it, so the
+            # funnel is measured and named explicitly.
+            funnel = self._fit_eligibility_funnel(sport_key, league_key, market)
+            excluded_events = max(
+                0, funnel["labeled_events"] - funnel["trusted_events"]
+            )
+            reason = (
+                f"Need {RESEARCH_MIN_EVENTS} fit-ready events and "
+                f"{RESEARCH_MIN_OBSERVATIONS} fit-ready observations. "
+                f"This segment has {len(event_order)} fit-ready event(s) from "
+                f"{len(raw_rows)} row(s)."
+            )
+            if excluded_events:
+                reason += (
+                    f" {excluded_events} of {funnel['labeled_events']} settled "
+                    "event(s) are excluded because their outcome has no trusted "
+                    "settlement provenance; those legacy labels are not safe "
+                    "training targets and are never silently repaired."
+                )
+            missing_state = max(
+                0, funnel["trusted_events"] - funnel["fit_ready_events"]
+            )
+            if missing_state:
+                reason += (
+                    f" A further {missing_state} trusted event(s) lack the live "
+                    "state the model requires."
+                )
             return self._store_fit_result(
                 sport_key,
                 league_key,
                 market,
                 "insufficient_data",
                 {
-                    "reason": (
-                        f"Need {RESEARCH_MIN_EVENTS} settled events and "
-                        f"{RESEARCH_MIN_OBSERVATIONS} observations for a "
-                        "research comparison."
-                    ),
-                    "settled_events": len(event_order),
-                    "settled_observations": len(raw_rows),
+                    "reason": reason,
+                    "fit_ready_events": len(event_order),
+                    "fit_ready_observations": len(raw_rows),
+                    "eligibility_funnel": funnel,
                     "research_only": True,
                     "promoted": False,
                 },

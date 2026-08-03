@@ -116,11 +116,11 @@ def test_mutation_requires_csrf_and_security_headers_are_strict():
 def test_deployed_dashboard_cannot_reuse_stale_javascript():
     with TestClient(app) as client:
         page = client.get("/")
-        script = client.get("/static/index.js?v=hosted-research-lobby-2")
+        script = client.get("/static/index.js?v=workstation-cockpit-1")
 
         assert page.status_code == 200
         assert script.status_code == 200
-        assert "/static/index.js?v=hosted-research-lobby-2" in page.text
+        assert "/static/index.js?v=workstation-cockpit-1" in page.text
         for response in (page, script):
             assert response.headers["cache-control"] == (
                 "no-store, no-cache, must-revalidate, max-age=0"

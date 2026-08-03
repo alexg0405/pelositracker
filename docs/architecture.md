@@ -24,10 +24,29 @@ event locks are process-local.
   the web process and no independent model artifact ships.
 - `app/history.py`, `app/ledger.py`: immutable evidence and decision/order/fill/
   close/settlement marks.
+- `app/polymarket_us_research.py`, `app/polymarket_us_trading.py`: the Polymarket
+  US execution sidecar — read-only public inventory, authenticated account and
+  order-book reads, and the isolated dry-run/live execution lanes.
 - `app/static/`: static HTML, CSS, local vendored libraries, and event-driven JS.
 
-The current safe boundary is deliberately paper-only. There is no wallet,
-private-key, signing, exchange authentication, or real order-routing component.
+## Execution boundary
+
+The original engine, paper-bot subsystem, and `app/execution.py` remain
+paper-only: deterministic Decimal fills against verified book state, with no
+wallet, private key, or signing component anywhere in the repository.
+
+The Polymarket US sidecar is **not** paper-only. When the workstation is started
+with `ENABLE_POLYMARKET_US_TRADING=true`, its live lane authenticates to
+Polymarket US with an API key/secret and can place real fill-or-kill limit
+orders. That capability is gated by, in order: a saved live-mode policy, a
+bounded arming latch that a restart always clears, an approval token on every
+protected action, hard 5¢–95¢ price bounds, and the allocation/exposure/reserve
+limits described in `WORKSTATION.md`. The dry-run lane never authenticates and
+never routes an order.
+
+Treat the two lanes as different trust domains. Anything that widens what the
+live lane may submit is a real-money change and needs the security review in
+`docs/security.md`, not just a test.
 
 ## Concurrency boundary
 

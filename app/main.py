@@ -60,6 +60,7 @@ from .lines import (
     pregame_priors,
 )
 from .gameclock import game_progress, league_rule, validate_state_transition
+from .matching import start_timestamp
 from .models import Event, GameState, Quote, as_json
 from .monitor_state import MonitorState
 from .sources import (_odds_quota, exclude_restricted_games, extract_polymarket_slug,
@@ -78,7 +79,7 @@ from .telemetry import memory_snapshot, runtime_telemetry, start_memory_trace
 from .identity import (CanonicalEvent, MappingDecision, MappingStatus)
 from .domain.time import parse_provider_timestamp
 from .http_clients import close_shared_client, open_shared_client
-from .mlb_live import is_mlb_event, mlb_linescore_poll
+from .mlb_live import fetch_mlb_schedule, is_mlb_event, mlb_linescore_poll
 from .notify import notify_webhook
 from .polymarket_us_research import (
     AUTHENTICATED_BASE_URL as POLYMARKET_US_AUTHENTICATED_BASE_URL,
@@ -87,6 +88,7 @@ from .polymarket_us_research import (
     credential_status as polymarket_us_credential_status,
     fetch_account_snapshot as fetch_polymarket_us_account,
     fetch_public_sports_events as fetch_polymarket_us_events,
+    fetch_public_sports_events_by_slugs as fetch_polymarket_us_events_by_slugs,
     public_market_quotes as polymarket_us_public_market_quotes,
 )
 from .polymarket_us_trading import (
@@ -1099,6 +1101,196 @@ async def auto_monitor_loop():
         await asyncio.sleep(60)
 
 
+# --- MLB game-day autopilot -------------------------------------------------
+# Operator plans a slate of monitored games; paid Odds API polling and the
+# dry-run lane's automation start when the first planned game goes live and
+# stop when every planned game has concluded. Strictly dry-lane: the live
+# lane's arming latch and approval token are untouched.
+
+GAMEDAY_STATE_KEY = "gameday_autopilot"
+# A planned game that is neither live nor final this long after its scheduled
+# start is treated as concluded (postponement/feed loss) so one dead game
+# cannot keep polling on all night.
+GAMEDAY_ABANDON_SECONDS = 7 * 3600.0
+
+_gameday_state: dict[str, Any] = {
+    "armed": False,
+    "phase": "idle",
+    "event_ids": [],
+    "armed_ts": None,
+    "went_live_ts": None,
+    "completed_ts": None,
+}
+
+_TERMINAL_STATE_STATUSES = {"final", "ended", "complete", "completed", "finished"}
+
+
+def _gameday_event_report(event_id: str, now: float) -> dict[str, Any]:
+    """One planned game's schedule/live/final view, from data already held."""
+    event = store.events.get(event_id)
+    if event is None:
+        # Removed from monitoring: it can no longer hold the plan open.
+        return {
+            "event_id": event_id,
+            "name": None,
+            "missing": True,
+            "live": False,
+            "final": True,
+            "abandoned": False,
+            "started": True,
+            "start_ts": None,
+        }
+    final = event_id in _finalized or event_id in _terminal_events
+    live = False
+    with store.lock:
+        states = list(store.states.get(event_id) or ())
+    if states:
+        last = states[-1]
+        status = str(last.status or "").casefold()
+        if status in _TERMINAL_STATE_STATUSES or last.ended:
+            final = True
+        elif status == "in_progress" or last.live:
+            live = True
+    start_ts = start_timestamp(event.game_start)
+    started = live or (start_ts is not None and now >= start_ts)
+    reference = start_ts if start_ts is not None else _amount_or(
+        _gameday_state.get("armed_ts"), now
+    )
+    abandoned = (
+        not final and not live and now - reference > GAMEDAY_ABANDON_SECONDS
+    )
+    return {
+        "event_id": event_id,
+        "name": event.name,
+        "missing": False,
+        "live": live,
+        "final": final,
+        "abandoned": abandoned,
+        "started": started,
+        "start_ts": start_ts,
+    }
+
+
+def _amount_or(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _gameday_transition(phase: str, reports: list[dict[str, Any]]) -> str:
+    """Pure phase logic: waiting -> active -> completed."""
+    if not reports:
+        return "completed"
+    if all(r["final"] or r["abandoned"] for r in reports):
+        return "completed"
+    if phase == "waiting":
+        playable = any(
+            (r["live"] or r["started"]) and not r["final"] and not r["abandoned"]
+            for r in reports
+        )
+        return "active" if playable else "waiting"
+    return "active"
+
+
+async def _gameday_set_polling(enabled: bool) -> None:
+    _config_state["odds_api_enabled"] = enabled
+    if monitor_state is not None:
+        await asyncio.to_thread(monitor_state.set_odds_api_enabled, enabled)
+
+
+async def _gameday_set_dry_automation(enabled: bool) -> None:
+    if dry_run_trader is None:
+        return
+    if bool(dry_run_trader.policy.automation_enabled) == enabled:
+        return
+    await asyncio.to_thread(
+        dry_run_trader.configure,
+        {"automation_enabled": enabled},
+    )
+
+
+async def _gameday_persist() -> None:
+    if monitor_state is None:
+        return
+    await asyncio.to_thread(
+        monitor_state.set_config_json,
+        GAMEDAY_STATE_KEY,
+        dict(_gameday_state),
+    )
+
+
+def _gameday_status(
+    reports: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    if reports is None:
+        now = time.time()
+        reports = [
+            _gameday_event_report(event_id, now)
+            for event_id in _gameday_state.get("event_ids", [])
+        ]
+    return {
+        "armed": bool(_gameday_state.get("armed")),
+        "phase": str(_gameday_state.get("phase") or "idle"),
+        "events": reports,
+        "armed_ts": _gameday_state.get("armed_ts"),
+        "went_live_ts": _gameday_state.get("went_live_ts"),
+        "completed_ts": _gameday_state.get("completed_ts"),
+        "odds_api_enabled": bool(_config_state.get("odds_api_enabled")),
+        "dry_automation_enabled": (
+            bool(dry_run_trader.policy.automation_enabled)
+            if dry_run_trader is not None
+            else None
+        ),
+    }
+
+
+async def _gameday_evaluate() -> dict[str, Any]:
+    """Run one autopilot evaluation; safe from the loop or an API call."""
+    if not _gameday_state.get("armed"):
+        return _gameday_status()
+    now = time.time()
+    reports = [
+        _gameday_event_report(event_id, now)
+        for event_id in _gameday_state.get("event_ids", [])
+    ]
+    phase = _gameday_transition(
+        str(_gameday_state.get("phase") or "waiting"), reports
+    )
+    if phase != _gameday_state.get("phase"):
+        _gameday_state["phase"] = phase
+        if phase == "active":
+            _gameday_state["went_live_ts"] = now
+            await _gameday_set_polling(True)
+            await _gameday_set_dry_automation(True)
+            logger.info(
+                "Game-day autopilot: planned games are live; Odds API polling "
+                "and dry-run automation are on"
+            )
+        elif phase == "completed":
+            _gameday_state["completed_ts"] = now
+            _gameday_state["armed"] = False
+            await _gameday_set_polling(False)
+            await _gameday_set_dry_automation(False)
+            logger.info(
+                "Game-day autopilot: every planned game concluded; Odds API "
+                "polling and dry-run automation are off"
+            )
+        await _gameday_persist()
+    return _gameday_status(reports)
+
+
+async def gameday_autopilot_loop():
+    while True:
+        try:
+            await _gameday_evaluate()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Game-day autopilot evaluation failed: %s", exc)
+        await asyncio.sleep(30)
+
+
 def _live_trading_snapshot() -> tuple[
     list[tuple[Event, list]],
     dict[str, GameState],
@@ -1108,6 +1300,22 @@ def _live_trading_snapshot() -> tuple[
     Signals are immutable for the duration of a cycle from the trader's point of
     view.  The existing engine and live store remain the sole calculation path.
     """
+    def newest_usable_state(states: list[GameState]) -> GameState:
+        # Prefer the newest structured MLB linescore state. The generic
+        # Polymarket feed emits states with no sport_state, and taking the
+        # bare last state let one such packet blank the trader's inning
+        # context for the cycle — the measured dominant cause of the
+        # state-aware stop guard failing to engage.
+        for state in reversed(states):
+            if (
+                isinstance(state.sport_state, dict)
+                and str(state.sport_state.get("schema") or "").startswith(
+                    "mlb-linescore-"
+                )
+            ):
+                return state
+        return states[-1]
+
     with store.lock:
         monitored = [
             (event, list(store.signals.get(event.id, [])))
@@ -1115,7 +1323,7 @@ def _live_trading_snapshot() -> tuple[
             if event.id not in _terminal_events and event.id not in _finalized
         ]
         latest_states = {
-            event.id: store.states[event.id][-1]
+            event.id: newest_usable_state(store.states[event.id])
             for event, _ in monitored
             if store.states.get(event.id)
         }
@@ -1233,6 +1441,55 @@ def _completed_mlb_segment_scores(
     return results
 
 
+async def _resolve_execution_us_events(
+    monitored_slugs: list[str],
+) -> dict[str, Any]:
+    """Resolve monitored US events without letting one slug blind the cycle.
+
+    The by-slug endpoint avoids the bounded-pagination blind spot, but it turns
+    one transport failure per monitored event into a possible cycle abort. The
+    same payload also drives position marks and protective exits, so partial
+    coverage is strictly better than none. When a slug fails for a reason other
+    than "not listed", the bounded inventory call is used to backfill only the
+    events that did not resolve.
+    """
+    payload = await fetch_polymarket_us_events_by_slugs(monitored_slugs)
+    resolution = dict(payload.get("resolution") or {})
+    failed = dict(resolution.get("failed") or {})
+    if not failed:
+        return payload
+    logger.warning(
+        "Polymarket US by-slug resolution incomplete: %d/%d resolved, %d failed (%s)",
+        int(resolution.get("resolved") or 0),
+        int(resolution.get("requested") or 0),
+        len(failed),
+        "; ".join(sorted(set(failed.values())))[:200],
+    )
+    try:
+        backfill = await fetch_polymarket_us_events(limit=500)
+    except Exception as exc:
+        logger.warning("Polymarket US inventory backfill failed: %s", exc)
+        resolution["backfilled"] = 0
+        payload["resolution"] = resolution
+        return payload
+    known = {
+        str(event.get("slug") or event.get("id") or "")
+        for event in payload.get("events", [])
+    }
+    added = [
+        event
+        for event in backfill.get("events", [])
+        if str(event.get("slug") or event.get("id") or "") not in known
+        and str(event.get("slug") or "") in failed
+    ]
+    resolution["backfilled"] = len(added)
+    return {
+        **payload,
+        "events": [*payload.get("events", []), *added],
+        "resolution": resolution,
+    }
+
+
 async def _run_execution_trading_cycle(
     trader: PolymarketUSAutoTrader,
 ) -> dict[str, Any]:
@@ -1260,7 +1517,17 @@ async def _run_execution_trading_cycle(
             segment_results=segment_results,
         )
     else:
-        payload = await fetch_polymarket_us_events(limit=500)
+        monitored_slugs = [
+            event.polymarket_slug
+            for event, _signals in snapshot
+            if event.polymarket_slug
+        ]
+        if monitored_slugs:
+            payload = await _resolve_execution_us_events(monitored_slugs)
+        else:
+            # Manually-created events may not carry a Polymarket slug. Keep the
+            # bounded discovery fallback for those uncommon research records.
+            payload = await fetch_polymarket_us_events(limit=500)
         snapshot = _execution_snapshot_with_us_segments(
             snapshot,
             payload,
@@ -1406,6 +1673,7 @@ async def lifespan(_: FastAPI):
     global live_trader, dry_run_trader, model_lab
     sports_task: asyncio.Task | None = None
     auto_task: asyncio.Task | None = None
+    gameday_task: asyncio.Task | None = None
     execution_tasks: list[asyncio.Task] = []
     if settings.enable_memory_trace:
         start_memory_trace()
@@ -1491,6 +1759,22 @@ async def lifespan(_: FastAPI):
         sports_task = asyncio.create_task(polymarket_sports_stream(
             lambda: list(store.events.values()), on_state, on_sports_status))
         auto_task = asyncio.create_task(auto_monitor_loop())
+        stored_gameday = await asyncio.to_thread(
+            monitor_state.config_json, GAMEDAY_STATE_KEY
+        )
+        if stored_gameday:
+            _gameday_state.update(
+                armed=bool(stored_gameday.get("armed")),
+                phase=str(stored_gameday.get("phase") or "idle"),
+                event_ids=[
+                    str(event_id)
+                    for event_id in stored_gameday.get("event_ids") or []
+                ],
+                armed_ts=stored_gameday.get("armed_ts"),
+                went_live_ts=stored_gameday.get("went_live_ts"),
+                completed_ts=stored_gameday.get("completed_ts"),
+            )
+        gameday_task = asyncio.create_task(gameday_autopilot_loop())
         if live_trader is not None:
             execution_tasks.append(asyncio.create_task(
                 execution_trading_loop(live_trader, lane="live")
@@ -1514,6 +1798,8 @@ async def lifespan(_: FastAPI):
             background.append(sports_task)
         if auto_task is not None:
             background.append(auto_task)
+        if gameday_task is not None:
+            background.append(gameday_task)
         background.extend(execution_tasks)
         background.extend(_notification_tasks)
         _notification_tasks.clear()
@@ -1637,6 +1923,11 @@ class ConfigIn(BaseModel):
     odds_api_poll_seconds: float | None = Field(default=None, ge=1, le=3600)
 
 
+class GamedayPlanIn(BaseModel):
+    event_ids: list[str] = Field(default_factory=list)
+    slugs: list[str] = Field(default_factory=list)
+
+
 class LiveTradingConfigIn(BaseModel):
     automation_enabled: bool | None = None
     execution_mode: str | None = None
@@ -1647,12 +1938,15 @@ class LiveTradingConfigIn(BaseModel):
     adaptive_exit_min_samples: int | None = None
     adaptive_exit_max_tightening: float | None = None
     volatility_stop_enabled: bool | None = None
+    stateless_stop_confirmation: bool | None = None
+    reversal_confirmation_readings: int | None = None
     stop_confirmation_readings: int | None = None
     stop_grace_minutes: float | None = None
     catastrophic_stop_multiplier: float | None = None
     post_exit_tracking_minutes: float | None = None
     require_engine_entry: bool | None = None
     required_engine_gates: list[str] | None = None
+    global_entry_enabled: bool | None = None
     allowed_market_types: list[str] | None = None
     allowed_market_scopes: list[str] | None = None
     allow_live_segment_markets: bool | None = None
@@ -1667,7 +1961,13 @@ class LiveTradingConfigIn(BaseModel):
     max_orders_per_hour: int | None = None
     min_edge: float | None = None
     max_edge: float | None = None
+    fee_edge_margin: float | None = None
     min_signal_quality: float | None = None
+    max_signal_quality: float | None = None
+    min_source_agreement: float | None = None
+    max_signal_age_seconds: float | None = None
+    entry_confirmation_readings: int | None = None
+    max_confirmation_price_drift: float | None = None
     min_reference_sources: int | None = None
     min_entry_price: float | None = None
     max_entry_price: float | None = None
@@ -1920,8 +2220,165 @@ async def update_config(payload: ConfigIn):
     return await config()
 
 
-_discover_cache: dict = {"at": 0.0, "data": []}
+@app.get("/api/gameday", dependencies=[Depends(verify_auth)])
+async def gameday_status():
+    """Report the game-day autopilot plan, advancing it if it is armed."""
+    return await _gameday_evaluate()
+
+
+@app.post("/api/gameday", dependencies=[Depends(verify_auth)])
+async def gameday_arm(payload: GamedayPlanIn):
+    """Arm the autopilot for a slate of already-monitored games.
+
+    Arming defers Odds API polling and dry-run automation until the first
+    planned game goes live; both stop when every planned game concludes.
+    Dry lane only — live arming still requires the operator's approval token.
+    """
+    if dry_run_trader is None:
+        raise HTTPException(
+            status_code=409,
+            detail="the dry-run execution lane is not available on this server",
+        )
+    event_ids: list[str] = []
+    seen: set[str] = set()
+    slug_map = {
+        event.polymarket_slug: event.id
+        for event in store.events.values()
+        if event.polymarket_slug
+    }
+    for event_id in payload.event_ids:
+        if event_id not in store.events:
+            raise HTTPException(
+                status_code=400,
+                detail=f"event {event_id} is not monitored",
+            )
+        if event_id not in seen:
+            seen.add(event_id)
+            event_ids.append(event_id)
+    for slug in payload.slugs:
+        event_id = slug_map.get(slug)
+        if event_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"game {slug} is not monitored; add it to Live Radar "
+                    "before planning it"
+                ),
+            )
+        if event_id not in seen:
+            seen.add(event_id)
+            event_ids.append(event_id)
+    if not event_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="select at least one monitored game",
+        )
+    _gameday_state.update(
+        armed=True,
+        phase="waiting",
+        event_ids=event_ids,
+        armed_ts=time.time(),
+        went_live_ts=None,
+        completed_ts=None,
+    )
+    await _gameday_set_polling(False)
+    await _gameday_set_dry_automation(False)
+    await _gameday_persist()
+    # Evaluate immediately so planning a slate that is already live starts
+    # polling now instead of on the next loop tick.
+    return await _gameday_evaluate()
+
+
+@app.delete("/api/gameday", dependencies=[Depends(verify_auth)])
+async def gameday_disarm():
+    """Disarm the autopilot; current polling/automation toggles are kept."""
+    _gameday_state.update(armed=False, phase="idle")
+    await _gameday_persist()
+    return _gameday_status()
+
+
+_discover_cache: dict[str, dict] = {}
+_mlb_schedule_cache: dict = {"at": 0.0, "data": []}
 _polymarket_us_cache: dict = {"at": 0.0, "data": None}
+
+# Polymarket's game slugs use lowercase team abbreviations that follow the
+# traditional forms where MLB's Stats API has since modernized
+# (Diamondbacks AZ->ari, Athletics ATH->oak).
+_MLB_TO_POLYMARKET_ABBR = {"az": "ari", "ath": "oak"}
+
+
+def _mlb_game_slug(game: Mapping[str, Any]) -> str | None:
+    """Construct the venue's game slug: mlb-<away>-<home>-<official date>."""
+    away = str(game.get("away_abbr") or "").strip().casefold()
+    home = str(game.get("home_abbr") or "").strip().casefold()
+    day = str(game.get("official_date") or "").strip()
+    if not away or not home or not day:
+        return None
+    away = _MLB_TO_POLYMARKET_ABBR.get(away, away)
+    home = _MLB_TO_POLYMARKET_ABBR.get(home, home)
+    return f"mlb-{away}-{home}-{day}"
+
+
+def _merge_mlb_schedule(
+    games: list[dict],
+    schedule: list[dict],
+) -> list[dict]:
+    """Fold the MLB daily schedule into the Polymarket discovery list.
+
+    Games the venue already lists are enriched (live status, start time);
+    scheduled games the venue pull missed are appended with a constructed
+    slug and marked unlisted so the picker can show the full slate. Final
+    games are dropped either way. Pure, for tests.
+    """
+    by_slug = {str(game.get("slug")): game for game in games}
+    merged = [dict(game) for game in games]
+    for scheduled in schedule:
+        status = str(scheduled.get("status") or "preview")
+        if status == "final":
+            continue
+        slug = _mlb_game_slug(scheduled)
+        if slug is None:
+            continue
+        existing = by_slug.get(slug)
+        if existing is not None:
+            listed = next(g for g in merged if str(g.get("slug")) == slug)
+            if status == "live" and listed.get("status") != "live":
+                listed["status"] = "live"
+                listed["status_source"] = "mlb-schedule"
+            if not listed.get("game_start") and scheduled.get("start"):
+                listed["game_start"] = scheduled["start"]
+            listed.setdefault("league", "MLB")
+            continue
+        merged.append({
+            "slug": slug,
+            "title": f"{scheduled.get('away')} @ {scheduled.get('home')}",
+            "league": "MLB",
+            "sport": "baseball",
+            "game_start": scheduled.get("start"),
+            "status": "live" if status == "live" else "upcoming",
+            "status_source": "mlb-schedule",
+            "source": "mlb-schedule",
+            "listed": False,
+        })
+    rank = {"live": 0, "started": 1, "upcoming": 2}
+    merged.sort(key=lambda game: (
+        rank.get(str(game.get("status")), 3),
+        str(game.get("game_start") or "9999"),
+    ))
+    return merged
+
+
+async def _mlb_schedule_today() -> list[dict]:
+    now = time.monotonic()
+    if _mlb_schedule_cache["data"] and now - _mlb_schedule_cache["at"] < 300:
+        return _mlb_schedule_cache["data"]
+    try:
+        schedule = await fetch_mlb_schedule()
+    except Exception as exc:
+        logger.warning("MLB schedule fetch failed: %s", exc)
+        return _mlb_schedule_cache["data"] or []
+    _mlb_schedule_cache.update(at=now, data=schedule)
+    return schedule
 
 
 def _active_polymarket_us_credentials() -> tuple[str, str]:
@@ -1934,18 +2391,31 @@ def _active_polymarket_us_credentials() -> tuple[str, str]:
 
 
 @app.get("/api/discover", dependencies=[Depends(verify_auth)])
-async def discover(refresh: bool = False):
-    """Browse live/upcoming Polymarket sports games to add without a link."""
+async def discover(refresh: bool = False, league: str = ""):
+    """Browse live/upcoming games to add without a link.
+
+    ``league`` narrows the Polymarket pull to one league tag so the ranked
+    cap applies within it. For MLB (or the default mixed view) the official
+    daily schedule is merged in, so the whole slate is plannable even before
+    the venue lists or ranks tonight's games.
+    """
+    league = league.strip().casefold()
     now = time.monotonic()
-    if not refresh and _discover_cache["data"] and now - _discover_cache["at"] < 45:
-        return _discover_cache["data"]  # cache so browsing doesn't hammer Gamma
+    cached = _discover_cache.get(league)
+    if not refresh and cached and cached["data"] and now - cached["at"] < 45:
+        return cached["data"]  # cache so browsing doesn't hammer Gamma
     try:
-        games = await polymarket_sports_events(live_statuses=_sports_status_compact)
+        games = await polymarket_sports_events(
+            live_statuses=_sports_status_compact,
+            leagues=[league] if league else None,
+        )
     except Exception as exc:
         raise HTTPException(502, f"Could not reach Polymarket: {exc}") from exc
     if settings.exclude_restricted_events:
         games = exclude_restricted_games(games)
-    _discover_cache.update(at=now, data=games)
+    if league in ("", "mlb"):
+        games = _merge_mlb_schedule(games, await _mlb_schedule_today())
+    _discover_cache[league] = {"at": now, "data": games}
     return games
 
 
@@ -2627,12 +3097,23 @@ async def polymarket_us_trading_exit_position(
     dependencies=[Depends(verify_auth)],
 )
 async def polymarket_us_trading_journal(
-    limit: int = 100,
+    limit: int = 25,
+    offset: int = 0,
+    kinds: str = "",
     lane: Literal["live", "dry_run"] | None = None,
 ):
+    """Return one bounded page of execution-journal rows.
+
+    `kinds` is a comma-separated filter. The response is a page object rather
+    than a bare list so the dashboard can show how much it is not displaying
+    instead of silently truncating.
+    """
+    selected = [part.strip() for part in kinds.split(",") if part.strip()]
     return await asyncio.to_thread(
-        _require_execution_lane(lane).journal,
+        _require_execution_lane(lane).journal_page,
         limit=limit,
+        offset=offset,
+        kinds=selected,
     )
 
 
@@ -2730,6 +3211,10 @@ async def polymarket_us_trading_performance_ledger(
         "entry_signal_edge",
         "entry_execution_edge",
         "entry_signal_quality",
+        "entry_source_agreement",
+        "entry_signal_age_seconds",
+        "entry_confirmation_count",
+        "entry_confirmation_price_drift",
         "entry_reference_sources",
         "exit_reason",
         "policy_session_id",
@@ -2901,6 +3386,23 @@ async def polymarket_us_trading_reset_live_performance(
     try:
         return await asyncio.to_thread(
             _require_live_trader().reset_live_performance,
+            payload.confirmation,
+        )
+    except TradingPolicyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post(
+    "/api/polymarket-us/trading/performance/reset-dry-run",
+    dependencies=[Depends(verify_auth)],
+)
+async def polymarket_us_trading_reset_dry_run_performance(
+    payload: LivePerformanceResetIn,
+):
+    """Start a fresh dry-run session tally; nothing is deleted."""
+    try:
+        return await asyncio.to_thread(
+            _require_execution_lane("dry_run").reset_dry_run_performance,
             payload.confirmation,
         )
     except TradingPolicyError as exc:
