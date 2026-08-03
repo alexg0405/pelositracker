@@ -234,15 +234,24 @@ only tick-level replay reads them, they exceed Supabase's smaller tiers on
 their own, and every research tool in `tools/` works from the settled
 outcomes and lane databases that do fit comfortably.
 
-### Cutover
+### Where new data goes: the split policy
 
-Set `DATABASE_URL` in `.env` and restart. Do it with both lanes stopped: the
-restart clears the live arming latch (by design), and a lane should never
-change its backend mid-session. `/api/ready` then confirms every store
-opened successfully against the new target (each dependency reports `true`);
-a store that could not reach Supabase fails there rather than silently
-falling back. Confirm the performance panel still shows the expected
-history, then re-arm.
+**Hosted (website) runs persist to Supabase; workstation runs stay local.**
+This is enforced, not just configured: a hosted deployment (`WORKSTATION_MODE`
+unset) opens every store — research stores and both execution lanes, the dry
+lane in its `polymarket_us_dry_run` schema — against `DATABASE_URL`. The
+workstation launcher sets `WORKSTATION_MODE=true`, and in that mode the
+server deliberately ignores `DATABASE_URL` even when one is present in
+`.env`, logging that all stores stay on local SQLite. A connection string
+configured for the website or the sync tool can therefore never cause a
+local session to write to the shared database.
 
-The local SQLite files are never modified by the migration — it opens them
-read-only — so they remain the fallback until the remote copy is verified.
+To point the website at Supabase: set `DATABASE_URL` in the hosting
+provider's environment (for Render, the service's environment settings —
+`render.yaml` deploys from `main`). `/api/ready` confirms every store opened
+against the target; a store that cannot reach Supabase fails there rather
+than silently falling back.
+
+The one-time copy above remains available if local history should seed the
+hosted database; it opens the local files read-only, so they are never
+modified. Local analysis tools keep reading the local files either way.

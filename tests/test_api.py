@@ -1,4 +1,5 @@
 import asyncio
+import os
 from dataclasses import replace
 
 from fastapi.testclient import TestClient
@@ -1154,3 +1155,18 @@ def test_live_trading_snapshot_prefers_structured_mlb_state():
         assert latest_states[event.id].sport_state is None
     finally:
         store.remove_event(event.id)
+
+
+def test_workstation_mode_never_follows_database_url(monkeypatch):
+    """Local-first policy: website runs persist to DATABASE_URL, workstation
+    runs must not — even when the variable is present in the environment."""
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql://user:secret@db.example.supabase.co/postgres"
+    )
+    with TestClient(app):
+        assert main_module.ledger.backend == "sqlite"
+        assert main_module.history_db.backend == "sqlite"
+        assert main_module.monitor_state.backend == "sqlite"
+        # The guard removes the variable so no later store construction can
+        # follow it either.
+        assert os.environ.get("DATABASE_URL") is None

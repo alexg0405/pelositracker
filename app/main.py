@@ -1679,6 +1679,16 @@ async def lifespan(_: FastAPI):
         start_memory_trace()
     open_shared_client()  # shared keep-alive pool for one-shot provider fetches
     try:
+        if settings.workstation_mode and os.environ.pop("DATABASE_URL", None):
+            # Local-first by policy: workstation runs never follow
+            # DATABASE_URL, even when one is configured in .env for the
+            # hosted deployment or the Supabase sync tool. Every store below
+            # opens its local SQLite file; only hosted deployments
+            # (WORKSTATION_MODE unset) persist to the shared database.
+            logger.info(
+                "Workstation mode: ignoring DATABASE_URL; all stores stay "
+                "on local SQLite"
+            )
         ledger = Ledger()
         account_book = AccountBook() if settings.enable_paper_bots else None
         history_db = HistoryDB()
