@@ -95,6 +95,19 @@ def default_stores(data_dir: Path = Path("workstation-data")) -> list[StoreSpec]
                 "database_namespace": "polymarket_us_dry_run",
             },
         ),
+        StoreSpec(
+            "trading_alex",
+            Path("polymarket-us-alex.db"),
+            # The optional second live lane mirrors the hosted schema split;
+            # reported as "missing" and skipped when the lane never ran here.
+            postgres_schema="polymarket_us_alex",
+            store=("app.polymarket_us_trading", "PolymarketUSAutoTrader"),
+            store_kwargs={
+                "key_id": "migration",
+                "secret_key": "migration",
+                "database_namespace": "polymarket_us_alex",
+            },
+        ),
     ]
 
 

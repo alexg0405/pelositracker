@@ -205,6 +205,12 @@
   let lastUSEvents = [];
   let usEventsLoading = false;
   let usCredentialsConfigured = false;
+  // Who is signed in and which lane (if any) they own, from /status. Lane
+  // ownership is enforced server-side; the client only adapts the default
+  // lane and labels so each person lands on their own book.
+  let usUserIdentity = null;
+  let usLaneCredentials = {};
+  let usLaneIdentityApplied = false;
   let usExecutionEnabled = false;
   let usExecutionBySignal = new Map();
 
@@ -221,15 +227,27 @@
       const response = await fetch("/api/polymarket-us/status", {cache:"no-store"});
       const data = await response.json().catch(()=>({}));
       if (!response.ok) throw new Error(data.detail || "Status unavailable");
-      usCredentialsConfigured = !!data.configured;
-      const credentialSource = data.credential_source === "runtime"
+      usUserIdentity = data.user || null;
+      usLaneCredentials = data.lane_credentials || {};
+      maybeAdoptOwnedLane();
+      // Show the key state of the lane the person is working in, not always
+      // the primary lane's, so Anthony and Alex each see their own key.
+      const credLane = isLiveModeLane(activeTradingLane)
+        ? activeTradingLane
+        : "live";
+      const cred = usLaneCredentials[credLane] || data;
+      usCredentialsConfigured = !!cred.configured;
+      const credentialSource = cred.credential_source === "runtime"
         ? "session memory"
-        : data.credential_source === "environment"
+        : cred.credential_source === "environment"
           ? "server environment"
           : "";
-      const key = data.configured
-        ? `Configured · ${esc(data.key_id_hint || "hidden")}${credentialSource ? ` · ${credentialSource}` : ""}`
-        : "Not configured";
+      const keyLaneTag = usLaneCredentials.alex
+        ? ` · ${tradingLaneLabel(credLane)} lane`
+        : "";
+      const key = (cred.configured
+        ? `Configured · ${esc(cred.key_id_hint || "hidden")}${credentialSource ? ` · ${credentialSource}` : ""}`
+        : "Not configured") + keyLaneTag;
       const automation = data.automation || {};
       const trading = !data.trading_enabled
         ? "Unavailable"
@@ -367,7 +385,14 @@
       ? "Signing a read-only balances and positions request…"
       : "No key is configured. Paste a session key above or add both values to the server environment.";
     try {
-      const response = await fetch("/api/polymarket-us/account", {cache:"no-store"});
+      // Test the key belonging to the lane the person is working in.
+      const response = await fetch(
+        tradingApi(
+          "/api/polymarket-us/account",
+          isLiveModeLane(activeTradingLane) ? activeTradingLane : "live"
+        ),
+        {cache:"no-store"}
+      );
       const data = await response.json().catch(()=>({}));
       if (!response.ok) throw new Error(data.detail || "Account request failed");
       renderUSAccount(data);
@@ -526,9 +551,16 @@
       const armed = isLiveModeLane(lane)
         ? laneStatus.armed ? " · ARMED" : " · DISARMED"
         : "";
+      const owner = usUserIdentity?.lane_owners?.[lane];
+      const ownerTag = !owner
+        ? ""
+        : owner === usUserIdentity?.username
+          ? " · your lane"
+          : ` · ${owner}'s lane`;
       summary.textContent = (
         `${state}${armed} · ${Number(laneStatus.open_positions || 0)} open · ` +
-        `$${Number(laneStatus.managed_exposure_usd || 0).toFixed(2)} exposure`
+        `$${Number(laneStatus.managed_exposure_usd || 0).toFixed(2)} exposure` +
+        ownerTag
       );
     }
     const coordination = document.querySelector("#us-lane-coordination-status");
@@ -543,6 +575,18 @@
           : running.length === 1
             ? `${tradingLaneLabel(running[0])} automation is running. Every other lane remains independently stopped.`
             : "All automation lanes are stopped. Tap a lane to edit its saved policy.";
+      const activeOwner = usUserIdentity?.lane_owners?.[activeTradingLane];
+      if (
+        !usTradingLaneSwitching
+        && activeOwner
+        && activeOwner !== usUserIdentity?.username
+      ) {
+        coordination.textContent += (
+          ` This is ${activeOwner}'s lane: you can watch it, stop it, or ` +
+          `disarm it, but only ${activeOwner} can save settings, arm, sell, ` +
+          "or change its key."
+        );
+      }
     }
     const selected = lanes[activeTradingLane] || {};
     const quickToggle = document.querySelector("#us-lane-automation-toggle");
@@ -597,6 +641,28 @@
     }
     if (run && !run.getAttribute("aria-busy")) {
       run.textContent = `Run ${laneLabel} cycle now`;
+    }
+  }
+
+  function maybeAdoptOwnedLane() {
+    // Once per page load: land each person on the lane they own. A stored
+    // preference is honored unless it points at somebody else's lane.
+    if (usLaneIdentityApplied) return;
+    usLaneIdentityApplied = true;
+    const owned = usUserIdentity?.owned_lanes || [];
+    if (!owned.length || owned.includes(activeTradingLane)) return;
+    let stored = null;
+    try {
+      stored = window.localStorage.getItem("pelosi-trading-lane");
+    } catch {
+      stored = null;
+    }
+    const owners = usUserIdentity?.lane_owners || {};
+    const storedIsForeign = !!(
+      stored && owners[stored] && owners[stored] !== usUserIdentity?.username
+    );
+    if (!stored || storedIsForeign) {
+      void switchTradingLane(owned[0]);
     }
   }
 
@@ -4020,7 +4086,7 @@
         const response = await fetch(
           tradingApi(
             "/api/polymarket-us/trading/performance/reset-live",
-            "live"
+            isLiveModeLane(activeTradingLane) ? activeTradingLane : "live"
           ),
           {
             method: "POST",
@@ -4052,9 +4118,13 @@
       syncStatus.textContent = "Reading authenticated Polymarket US account positions…";
     }
     try {
-      const response = await fetch("/api/polymarket-us/trading/sync", {
-        method: "POST"
-      });
+      const response = await fetch(
+        tradingApi(
+          "/api/polymarket-us/trading/sync",
+          isLiveModeLane(activeTradingLane) ? activeTradingLane : "live"
+        ),
+        {method: "POST"}
+      );
       const body = await response.json().catch(()=>({}));
       if (!response.ok) throw new Error(detailMessage(body));
       if (syncStatus) {
@@ -4167,7 +4237,9 @@
       }
       try {
         const response = await fetch(
-          `/api/polymarket-us/trading/positions/${encodeURIComponent(positionId)}/exit`,
+          tradingApi(
+            `/api/polymarket-us/trading/positions/${encodeURIComponent(positionId)}/exit`
+          ),
           {
             method: "POST",
             headers: {"content-type":"application/json"},

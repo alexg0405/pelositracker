@@ -211,15 +211,87 @@ async def verify_auth(request: Request):
     request.state.session = session
 
 
-async def verify_execution_admin(request: Request):
-    """Restrict account credentials and evidence imports to the site operator."""
-    await verify_auth(request)
-    username = request.state.session.username
+def _is_execution_admin(username: str) -> bool:
     sole_authorized_user = (
         len(AUTHORIZED_USERS) == 1 and username in AUTHORIZED_USERS
     )
-    if username != settings.admin_username and not sole_authorized_user:
+    return username == settings.admin_username or sole_authorized_user
+
+
+async def verify_execution_admin(request: Request):
+    """Restrict account credentials and evidence imports to the site operator."""
+    await verify_auth(request)
+    if not _is_execution_admin(request.state.session.username):
         raise HTTPException(status_code=403, detail="Operator access required")
+
+
+def _lane_owner(lane: "ExecutionLane | None") -> str | None:
+    """The username that owns a lane, or None when the lane is shared.
+
+    Omitting the lane has always meant the primary live lane, so ownership
+    follows the same default. The dry-run lane is a shared measurement bed
+    and can never be owned.
+    """
+    effective = lane or "live"
+    if effective == "dry_run":
+        return None
+    return settings.polymarket_us_lane_owners.get(effective)
+
+
+def _require_lane_operator(
+    request: Request,
+    lane: "ExecutionLane | None",
+) -> None:
+    owner = _lane_owner(lane)
+    if owner is None:
+        return
+    session = getattr(request.state, "session", None)
+    username = getattr(session, "username", "")
+    if username != owner:
+        label = LANE_LABELS.get(lane or "live", str(lane or "live"))
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"The {label} lane belongs to {owner}; sign in as {owner} "
+                "to change it. Protective stop and disarm controls remain "
+                "available to everyone."
+            ),
+        )
+
+
+async def verify_lane_operator(
+    request: Request,
+    lane: "ExecutionLane | None" = None,
+):
+    """Authenticate, then require the lane's owner when one is configured.
+
+    Ownership only restricts actions that add risk: saving policy, arming,
+    running cycles, selling, resets, and credential changes. Disarm, stop,
+    and emergency stop deliberately stay open to every authenticated user so
+    anyone can always make a lane safer.
+    """
+    await verify_auth(request)
+    _require_lane_operator(request, lane)
+
+
+async def verify_credential_operator(
+    request: Request,
+    lane: "ExecutionLane | None" = None,
+):
+    """Credential install/forget: the lane's owner, else the site operator.
+
+    On an owned lane the owner manages their own venue key without needing
+    site-operator rights; unowned lanes keep the historical operator-only
+    behavior.
+    """
+    await verify_auth(request)
+    if _lane_owner(lane) is None:
+        if not _is_execution_admin(request.state.session.username):
+            raise HTTPException(
+                status_code=403, detail="Operator access required"
+            )
+        return
+    _require_lane_operator(request, lane)
 
 def _notify_subscribers() -> None:
     """Wake every SSE client that a snapshot changed (coalesced per client)."""
@@ -2498,7 +2570,7 @@ async def discover(refresh: bool = False, league: str = ""):
 
 
 @app.get("/api/polymarket-us/status", dependencies=[Depends(verify_auth)])
-async def polymarket_us_status():
+async def polymarket_us_status(request: Request):
     """Return safe venue capability metadata; never return either API credential."""
     result = {
         "workstation": settings.workstation_mode,
@@ -2514,6 +2586,26 @@ async def polymarket_us_status():
                 settings.polymarket_us_secret_key,
             )
         ),
+    }
+    # Per-lane credential fingerprints so each person can see their own
+    # lane's key state; the flat fields above remain the primary lane's for
+    # existing clients.
+    lane_credentials = {
+        lane: trader.credential_status()
+        for lane, trader in (("live", live_trader), ("alex", alex_trader))
+        if trader is not None
+    }
+    if lane_credentials:
+        result["lane_credentials"] = lane_credentials
+    username = request.state.session.username
+    owners = dict(settings.polymarket_us_lane_owners)
+    result["user"] = {
+        "username": username,
+        "execution_admin": _is_execution_admin(username),
+        "lane_owners": owners,
+        "owned_lanes": [
+            lane for lane, owner in owners.items() if owner == username
+        ],
     }
     if live_trader is not None:
         result.update({
@@ -2562,7 +2654,7 @@ async def polymarket_us_account(lane: ExecutionLane | None = None):
 
 @app.post(
     "/api/polymarket-us/runtime-credentials",
-    dependencies=[Depends(verify_execution_admin)],
+    dependencies=[Depends(verify_credential_operator)],
 )
 async def polymarket_us_runtime_credentials(
     payload: RuntimeCredentialsIn,
@@ -2613,7 +2705,7 @@ async def polymarket_us_runtime_credentials(
 
 @app.delete(
     "/api/polymarket-us/runtime-credentials",
-    dependencies=[Depends(verify_execution_admin)],
+    dependencies=[Depends(verify_credential_operator)],
 )
 async def clear_polymarket_us_runtime_credentials(
     lane: ExecutionLane | None = None,
@@ -2918,12 +3010,14 @@ async def polymarket_us_trading_status(
 
 @app.post(
     "/api/polymarket-us/trading/sync",
-    dependencies=[Depends(verify_auth)],
+    dependencies=[Depends(verify_lane_operator)],
 )
-async def polymarket_us_trading_sync():
+async def polymarket_us_trading_sync(lane: ExecutionLane | None = None):
+    """Read the authenticated portfolio for one credential-holding lane."""
+    trader = _require_credential_lane(lane)
     try:
         return await asyncio.to_thread(
-            _require_live_trader().synchronize_live_positions
+            trader.synchronize_live_positions
         )
     except TradingPolicyError as exc:
         raise HTTPException(409, str(exc)) from exc
@@ -2934,7 +3028,7 @@ async def polymarket_us_trading_sync():
 
 @app.put(
     "/api/polymarket-us/trading/config",
-    dependencies=[Depends(verify_auth)],
+    dependencies=[Depends(verify_lane_operator)],
 )
 async def polymarket_us_trading_config(
     payload: LiveTradingConfigIn,
@@ -2958,7 +3052,7 @@ async def polymarket_us_trading_config(
 
 @app.delete(
     "/api/polymarket-us/trading/adaptive-exit/history",
-    dependencies=[Depends(verify_auth)],
+    dependencies=[Depends(verify_lane_operator)],
 )
 async def polymarket_us_trading_clear_adaptive_exit_history(
     payload: AdaptiveExitHistoryClearIn,
@@ -2975,7 +3069,7 @@ async def polymarket_us_trading_clear_adaptive_exit_history(
 
 @app.post(
     "/api/polymarket-us/trading/arm",
-    dependencies=[Depends(verify_auth)],
+    dependencies=[Depends(verify_lane_operator)],
 )
 async def polymarket_us_trading_arm(
     payload: LiveTradingArmIn,
@@ -3055,7 +3149,7 @@ async def polymarket_us_trading_emergency_stop(
 
 @app.post(
     "/api/polymarket-us/trading/run",
-    dependencies=[Depends(verify_auth)],
+    dependencies=[Depends(verify_lane_operator)],
 )
 async def polymarket_us_trading_run(
     lane: ExecutionLane | None = None,
@@ -3079,7 +3173,7 @@ async def polymarket_us_trading_run(
 
 @app.post(
     "/api/polymarket-us/trading/liquidate",
-    dependencies=[Depends(verify_auth)],
+    dependencies=[Depends(verify_lane_operator)],
 )
 async def polymarket_us_trading_liquidate(
     payload: LiveTradingLiquidateIn,
@@ -3114,7 +3208,7 @@ async def polymarket_us_trading_liquidate(
 
 @app.delete(
     "/api/polymarket-us/trading/history/dry-run",
-    dependencies=[Depends(verify_auth)],
+    dependencies=[Depends(verify_lane_operator)],
 )
 async def polymarket_us_trading_clear_dry_run_history(
     payload: DryRunHistoryClearIn,
@@ -3137,17 +3231,42 @@ async def polymarket_us_trading_clear_dry_run_history(
     dependencies=[Depends(verify_auth)],
 )
 async def polymarket_us_trading_exit_position(
+    request: Request,
     position_id: str,
     payload: LiveTradingPositionExitIn,
+    lane: ExecutionLane | None = None,
 ):
     try:
-        trader = _require_live_trader()
-        position = await asyncio.to_thread(trader.position, position_id)
-        if position is None and dry_run_trader is not None:
-            trader = dry_run_trader
-            position = await asyncio.to_thread(trader.position, position_id)
+        # A named lane searches only that book. Without one, search every
+        # available lane (the historical live-then-dry order, plus Alex) so
+        # older clients keep working.
+        if lane is not None:
+            searched: list[tuple[ExecutionLane, PolymarketUSAutoTrader]] = [
+                (lane, _require_execution_lane(lane))
+            ]
+        else:
+            searched = [("live", _require_live_trader())]
+            if alex_trader is not None:
+                searched.append(("alex", alex_trader))
+            if dry_run_trader is not None:
+                searched.append(("dry_run", dry_run_trader))
+        position = None
+        position_lane: ExecutionLane = "live"
+        trader = searched[0][1]
+        for search_lane, search_trader in searched:
+            candidate = await asyncio.to_thread(
+                search_trader.position, position_id
+            )
+            if candidate is not None:
+                position = candidate
+                position_lane = search_lane
+                trader = search_trader
+                break
         if position is None:
             raise HTTPException(404, "Managed position was not found")
+        # Selling someone's position adds risk to their book, so the owner
+        # gate binds to the lane the position actually lives in.
+        _require_lane_operator(request, position_lane)
         if position["mode"] == "live":
             if trader.policy.execution_mode != "live":
                 raise HTTPException(
@@ -3225,7 +3344,7 @@ async def polymarket_us_trading_positions(
 
 @app.post(
     "/api/polymarket-us/trading/positions/archive-exited",
-    dependencies=[Depends(verify_auth)],
+    dependencies=[Depends(verify_lane_operator)],
 )
 async def polymarket_us_trading_archive_exited_positions(
     lane: ExecutionLane | None = None,
@@ -3453,7 +3572,7 @@ async def polymarket_us_trading_model_readiness(
 
 @app.post(
     "/api/polymarket-us/trading/policy-advisor/{advice_id}/apply",
-    dependencies=[Depends(verify_auth)],
+    dependencies=[Depends(verify_lane_operator)],
 )
 async def polymarket_us_trading_apply_policy_advice(
     advice_id: str,
@@ -3472,14 +3591,15 @@ async def polymarket_us_trading_apply_policy_advice(
 
 @app.post(
     "/api/polymarket-us/trading/performance/reset-live",
-    dependencies=[Depends(verify_auth)],
+    dependencies=[Depends(verify_lane_operator)],
 )
 async def polymarket_us_trading_reset_live_performance(
     payload: LivePerformanceResetIn,
+    lane: ExecutionLane | None = None,
 ):
     try:
         return await asyncio.to_thread(
-            _require_live_trader().reset_live_performance,
+            _require_credential_lane(lane).reset_live_performance,
             payload.confirmation,
         )
     except TradingPolicyError as exc:
@@ -3505,7 +3625,7 @@ async def polymarket_us_trading_reset_dry_run_performance(
 
 @app.post(
     "/api/polymarket-us/trading/risk-session/reset",
-    dependencies=[Depends(verify_auth)],
+    dependencies=[Depends(verify_lane_operator)],
 )
 async def polymarket_us_trading_reset_risk_session(
     payload: RiskSessionResetIn,
@@ -3565,6 +3685,8 @@ async def export_research_data():
     traders = {"live": trader}
     if dry_run_trader is not None:
         traders["dry_run"] = dry_run_trader
+    if alex_trader is not None:
+        traders["alex"] = alex_trader
     try:
         await asyncio.to_thread(
             write_research_bundle,
@@ -3601,6 +3723,11 @@ async def import_research_data(bundle: UploadFile = File(...)):
                 **(
                     {"dry_run": dry_run_trader}
                     if dry_run_trader is not None
+                    else {}
+                ),
+                **(
+                    {"alex": alex_trader}
+                    if alex_trader is not None
                     else {}
                 ),
             },

@@ -43,6 +43,40 @@ def _optional_path(env: Mapping[str, str], name: str) -> Path | None:
     return Path(value) if value else None
 
 
+_OWNABLE_LANES = ("live", "alex")
+
+
+def _lane_owners(env: Mapping[str, str], name: str) -> dict[str, str]:
+    """Parse ``lane:username`` pairs, e.g. ``live:anthony,alex:alex``.
+
+    Only the two live-mode lanes can be owned; the dry-run lane is a shared
+    measurement bed. An empty value keeps every lane unowned, which preserves
+    the historical any-authenticated-user behavior.
+    """
+    raw = env.get(name, "").strip()
+    if not raw:
+        return {}
+    owners: dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if ":" not in pair:
+            raise ValueError(f"{name} entries must be lane:username pairs")
+        lane, username = (part.strip() for part in pair.split(":", 1))
+        if lane not in _OWNABLE_LANES:
+            raise ValueError(
+                f"{name} lane must be one of {'/'.join(_OWNABLE_LANES)}; "
+                f"got {lane!r}"
+            )
+        if not username:
+            raise ValueError(f"{name} owner username must not be empty")
+        if lane in owners:
+            raise ValueError(f"{name} names the {lane} lane twice")
+        owners[lane] = username
+    return owners
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     environment: str
@@ -83,6 +117,10 @@ class Settings:
     polymarket_us_alex_key_id: str
     polymarket_us_alex_secret_key: str
     polymarket_us_alex_trading_db: Path
+    # Optional lane ownership so each person controls only their own lane
+    # (policy, arming, credentials, sells) with their own login. Unset lanes
+    # keep the historical any-authenticated-user behavior.
+    polymarket_us_lane_owners: dict[str, str]
     model_lab_db: Path
     odds_api_key: str
     odds_regions: str
@@ -178,6 +216,9 @@ class Settings:
                     "polymarket-us-alex.db",
                 )
             ),
+            polymarket_us_lane_owners=_lane_owners(
+                values, "POLYMARKET_US_LANE_OWNERS"
+            ),
             model_lab_db=Path(
                 values.get("MODEL_LAB_DB", "workstation-data/model-lab.db")
             ),
@@ -221,3 +262,19 @@ class Settings:
             raise ValueError(
                 "POLYMARKET_US_KEY_ID and POLYMARKET_US_SECRET_KEY must be set together"
             )
+        if self.polymarket_us_lane_owners:
+            # An owner that matches no login would permanently lock its lane,
+            # so a typo must fail loudly at startup rather than at 3 AM.
+            known = {
+                pair.split(":", 1)[0].strip()
+                for pair in self.authorized_users.split(",")
+                if ":" in pair
+            }
+            known.add(self.admin_username)
+            for lane, owner in self.polymarket_us_lane_owners.items():
+                if owner not in known:
+                    raise ValueError(
+                        f"POLYMARKET_US_LANE_OWNERS names {owner!r} for the "
+                        f"{lane} lane, but no such login exists in "
+                        "AUTHORIZED_USERS or ADMIN_USERNAME"
+                    )

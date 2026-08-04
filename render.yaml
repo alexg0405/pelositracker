@@ -15,6 +15,12 @@ services:
         sync: false
       - key: ADMIN_PASSWORD
         sync: false
+      # Two-person hosted use: set to "anthony:<password>,alex:<password>" in
+      # the Render dashboard (never in this file) so each person has their own
+      # login. Set ADMIN_USERNAME=anthony so research import/export stays with
+      # the site operator.
+      - key: AUTHORIZED_USERS
+        sync: false
       - key: THE_ODDS_API_KEY   # optional; public Polymarket feeds need no key
         sync: false
       - key: ODDS_POLL_SECONDS
@@ -40,6 +46,21 @@ services:
       - key: POLYMARKET_US_KEY_ID
         sync: false
       - key: POLYMARKET_US_SECRET_KEY
+        sync: false
+      # Second live lane so Alex trades his own Polymarket account beside
+      # Anthony's. Each lane keeps its own policy, book, journal, and arming
+      # latch; hosted storage separates them by PostgreSQL schema.
+      - key: ENABLE_POLYMARKET_US_ALEX_LANE
+        value: "true"
+      # Bind each live lane to one login: only that person can save policy,
+      # arm, sell, or install the lane's API key. Anyone can still stop or
+      # disarm any lane. Keys are usually pasted per-session from the
+      # dashboard; the env pair below is the optional persistent fallback.
+      - key: POLYMARKET_US_LANE_OWNERS
+        value: "live:anthony,alex:alex"
+      - key: POLYMARKET_US_ALEX_KEY_ID
+        sync: false
+      - key: POLYMARKET_US_ALEX_SECRET_KEY
         sync: false
       # Used only if DATABASE_URL is missing. The dashboard marks this fallback
       # as non-durable on hosted instances.

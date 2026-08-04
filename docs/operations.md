@@ -322,6 +322,31 @@ workstation runs use `POLYMARKET_US_ALEX_TRADING_DB`
 default — the server behaves exactly as a single-live-lane deployment and
 the Alex button stays hidden.
 
+### Per-person logins and lane ownership (added 2026-08-04)
+
+A shared hosted dashboard is one server, not two instances, so lane
+ownership binds each live lane to one login. Configure:
+
+- `AUTHORIZED_USERS="anthony:<password>,alex:<password>"` — two separate
+  logins (sessions and CSRF tokens are already per-session).
+- `ADMIN_USERNAME=anthony` — research import/export and unowned-lane
+  credential installs stay with the site operator.
+- `POLYMARKET_US_LANE_OWNERS="live:anthony,alex:alex"` — each owner must
+  match a configured login or the server refuses to start.
+
+With ownership set, an owned lane accepts **policy saves, arming, cycle
+runs, sells/liquidation, wipes, advisor applies, performance and
+risk-session resets, and API-key install/forget** only from its owner's
+login. Every authenticated user can still **watch any lane, stop it,
+disarm it, or emergency-stop it** — anyone can make a lane safer, only the
+owner can add risk. The dry-run lane stays shared. Each person's dashboard
+lands on their own lane by default and shows the selected lane's key
+fingerprint; runtime keys still install into whichever live lane is
+selected, now gated to that lane's owner. `render.yaml` ships the two-lane
+ownership layout; the passwords and API keys remain dashboard-only Render
+variables. With `POLYMARKET_US_LANE_OWNERS` unset nothing changes from the
+historical single-operator behavior.
+
 ## Settings derivation 2026-08-04 (post Aug-3 slate)
 
 The lock readout graded 16 of 19 decay sales as settlement winners

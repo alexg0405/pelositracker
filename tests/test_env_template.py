@@ -16,7 +16,7 @@ _TEMPLATE = _ROOT / "env.example"
 # check updates itself when a setting is added (values.get("X"...) and the
 # _float/_bool/_int/_optional_path(values, "X"...) helpers).
 _ENV_KEY_PATTERN = re.compile(
-    r'(?:values\.get|_float|_bool|_int|_optional_path)'
+    r'(?:values\.get|_float|_bool|_int|_optional_path|_lane_owners)'
     r'\(\s*(?:values,\s*)?"([A-Z][A-Z0-9_]+)"'
 )
 # Documented keys in the template, including intentionally-commented optionals
