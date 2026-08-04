@@ -32,6 +32,15 @@
 - Made the native-engine import fail closed at first scoring call rather than at
   import, so storage, security, and identity tests no longer need the compiled
   extension; production startup still refuses to run without it.
+- Added `idx_account_bets_open_exposure`, a covering partial index on
+  `account_bets(account, correlation_group, stake) WHERE status='open'`
+  (accounts migration v5). `account_bets` previously had no index of its own,
+  so the open-exposure sums in `place` — which run on every decision with entry
+  candidates — read every row an account had ever placed: 12.2 ms at 100k rows,
+  growing with history. Now 0.14 ms and 0.09 ms. Derived from real query plans
+  via the new `tools/explain_queries.py`; the report's five other proposed
+  indexes were measured and not adopted, since the queries they targeted are
+  already served.
 - Moved the canonical evaluation request out of `decision_marks` into a new
   `decision_inputs` table (ledger migration v9): one zlib-compressed row per
   `decision_hash` instead of a ~1.1 MiB blob inline on every `PAPER_BET` row.

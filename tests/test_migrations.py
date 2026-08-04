@@ -22,6 +22,7 @@ def test_fresh_shared_sqlite_database_applies_each_component_once(tmp_path):
         ("account_activity", 1),
         ("account_marks", 1),
         ("accounts", 1), ("accounts", 2), ("accounts", 3), ("accounts", 4),
+        ("accounts", 5),
         ("history", 1), ("history", 2), ("history", 3),
         ("history", 4),
         ("history", 5),

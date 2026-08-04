@@ -674,6 +674,27 @@ class AccountBook:
                     "active": "INTEGER NOT NULL DEFAULT 1",
                 },
             })
+            # Open-exposure lookups run on every decision that has entry
+            # candidates: `place` sums an account's open stake, and again per
+            # correlation group. `account_bets` carried no index of its own, so
+            # both fell back to the UNIQUE(account, event_id, market, outcome)
+            # auto-index and read every row that account had ever placed --
+            # measured at 12.2 ms against 100k rows, growing with history.
+            #
+            # Partial (open bets are a small live tail of a mostly-settled
+            # table) and covering (carrying correlation_group and stake, so the
+            # sums never touch the table): 12.2 ms -> 0.14 ms and 0.09 ms.
+            # Validate any change here with `python -m tools.explain_queries`.
+            #
+            # Deliberately NOT indexing the event-scoped predicates: they read
+            # ~0.1 ms already, because the same auto-index is skip-scanned for
+            # `event_id=?`. An index earns its write cost or it does not go in.
+            self._db.initialize(
+                "CREATE INDEX IF NOT EXISTS idx_account_bets_open_exposure "
+                "ON account_bets(account, correlation_group, stake) "
+                "WHERE status='open';",
+                component="accounts", version=5,
+            )
             self._db.initialize(_MARKS_SCHEMA, component="account_marks", version=1)
             self._db.initialize(_ACTIVITY_SCHEMA, component="account_activity", version=1)
             # Preserve custom bots created before the explicit flag existed.

@@ -271,6 +271,42 @@ Properties preserved, each with a test in `tests/test_decision_inputs.py`:
   with its own `as_of` index. Without that, the table added to bound disk would
   itself grow without limit — the exact failure being fixed.
 
+## Fifth pass: indexes derived from real query plans
+
+The report proposed six composite/partial indexes, explicitly as hypotheses.
+`tools/explain_queries.py` populates `account_bets` with production-shaped
+volume and runs the queries the application really issues, because an index that
+does not match the actual predicate is dead weight that still costs a write on
+every insert.
+
+Median ms, 100,000 rows, each index measured alone:
+
+| Query (call site) | baseline | report's | event_id-leading | **covering partial** |
+|---|---:|---:|---:|---:|
+| open count by event (`open_count`) | 0.10 | 0.09 | 0.08 | 0.10 |
+| mark by event (`mark_and_cash_out`) | 0.10 | 0.09 | 0.09 | 0.10 |
+| open exposure by account (`place`) | **12.19** | 3.41 | 12.10 | **0.14** |
+| exposure by account + group (`place`) | **12.16** | 3.39 | 12.39 | **0.09** |
+| bets joined to accounts | 0.10 | 0.09 | 0.09 | 0.10 |
+
+Three findings, and two of them contradict an assumption that was worth testing:
+
+1. **`account_bets` had no index of its own.** The exposure sums in `place` —
+   which run on every decision with entry candidates — fell back to the
+   `UNIQUE(account, event_id, market, outcome)` auto-index and read every row
+   that account had ever placed. 12.2 ms, growing with history.
+2. **The event-scoped queries needed nothing.** They read ~0.1 ms already,
+   because SQLite skip-scans the same auto-index for `event_id=?`. An
+   `(event_id, status)` index changes nothing and was rejected — it is recorded
+   as a negative result in the tool so it does not get re-proposed.
+3. **The report's index was directionally right but the wrong shape.** Leading
+   with `account` and filtering `status='open'` gets 3.6×; making it *covering*
+   for the actual predicate — carrying `correlation_group` and `stake`, so the
+   sums never touch the table — gets 85× and 143×.
+
+Only `idx_account_bets_open_exposure` was added (accounts migration v5). One
+index, because one is what the measurements justified.
+
 ## Event-loop lag
 
 `normal` fixture, 8 events scoring concurrently, lag sampled by an ordinary
