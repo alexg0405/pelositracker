@@ -24,7 +24,17 @@ def start_memory_trace() -> None:
 
 def _windows_memory_counters():
     """The Win32 PROCESS_MEMORY_COUNTERS for this process, or None. Exposes both
-    the current (WorkingSetSize) and peak (PeakWorkingSetSize) working set."""
+    the current (WorkingSetSize) and peak (PeakWorkingSetSize) working set.
+
+    The platform test is what makes ``ctypes.windll`` legal to reference: it
+    exists only on Windows, and a type checker running against the Linux deploy
+    target rejects the attribute outright. Narrowing on ``sys.platform`` tells it
+    this block is Windows-only, and it is better than the previous reliance on
+    the AttributeError being swallowed below -- an exception was doing the work
+    of a conditional on every non-Windows call.
+    """
+    if sys.platform != "win32":
+        return None
     try:
         import ctypes
         from ctypes import wintypes
