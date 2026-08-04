@@ -8,6 +8,8 @@ import pytest
 import app.main as main_module
 from app.main import app, store
 from app.models import Event, Quote, Signal
+from app.security import SlidingWindowLimiter
+from app.telemetry import decision_sizes, stage_latency
 
 
 def login(client):
@@ -43,6 +45,43 @@ def enabled_live_trading(monkeypatch, tmp_path):
             polymarket_us_dry_run_db=dry_run_db,
         ),
     )
+
+
+def test_runtime_endpoint_reports_the_decision_stage_breakdown(monkeypatch):
+    """Latency has to be readable from the running service, not only offline.
+
+    Without this, every optimization claim about the decision path would rest on
+    a benchmark run on a developer's machine rather than on production shape.
+    """
+    # The module-level login limiter is shared by the whole suite and allows ten
+    # logins per five minutes, so a test that adds one can push an unrelated
+    # test over the limit. Same fixture the scheduler tests use.
+    monkeypatch.setattr(main_module, "login_limiter", SlidingWindowLimiter(10, 5 * 60))
+    stage_latency.observe("engine.native", 0.001)
+    decision_sizes.observe("decision_request_bytes", 1_234)
+    with TestClient(app) as client:
+        login(client)
+        runtime = client.get("/api/runtime")
+        assert runtime.status_code == 200
+        performance = runtime.json()["performance"]
+        assert set(performance) == {"stages", "sizes"}
+        assert performance["stages"]["engine.native"]["count"] >= 1
+        assert performance["sizes"]["decision_request_bytes"]["max"] >= 1_234
+        for stats in performance["stages"].values():
+            assert stats["p99"] >= stats["p50"] >= 0.0
+
+        # Identity memoization is only a win if the hit rate is high on real
+        # market vocabulary, so the counters have to be readable in production.
+        caches = runtime.json()["identity_caches"]
+        assert {"base_market_type", "market_scope", "market_key",
+                "canonical_source", "classify_source"} <= set(caches)
+        for stats in caches.values():
+            assert stats["entries"] <= stats["maxsize"]
+
+
+def test_runtime_endpoint_requires_a_session():
+    with TestClient(app) as client:
+        assert client.get("/api/runtime").status_code == 401
 
 
 def test_registered_event_can_be_removed():

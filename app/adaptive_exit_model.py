@@ -21,7 +21,8 @@ import json
 import math
 import re
 import threading
-from typing import Any, Callable, Mapping
+from typing import Any
+from collections.abc import Callable, Mapping
 
 from .approval import APPROVAL_TOKEN, approval_granted, approval_instruction
 from .database import Database
@@ -921,7 +922,7 @@ class AdaptiveExitModel:
         now = self._clock()
         bucket = int(now // ADAPTIVE_EXIT_OBSERVATION_BUCKET_SECONDS)
         identifier = hashlib.sha256(
-            f"{position['id']}|{bucket}".encode("utf-8")
+            f"{position['id']}|{bucket}".encode()
         ).hexdigest()
         state = decision.state
         feature_payload = {

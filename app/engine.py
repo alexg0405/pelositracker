@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import math
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -20,6 +23,7 @@ from .lines import (
 )
 from .models import GameState, Quote, Signal, canonical_source, classify_source
 from .execution import BookLevel, simulate_buy
+from .telemetry import decision_sizes, stage_latency
 
 
 ENGINE_VERSION = "live-edge-engine-0.6.3"
@@ -28,13 +32,95 @@ SOURCE_MAPPING_VERSION = "canonical-source-family-v1"
 DEFAULT_MODEL_VERSION = "equal-family-logit-consensus-v2-display-only"
 EXECUTION_POLICY_VERSION = "paper-depth-fee-rate-v3"
 
+NATIVE_ENGINE_BUILD_HINT = (
+    "The Rust engine is not built. Run: .\\.venv\\Scripts\\python.exe -m "
+    "maturin develop --release"
+)
+
+
+class NativeEngineUnavailable(RuntimeError):
+    """Raised when scoring is attempted without the compiled Rust extension."""
+
+
+# Importing the extension is deliberately allowed to fail *here* and made fatal
+# at the first scoring call instead. Raising at import time meant a missing
+# native build stopped unrelated storage, security, identity and HTTP tests from
+# even being collected, which made the extension a prerequisite for work that
+# does not touch it. Scoring itself still fails closed -- there is no Python
+# fallback scorer -- and production startup asserts the engine is present (see
+# require_native_engine's call in the application lifespan).
 try:
-    from ._native_engine import evaluate_json
-except ImportError as exc:  # pragma: no cover - exercised only before native build
-    raise ImportError(
-        "The Rust engine is not built. Run: .\\.venv\\Scripts\\python.exe -m "
-        "maturin develop --release"
-    ) from exc
+    from ._native_engine import evaluate_json as _native_evaluate_json
+except ImportError:  # pragma: no cover - exercised only before native build
+    _native_evaluate_json = None
+
+
+def require_native_engine() -> Callable[[str], str]:
+    """The native scorer, or a hard failure explaining how to build it."""
+    if _native_evaluate_json is None:
+        raise NativeEngineUnavailable(NATIVE_ENGINE_BUILD_HINT)
+    return _native_evaluate_json
+
+
+def native_engine_available() -> bool:
+    return _native_evaluate_json is not None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedRequest:
+    """One immutable, fully-canonicalized decision input.
+
+    Splitting preparation from scoring is what lets the native round trip run
+    on a worker thread while the store mutation and signal installation stay on
+    the event-loop thread. Only ``canonical_request`` -- a ``str``, so nothing
+    the loop can still mutate -- has to cross into the worker.
+
+    The lineage versions are snapshotted here rather than re-read off the engine
+    during materialization: the canonical request already embeds them, so
+    reading them again later would let a calibration install that landed
+    mid-evaluation stamp a signal with lineage its own decision hash never
+    covered.
+    """
+
+    event_id: str
+    as_of: datetime
+    canonical_request: str
+    request_bytes: int
+    decision_hash: str
+    configuration_hash: str
+    model_version: str
+    calibration_version: str
+    independent_model_registry_version: str
+    audit_by_key: Mapping[tuple[str, str, str], dict]
+
+
+def _native_round_trip(canonical_request: str) -> list[dict]:
+    """The native scoring round trip: JSON in, parsed results out.
+
+    Kept as a module-level function taking only a ``str`` so it is safe to hand
+    to a worker thread -- it touches no engine or store state.
+    """
+    scorer = require_native_engine()
+    with stage_latency.timer("engine.native"):
+        results = json.loads(scorer(canonical_request))
+    decision_sizes.observe("decision_output_count", len(results))
+    return results
+
+
+def evaluate_prepared(prepared: PreparedRequest) -> list[dict]:
+    """Score a prepared request on the calling thread."""
+    return _native_round_trip(prepared.canonical_request)
+
+
+async def evaluate_prepared_async(prepared: PreparedRequest) -> list[dict]:
+    """Score a prepared request on a worker thread.
+
+    ``asyncio.to_thread`` alone would not help a CPU-bound extension that holds
+    the interpreter for the duration; it pays off because the Rust side detaches
+    from Python around the scoring kernel (native_engine::evaluate_json), so the
+    event loop really does get its thread back.
+    """
+    return await asyncio.to_thread(_native_round_trip, prepared.canonical_request)
 
 
 class SignalEngine:
@@ -155,6 +241,59 @@ class SignalEngine:
                  pregame_total: float | None = None,
                  *, as_of: datetime | None = None,
                  canonical_event_id: str | None = None) -> list[Signal]:
+        """Score an event synchronously. Equivalent to prepare + native + materialize."""
+        prepared = self.prepare_request(
+            event_id, quotes, states, away_outcome, sport, league, home_outcome,
+            pregame_spread, pregame_total, as_of=as_of,
+            canonical_event_id=canonical_event_id,
+        )
+        return self.materialize_signals(prepared, evaluate_prepared(prepared))
+
+    async def evaluate_async(self, event_id: str, quotes: list[Quote],
+                             states: list[GameState],
+                             away_outcome: str = "away", sport: str = "", league: str = "",
+                             home_outcome: str = "",
+                             pregame_spread: float | None = None,
+                             pregame_total: float | None = None,
+                             *, as_of: datetime | None = None,
+                             canonical_event_id: str | None = None) -> list[Signal]:
+        """Score an event with the native round trip off the calling thread.
+
+        Preparation and materialization stay on the caller's thread because they
+        read engine configuration and build ``Signal`` objects the caller then
+        installs; only the Rust call is offloaded. Combined with ``py.detach`` on
+        the Rust side, that is what keeps the event loop responsive while an
+        event is being scored.
+        """
+        prepared = self.prepare_request(
+            event_id, quotes, states, away_outcome, sport, league, home_outcome,
+            pregame_spread, pregame_total, as_of=as_of,
+            canonical_event_id=canonical_event_id,
+        )
+        results = await evaluate_prepared_async(prepared)
+        return self.materialize_signals(prepared, results)
+
+    def prepare_request(self, event_id: str, quotes: list[Quote], states: list[GameState],
+                        away_outcome: str = "away", sport: str = "", league: str = "",
+                        home_outcome: str = "",
+                        pregame_spread: float | None = None,
+                        pregame_total: float | None = None,
+                        *, as_of: datetime | None = None,
+                        canonical_event_id: str | None = None) -> PreparedRequest:
+        with stage_latency.timer("engine.prepare"):
+            return self._prepare_request(
+                event_id, quotes, states, away_outcome, sport, league, home_outcome,
+                pregame_spread, pregame_total, as_of=as_of,
+                canonical_event_id=canonical_event_id,
+            )
+
+    def _prepare_request(self, event_id: str, quotes: list[Quote], states: list[GameState],
+                         away_outcome: str = "away", sport: str = "", league: str = "",
+                         home_outcome: str = "",
+                         pregame_spread: float | None = None,
+                         pregame_total: float | None = None,
+                         *, as_of: datetime | None = None,
+                         canonical_event_id: str | None = None) -> PreparedRequest:
         if as_of is None:
             raise ValueError("as_of is required for deterministic evaluation")
         as_of = ensure_utc(as_of)
@@ -221,10 +360,13 @@ class SignalEngine:
                 for s in states
             ],
         }
-        canonical_request = json.dumps(request, separators=(",", ":"), sort_keys=True,
-                                       allow_nan=False)
-        decision_hash = hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()
-        results = json.loads(evaluate_json(canonical_request))
+        with stage_latency.timer("engine.canonicalize"):
+            canonical_request = json.dumps(request, separators=(",", ":"), sort_keys=True,
+                                           allow_nan=False)
+            encoded_request = canonical_request.encode("utf-8")
+            decision_hash = hashlib.sha256(encoded_request).hexdigest()
+        decision_sizes.observe("decision_request_bytes", len(encoded_request))
+        decision_sizes.observe("decision_quote_payloads", len(quote_payloads))
         # Index the audit payloads once instead of re-scanning quote_payloads for
         # every result (was O(results x quotes)). setdefault keeps the first
         # match, preserving the previous next()-based selection exactly.
@@ -232,38 +374,57 @@ class SignalEngine:
         for payload in quote_payloads:
             audit_by_key.setdefault(
                 (payload["market"], payload["outcome"], payload["source"]), payload)
-        signals = []
-        for result in results:
-            audit = audit_by_key.get(
-                (result["market"], result["outcome"], result["quote_source"]), {})
-            decision_id = hashlib.sha256(
-                f"{decision_hash}:{result['market']}:{result['outcome']}".encode("utf-8")
-            ).hexdigest()
-            signals.append(Signal(
-                **result,
-                observed_at=as_of,
-                decision_hash=decision_hash,
-                requested_cash=audit.get("requested_cash"),
-                filled_cash=audit.get("filled_cash"),
-                filled_shares=audit.get("filled_shares"),
-                execution_fee=audit.get("execution_fee"),
-                execution_vwap=audit.get("execution_vwap"),
-                execution_complete=bool(audit.get("execution_complete")),
-                decision_id=decision_id,
-                engine_version=ENGINE_VERSION,
-                configuration_hash=configuration_hash,
-                source_mapping_version=SOURCE_MAPPING_VERSION,
-                model_version=self.model_version,
-                calibration_version=self.calibration_version,
-                independent_model_registry_version=(
-                    self.independent_model_registry_version
-                ),
-                execution_policy_version=EXECUTION_POLICY_VERSION,
-                input_snapshot_json=canonical_request,
-                token_id=audit.get("token_id"),
-                order_book_snapshot_id=audit.get("book_hash"),
-            ))
-        return signals
+        return PreparedRequest(
+            event_id=event_id,
+            as_of=as_of,
+            canonical_request=canonical_request,
+            request_bytes=len(encoded_request),
+            decision_hash=decision_hash,
+            configuration_hash=configuration_hash,
+            model_version=self.model_version,
+            calibration_version=self.calibration_version,
+            independent_model_registry_version=self.independent_model_registry_version,
+            audit_by_key=audit_by_key,
+        )
+
+    def materialize_signals(self, prepared: PreparedRequest,
+                            results: list[dict]) -> list[Signal]:
+        """Turn native scorer output into ``Signal`` objects with full lineage."""
+        with stage_latency.timer("engine.materialize"):
+            decision_hash = prepared.decision_hash
+            audit_by_key = prepared.audit_by_key
+            signals = []
+            for result in results:
+                audit = audit_by_key.get(
+                    (result["market"], result["outcome"], result["quote_source"]), {})
+                decision_id = hashlib.sha256(
+                    f"{decision_hash}:{result['market']}:{result['outcome']}".encode()
+                ).hexdigest()
+                signals.append(Signal(
+                    **result,
+                    observed_at=prepared.as_of,
+                    decision_hash=decision_hash,
+                    requested_cash=audit.get("requested_cash"),
+                    filled_cash=audit.get("filled_cash"),
+                    filled_shares=audit.get("filled_shares"),
+                    execution_fee=audit.get("execution_fee"),
+                    execution_vwap=audit.get("execution_vwap"),
+                    execution_complete=bool(audit.get("execution_complete")),
+                    decision_id=decision_id,
+                    engine_version=ENGINE_VERSION,
+                    configuration_hash=prepared.configuration_hash,
+                    source_mapping_version=SOURCE_MAPPING_VERSION,
+                    model_version=prepared.model_version,
+                    calibration_version=prepared.calibration_version,
+                    independent_model_registry_version=(
+                        prepared.independent_model_registry_version
+                    ),
+                    execution_policy_version=EXECUTION_POLICY_VERSION,
+                    input_snapshot_json=prepared.canonical_request,
+                    token_id=audit.get("token_id"),
+                    order_book_snapshot_id=audit.get("book_hash"),
+                ))
+            return signals
 
     @staticmethod
     def _state_payload(s: GameState, sport: str, league: str) -> dict:

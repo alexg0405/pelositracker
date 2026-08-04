@@ -265,10 +265,8 @@ def main() -> int:
     args = parser.parse_args()
     lanes = args.lane_db or list(DEFAULT_LANES)
     missing = find_missing(lanes, args.history_db)
-    decisions = []
     with httpx.Client(timeout=20.0) as client:
-        for item in missing:
-            decisions.append(resolve_final(item, client))
+        decisions = [resolve_final(item, client) for item in missing]
     written = 0
     if args.apply:
         written = apply_writes(args.history_db, decisions)

@@ -2007,18 +2007,35 @@ fn evaluate(request: EvaluateRequest, now_seconds: f64) -> Vec<SignalOutput> {
     signals
 }
 
+/// Score one decision request.
+///
+/// Everything after the request is deserialized is pure Rust that never touches
+/// a Python object, so the whole parse/score/encode body runs inside
+/// `Python::detach`. Without that, this call holds the interpreter for its full
+/// duration: offloading it to a worker thread on the Python side would move the
+/// work but not release the event loop, because the worker would still be the
+/// thread holding the GIL. Detaching is also the shape free-threaded Python
+/// wants, since it declares outright that no interpreter state is in use here.
+///
+/// The argument is taken as an owned `String` rather than `&str` on purpose: a
+/// `&str` would borrow the Python object's buffer, and reading it while detached
+/// means reading Python-owned memory with no interpreter reference held. Paying
+/// one copy of the request is a rounding error next to parsing it, and it means
+/// nothing Python owns is touched inside the detached block.
 #[pyfunction]
-fn evaluate_json(request_json: &str) -> PyResult<String> {
-    let request: EvaluateRequest = serde_json::from_str(request_json)
-        .map_err(|error| PyValueError::new_err(format!("invalid engine request: {error}")))?;
-    if !request.as_of.is_finite() {
-        return Err(PyValueError::new_err(
-            "as_of must be a finite Unix timestamp",
-        ));
-    }
-    let as_of = request.as_of;
-    serde_json::to_string(&evaluate(request, as_of))
-        .map_err(|error| PyValueError::new_err(format!("could not encode signals: {error}")))
+fn evaluate_json(py: Python<'_>, request_json: String) -> PyResult<String> {
+    py.detach(move || {
+        let request: EvaluateRequest = serde_json::from_str(&request_json)
+            .map_err(|error| PyValueError::new_err(format!("invalid engine request: {error}")))?;
+        if !request.as_of.is_finite() {
+            return Err(PyValueError::new_err(
+                "as_of must be a finite Unix timestamp",
+            ));
+        }
+        let as_of = request.as_of;
+        serde_json::to_string(&evaluate(request, as_of))
+            .map_err(|error| PyValueError::new_err(format!("could not encode signals: {error}")))
+    })
 }
 
 #[pymodule]

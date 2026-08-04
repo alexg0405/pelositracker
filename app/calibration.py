@@ -48,7 +48,7 @@ class BetaCoefficients:
     c: float
 
     @classmethod
-    def from_value(cls, value: dict[str, Any] | list[float] | tuple[float, ...]) -> "BetaCoefficients":
+    def from_value(cls, value: dict[str, Any] | list[float] | tuple[float, ...]) -> BetaCoefficients:
         if isinstance(value, dict):
             coefficients = cls(
                 _finite(value["a"], "beta a"),
@@ -100,7 +100,7 @@ class CalibrationPolicy:
     missing_family_coefficients: tuple[tuple[str, float], ...] = ()
 
     @classmethod
-    def from_payload(cls, payload: dict[str, Any]) -> "CalibrationPolicy":
+    def from_payload(cls, payload: dict[str, Any]) -> CalibrationPolicy:
         calibration_method = _key(payload.get("calibration_method"), "identity")
         coefficients = BetaCoefficients.from_value(
             payload.get("beta_coefficients", {"a": 1.0, "b": 1.0, "c": 0.0})
@@ -355,7 +355,7 @@ class CalibrationArtifact:
     action_eligible: bool = True
 
     @classmethod
-    def load(cls, path: str | Path) -> "CalibrationArtifact":
+    def load(cls, path: str | Path) -> CalibrationArtifact:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         version = str(payload["artifact_version"])
         if version == "1":

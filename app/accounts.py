@@ -156,7 +156,7 @@ class Strategy:
         return json.dumps(asdict(self))
 
     @staticmethod
-    def from_json(raw: str) -> "Strategy":
+    def from_json(raw: str) -> Strategy:
         data = json.loads(raw)
         known = {f.name for f in fields(Strategy)}
         data = {k: v for k, v in data.items() if k in known}

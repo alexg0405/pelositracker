@@ -1,0 +1,16 @@
+{
+  "name": "heavy",
+  "description": "Prop-heavy event: forty player-prop selections on top of the full game markets, twelve books, deep exchange books and a long tail of superseded quotes. This is the shape that decides whether full-event recomputation stays affordable.",
+  "sport": "basketball",
+  "league": "nba",
+  "sportsbooks": 12,
+  "spread_lines": 8,
+  "total_lines": 8,
+  "player_props": 40,
+  "exchange_book_depth": 12,
+  "stale_duplicates_per_selection": 3,
+  "states": 16,
+  "invalid_quotes": 0,
+  "quarantined_quotes": 0,
+  "aggregator_aliases": 2
+}

@@ -107,7 +107,7 @@ class BaselineComparison:
     probability_log_loss_better: float
 
     @classmethod
-    def from_payload(cls, payload: dict[str, Any]) -> "BaselineComparison":
+    def from_payload(cls, payload: dict[str, Any]) -> BaselineComparison:
         comparison = cls(
             sample_size=_integer(payload["sample_size"], "baseline sample size"),
             brier_score=_finite(payload["brier_score"], "baseline Brier score"),
@@ -142,7 +142,7 @@ class CalibrationSlice:
     calibration_slope: float
 
     @classmethod
-    def from_payload(cls, payload: dict[str, Any]) -> "CalibrationSlice":
+    def from_payload(cls, payload: dict[str, Any]) -> CalibrationSlice:
         metric = cls(
             sample_size=_integer(payload["sample_size"], "slice sample size"),
             brier_score=_finite(payload["brier_score"], "slice Brier score"),
@@ -208,7 +208,7 @@ class IndependentModelPolicy:
     reviewed_at: datetime
 
     @classmethod
-    def from_payload(cls, payload: dict[str, Any]) -> "IndependentModelPolicy":
+    def from_payload(cls, payload: dict[str, Any]) -> IndependentModelPolicy:
         approved = payload["approved_for_display"]
         if not isinstance(approved, bool):
             raise ValueError("approved_for_display must be a JSON boolean")
@@ -531,7 +531,7 @@ class IndependentModelArtifact:
     policies: tuple[IndependentModelPolicy, ...]
 
     @classmethod
-    def load(cls, path: str | Path) -> "IndependentModelArtifact":
+    def load(cls, path: str | Path) -> IndependentModelArtifact:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
             raise ValueError("independent-model artifact must contain a JSON model list")

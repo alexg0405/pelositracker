@@ -31,7 +31,8 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any
+from collections.abc import Iterator, Sequence
 
 from app.database import Database
 
@@ -200,13 +201,17 @@ def reset_sequences(target: Database, table: str, columns: Sequence[str]) -> Non
     with target.transaction() as cur:
         target.execute(
             cur,
-            """SELECT setval(
+            # The table name is an identifier, so it is interpolated (as the
+            # INSERT above already does); only the two `pg_get_serial_sequence`
+            # arguments are values and stay as bound parameters. The previous
+            # `%`-format had to smuggle literal "%s" through its own arguments
+            # to achieve this, which read as if the placeholders were data.
+            f"""SELECT setval(
                    pg_get_serial_sequence(%s, 'id'),
-                   COALESCE((SELECT MAX(id) FROM "%s"), 1),
+                   COALESCE((SELECT MAX(id) FROM "{table}"), 1),
                    true
                )
-               WHERE pg_get_serial_sequence(%s, 'id') IS NOT NULL"""
-            % ("%s", table, "%s"),
+               WHERE pg_get_serial_sequence(%s, 'id') IS NOT NULL""",
             (table, table),
         )
 

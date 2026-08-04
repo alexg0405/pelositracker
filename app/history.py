@@ -2,7 +2,7 @@ import threading
 import time
 import json
 import os
-from typing import Iterable
+from collections.abc import Iterable
 
 from .database import Database
 from .models import Event, GameState, Quote

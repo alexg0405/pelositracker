@@ -1,0 +1,16 @@
+{
+  "name": "adversarial",
+  "description": "Same market count as heavy, but most of the input is meant to be rejected: out-of-range probabilities, quarantined identities, aggregator aliases of books already present, and a deep tail of superseded quotes. Measures the cost of the validity and freshness reductions rather than the cost of scoring.",
+  "sport": "basketball",
+  "league": "nba",
+  "sportsbooks": 12,
+  "spread_lines": 8,
+  "total_lines": 8,
+  "player_props": 40,
+  "exchange_book_depth": 24,
+  "stale_duplicates_per_selection": 8,
+  "states": 16,
+  "invalid_quotes": 400,
+  "quarantined_quotes": 200,
+  "aggregator_aliases": 6
+}

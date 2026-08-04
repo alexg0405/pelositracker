@@ -1,0 +1,16 @@
+{
+  "name": "small",
+  "description": "Floor case: a two-way moneyline with two books and no exchange depth. Anything slower than this is fixed overhead, not workload.",
+  "sport": "basketball",
+  "league": "nba",
+  "sportsbooks": 2,
+  "spread_lines": 0,
+  "total_lines": 0,
+  "player_props": 0,
+  "exchange_book_depth": 3,
+  "stale_duplicates_per_selection": 0,
+  "states": 1,
+  "invalid_quotes": 0,
+  "quarantined_quotes": 0,
+  "aggregator_aliases": 0
+}

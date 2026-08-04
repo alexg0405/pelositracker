@@ -38,6 +38,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import itertools
 from math import log
 
 
@@ -117,7 +118,7 @@ def enumerate_scenarios(candidates: list[Candidate]) -> list[Scenario] | None:
         # Boundaries of u induced by the members' win thresholds (their probs).
         cuts = sorted({0.0, 1.0, *(min(max(candidates[i].prob, 0.0), 1.0) for i in members)})
         atoms: list[tuple[float, frozenset[int]]] = []
-        for lo, hi in zip(cuts, cuts[1:]):
+        for lo, hi in itertools.pairwise(cuts):
             mass = hi - lo
             if mass <= 0.0:
                 continue

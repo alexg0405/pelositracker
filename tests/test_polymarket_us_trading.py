@@ -1466,7 +1466,7 @@ def test_reversal_confirmation_defaults_to_single_reading_behavior(tmp_path):
     trader.configure({"min_edge": 0.02})
     position = {"reversal_triggered_ts": None, "reversal_observation_count": 0}
 
-    confirmed, triggered, count = trader._reversal_confirmation(
+    confirmed, _triggered, count = trader._reversal_confirmation(
         position, trader.policy, -0.05
     )
     assert confirmed is True

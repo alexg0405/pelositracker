@@ -15,7 +15,8 @@ import json
 import math
 from pathlib import Path
 import random
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 from .calibration import BetaCoefficients
 from .domain.time import ensure_utc
@@ -109,7 +110,7 @@ class CandidateSpecification:
     missing_family_coefficients: tuple[tuple[str, float], ...] = ()
 
     @classmethod
-    def from_payload(cls, payload: dict[str, Any]) -> "CandidateSpecification":
+    def from_payload(cls, payload: dict[str, Any]) -> CandidateSpecification:
         return cls(
             devig_method=str(payload["devig_method"]).strip().casefold(),
             consensus_method=str(payload["consensus_method"]).strip().casefold(),

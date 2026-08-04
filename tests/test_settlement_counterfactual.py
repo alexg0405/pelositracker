@@ -241,7 +241,7 @@ def test_emits_calibration_pairs_with_stage_labels(
 def test_calibration_pairs_tolerate_missing_stage(
     databases: tuple[Path, Path],
 ) -> None:
-    trading, history = databases
+    _trading, _history = databases
     graded, _ = grade_positions(
         [
             {

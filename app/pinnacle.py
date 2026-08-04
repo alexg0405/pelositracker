@@ -6,7 +6,7 @@ own credential and explicitly enable it; no availability or rate limit is assume
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
 
 import httpx
 

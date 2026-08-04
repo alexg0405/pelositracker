@@ -50,8 +50,8 @@ jobs:
       - name: Python lint and focused types
         run: |
           . .venv/bin/activate
-          ruff check app tests
-          mypy app/domain app/execution.py app/identity.py app/security.py app/settings.py app/calibration.py app/model_training.py app/model_registry.py
+          ruff check app tests tools
+          mypy app/domain app/execution.py app/identity.py app/security.py app/settings.py app/calibration.py app/model_training.py app/model_registry.py app/telemetry.py app/dbwriter.py
 
       - name: Dependency audit
         run: |
@@ -67,6 +67,43 @@ jobs:
         run: |
           cargo fmt --manifest-path native_engine/Cargo.toml -- --check
           cargo clippy --locked --manifest-path native_engine/Cargo.toml --all-targets -- -D warnings
+
+  # Deliberately non-blocking. A shared hosted runner has enough scheduling and
+  # neighbour noise that a latency threshold would either fail constantly or be
+  # set so loose it catches nothing. The value here is the published artifact:
+  # request/output bytes and the stage ordering are stable enough to review, and
+  # a run-over-run comparison shows whether a change moved the decision path.
+  # Tighten this into a gate only after several weeks of variance data, and then
+  # only on the coarse end-to-end numbers.
+  benchmark:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: dtolnay/rust-toolchain@1.97.0
+
+      - name: Install deps and build the native engine
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          maturin develop --release
+
+      - name: Benchmark the decision path
+        run: |
+          . .venv/bin/activate
+          python -m tools.bench_decision --json benchmark-report.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: decision-path-benchmark-${{ github.sha }}
+          path: benchmark-report.json
+          retention-days: 30
 
   docker:
     runs-on: ubuntu-latest

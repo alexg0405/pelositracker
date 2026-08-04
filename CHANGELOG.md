@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased — Measured decision path
+
+- Detached the Rust scorer from the interpreter (`Python::detach`) and split
+  `SignalEngine.evaluate` into `prepare_request` / `evaluate_prepared` /
+  `materialize_signals`, so `record()` awaits the native round trip on a worker
+  instead of running it on the event loop's thread. p99 loop lag under eight
+  concurrent events falls 2.4–3.8x with no throughput loss; decision hashes,
+  signal ids, and lineage are bit-identical.
+- Snapshotted the model/calibration lineage at request preparation, so a
+  calibration installed mid-evaluation can no longer stamp a signal with lineage
+  its own decision hash never covered.
+- Added bounded stage-latency and size distributions (p50/p95/p99) plus an
+  event-loop lag sampler, exposed on `/api/runtime` under `performance`.
+- Added `tools/bench_decision.py` and immutable `benchmarks/fixtures/*.json`
+  covering ingestion, preparation, the native boundary, materialization, loop lag
+  under concurrency, and durable decision writes; CI publishes the report as a
+  non-blocking artifact.
+- Recorded the baseline in `docs/decision-path-performance.md`. It shows the
+  native round trip is ~10% of a prop-heavy decision while Python-side quote
+  payload construction and ingestion are ~85%, and that thin LTO produced no
+  measurable gain, so no release-profile tuning was adopted.
+- Memoized market and source identity normalization (`lines._market_key`,
+  `market_scope`, `base_market_type`, `models.canonical_source`,
+  `classify_source`) with bounded caches, after profiling showed
+  `base_market_type` running ~13 times per quote on the same handful of market
+  names. Interleaved in-session A/B on the prop-heavy fixture: quote ingestion
+  **3.3x** faster, request preparation **1.5x** faster, canonical request and
+  decision hash byte-identical. Hit rates are reported at `/api/runtime` under
+  `identity_caches`; the caches evict rather than grow on unbounded input.
+- Made the native-engine import fail closed at first scoring call rather than at
+  import, so storage, security, and identity tests no longer need the compiled
+  extension; production startup still refuses to run without it.
+- Replaced shared-executor store calls with one bounded write lane per database
+  (`app/dbwriter.py`). Ledger and account writes stay durable-before-continue;
+  model-lab research rows are queued instead of awaited, leaving the per-event
+  critical section. A full queue applies backpressure rather than dropping rows,
+  because discarding model-lab observations would bias the calibration training
+  sample, and shutdown drains before the stores close. Depth, wait time and
+  per-operation latency are reported at `/api/runtime` under `db_writers`.
+- Expanded Ruff to bugbear, asyncio, pyupgrade, simplify, perf, and Ruff-specific
+  rules, added `tools/` to the lint target and `app/telemetry.py` to the type
+  gate, and fixed the findings (including a blocking `unlink` on the event loop).
+
 ## Unreleased — Cost-aware paper-bot exits
 
 - Replaced signal-price bot entries with exact full-depth Decimal ask walks,

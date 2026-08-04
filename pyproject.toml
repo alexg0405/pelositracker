@@ -34,7 +34,67 @@ target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F"]
+# E4/E7/E9/F alone caught syntax and pyflakes problems only. The families below
+# are the bug-oriented ones for this codebase: B finds mutable-default and
+# loop-variable-capture classes of defect, ASYNC finds blocking calls on the
+# event loop (directly relevant to the decision path), PERF finds the loop
+# anti-patterns that show up in the analytical endpoints, and UP/SIM/RUF keep
+# obsolete constructs and needless branching from accumulating.
+select = ["E4", "E7", "E9", "F", "B", "ASYNC", "UP", "SIM", "RUF", "PERF"]
+# Complexity limits (C901/PLR) are deliberately not enabled yet: the execution
+# and orchestration modules would emit hundreds of findings that cannot be fixed
+# without the decomposition work, and that noise would bury real new violations.
+#
+# Every entry below was reviewed against the actual findings rather than added
+# to make the run go green. Anything that turned out to be a genuine defect was
+# fixed instead of listed here.
+ignore = [
+  # Style, not defects: nested `with` blocks in the stores keep the transaction
+  # and lock scopes visually distinct, and collapsing 95 of them into tuple form
+  # would be a large mechanical diff through money-critical code for no
+  # behavioral gain.
+  "SIM117",
+  # `contextlib.suppress` hides which statement is allowed to fail; the explicit
+  # try/except/pass at these sites documents the tolerated error.
+  "SIM105",
+  # Guard-clause chains that end in `return True` read better than one inverted
+  # boolean expression (see SignalEngine._freshest_valid_payloads).
+  "SIM103",
+  # Both flagged closures are called inside the iteration that defines them, so
+  # the late-binding hazard B023 warns about cannot occur here. Re-check any new
+  # occurrence by hand rather than assuming this holds.
+  "B023",
+  # `zip(..., strict=)` changes runtime behavior on length mismatch instead of
+  # fixing a bug; these need individual review, not a bulk edit.
+  "B905",
+  # Ternaries in place of short if/else blocks make gate logic harder to read.
+  "SIM108",
+  # Em dashes and typographic quotes in prose comments are intentional.
+  "RUF001",
+  "RUF002",
+  # `a + [b]` is clearer than `[*a, b]` at these call sites.
+  "RUF005",
+  # Retrying or logging per item requires the try inside the loop; hoisting it
+  # would abort the whole batch on one bad row.
+  "PERF203",
+]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency and body markers are evaluated once at import and are the
+# framework's documented calling convention, so B008 does not apply to them.
+extend-immutable-calls = [
+  "fastapi.Depends",
+  "fastapi.File",
+  "fastapi.Form",
+  "fastapi.Query",
+  "fastapi.Body",
+  "fastapi.Header",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests build deliberately odd inputs, use bare asserts on them, and define
+# throwaway stub classes with mutable attributes.
+"tests/*" = ["B011", "RUF012", "RUF043"]
 
 [tool.mypy]
 python_version = "3.10"

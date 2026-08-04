@@ -8,12 +8,14 @@ fail closed when later-event evidence is too small or uncertain.
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from collections.abc import Iterable, Mapping, Sequence
 import hashlib
+import itertools
 import json
 import math
 import random
 import statistics
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any
 
 
 ADVISOR_VERSION = "execution-policy-advisor-v5-candidate-population"
@@ -334,7 +336,7 @@ def _active_hours(timestamps: Iterable[float]) -> float:
     if len(values) == 1:
         return 0.25
     seconds = 15 * 60
-    for before, after in zip(values, values[1:]):
+    for before, after in itertools.pairwise(values):
         seconds += min(max(0.0, after - before), 60 * 60)
     return max(0.25, seconds / 3600.0)
 
@@ -591,7 +593,10 @@ def _base_candidate_grid(
                 for references in reference_values:
                     for floor, ceiling in sorted(brackets):
                         for markets in sorted(market_sets):
-                            candidates.append({
+                            # An `extend` generator here would hide the grid
+                            # structure this loop nest exists to express, and
+                            # the candidate count is bounded.
+                            candidates.append({  # noqa: PERF401
                                 **base,
                                 "allowed_market_types": list(markets),
                                 "min_edge": minimum,

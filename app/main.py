@@ -12,9 +12,11 @@ import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from functools import partial
 import secrets
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, Mapping
+from typing import Any, Literal
+from collections.abc import Callable, Iterable, Mapping
 
 from fastapi import (
     Depends,
@@ -32,7 +34,8 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field, SecretStr
 from starlette.background import BackgroundTask
 
-from .engine import SignalEngine
+from .dbwriter import writers
+from .engine import SignalEngine, require_native_engine
 from . import __version__, backtest, shadow_eval
 from .accounts import AccountBook, DEFAULT_STRATEGIES, bot_entry_candidates, line_type
 from .tennis_model import (
@@ -57,11 +60,12 @@ from .ledger import Ledger
 from .lines import (
     FULL_GAME_SCOPE,
     SUPPORTED_MARKET_SCOPES,
+    market_cache_stats,
     pregame_priors,
 )
 from .gameclock import game_progress, league_rule, validate_state_transition
 from .matching import start_timestamp
-from .models import Event, GameState, Quote, as_json
+from .models import Event, GameState, Quote, as_json, source_cache_stats
 from .monitor_state import MonitorState
 from .sources import (_odds_quota, exclude_restricted_games, extract_polymarket_slug,
                       game_start_matches_slug, infer_polymarket_event, odds_api_poll,
@@ -75,7 +79,15 @@ from .settings import Settings
 from .security import AuthManager, SlidingWindowLimiter
 from .calibration import load_calibration
 from .model_registry import load_independent_models
-from .telemetry import memory_snapshot, runtime_telemetry, start_memory_trace
+from .telemetry import (
+    decision_sizes,
+    event_loop_monitor,
+    memory_snapshot,
+    performance_snapshot,
+    runtime_telemetry,
+    stage_latency,
+    start_memory_trace,
+)
 from .identity import (CanonicalEvent, MappingDecision, MappingStatus)
 from .domain.time import parse_provider_timestamp
 from .http_clients import close_shared_client, open_shared_client
@@ -147,7 +159,15 @@ _finalized: set[str] = set()
 # is the permanent idempotency guard (ids only, negligible); this is the subset
 # whose heavy buffers we keep for dashboard review until they age past the
 # retention cap. See _evict_finalized_overflow.
-_finalized_order: "OrderedDict[str, None]" = OrderedDict()
+_finalized_order: OrderedDict[str, None] = OrderedDict()
+# One write lane per database. Splitting them is the point: the ledger and the
+# model lab are different files, so their writes no longer have to happen as two
+# serial awaits inside the per-event lock. The research lane is sized larger
+# because it absorbs bursts; the money lanes stay shallow so a backlog there
+# surfaces as visible latency rather than as a deep hidden queue.
+ledger_writer = writers.lane("ledger", max_queue=512)
+account_writer = writers.lane("accounts", max_queue=512)
+model_lab_writer = writers.lane("model_lab", max_queue=2048)
 _terminal_events: dict[str, str] = {}  # event_id -> final | canceled | deleted | shutdown
 _event_locks: dict[str, asyncio.Lock] = {}
 _pregame: dict[str, dict] = {}  # event_id -> {"spread": home point, "total": line}, captured near tip
@@ -168,7 +188,7 @@ _snapshot_lock = asyncio.Lock()
 # status + freshness (compact, every slug, TTL/LRU-bounded); the in-play models
 # need the score-rich payload but only for tracked events (detail, pruned with
 # its compact entry). See on_sports_status / _prune_sports_status.
-_sports_status_compact: "OrderedDict[str, dict]" = OrderedDict()
+_sports_status_compact: OrderedDict[str, dict] = OrderedDict()
 _sports_status_detail: dict[str, dict] = {}
 _SPORTS_STATUS_TTL_SECONDS = 600.0  # drop slugs untouched for 10 min
 _SPORTS_STATUS_MAX = 512  # hard cap on compact entries (LRU eviction)
@@ -225,7 +245,7 @@ async def verify_execution_admin(request: Request):
         raise HTTPException(status_code=403, detail="Operator access required")
 
 
-def _lane_owner(lane: "ExecutionLane | None") -> str | None:
+def _lane_owner(lane: ExecutionLane | None) -> str | None:
     """The username that owns a lane, or None when the lane is shared.
 
     Omitting the lane has always meant the primary live lane, so ownership
@@ -240,7 +260,7 @@ def _lane_owner(lane: "ExecutionLane | None") -> str | None:
 
 def _require_lane_operator(
     request: Request,
-    lane: "ExecutionLane | None",
+    lane: ExecutionLane | None,
 ) -> None:
     owner = _lane_owner(lane)
     if owner is None:
@@ -261,7 +281,7 @@ def _require_lane_operator(
 
 async def verify_lane_operator(
     request: Request,
-    lane: "ExecutionLane | None" = None,
+    lane: ExecutionLane | None = None,
 ):
     """Authenticate, then require the lane's owner when one is configured.
 
@@ -276,7 +296,7 @@ async def verify_lane_operator(
 
 async def verify_credential_operator(
     request: Request,
-    lane: "ExecutionLane | None" = None,
+    lane: ExecutionLane | None = None,
 ):
     """Credential install/forget: the lane's owner, else the site operator.
 
@@ -878,21 +898,37 @@ def _settle_scores(event: Event, states: list) -> tuple[float, float]:
     return home_score, away_score
 
 
-def recompute(event_id: str, *, as_of: datetime) -> list:
+async def recompute(event_id: str, *, as_of: datetime) -> list:
+    """Score one event and install its signals.
+
+    The native round trip is awaited on a worker thread (see
+    ``SignalEngine.evaluate_async``) so an event being scored no longer blocks
+    the loop's thread. Everything else here — the store read that builds the
+    snapshot, installing the signals, and capturing the pre-match anchors — stays
+    on the loop thread, and the caller holds this event's lock throughout, so the
+    evaluation order for a single event is unchanged. A quote that lands during
+    the await simply queues its own ``record()`` behind the same lock and is
+    scored next, with its own ``as_of``.
+    """
     event = store.events.get(event_id)
     if event is None:  # event removed between emit and callback
         return []
-    quotes = store.quote_values(event_id)
+    with stage_latency.timer("event.snapshot"):
+        quotes = store.quote_values(event_id)
+        states = list(store.states.get(event_id, []))
     prior = _pregame.setdefault(event_id, {"spread": None, "total": None})
     if prior["spread"] is None or prior["total"] is None:
         spread, total = pregame_priors(quotes, event.home, event.away)
         prior["spread"] = prior["spread"] if prior["spread"] is not None else spread
         prior["total"] = prior["total"] if prior["total"] is not None else total
-    signals = engine.evaluate(event_id, quotes, store.states.get(event_id, []), event.away,
-                              sport=event.sport, league=event.league,
-                              home_outcome=event.home,
-                              pregame_spread=prior["spread"], pregame_total=prior["total"],
-                              as_of=as_of, canonical_event_id=event.canonical_event_id)
+    signals = await engine.evaluate_async(
+        event_id, quotes, states, event.away,
+        sport=event.sport, league=event.league,
+        home_outcome=event.home,
+        pregame_spread=prior["spread"], pregame_total=prior["total"],
+        as_of=as_of, canonical_event_id=event.canonical_event_id)
+    if event_id not in store.events:  # removed while the scorer ran
+        return []
     store.set_signals(event_id, signals)
     # Anchor an in-play model to the market at the FIRST observation, whatever the
     # game state: invert the model's strength parameter from the current price and
@@ -939,71 +975,112 @@ def recompute(event_id: str, *, as_of: datetime) -> list:
 
 
 async def record(event_id: str, *, as_of: datetime | None = None) -> None:
+    lock_requested_at = time.perf_counter()
     async with _event_lock(event_id):
+        stage_latency.observe("event.lock_wait", time.perf_counter() - lock_requested_at)
         if event_id in _terminal_events or event_id in _finalized:
             return
         decision_at = as_of or datetime.now(timezone.utc)
-        signals = recompute(event_id, as_of=decision_at)
-        _notify_subscribers()  # push the fresh snapshot to the dashboard immediately
-        event = store.events.get(event_id)
-        # Ledger commits fsync to disk; keep that off the event loop.
-        if ledger is not None and event is not None and signals:
-            await asyncio.to_thread(ledger.record_signals, event, signals)
-        if model_lab is not None and event is not None and signals:
-            await asyncio.to_thread(
-                model_lab.record,
-                event,
-                signals,
-                store.quote_values(event_id),
-                list(store.states.get(event_id, [])),
-                as_of=decision_at,
+        with stage_latency.timer("decision.total"):
+            await _record_locked(event_id, decision_at)
+
+
+async def _record_locked(event_id: str, decision_at: datetime) -> None:
+    """The body of :func:`record`, run with this event's lock already held."""
+    signals = await recompute(event_id, as_of=decision_at)
+    _notify_subscribers()  # push the fresh snapshot to the dashboard immediately
+    # Scoring now yields the loop's thread, so a terminal update can be flagged
+    # while it runs. Re-check before any durable write so a finalized event still
+    # records nothing after its gate closed -- the same guarantee the fully
+    # synchronous evaluation gave for free.
+    if event_id in _terminal_events or event_id in _finalized:
+        return
+    event = store.events.get(event_id)
+    # The ledger row is this decision's audit record and the bet's evidence, so
+    # it stays durable-before-continue: an account entry must never precede the
+    # decision mark that justifies it. It commits fsync to disk, so it runs on
+    # the ledger's own writer lane rather than the shared executor.
+    if ledger is not None and event is not None and signals:
+        with stage_latency.timer("ledger.write"):
+            await ledger_writer.submit(
+                "record_signals",
+                partial(ledger.record_signals, event, signals),
             )
-        # A terminal state can arrive while the ledger write is in flight. It
-        # closes the gate immediately; do not begin a new account entry after it.
-        if event_id in _terminal_events or event_id in _finalized:
-            return
-        if account_book is not None and event is not None:
-            quotes = store.quote_values(event_id)
-            # One current decision context, computed before mark/exit/entry, so a
-            # harness-backed position is managed with the same probability family
-            # that opened it (not the odds consensus).
+    # Model-lab rows are research evidence for offline fitting. Nothing later in
+    # this decision reads them, so they are queued rather than awaited: this was
+    # the second serial database round trip inside the per-event lock, against a
+    # different database than the ledger. `record` copies the quote and state
+    # snapshots it is given, so the caller may proceed immediately.
+    if model_lab is not None and event is not None and signals:
+        with stage_latency.timer("model_lab.enqueue"):
+            await model_lab_writer.schedule(
+                "record",
+                partial(
+                    model_lab.record,
+                    event,
+                    signals,
+                    store.quote_values(event_id),
+                    list(store.states.get(event_id, [])),
+                    as_of=decision_at,
+                ),
+            )
+    # A terminal state can arrive while the ledger write is in flight. It
+    # closes the gate immediately; do not begin a new account entry after it.
+    if event_id in _terminal_events or event_id in _finalized:
+        return
+    if account_book is not None and event is not None:
+        quotes = store.quote_values(event_id)
+        # One current decision context, computed before mark/exit/entry, so a
+        # harness-backed position is managed with the same probability family
+        # that opened it (not the odds consensus).
+        with stage_latency.timer("account.model_probabilities"):
             model_probabilities, model_uncertainty = (
                 _model_probabilities(event, signals, as_of=decision_at)
                 if signals else ({}, {}))
-            exited_bets = await asyncio.to_thread(
-                account_book.mark_and_cash_out, event, quotes, signals,
-                as_of=decision_at, model_probabilities=model_probabilities,
-                max_quote_age_seconds=settings.max_data_age_seconds,
+        # Marks and entries move fake money and must be durable before the next
+        # decision for this event can act on the resulting position.
+        with stage_latency.timer("account.mark"):
+            exited_bets = await account_writer.submit(
+                "mark_and_cash_out",
+                partial(
+                    account_book.mark_and_cash_out, event, quotes, signals,
+                    as_of=decision_at, model_probabilities=model_probabilities,
+                    max_quote_age_seconds=settings.max_data_age_seconds,
+                ),
             )
-            for paper_event in exited_bets:
-                if paper_event.get("webhook_url"):
-                    _schedule_notification(paper_event)
-            if signals:
-                entry_signals = bot_entry_candidates(
-                    signals,
-                    allow_uncalibrated=settings.allow_uncalibrated_paper,
-                    model_probabilities=model_probabilities,
+        for paper_event in exited_bets:
+            if paper_event.get("webhook_url"):
+                _schedule_notification(paper_event)
+        if signals:
+            entry_signals = bot_entry_candidates(
+                signals,
+                allow_uncalibrated=settings.allow_uncalibrated_paper,
+                model_probabilities=model_probabilities,
+            )
+            skipped = len(signals) - len(entry_signals)
+            if skipped:
+                runtime_telemetry.increment("bot_entry_prefiltered", skipped)
+            if entry_signals:
+                runtime_telemetry.increment(
+                    "bot_entry_candidates", len(entry_signals)
                 )
-                skipped = len(signals) - len(entry_signals)
-                if skipped:
-                    runtime_telemetry.increment("bot_entry_prefiltered", skipped)
-                if entry_signals:
-                    runtime_telemetry.increment(
-                        "bot_entry_candidates", len(entry_signals)
+                with stage_latency.timer("account.place"):
+                    placed_bets = await account_writer.submit(
+                        "place",
+                        partial(
+                            account_book.place, event, entry_signals, quotes,
+                            as_of=decision_at,
+                            allow_uncalibrated=settings.allow_uncalibrated_paper,
+                            model_probabilities=model_probabilities,
+                            model_uncertainty=model_uncertainty,
+                            edge_uncertainty_z=settings.edge_uncertainty_z,
+                            portfolio_kelly=settings.enable_portfolio_kelly,
+                            max_quote_age_seconds=settings.max_data_age_seconds,
+                        ),
                     )
-                    placed_bets = await asyncio.to_thread(
-                        account_book.place, event, entry_signals, quotes,
-                        as_of=decision_at,
-                        allow_uncalibrated=settings.allow_uncalibrated_paper,
-                        model_probabilities=model_probabilities,
-                        model_uncertainty=model_uncertainty,
-                        edge_uncertainty_z=settings.edge_uncertainty_z,
-                        portfolio_kelly=settings.enable_portfolio_kelly,
-                        max_quote_age_seconds=settings.max_data_age_seconds,
-                    )
-                    for paper_event in placed_bets:
-                        if paper_event.get("webhook_url"):
-                            _schedule_notification(paper_event)
+                for paper_event in placed_bets:
+                    if paper_event.get("webhook_url"):
+                        _schedule_notification(paper_event)
 
 
 def _winner_labels(event: Event, home_score: float, away_score: float) -> set[str]:
@@ -1425,6 +1502,14 @@ def _execution_snapshot_with_us_segments(
     retaining the same sportsbook references and untouched engine formulas.
     Authenticated depth, fee, and open-book checks still occur immediately
     before either a simulated or live fill.
+
+    NOTE: this is the one remaining synchronous ``engine.evaluate`` on the event
+    loop's thread (``record`` now awaits its native call on a worker). It is
+    timed as ``trading.us_segment_eval`` so the cost is visible on
+    ``/api/runtime``. Offloading it is not a one-line change: it reads
+    ``store.states`` without holding ``store.lock``, which is safe only because
+    ``add_state`` also runs on this thread, so the snapshot has to be taken under
+    the lock before the work can move to a worker.
     """
     selected = {
         scope for scope in trader.policy.allowed_market_scopes
@@ -1583,22 +1668,15 @@ async def _run_execution_trading_cycle(
         )
     snapshot, game_states = _live_trading_snapshot()
     segment_results = _completed_mlb_segment_scores(snapshot)
-    if not trader.policy.automation_enabled:
-        result = await asyncio.to_thread(
-            trader.run_cycle,
-            snapshot,
-            {"events": []},
-            game_states=game_states,
-            segment_results=segment_results,
-        )
-    elif not snapshot:
-        result = await asyncio.to_thread(
-            trader.run_cycle,
-            snapshot,
-            {"events": []},
-            game_states=game_states,
-            segment_results=segment_results,
-        )
+    if not trader.policy.automation_enabled or not snapshot:
+        with stage_latency.timer("trading.cycle"):
+            result = await asyncio.to_thread(
+                trader.run_cycle,
+                snapshot,
+                {"events": []},
+                game_states=game_states,
+                segment_results=segment_results,
+            )
     else:
         monitored_slugs = [
             event.polymarket_slug
@@ -1611,18 +1689,20 @@ async def _run_execution_trading_cycle(
             # Manually-created events may not carry a Polymarket slug. Keep the
             # bounded discovery fallback for those uncommon research records.
             payload = await fetch_polymarket_us_events(limit=500)
-        snapshot = _execution_snapshot_with_us_segments(
-            snapshot,
-            payload,
-            trader,
-        )
-        result = await asyncio.to_thread(
-            trader.run_cycle,
-            snapshot,
-            payload,
-            game_states=game_states,
-            segment_results=segment_results,
-        )
+        with stage_latency.timer("trading.us_segment_eval"):
+            snapshot = _execution_snapshot_with_us_segments(
+                snapshot,
+                payload,
+                trader,
+            )
+        with stage_latency.timer("trading.cycle"):
+            result = await asyncio.to_thread(
+                trader.run_cycle,
+                snapshot,
+                payload,
+                game_states=game_states,
+                segment_results=segment_results,
+            )
     if model_lab is not None:
         positions = await asyncio.to_thread(
             trader.positions,
@@ -1760,6 +1840,14 @@ async def lifespan(_: FastAPI):
     execution_tasks: list[asyncio.Task] = []
     if settings.enable_memory_trace:
         start_memory_trace()
+    # Scoring has no Python fallback, so a running server without the compiled
+    # extension is never a usable state: fail startup here rather than at the
+    # first quote. (The import itself is tolerant so unrelated tests can run.)
+    require_native_engine()
+    # Sampling loop lag is how we see whether synchronous work is starving the
+    # loop; start it before any provider task can occupy the thread.
+    event_loop_monitor.start()
+    writers.start_all()
     open_shared_client()  # shared keep-alive pool for one-shot provider fetches
     try:
         if settings.workstation_mode and os.environ.pop("DATABASE_URL", None):
@@ -1905,6 +1993,7 @@ async def lifespan(_: FastAPI):
             ))
         yield
     finally:
+        await event_loop_monitor.stop()
         # Close the entry gate, then let any already-running record() section
         # finish before canceling feed tasks and closing database connections.
         for event_id in list(store.events):
@@ -1927,6 +2016,12 @@ async def lifespan(_: FastAPI):
         # Close the shared HTTP pool only after every task that could borrow it
         # has been cancelled and awaited above.
         await close_shared_client()
+
+        # Drain every write lane before the stores below are closed. Scheduled
+        # research writes are not awaited by their submitter, so skipping this
+        # would discard exactly the evidence the lanes refuse to drop under load
+        # -- and would then try to write it through a closed connection.
+        await writers.stop_all()
 
         for database_store in (
             ledger,
@@ -2215,6 +2310,17 @@ async def runtime_status():
         "deletions_in_flight": len(_event_deletions),
         "notifications_in_flight": len(_notification_tasks),
         "memory": memory_snapshot(),
+        # Stage latency percentiles and request/output sizes. Every optimization
+        # in this area is supposed to move one of these numbers; without them a
+        # change is a claim rather than a measurement.
+        "performance": performance_snapshot(),
+        # Identity memoization is only a win if the hit rate is high on real
+        # market and bookmaker vocabulary. Reported so that is observable rather
+        # than assumed.
+        "identity_caches": {**market_cache_stats(), **source_cache_stats()},
+        # Queue depth is the early warning for persistence falling behind the
+        # feed; latency alone only shows it once it is already hurting.
+        "db_writers": writers.stats(),
         "buffers": {
             "sports_status_compact": len(_sports_status_compact),
             "sports_status_detail": len(_sports_status_detail),
@@ -3695,7 +3801,9 @@ async def export_research_data():
             model_lab=lab,
         )
     except Exception:
-        Path(archive_path).unlink(missing_ok=True)
+        # Deleting the partial archive is filesystem I/O, so it belongs on a
+        # worker like the write that just failed -- not on the event loop.
+        await asyncio.to_thread(Path(archive_path).unlink, missing_ok=True)
         raise
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
     return FileResponse(
@@ -3800,10 +3908,13 @@ async def _events_snapshot_json() -> bytes:
         # A newer notification may have arrived while this coroutine waited.
         target = _snapshot_version
         if _snapshot_cache["version"] != target:
-            views = await _sorted_event_views()
-            payload = json.dumps(
-                views, default=str, separators=(",", ":")
-            ).encode("utf-8")
+            with stage_latency.timer("sse.snapshot"):
+                views = await _sorted_event_views()
+                payload = json.dumps(
+                    views, default=str, separators=(",", ":")
+                ).encode("utf-8")
+            decision_sizes.observe("sse_snapshot_bytes", len(payload))
+            decision_sizes.observe("sse_subscriber_count", len(_subscribers))
             # If state changed while rendering, callers may still use this
             # internally consistent payload, but do not publish it as the cache
             # for the newer version.

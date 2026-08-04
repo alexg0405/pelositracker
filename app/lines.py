@@ -10,6 +10,24 @@ home | away | over | under, and hand Rust just (point, side).
 from __future__ import annotations
 
 import re
+from functools import lru_cache
+
+# Market identity normalization is pure (string in, string out) and was measured
+# as the single largest cost in both quote ingestion and request preparation:
+# `base_market_type` ran ~13 times per quote, each time re-running the same
+# regex over the same handful of market names. Memoizing the single-argument
+# normalizers removes that repetition without changing any result, and it also
+# makes the multi-argument callers below cheap, because almost all of their cost
+# was these calls rather than their own work.
+#
+# The caches are bounded by `maxsize`, so a provider that emits unbounded distinct
+# market strings degrades to today's behavior (misses) instead of growing memory.
+# The size is generous relative to the real market vocabulary and cheap in bytes:
+# keys are strings the caller already holds, and most values are either one of
+# the small set of family literals below or a `_market_key` result that is itself
+# already cached. `lru_cache` is thread-safe, which matters because these are
+# reached from the store-writer threads as well as the event loop.
+_MARKET_CACHE_SIZE = 4096
 
 FULL_GAME_SCOPE = "full_game"
 MLB_FIRST_INNING_SCOPE = "first_inning"
@@ -47,10 +65,12 @@ _MONEYLINE_MARKETS = {
 }
 
 
+@lru_cache(maxsize=_MARKET_CACHE_SIZE)
 def _market_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", (value or "").strip().casefold()).strip("_")
 
 
+@lru_cache(maxsize=_MARKET_CACHE_SIZE)
 def market_scope(market: str) -> str:
     """Return the exact regulation segment encoded by a market identity.
 
@@ -77,6 +97,7 @@ def market_scope(market: str) -> str:
     return FULL_GAME_SCOPE
 
 
+@lru_cache(maxsize=_MARKET_CACHE_SIZE)
 def base_market_type(market: str) -> str:
     """Collapse a scoped identity only to its line family.
 
@@ -191,6 +212,35 @@ def comparison_keys(
     elif outcome_key in {"away", (away or "").strip().casefold()}:
         outcome_key = "away"
     return market_key, outcome_key
+
+
+def market_cache_stats() -> dict[str, dict[str, int]]:
+    """Hit/miss counters for the identity caches, for ``/api/runtime``.
+
+    Exposed because a memoization win is only real if the hit rate is high on
+    production market vocabulary; a low rate would mean the cache is being
+    thrashed by high-cardinality market strings and should be resized or dropped.
+    """
+    return {
+        name: {
+            "hits": info.hits,
+            "misses": info.misses,
+            "entries": info.currsize,
+            "maxsize": info.maxsize or 0,
+        }
+        for name, info in (
+            ("market_key", _market_key.cache_info()),
+            ("market_scope", market_scope.cache_info()),
+            ("base_market_type", base_market_type.cache_info()),
+        )
+    }
+
+
+def clear_market_caches() -> None:
+    """Drop every memoized identity result. For tests and benchmarks."""
+    _market_key.cache_clear()
+    market_scope.cache_clear()
+    base_market_type.cache_clear()
 
 
 def pregame_priors(quotes, home: str, away: str) -> tuple[float | None, float | None]:

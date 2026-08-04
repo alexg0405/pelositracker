@@ -10,7 +10,7 @@ import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from urllib.parse import unquote, urlparse
 
 import httpx
@@ -504,9 +504,10 @@ def _is_sports_event(event: dict) -> bool:
 def _league_label(event: dict) -> str:
     for t in (event.get("tags") or []):
         label = str(t.get("label", ""))
-        if label.casefold() in _SPORTS_TAGS or any(kw in label.casefold() for kw in _SPORTS_TAGS):
-            if label.casefold() not in ("sports", "games", "football"):
-                return label
+        folded = label.casefold()
+        if ((folded in _SPORTS_TAGS or any(kw in folded for kw in _SPORTS_TAGS))
+                and folded not in ("sports", "games", "football")):
+            return label
     return "Sports"
 
 

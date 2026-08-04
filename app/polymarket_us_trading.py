@@ -24,7 +24,8 @@ import math
 import re
 import threading
 import time
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from uuid import uuid4
 
 from .approval import APPROVAL_TOKEN, approval_granted, approval_instruction
@@ -818,7 +819,7 @@ class TradingPolicy:
     line_execution_profiles: tuple[dict[str, Any], ...] = ()
 
     @classmethod
-    def from_mapping(cls, values: Mapping[str, Any]) -> "TradingPolicy":
+    def from_mapping(cls, values: Mapping[str, Any]) -> TradingPolicy:
         known = {field.name for field in fields(cls)}
         clean = {key: value for key, value in values.items() if key in known}
         # Policies saved before the allocation field existed used total exposure
@@ -892,7 +893,7 @@ class TradingPolicy:
         self,
         market_type: str,
         fraction_remaining: float | None,
-    ) -> tuple["TradingPolicy" | None, str]:
+    ) -> tuple[TradingPolicy | None, str]:
         """Resolve an auditable line/stage overlay around existing metrics."""
         kind = _market_kind(market_type)
         stage = _execution_game_stage(fraction_remaining)
@@ -1262,7 +1263,7 @@ def _fee_implied_edge_floor(entry_cost: float, margin: float) -> float | None:
 
 
 def _required_execution_edge(
-    policy: "TradingPolicy",
+    policy: TradingPolicy,
     signal: Signal,
     entry_cost: float,
 ) -> tuple[float, float | None]:

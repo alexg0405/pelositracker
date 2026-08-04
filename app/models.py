@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import lru_cache
 import re
 from typing import Any
 from uuid import uuid4
@@ -20,20 +21,54 @@ _EXCHANGE_SOURCES = {
 }
 
 
+# Source identity is pure (name in, canonical name out) over a vocabulary of a
+# few dozen bookmakers, but it was being recomputed -- regex included -- several
+# times per quote on both the ingestion and evaluation paths. Memoized with a
+# bounded cache, so an unexpected flood of distinct source names degrades to
+# today's cost rather than growing memory. See app/lines.py for the same
+# treatment of market identity.
+_SOURCE_CACHE_SIZE = 1024
+
+_SOURCE_ALIASES = {
+    "williamhill": "caesars",
+    "williamhillus": "caesars",
+}
+
+
+@lru_cache(maxsize=_SOURCE_CACHE_SIZE)
 def classify_source(name: str) -> tuple[float, bool]:
     """Return an equal consensus weight and whether the venue is an exchange."""
     source = canonical_source(name)
     return (1.0, any(fragment in source for fragment in _EXCHANGE_SOURCES))
 
 
+@lru_cache(maxsize=_SOURCE_CACHE_SIZE)
 def canonical_source(name: str) -> str:
     """Stable identity for one book across direct and aggregator adapters."""
     compact = re.sub(r"[^a-z0-9]+", "", (name or "").casefold())
-    aliases = {
-        "williamhill": "caesars",
-        "williamhillus": "caesars",
+    return _SOURCE_ALIASES.get(compact, compact or "unknown")
+
+
+def source_cache_stats() -> dict[str, dict[str, int]]:
+    """Hit/miss counters for the source-identity caches, for ``/api/runtime``."""
+    return {
+        name: {
+            "hits": info.hits,
+            "misses": info.misses,
+            "entries": info.currsize,
+            "maxsize": info.maxsize or 0,
+        }
+        for name, info in (
+            ("canonical_source", canonical_source.cache_info()),
+            ("classify_source", classify_source.cache_info()),
+        )
     }
-    return aliases.get(compact, compact or "unknown")
+
+
+def clear_source_caches() -> None:
+    """Drop every memoized source identity. For tests and benchmarks."""
+    canonical_source.cache_clear()
+    classify_source.cache_clear()
 
 
 @dataclass(slots=True)

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
-from typing import Mapping
+from collections.abc import Mapping
 
 
 def _bool(env: Mapping[str, str], name: str, default: bool = False) -> bool:
@@ -140,7 +140,7 @@ class Settings:
     admin_password: str
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
+    def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
         values = os.environ if env is None else env
         environment = values.get("APP_ENV", "development").strip().casefold()
         settings = cls(

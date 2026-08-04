@@ -19,7 +19,7 @@ import threading
 import time
 import hashlib
 import json
-from typing import Iterable, Sequence
+from collections.abc import Iterable, Sequence
 
 from .database import Database
 from .entry_policy import entry_price_allowed
@@ -556,7 +556,7 @@ class Ledger:
                     inserted += max(cur.rowcount, 0)
                     if cur.rowcount:
                         order_id = hashlib.sha256(
-                            f"{row[14]}:{row[3]}:{row[4]}".encode("utf-8")
+                            f"{row[14]}:{row[3]}:{row[4]}".encode()
                         ).hexdigest()
                         requested_cash = float(row[19])
                         filled_cash = float(row[20])

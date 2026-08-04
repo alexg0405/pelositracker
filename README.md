@@ -266,6 +266,7 @@ stored research fields, and analysis endpoints.
 - `native_engine/`: pure explicit-`as_of` consensus/policy engine.
 - `migrations/`: dialect migration-ledger snapshots.
 - `tests/fixtures/providers/`: golden provider payloads.
+- `benchmarks/fixtures/`: immutable synthetic decision-path workload specs.
 - `docs/audit-baseline.md`: pre-remediation evidence and rollback point.
 
 Design and operating records are in [architecture](docs/architecture.md),
@@ -274,7 +275,21 @@ Design and operating records are in [architecture](docs/architecture.md),
 [independent-model registry](docs/independent-model-registry.md),
 [backtesting methodology](docs/backtesting-methodology.md),
 [paper-bot lifecycle](docs/paper-bot-lifecycle.md),
+[decision-path performance](docs/decision-path-performance.md),
 [security](docs/security.md), and [operations](docs/operations.md).
+
+## Measuring the decision path
+
+```powershell
+.\.venv\Scripts\python.exe -m tools.bench_decision --json bench.json
+```
+
+Reports p50/p95/p99 for ingestion, request preparation, the native round trip,
+signal materialization, event-loop lag under concurrent scoring, and durable
+decision writes, over the checked-in fixtures. The same distributions are
+available from a running service at `GET /api/runtime` under `performance`. The
+recorded baseline and what it implies for optimization priorities are in
+[decision-path performance](docs/decision-path-performance.md).
 
 ## Offline calibration workflow
 

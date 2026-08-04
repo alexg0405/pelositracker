@@ -18,3 +18,13 @@ serde_json = "1.0"
 # tests (extension-module tells the linker NOT to link libpython).
 [features]
 extension-module = ["pyo3/extension-module"]
+
+# No [profile.release] tuning on purpose. `lto = "thin"` + `codegen-units = 1`
+# was measured with `python -m tools.bench_decision` (five runs each way) and
+# moved the heavy-fixture native p50 by ~1%, which is inside the run-to-run
+# spread, while taking the build from 7s to 44s. Scoring is not where this
+# system's decision latency lives -- see docs/decision-path-performance.md -- so
+# re-run the benchmark before adding compiler tuning here, not the other way
+# round.
+# `panic = "abort"` is additionally unsafe for us: PyO3 turns a Rust panic into a
+# Python exception, and aborting would take the trading process down with it.

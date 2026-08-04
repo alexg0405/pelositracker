@@ -31,7 +31,12 @@ def _at_utc(timestamp: float) -> datetime:
 
 
 def _value(row: sqlite3.Row, name: str, default=None):
-    return row[name] if name in row.keys() and row[name] is not None else default
+    # `.keys()` is required here, not decoration: `sqlite3.Row` defines no
+    # `__contains__`, so `name in row` falls back to iterating the row's *values*
+    # and asks whether a column name equals a stored value. That silently made
+    # every lookup miss and every replay produce zero bets.
+    return (row[name] if name in row.keys()  # noqa: SIM118
+            and row[name] is not None else default)
 
 
 def run_replay(history_db_path: str | os.PathLike[str] = "history.db", *,

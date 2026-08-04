@@ -92,7 +92,7 @@ def test_band_is_ordered_and_within_the_unit_interval():
 
 
 def test_band_mid_matches_the_point_estimate():
-    low, mid, high = match_win_probability_band(0.62, 0, 0, 0, 0)
+    _low, mid, _high = match_win_probability_band(0.62, 0, 0, 0, 0)
     g = game_prob_from_prematch(0.62)
     assert mid == pytest.approx(match_win_prob(0, 0, 0, 0, g), abs=1e-9)
 

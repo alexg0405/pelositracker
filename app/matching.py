@@ -5,7 +5,8 @@ from __future__ import annotations
 import re
 import unicodedata
 from datetime import datetime, timezone
-from typing import Callable, Iterable, TypeVar
+from typing import TypeVar
+from collections.abc import Callable, Iterable
 
 
 T = TypeVar("T")

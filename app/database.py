@@ -14,7 +14,8 @@ import json
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 
 try:  # SQLite-only installs should not need a PostgreSQL driver at import time.
     import psycopg2
@@ -167,7 +168,7 @@ class Database:
         sqlite_envs: Sequence[str],
         sqlite_default: str,
         postgres_schema: str | None = None,
-    ) -> "Database":
+    ) -> Database:
         # An explicit constructor argument is intentionally authoritative so
         # tests and maintenance tools can select an isolated SQLite file even
         # on a machine that also has DATABASE_URL configured.

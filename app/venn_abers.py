@@ -24,7 +24,8 @@ verifiable against the PAV already tested in app/backtest.py.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any
+from collections.abc import Iterable, Mapping
 
 from .polymarket_us_trading import _fee_implied_edge_floor
 

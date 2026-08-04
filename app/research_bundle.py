@@ -14,7 +14,8 @@ import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Any, BinaryIO, Mapping
+from typing import Any, BinaryIO
+from collections.abc import Mapping
 
 from .adaptive_exit_model import (
     RESEARCH_EVIDENCE_TABLES as ADAPTIVE_EVIDENCE_TABLES,

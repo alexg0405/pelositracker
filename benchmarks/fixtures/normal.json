@@ -1,0 +1,16 @@
+{
+  "name": "normal",
+  "description": "A typical tracked in-play game: moneyline plus three spread and three total lines across six books and the exchange, with a short tail of superseded quotes.",
+  "sport": "basketball",
+  "league": "nba",
+  "sportsbooks": 6,
+  "spread_lines": 3,
+  "total_lines": 3,
+  "player_props": 0,
+  "exchange_book_depth": 8,
+  "stale_duplicates_per_selection": 2,
+  "states": 4,
+  "invalid_quotes": 0,
+  "quarantined_quotes": 0,
+  "aggregator_aliases": 1
+}

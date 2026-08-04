@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_EVEN, getcontext
 from enum import Enum
-from typing import Iterable
+from collections.abc import Iterable
 
 getcontext().prec = 28
 
@@ -34,7 +34,7 @@ class BookLevel:
     size: Decimal
 
     @classmethod
-    def create(cls, price: object, size: object) -> "BookLevel":
+    def create(cls, price: object, size: object) -> BookLevel:
         level = cls(D(price), D(size))
         if not (Decimal("0") < level.price < Decimal("1")) or level.size < 0:
             raise ValueError("invalid order-book level")

@@ -1,4 +1,5 @@
 """Venn-Abers intervals: validity, monotonicity, and the fee refusal rule."""
+import itertools
 import random
 
 import pytest
@@ -48,7 +49,7 @@ def test_interval_bounds_are_monotone_in_the_score():
     predictor = VennAbersPredictor(scores, labels)
     queries = [round(0.05 + 0.09 * step, 2) for step in range(10)]
     intervals = [predictor.interval(query) for query in queries]
-    for previous, current in zip(intervals, intervals[1:]):
+    for previous, current in itertools.pairwise(intervals):
         assert current.lower >= previous.lower - 1e-9
         assert current.upper >= previous.upper - 1e-9
 
@@ -115,8 +116,10 @@ def test_shadow_report_groups_by_line_and_stage():
             _pair("moneyline", "early", price, edge, label, f"event-{index % 8}")
         )
     # Spread late: only three pairs, below the evidence bar.
-    for index in range(3):
-        pairs.append(_pair("spread", "late", 0.4, 0.05, 1, f"spread-{index}"))
+    pairs.extend(
+        _pair("spread", "late", 0.4, 0.05, 1, f"spread-{index}")
+        for index in range(3)
+    )
     # A pair with no recorded edge cannot be scored.
     pairs.append(
         {
@@ -151,17 +154,16 @@ def test_shadow_report_groups_by_line_and_stage():
 
 
 def test_shadow_report_calibrated_point_beats_a_miscalibrated_price():
-    pairs = []
     # The market price is systematically 15 points below the true rate, and
     # the recorded edge captures that gap: calibration should beat price.
     # Labels are exact (30 of 60) so the comparison is deterministic.
-    for index in range(60):
-        pairs.append(
-            _pair(
-                "moneyline", "early", 0.35, 0.15,
-                1 if index % 2 == 0 else 0, f"event-{index % 15}",
-            )
+    pairs = [
+        _pair(
+            "moneyline", "early", 0.35, 0.15,
+            1 if index % 2 == 0 else 0, f"event-{index % 15}",
         )
+        for index in range(60)
+    ]
     report = shadow_report(pairs)
     group = report["groups"][0]
     assert group["calibrated_beats_price"] is True

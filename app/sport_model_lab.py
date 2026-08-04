@@ -18,7 +18,8 @@ import re
 import shutil
 import threading
 import time
-from typing import Any, Iterable, Mapping
+from typing import Any
+from collections.abc import Iterable, Mapping
 from uuid import uuid4
 
 from .accounts import line_type
@@ -1254,7 +1255,7 @@ class SportModelLab:
             with self._db.cursor(dict_rows=True) as cur:
                 self._db.execute(
                     cur,
-                    """SELECT sport,league,COUNT(*) observations,
+                    f"""SELECT sport,league,COUNT(*) observations,
                               COUNT(DISTINCT event_id) observed_events,
                               SUM(CASE WHEN fraction_remaining IS NOT NULL
                                   AND score_differential IS NOT NULL
@@ -1290,9 +1291,7 @@ class SportModelLab:
                               MAX(observed_ts) last_observed_ts
                        FROM sport_model_observations
                        WHERE canceled=0
-                       GROUP BY sport,league ORDER BY observations DESC""".format(
-                           _TRUSTED_SETTLEMENT_SQL=_TRUSTED_SETTLEMENT_SQL
-                       ),
+                       GROUP BY sport,league ORDER BY observations DESC""",
                 )
                 segments = [dict(row) for row in cur.fetchall()]
                 self._db.execute(
@@ -1563,7 +1562,7 @@ class SportModelLab:
             with self._db.cursor(dict_rows=True) as cur:
                 self._db.execute(
                     cur,
-                    """SELECT COUNT(*) observations,
+                    f"""SELECT COUNT(*) observations,
                               COUNT(DISTINCT event_id) observed_events,
                               SUM(CASE WHEN result_label IS NOT NULL
                                        AND canceled=0 THEN 1 ELSE 0 END)
@@ -1598,9 +1597,7 @@ class SportModelLab:
                               ,COUNT(DISTINCT CASE WHEN state_completeness>=0.75
                                                    THEN event_id END)
                                   rich_state_events
-                       FROM sport_model_observations WHERE sport=%s""".format(
-                           _TRUSTED_SETTLEMENT_SQL=_TRUSTED_SETTLEMENT_SQL
-                       ),
+                       FROM sport_model_observations WHERE sport=%s""",
                     (sport_key,),
                 )
                 segment_row = cur.fetchone()
@@ -2384,7 +2381,7 @@ class SportModelLab:
         away_score: float | None,
     ) -> float | None:
         if home_score is None or away_score is None or side == "draw":
-            return None if side == "draw" else None
+            return None
         difference = home_score - away_score
         return difference if side == "home" else -difference
 
@@ -2527,7 +2524,7 @@ class SportModelLab:
             outcome_definition = TARGET_DEFINITIONS["event_outcome"]
             self._db.execute(
                 cur,
-                """INSERT INTO sport_model_targets
+                f"""INSERT INTO sport_model_targets
                    (observation_id,target_name,horizon_seconds,label_value,label_ts,
                     source,target_version,metadata_json)
                    SELECT id,%s,0,result_label,settled_ts,%s,%s,%s
@@ -2540,9 +2537,7 @@ class SportModelLab:
                      label_ts=excluded.label_ts,
                      source=excluded.source,
                      target_version=excluded.target_version,
-                     metadata_json=excluded.metadata_json""".format(
-                       _TRUSTED_SETTLEMENT_SQL=_TRUSTED_SETTLEMENT_SQL
-                   ),
+                     metadata_json=excluded.metadata_json""",
                 (
                     "event_outcome",
                     outcome_definition["source"],

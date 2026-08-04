@@ -2,7 +2,7 @@ import asyncio
 import logging
 import re as _re
 from datetime import datetime, timezone
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
 
 import httpx
 

@@ -148,7 +148,7 @@ def _poisson_partition(mu: float, line: float) -> DiscreteLineProbability:
     if mu > _EXACT_COUNT_MAX_MEAN:
         return _continuity_corrected(mu, sd, line, "poisson", {"mu": mu})
     log_mu = math.log(mu)
-    upper = max(int(math.ceil(mu + 12.0 * sd + 20.0)), math.floor(line) + 2)
+    upper = max(math.ceil(mu + 12.0 * sd + 20.0), math.floor(line) + 2)
     # Each pmf is computed independently in log space, so a tiny P(X=0) never
     # zeros the recurrence the way a forward `exp(-mu)` product would.
     pmf = [math.exp(-mu + k * log_mu - math.lgamma(k + 1)) for k in range(upper + 1)]
@@ -168,7 +168,7 @@ def _negbin_partition(mu: float, variance: float, line: float) -> DiscreteLinePr
     if mu > _EXACT_COUNT_MAX_MEAN:
         return _continuity_corrected(mu, sd, line, "negative_binomial", params)
     log_p, log_1mp = math.log(p), math.log1p(-p)
-    upper = max(int(math.ceil(mu + 12.0 * sd + 20.0)), math.floor(line) + 2)
+    upper = max(math.ceil(mu + 12.0 * sd + 20.0), math.floor(line) + 2)
     pmf = [
         math.exp(math.lgamma(k + r) - math.lgamma(r) - math.lgamma(k + 1)
                  + r * log_p + k * log_1mp)

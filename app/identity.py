@@ -48,7 +48,7 @@ class CanonicalParticipant:
     canonical_name: str
 
     @classmethod
-    def create(cls, sport: str, name: str) -> "CanonicalParticipant":
+    def create(cls, sport: str, name: str) -> CanonicalParticipant:
         normalized_sport = canonical_text(sport)
         normalized_name = canonical_text(name)
         return cls(stable_id("participant", normalized_sport, normalized_name),
@@ -66,7 +66,7 @@ class CanonicalEvent:
 
     @classmethod
     def create(cls, sport: str, league: str, starts_at: datetime | None,
-               home: str, away: str) -> "CanonicalEvent":
+               home: str, away: str) -> CanonicalEvent:
         home_participant = CanonicalParticipant.create(sport, home)
         away_participant = CanonicalParticipant.create(sport, away)
         utc_start = ensure_utc(starts_at) if starts_at else None
@@ -89,7 +89,7 @@ class CanonicalMarket:
 
     @classmethod
     def create(cls, event_id: str, market_type: str, line_value: object | None,
-               period_scope: str = "full_game") -> "CanonicalMarket":
+               period_scope: str = "full_game") -> CanonicalMarket:
         line = canonical_line(line_value)
         kind = canonical_text(market_type)
         scope = canonical_text(period_scope)
