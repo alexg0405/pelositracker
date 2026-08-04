@@ -32,6 +32,14 @@
 - Made the native-engine import fail closed at first scoring call rather than at
   import, so storage, security, and identity tests no longer need the compiled
   extension; production startup still refuses to run without it.
+- Moved the canonical evaluation request out of `decision_marks` into a new
+  `decision_inputs` table (ledger migration v9): one zlib-compressed row per
+  `decision_hash` instead of a ~1.1 MiB blob inline on every `PAPER_BET` row.
+  Measured 23.2x smaller on disk at one bet per decision and 68.8x at three.
+  The decision hash still covers the uncompressed request, so replay and
+  lineage verification are unchanged; `Ledger.decision_input()` reads the new
+  table and falls back to the inline column for rows written earlier. The new
+  table ages out on the same retention window, with its own `as_of` index.
 - Batched the ledger's decision-mark and close-mark inserts through
   `Database.execute_many` instead of one statement per signal (~114 per
   prop-heavy tick). 1.21x on local SQLite; the round-trip saving it exists for

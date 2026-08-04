@@ -13,12 +13,14 @@ need data the system does not yet ingest.
 """
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import threading
 import time
 import hashlib
 import json
+import zlib
 from collections.abc import Iterable, Sequence
 
 from .database import Database
@@ -26,6 +28,47 @@ from .entry_policy import entry_price_allowed
 from .models import Event, Signal
 
 logger = logging.getLogger(__name__)
+
+# The canonical evaluation request is the decision's audit artifact: every quote
+# considered, the full configuration, and the lineage the decision hash covers.
+# It is also large -- ~1.1 MiB for a prop-heavy event -- and it was stored inline
+# on every PAPER_BET row, in the table that has already filled a managed database
+# once. Two things are wrong with that, and `decision_inputs` fixes both.
+#
+# It is stored once per `decision_hash` rather than once per placed selection, so
+# an evaluation that places several bets keeps one copy instead of N.
+#
+# It is compressed. Canonical JSON is extremely repetitive -- the same key names
+# repeated across every quote payload -- so zlib at level 1 measures ~33x on the
+# heavy fixture (1,157,181 -> 34,617 bytes) for ~3.4 ms. Level 1 rather than the
+# default: level 6 reaches ~54x but costs ~7.7 ms, and this runs inside the
+# awaited ledger write. Base64 gives back a third of the win (net ~25x) and is
+# the price of a portable TEXT column: SQLite spells binary BLOB and PostgreSQL
+# spells it BYTEA, and this schema layer does not translate types.
+#
+# The hash still covers the *uncompressed* text, so lineage is unchanged and a
+# stored snapshot can always be verified against the decision hash it belongs to.
+SNAPSHOT_ENCODING_ZLIB = "zlib+base64"
+SNAPSHOT_ENCODING_TEXT = "text"
+_SNAPSHOT_COMPRESSION_LEVEL = 1
+
+
+def encode_snapshot(text: str) -> tuple[str, str]:
+    """Return ``(encoding, payload)`` for storage."""
+    compressed = zlib.compress(text.encode("utf-8"), _SNAPSHOT_COMPRESSION_LEVEL)
+    return SNAPSHOT_ENCODING_ZLIB, base64.b64encode(compressed).decode("ascii")
+
+
+def decode_snapshot(encoding: str | None, payload: str) -> str:
+    """Inverse of :func:`encode_snapshot`, tolerating legacy plain text.
+
+    Rows written before this change stored the request inline and uncompressed;
+    an audit read has to keep working against them, so an unknown or absent
+    encoding is treated as plain text rather than an error.
+    """
+    if encoding == SNAPSHOT_ENCODING_ZLIB:
+        return zlib.decompress(base64.b64decode(payload)).decode("utf-8")
+    return payload
 
 
 def _retention_seconds() -> float:
@@ -307,6 +350,29 @@ class Ledger:
                 "ON decision_marks(as_of, decision_hash, market, outcome);",
                 component="ledger", version=8,
             )
+            # One compressed request snapshot per decision, replacing the inline
+            # per-row copy on decision_marks. Additive: existing rows keep their
+            # inline blob and stay readable (see decision_input()). The as_of
+            # index carries the retention prune, for the same reason version 7
+            # added one to decision_marks -- an unindexed prune sorts the whole
+            # table into a temp file, which is the write that fails when the
+            # database is already full.
+            self._db.initialize(
+                """
+                CREATE TABLE IF NOT EXISTS decision_inputs (
+                    decision_hash TEXT PRIMARY KEY,
+                    event_id TEXT NOT NULL,
+                    as_of DOUBLE PRECISION NOT NULL,
+                    encoding TEXT NOT NULL,
+                    snapshot TEXT NOT NULL,
+                    engine_version TEXT,
+                    configuration_hash TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_decision_inputs_as_of
+                ON decision_inputs(as_of);
+                """,
+                component="ledger", version=9,
+            )
             # Bound the audit log at boot, not only while actively recording: a
             # process that starts against an already-oversized table (e.g. after
             # downtime, or right after an operator frees space) would otherwise
@@ -328,6 +394,17 @@ class Ledger:
         path or standalone at boot."""
         self._db.execute(
             cur, "DELETE FROM decision_marks WHERE as_of < %s",
+            (now - self._retention_seconds,),
+        )
+        # decision_inputs ages out on the same window. Without this the table
+        # that was created to bound disk would itself grow without limit, which
+        # is precisely the failure being fixed. Age rather than orphan-matching:
+        # it uses idx_decision_inputs_as_of, whereas `NOT IN (SELECT
+        # decision_hash FROM decision_marks)` has no supporting index and would
+        # scan. A snapshot whose marks were removed early by the row cap below
+        # therefore lingers until it ages out -- bounded, and far cheaper.
+        self._db.execute(
+            cur, "DELETE FROM decision_inputs WHERE as_of < %s",
             (now - self._retention_seconds,),
         )
         if self._max_decision_rows > 0:
@@ -423,9 +500,9 @@ class Ledger:
             signal.engine_version, signal.configuration_hash,
             signal.source_mapping_version, signal.model_version,
             signal.calibration_version, signal.execution_policy_version,
-            # The full request snapshot is kept only for placed entries; a
-            # WATCH row's lineage is reproducible from its decision hash.
-            (signal.input_snapshot_json if signal.action == "PAPER_BET" else None),
+            # The snapshot now lives in decision_inputs, one row per decision
+            # hash. The column stays for the rows written before that change.
+            None,
             signal.token_id,
             signal.order_book_snapshot_id, signal.requested_cash,
             signal.execution_vwap, signal.execution_fee,
@@ -442,6 +519,32 @@ class Ledger:
             signal.independent_model_event_count,
             signal.independent_model_registry_version,
         )
+
+    @staticmethod
+    def _decision_input_rows(event: Event, signals: list[Signal]) -> list[tuple]:
+        """One compressed snapshot row per distinct decision hash.
+
+        Deduplicated here rather than relying on ON CONFLICT alone, so a wide
+        decision compresses its request once instead of once per placed
+        selection -- the compression, not the insert, is the cost worth avoiding.
+        """
+        seen: dict[str, tuple] = {}
+        for signal in signals:
+            if signal.action != "PAPER_BET" or not signal.input_snapshot_json:
+                continue
+            if signal.decision_hash in seen:
+                continue
+            encoding, payload = encode_snapshot(signal.input_snapshot_json)
+            seen[signal.decision_hash] = (
+                signal.decision_hash,
+                event.id,
+                signal.observed_at.timestamp(),
+                encoding,
+                payload,
+                signal.engine_version,
+                signal.configuration_hash,
+            )
+        return list(seen.values())
 
     @staticmethod
     def _close_mark_row(event: Event, signal: Signal) -> tuple | None:
@@ -550,6 +653,21 @@ class Ledger:
                         if id(signal) not in persisted_ids
                     ) if row is not None
                 ]
+                # One snapshot per decision hash, not per placed selection.
+                # Only placed entries carry one: a WATCH row's inputs are
+                # reproducible from its lineage, and keeping the request for
+                # every diagnostic row is what made this table unbounded.
+                input_rows = self._decision_input_rows(event, signals)
+                if input_rows:
+                    self._db.execute_many(
+                        cur,
+                        """INSERT INTO decision_inputs
+                           (decision_hash, event_id, as_of, encoding, snapshot,
+                            engine_version, configuration_hash)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT(decision_hash) DO NOTHING""",
+                        input_rows,
+                    )
                 if close_rows:
                     self._db.execute_many(
                         cur,
@@ -788,6 +906,38 @@ class Ledger:
                        ORDER BY d.as_of""",
                 )
                 return [dict(row) for row in cur.fetchall()]
+
+    def decision_input(self, decision_hash: str) -> str | None:
+        """The canonical evaluation request behind a decision, or None.
+
+        Reads the normalized table first and falls back to the inline column,
+        so a decision recorded before the split still replays. Returns the
+        original uncompressed text either way: callers verify it against the
+        decision hash, which has always been taken over the plain request.
+        """
+        with self._lock:
+            with self._db.cursor(dict_rows=True) as cur:
+                self._db.execute(
+                    cur,
+                    "SELECT encoding, snapshot FROM decision_inputs "
+                    "WHERE decision_hash=%s",
+                    (decision_hash,),
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    row = dict(row)
+                    return decode_snapshot(row["encoding"], row["snapshot"])
+                self._db.execute(
+                    cur,
+                    "SELECT input_snapshot_json FROM decision_marks "
+                    "WHERE decision_hash=%s AND input_snapshot_json IS NOT NULL "
+                    "LIMIT 1",
+                    (decision_hash,),
+                )
+                legacy = cur.fetchone()
+        if legacy is None:
+            return None
+        return dict(legacy)["input_snapshot_json"] or None
 
     def decision_coverage(self, *, since_ts: float | None = None,
                           limit: int | None = None) -> list[dict]:

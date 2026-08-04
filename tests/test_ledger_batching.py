@@ -109,19 +109,26 @@ def test_recording_the_same_decision_twice_is_idempotent(tmp_path):
 
 
 def test_the_request_snapshot_is_stored_only_for_placed_entries(tmp_path):
-    """Batching must not widen which rows carry the heavy blob."""
+    """Batching must not widen which decisions keep the heavy request.
+
+    The snapshot now lives in `decision_inputs` rather than inline on every
+    row (see test_decision_inputs.py); what has not changed is that only a
+    placed entry keeps one.
+    """
     ledger = Ledger(str(tmp_path / "snapshot.db"))
     try:
         watch = _signal("moneyline", "away")
         watch.input_snapshot_json = "x" * 5_000
         placed = _signal("moneyline", "home", action="PAPER_BET")
         placed.input_snapshot_json = "y" * 5_000
+        placed.decision_hash = "placed-hash"
         ledger.record_signals(_event(), [watch, placed])
-        by_outcome = {
-            row["outcome"]: row for row in ledger.all_decisions()
-        }
-        assert by_outcome["away"]["input_snapshot_json"] is None
-        assert by_outcome["home"]["input_snapshot_json"] == "y" * 5_000
+        # No row carries the blob inline any more.
+        assert all(
+            row["input_snapshot_json"] is None for row in ledger.all_decisions()
+        )
+        assert ledger.decision_input("placed-hash") == "y" * 5_000
+        assert ledger.decision_input("hash-1") is None  # the WATCH decision
     finally:
         ledger.close()
 

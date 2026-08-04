@@ -223,6 +223,54 @@ same A/B there on every run, uploaded as the `postgres-write-benchmark`
 artifact. Read that artifact before concluding anything about the production
 effect of this change.
 
+## Fourth pass: normalized, compressed decision snapshots
+
+`Signal.input_snapshot_json` — the canonical evaluation request, ~1.1 MiB for a
+prop-heavy event — was stored inline on every `PAPER_BET` row of
+`decision_marks`, the table that has already filled a managed database once.
+
+The report proposed splitting it into a `decision_inputs` table keyed by
+`decision_hash`. That is done, but **the split alone would not have paid**: it
+only reclaims space when several placed selections share one decision hash, and
+in a deployment that places one bet per decision the dedup factor is 1.0. That
+number is not visible from a development machine, so the change was not left
+resting on it.
+
+What pays unconditionally is compression. Canonical JSON repeats its key names
+on every quote payload, so it compresses extremely well:
+
+| Fixture | Raw | zlib-1 | zlib-1 + base64 |
+|---|---:|---:|---:|
+| normal | 74.4 KiB | 19.1× | ~14× |
+| heavy | 1130.1 KiB | 33.4× | 25.1× |
+
+Level 1 rather than the default 6: level 6 reaches 54× but costs 7.7 ms against
+3.4 ms, and this runs inside the awaited ledger write. Base64 gives back a third
+of the win and buys a portable `TEXT` column — SQLite spells binary `BLOB`,
+PostgreSQL spells it `BYTEA`, and this schema layer does not translate types.
+
+End to end, 40 heavy decisions:
+
+| | Inline (before) | decision_inputs (after) | |
+|---|---:|---:|---:|
+| 1 bet per decision | 44.1 MiB | 1.9 MiB | 23.2× |
+| 3 bets per decision | 132.4 MiB | 1.9 MiB | 68.8× |
+
+Compression carries the first row; dedup is what makes the second row flat
+rather than three times larger.
+
+Properties preserved, each with a test in `tests/test_decision_inputs.py`:
+
+* the decision hash still covers the **uncompressed** request, so lineage and
+  replay verification are unchanged and the snapshot round-trips byte-exactly;
+* rows written before the split keep their inline blob and still read, via
+  `Ledger.decision_input()`, which falls back to the old column;
+* only placed entries keep a request — a WATCH row's inputs remain reproducible
+  from its lineage, and that limit is what bounds the table;
+* `decision_inputs` ages out on the same retention window as `decision_marks`,
+  with its own `as_of` index. Without that, the table added to bound disk would
+  itself grow without limit — the exact failure being fixed.
+
 ## Event-loop lag
 
 `normal` fixture, 8 events scoring concurrently, lag sampled by an ordinary
