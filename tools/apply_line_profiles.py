@@ -82,80 +82,83 @@ RUNTIME_NEW_PROFILE_FIELDS = frozenset({
 # Entry gates (bands, edge windows, side gate) carry the edge:
 # ML 0.45 price cliff, ML max_edge 0.10 red-flag cap, totals Unders-only
 # in the cheap high-conviction pocket.
+# 2026-08-04 derivation (settled data through the Aug 3 slate; the lock
+# readout graded 16 of 19 decay sales as settlement winners, +$170.51 left):
+# live takes only CI-validated changes; dry probes one regime step further.
 RECOMMENDED_PROFILES: dict[str, list[dict[str, Any]]] = {
     "live": [
-        # ML enters on the first fresh qualifying signal: the 92 candidates
-        # the 2-reading rule never re-confirmed graded +142.7% per $1 at the
-        # reading-1 price (69% winners, n=42 ML) — identical to the taken
-        # pocket. Fill-or-kill limits behind depth/spread/fee gates bound
-        # the phantom-quote risk; spread and totals keep 2 readings, where
-        # first-sight quotes graded mediocre.
+        # ML floor 0.10: the 10-15c pocket graded +403.8%/$1 with the CI
+        # excluding zero (n=10, [+97, +773]) and 15-25c +245.9% (n=34).
+        # First-sight entry stays (the 2-reading rule graded +142.7%/$1
+        # left behind on ML); decay -0.30 is the operator's 2026-08-03
+        # setting, untested but directionally confirmed by the readout.
         {"market_type": "moneyline", "game_stage": "all", "enabled": True,
-         "overrides": {"min_entry_price": 0.15, "max_entry_price": 0.45,
+         "overrides": {"min_entry_price": 0.10, "max_entry_price": 0.45,
                        "min_edge": 0.03, "max_edge": 0.10,
                        "entry_confirmation_readings": 1,
+                       "exit_edge": -0.30,
                        "stop_loss": 0.95, "profit_target": 0.40,
                        "reversal_confirmation_readings": 10,
                        "reversal_confirmation_seconds": 300.0}},
-        # Spread runs live at concentrated size (2026-08-03, operator):
-        # entries were always good (54% settlement win at ~35c, +$138.67
-        # held over 136 trades) but it is the thinnest edge per dollar, so
-        # the never-before-used profile caps bound it: $1 positions, 2
-        # concurrent, $5 of profile exposure. The agreement>=70 gate stays
-        # a dry-lane experiment until it grades; live adopts it only then.
+        # Spread adopts agreement >= 55: within kept-side dogs the sub-55
+        # band's CI includes zero ([-10, +81]) while 55-70 is validated
+        # (+75.2%, [+16, +132]) - gating at 70 would discard proven volume.
+        # Concentrated size caps stay.
         {"market_type": "spread", "game_stage": "all", "enabled": True,
          "overrides": {"max_position_usd": 1.0,
                        "max_profile_open_positions": 2,
                        "max_profile_exposure_usd": 5.0,
                        "min_entry_price": 0.23, "max_entry_price": 0.45,
-                       "min_edge": 0.03,
+                       "min_edge": 0.03, "min_source_agreement": 55.0,
+                       "exit_edge": -0.15,
                        "stop_loss": 0.95, "profit_target": 0.30,
                        "reversal_confirmation_readings": 10,
                        "reversal_confirmation_seconds": 300.0}},
         {"market_type": "spread", "game_stage": "late", "enabled": True,
          "overrides": {}},
-        # One totals profile (2026-08-03, operator): with the Under-only
-        # side gate carrying the real protection and every stage graded
-        # positive, three identical stage profiles collapse into the
-        # all-stage pocket. (The old early-only min_mlb_fraction 0.15 was a
-        # no-op — early stage already means >=50% of the game remains — and
-        # refs/quality overrides merely restated lane values.)
+        # Totals ceiling stays 0.38 on the money lane: the 38-45c Unders
+        # band leans positive (+51.9%) but its CI includes zero
+        # ([-9.4, +93.9]) - not validated, so the safe lane holds while
+        # dry keeps measuring at 0.45.
         {"market_type": "total", "game_stage": "all", "enabled": True,
          "overrides": {"min_entry_price": 0.15, "max_entry_price": 0.38,
                        "min_edge": 0.10, "max_position_usd": 1.0,
-                       "profit_target": 0.30,
+                       "profit_target": 0.30, "exit_edge": -0.20,
                        "stop_loss": 0.95,
                        "reversal_confirmation_readings": 10,
                        "reversal_confirmation_seconds": 300.0}},
     ],
     "dry": [
-        # Dry band-widening experiments (2026-08-03): the lab probes each
-        # boundary the live lane holds — ML floor 0.10 (10-15c graded
-        # +403.8%/$1, n=10), spread-dog floor 0.15 (dogs at 10-30c graded
-        # +141.7%), Unders ceiling 0.45 (38-45c graded +57.2%, n=65).
+        # The lab runs one regime step past live everywhere: floor 0.06
+        # (the validator requires strictly above the 5c hard bound; this
+        # collects the thin 6-10c band), min_edge 0.01 (every dry-clean
+        # kept-side edge band graded positive with CIs excluding zero;
+        # the reversal trigger stays -0.03 because it floors at
+        # -max(0.03, min_edge)), and decay -0.50 (the -0.03 locks sold
+        # 84% eventual winners; -0.30 has no data yet, so dry probes the
+        # next step while live holds -0.30).
         {"market_type": "moneyline", "game_stage": "all", "enabled": True,
-         "overrides": {"min_entry_price": 0.10, "max_entry_price": 0.45,
-                       "min_edge": 0.03, "max_edge": 0.10,
+         "overrides": {"min_entry_price": 0.06, "max_entry_price": 0.45,
+                       "min_edge": 0.01, "max_edge": 0.10,
+                       "exit_edge": -0.50,
                        "stop_loss": 0.95, "profit_target": 0.40,
                        "reversal_confirmation_readings": 10,
                        "reversal_confirmation_seconds": 300.0}},
-        # Dry spread experiment (2026-08-03): source agreement >= 70, the
-        # one entry signal with a monotone settlement gradient on this line
-        # in both lanes independently (dry +19.8% -> +48.0% per $1 across
-        # the bands; live +5.8% -> +33.8%). Grades over 3-4 slates before
-        # spread returns to the live lane.
+        # The agreement>=70 experiment answered (gradient validated, gate
+        # adopted by live at 55); dry reopens fully so the sub-55 control
+        # band keeps accruing evidence.
         {"market_type": "spread", "game_stage": "all", "enabled": True,
          "overrides": {"min_entry_price": 0.15, "max_entry_price": 0.45,
-                       "min_edge": 0.03, "min_source_agreement": 70.0,
+                       "min_edge": 0.01, "exit_edge": -0.30,
                        "stop_loss": 0.95, "profit_target": 0.30,
                        "reversal_confirmation_readings": 10,
                        "reversal_confirmation_seconds": 300.0}},
-        # Dry totals experiment, consolidated to one all-stage profile:
-        # Unders-only lane gate, widened bands (ceiling 0.45, floor 0.06),
-        # target sized to the pocket's +150% settlement payoffs.
+        # Unders: ceiling 0.45 under continued measurement, conviction
+        # floor relaxed to 0.03 (every Unders edge band graded positive).
         {"market_type": "total", "game_stage": "all", "enabled": True,
          "overrides": {"min_entry_price": 0.15, "max_entry_price": 0.45,
-                       "min_edge": 0.06, "profit_target": 0.60,
+                       "min_edge": 0.03, "profit_target": 0.60,
+                       "exit_edge": -0.35,
                        "stop_loss": 0.95,
                        "reversal_confirmation_readings": 10,
                        "reversal_confirmation_seconds": 300.0}},

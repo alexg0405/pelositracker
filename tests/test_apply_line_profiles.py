@@ -109,7 +109,7 @@ def test_recommended_payloads_validate_for_both_lanes():
                 0.45 if lane == "dry" else 0.38
             ), lane
             assert stage_policy.min_edge == pytest.approx(
-                0.06 if lane == "dry" else 0.10
+                0.03 if lane == "dry" else 0.10
             ), (lane, fraction)
         middle, _ = policy.execution_policy_for("total", 0.375)
         moneyline, _ = policy.execution_policy_for("moneyline", None)
@@ -132,22 +132,35 @@ def test_recommended_payloads_validate_for_both_lanes():
         assert spread.reversal_confirmation_readings == 10, lane
         if lane == "live":
             # Live spread runs concentrated: the profile-only caps bound
-            # the thinnest-edge book while the agreement gate proves out
-            # on dry.
+            # the thinnest-edge book, and it adopts the validated
+            # agreement gate at 55 (sub-55 dogs' CI includes zero;
+            # 55-70 is proven volume, so 70 would over-gate).
             assert spread.max_position_usd == pytest.approx(1.0), lane
             assert spread.max_profile_open_positions == 2, lane
             assert spread.max_profile_exposure_usd == pytest.approx(5.0), lane
+            assert spread.min_source_agreement == pytest.approx(55.0), lane
             # ML fires on first sight (the missed reading-1 pocket graded
             # +142.7% per $1); spread keeps the lane's glitch guard.
             assert moneyline.entry_confirmation_readings == 1
             assert spread.entry_confirmation_readings == (
                 policy.entry_confirmation_readings
             )
-        else:
-            assert spread.min_source_agreement == pytest.approx(70.0), lane
-            # Dry band-widening probes.
-            assert spread.min_entry_price == pytest.approx(0.15), lane
+            # Validated floor: 10-15c MLs graded +403.8%/$1, CI > 0.
             assert moneyline.min_entry_price == pytest.approx(0.10), lane
+            # Untested-but-directional decay values hold on the money lane.
+            assert moneyline.exit_edge == pytest.approx(-0.30), lane
+            assert spread.exit_edge == pytest.approx(-0.15), lane
+        else:
+            # Dry reopens the agreement control band and probes one regime
+            # step past live everywhere.
+            assert spread.min_source_agreement == pytest.approx(
+                policy.min_source_agreement
+            ), lane
+            assert spread.min_entry_price == pytest.approx(0.15), lane
+            assert moneyline.min_entry_price == pytest.approx(0.06), lane
+            assert moneyline.min_edge == pytest.approx(0.01), lane
+            assert moneyline.exit_edge == pytest.approx(-0.50), lane
+            assert spread.exit_edge == pytest.approx(-0.30), lane
         # Unders joined guards-off: the totals guards' protective record
         # was Over contamination (reversal-sold Unders won 76%, stopped
         # Unders 50%). The side gate is the totals protection.

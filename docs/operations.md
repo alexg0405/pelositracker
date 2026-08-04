@@ -306,3 +306,30 @@ reversal exit is near-vestigial on those lines. Totals keep readings 3;
 reversal exits genuinely save money there. The standing cautions apply: a UI
 save rebuilds profiles from the editor, and an advisor apply can overwrite
 them — check profiles after either.
+
+## Two-person lanes: Anthony and Alex (added 2026-08-04)
+
+The primary live lane displays as **Anthony**; an optional second live lane
+(**Alex**) lets a second person trade their own Polymarket account beside
+it, with an isolated policy, book, journal, and arming latch. Enable with
+`ENABLE_POLYMARKET_US_ALEX_LANE=true` (plus optional
+`POLYMARKET_US_ALEX_KEY_ID`/`POLYMARKET_US_ALEX_SECRET_KEY`, or paste a
+session key from the dashboard with the Alex lane selected — runtime keys
+install into whichever live lane is active). Storage follows the standard
+split: hosted runs use the `polymarket_us_alex` schema in `DATABASE_URL`;
+workstation runs use `POLYMARKET_US_ALEX_TRADING_DB`
+(default `polymarket-us-alex.db`). With the flag unset — the workstation
+default — the server behaves exactly as a single-live-lane deployment and
+the Alex button stays hidden.
+
+## Settings derivation 2026-08-04 (post Aug-3 slate)
+
+The lock readout graded 16 of 19 decay sales as settlement winners
+(+$170.51 left), confirming the deeper decay direction. Live adopted only
+CI-validated changes: ML floor 0.10 (10-15c graded +403.8%/$1, CI > 0) and
+spread `min_source_agreement` 55 (sub-55 dogs' CI includes zero; 55-70 is
+validated volume). The Unders ceiling stays 0.38 on live (38-45c CI
+includes zero) while dry keeps measuring 0.45. Dry probes one regime step
+further everywhere: ML floor 0.06, `min_edge` 0.01 (ML/spread) and 0.03
+(totals), decay -0.50/-0.30/-0.35, agreement gate removed so the sub-55
+control band keeps accruing.

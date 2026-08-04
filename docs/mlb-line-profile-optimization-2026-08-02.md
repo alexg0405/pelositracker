@@ -284,3 +284,37 @@ protective on this line.
 
 The field requires a server started from this code; an older runtime
 ignores it and its next save drops it. Restart before arming.
+
+## Addendum — 2026-08-03 slate: the catastrophic path was selling book gaps
+
+The first guards-off slate promoted the last un-audited exit rule into the
+light. Four live positions exited `catastrophic_stop_loss`; the 30-minute
+post-exit tracker shows **all four recovered to entry price**, and three of
+the four *filled 15–35c above the quote that triggered them* — the
+fill-or-kill executed after the book had already refilled. Dry showed the
+same at size: an Under 7.5 sold at 2c traded to 63c (+$27 forgone), another
+at 1c to 45c.
+
+The rule fires when `return_fraction <= -min(0.95, stop_loss ×
+catastrophic_stop_multiplier)`. The 0.95 cap means **a 0.95 stop_loss does
+not disable it** — guards-off left it armed — and it exits `immediate`,
+deliberately skipping the confirmation window every other exit now uses.
+That combination is precisely what a one-tick liquidity gap needs to become
+a realized loss.
+
+The code already refused the symmetric mistake: `settled_in_favor` holds a
+low quote that conflicts with a *favorable* score. There was no mirror for
+the adverse direction. There is now:
+
+- **State-aware path**: the price-only catastrophic exit requires live game
+  state to corroborate the collapse (`terminal` or `structurally_lost`). If
+  the game says the position is still reachable, the quote is marked
+  `catastrophic_price_unconfirmed` and falls through to the ordinary bounded
+  confirmation window. A genuinely lost position still exits immediately —
+  that branch is unchanged.
+- **Stateless path**: with no witness but the price, the boundary must
+  survive one further reading before selling.
+
+Live cost of the mispriced exits on the night was only $0.31 (small totals
+stakes), but the mechanism scales with position size, which is why it was
+fixed the same evening rather than queued.

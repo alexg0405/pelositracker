@@ -782,14 +782,24 @@ def test_state_aware_mlb_stop_requires_bounded_confirmation(tmp_path):
     trader.close()
 
 
-def test_state_aware_mlb_stop_keeps_catastrophic_boundary_immediate(tmp_path):
+def test_catastrophic_boundary_holds_when_state_does_not_corroborate(tmp_path):
+    """A lone gapped quote must not sell a position the game says is alive.
+
+    The 2026-08-03 slate sold four positions on this path whose orders then
+    filled 15-35c above the triggering quote and kept climbing: the book had
+    refilled before the fill-or-kill executed. With live state available and
+    the total still reachable, the quote is treated as suspect.
+    """
     clock = Clock()
     trader = make_trader(tmp_path, clock, fail_on_orders=True)
     trader.configure({
         "volatility_stop_enabled": True,
         "stop_loss": 0.20,
         "catastrophic_stop_multiplier": 1.50,
+        "stop_confirmation_readings": 3,
     })
+    # Top 5, 1-1: an Over 7.5 is still reachable, so nothing corroborates a
+    # collapse except the price itself.
     mlb, live_state = mlb_event_and_state(clock)
     position = {
         "id": "position-1",
@@ -813,13 +823,65 @@ def test_state_aware_mlb_stop_keeps_catastrophic_boundary_immediate(tmp_path):
         stop_loss=0.20,
     )
 
-    reason, guard, *_ = trader._stop_guard_decision(
+    reason, guard, _triggered, count, _low = trader._stop_guard_decision(
         position,
         event=mlb,
         state=live_state,
         exit_value=0.27,
         current_edge=0.05,
         return_fraction=-0.325,
+        adaptive_exit=adaptive,
+    )
+
+    assert reason is None
+    assert guard["catastrophic_price_unconfirmed"] is True
+    assert guard["status"] == "observing_recovery"
+    assert count == 1
+    trader.close()
+
+
+def test_catastrophic_boundary_stays_immediate_when_state_confirms(tmp_path):
+    """A real collapse still exits at once: the score makes it irreversible."""
+    clock = Clock()
+    trader = make_trader(tmp_path, clock, fail_on_orders=True)
+    trader.configure({
+        "volatility_stop_enabled": True,
+        "stop_loss": 0.20,
+        "catastrophic_stop_multiplier": 1.50,
+    })
+    # 9 runs already scored puts an Under 7.5 permanently out of reach.
+    mlb, live_state = mlb_event_and_state(
+        clock, period="Top 8", home_score=5, away_score=4
+    )
+    position = {
+        "id": "position-1",
+        "event_id": mlb.id,
+        "event_name": mlb.name,
+        "market_slug": "under-7-5",
+        "market_type": "total",
+        "selection": "Under 7.5",
+        "position_side": "long",
+        "mode": "dry_run",
+        "quantity": 2.0,
+        "entry_cost": 0.40,
+    }
+    adaptive = trader._adaptive_exit.base_decision(
+        profile="observe",
+        reason="test",
+        applicable=True,
+        profit_target=0.10,
+        trailing_drawdown=0.04,
+        exit_edge=0.0,
+        stop_loss=0.20,
+    )
+
+    reason, guard, *_ = trader._stop_guard_decision(
+        position,
+        event=mlb,
+        state=live_state,
+        exit_value=0.02,
+        current_edge=0.05,
+        return_fraction=-0.95,
         adaptive_exit=adaptive,
     )
 
@@ -1013,9 +1075,13 @@ def test_stateless_confirmation_bounds_the_stop_without_mlb_state(tmp_path):
     trader.close()
 
 
-def test_stateless_confirmation_keeps_catastrophic_boundary_immediate(
-    tmp_path,
-):
+def test_stateless_catastrophic_boundary_needs_a_second_reading(tmp_path):
+    """With no game state there is no witness but the price itself.
+
+    One gapped quote cannot sell the position; a boundary that survives the
+    next reading can. A real collapse stays collapsed, a thin-book gap does
+    not.
+    """
     clock = Clock()
     trader = make_trader(tmp_path, clock, fail_on_orders=True)
     trader.configure({
@@ -1023,6 +1089,7 @@ def test_stateless_confirmation_keeps_catastrophic_boundary_immediate(
         "stateless_stop_confirmation": True,
         "stop_loss": 0.20,
         "catastrophic_stop_multiplier": 1.50,
+        "stop_confirmation_readings": 3,
     })
     mlb, _ = mlb_event_and_state(clock)
     adaptive = trader._adaptive_exit.base_decision(
@@ -1034,9 +1101,29 @@ def test_stateless_confirmation_keeps_catastrophic_boundary_immediate(
         exit_edge=0.0,
         stop_loss=0.20,
     )
+    position = _stateless_stop_position(mlb)
 
+    reason, guard, triggered, count, _low = trader._stop_guard_decision(
+        position,
+        event=mlb,
+        state=None,
+        exit_value=0.27,
+        current_edge=0.05,
+        return_fraction=-0.325,
+        adaptive_exit=adaptive,
+    )
+
+    assert reason is None
+    assert guard["catastrophic_price_unconfirmed"] is True
+    assert count == 1
+
+    # The boundary persists into the next reading: now it may sell.
+    position.update(
+        stop_triggered_ts=triggered, stop_observation_count=count
+    )
+    clock.value += 30
     reason, guard, *_ = trader._stop_guard_decision(
-        _stateless_stop_position(mlb),
+        position,
         event=mlb,
         state=None,
         exit_value=0.27,

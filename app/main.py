@@ -117,6 +117,17 @@ history_db: HistoryDB | None = None
 monitor_state: MonitorState | None = None
 live_trader: PolymarketUSAutoTrader | None = None
 dry_run_trader: PolymarketUSAutoTrader | None = None
+# Optional second live lane so two people can trade their own Polymarket
+# accounts side by side. The primary live lane displays as "Anthony", the
+# second as "Alex"; nothing about the second lane exists at runtime unless
+# ENABLE_POLYMARKET_US_ALEX_LANE is set.
+alex_trader: PolymarketUSAutoTrader | None = None
+ExecutionLane = Literal["live", "dry_run", "alex"]
+LANE_LABELS: dict[str, str] = {
+    "live": "Anthony",
+    "alex": "Alex",
+    "dry_run": "Dry run",
+}
 model_lab: SportModelLab | None = None
 engine = SignalEngine(settings.confidence_threshold,
                       settings.edge_threshold,
@@ -1557,7 +1568,7 @@ async def _run_live_trading_cycle() -> dict[str, Any]:
 async def execution_trading_loop(
     trader: PolymarketUSAutoTrader,
     *,
-    lane: Literal["live", "dry_run"],
+    lane: ExecutionLane,
 ):
     while True:
         delay = 30
@@ -1622,7 +1633,7 @@ def _active_mlb_market_scopes() -> tuple[str, ...]:
     for the existing engine and display.
     """
     selected = {FULL_GAME_SCOPE}
-    for trader in (live_trader, dry_run_trader):
+    for trader in (live_trader, dry_run_trader, alex_trader):
         if trader is None or not trader.policy.automation_enabled:
             continue
         selected.update(trader.policy.allowed_market_scopes)
@@ -1670,7 +1681,7 @@ def _start_event_feeds(event: Event) -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global ledger, account_book, history_db, monitor_state
-    global live_trader, dry_run_trader, model_lab
+    global live_trader, dry_run_trader, alex_trader, model_lab
     sports_task: asyncio.Task | None = None
     auto_task: asyncio.Task | None = None
     gameday_task: asyncio.Task | None = None
@@ -1727,9 +1738,32 @@ async def lifespan(_: FastAPI):
             if live_trader is not None
             else None
         )
+        alex_trader = (
+            PolymarketUSAutoTrader(
+                (
+                    None
+                    if settings.database_url and not settings.workstation_mode
+                    else str(settings.polymarket_us_alex_trading_db)
+                ),
+                key_id=settings.polymarket_us_alex_key_id,
+                secret_key=settings.polymarket_us_alex_secret_key,
+                database_namespace=(
+                    "polymarket_us_alex"
+                    if settings.database_url and not settings.workstation_mode
+                    else None
+                ),
+            )
+            if (
+                settings.enable_polymarket_us_alex_lane
+                and live_trader is not None
+            )
+            else None
+        )
         if dry_run_trader is not None:
             _pin_execution_lane(live_trader, "live")
             _pin_execution_lane(dry_run_trader, "dry_run")
+        if alex_trader is not None:
+            _pin_execution_lane(alex_trader, "live")
         model_lab = (
             SportModelLab(
                 str(settings.model_lab_db)
@@ -1792,6 +1826,10 @@ async def lifespan(_: FastAPI):
         if dry_run_trader is not None:
             execution_tasks.append(asyncio.create_task(
                 execution_trading_loop(dry_run_trader, lane="dry_run")
+            ))
+        if alex_trader is not None:
+            execution_tasks.append(asyncio.create_task(
+                execution_trading_loop(alex_trader, lane="alex")
             ))
         yield
     finally:
@@ -2394,13 +2432,40 @@ async def _mlb_schedule_today() -> list[dict]:
     return schedule
 
 
-def _active_polymarket_us_credentials() -> tuple[str, str]:
-    if live_trader is not None:
-        return live_trader._credential_pair_for_server()
+def _require_credential_lane(
+    lane: ExecutionLane | None,
+) -> PolymarketUSAutoTrader:
+    """Resolve a lane that holds real venue credentials (live-mode only)."""
+    if lane == "dry_run":
+        raise HTTPException(
+            409,
+            "The dry-run lane simulates fills and never holds venue "
+            "credentials.",
+        )
+    return _require_execution_lane(lane)
+
+
+def _lane_environment_credentials(
+    lane: ExecutionLane | None,
+) -> tuple[str, str]:
+    if lane == "alex":
+        return (
+            settings.polymarket_us_alex_key_id,
+            settings.polymarket_us_alex_secret_key,
+        )
     return (
         settings.polymarket_us_key_id,
         settings.polymarket_us_secret_key,
     )
+
+
+def _active_polymarket_us_credentials(
+    lane: ExecutionLane | None = None,
+) -> tuple[str, str]:
+    trader = alex_trader if lane == "alex" else live_trader
+    if trader is not None:
+        return trader._credential_pair_for_server()
+    return _lane_environment_credentials(lane)
 
 
 @app.get("/api/discover", dependencies=[Depends(verify_auth)])
@@ -2476,9 +2541,9 @@ async def polymarket_us_events(refresh: bool = False, limit: int = 60):
 
 
 @app.get("/api/polymarket-us/account", dependencies=[Depends(verify_auth)])
-async def polymarket_us_account():
+async def polymarket_us_account(lane: ExecutionLane | None = None):
     """Read account balances and every position, including unmanaged positions."""
-    key_id, secret_key = _active_polymarket_us_credentials()
+    key_id, secret_key = _active_polymarket_us_credentials(lane)
     if not key_id or not secret_key:
         raise HTTPException(
             409,
@@ -2499,14 +2564,18 @@ async def polymarket_us_account():
     "/api/polymarket-us/runtime-credentials",
     dependencies=[Depends(verify_execution_admin)],
 )
-async def polymarket_us_runtime_credentials(payload: RuntimeCredentialsIn):
+async def polymarket_us_runtime_credentials(
+    payload: RuntimeCredentialsIn,
+    lane: ExecutionLane | None = None,
+):
     """Verify and install a key in process memory only.
 
     The request body is never logged or persisted. Installing a different
     account revokes automation authority and is rejected while a live managed
-    position is open.
+    position is open. Naming a lane targets that person's lane (Anthony is
+    the primary live lane, Alex the optional second one).
     """
-    trader = _require_live_trader()
+    trader = _require_credential_lane(lane)
     key_id = payload.key_id.strip()
     secret_key = payload.secret_key.get_secret_value().strip()
     if not secret_key:
@@ -2546,18 +2615,17 @@ async def polymarket_us_runtime_credentials(payload: RuntimeCredentialsIn):
     "/api/polymarket-us/runtime-credentials",
     dependencies=[Depends(verify_execution_admin)],
 )
-async def clear_polymarket_us_runtime_credentials():
-    trader = _require_live_trader()
-    source = (
-        "environment"
-        if settings.polymarket_us_key_id and settings.polymarket_us_secret_key
-        else "none"
-    )
+async def clear_polymarket_us_runtime_credentials(
+    lane: ExecutionLane | None = None,
+):
+    trader = _require_credential_lane(lane)
+    env_key, env_secret = _lane_environment_credentials(lane)
+    source = "environment" if env_key and env_secret else "none"
     try:
         status = await asyncio.to_thread(
             trader.set_runtime_credentials,
-            settings.polymarket_us_key_id,
-            settings.polymarket_us_secret_key,
+            env_key,
+            env_secret,
             source=source,
         )
     except TradingPolicyError as exc:
@@ -2580,7 +2648,7 @@ def _require_live_trader() -> PolymarketUSAutoTrader:
 
 
 def _require_execution_lane(
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ) -> PolymarketUSAutoTrader:
     """Return one isolated automation lane.
 
@@ -2595,16 +2663,29 @@ def _require_execution_lane(
                 "application.",
             )
         return dry_run_trader
+    if lane == "alex":
+        if alex_trader is None:
+            raise HTTPException(
+                409,
+                "The Alex lane is not enabled; set "
+                "ENABLE_POLYMARKET_US_ALEX_LANE=true on the server and "
+                "restart.",
+            )
+        return alex_trader
     return _require_live_trader()
 
 
 def _execution_data_sources(
-    mode: Literal["all", "combined", "live", "dry_run"],
+    mode: Literal["all", "combined", "live", "dry_run", "alex"],
 ) -> list[tuple[str, PolymarketUSAutoTrader]]:
-    requested = {"live", "dry_run"} if mode in {"all", "combined"} else {mode}
+    requested = (
+        {"live", "dry_run", "alex"} if mode in {"all", "combined"}
+        else {mode}
+    )
     available = {
         "live": live_trader,
         "dry_run": dry_run_trader,
+        "alex": alex_trader,
     }
     sources = [
         (lane, trader)
@@ -2722,6 +2803,7 @@ async def _execution_lane_summaries() -> dict[str, dict[str, Any]]:
     for lane, trader in (
         ("live", live_trader),
         ("dry_run", dry_run_trader),
+        ("alex", alex_trader),
     ):
         if trader is None:
             continue
@@ -2729,6 +2811,7 @@ async def _execution_lane_summaries() -> dict[str, dict[str, Any]]:
         policy = status.get("policy") or {}
         summaries[lane] = {
             "lane": lane,
+            "label": LANE_LABELS.get(lane, lane),
             "automation_enabled": bool(policy.get("automation_enabled")),
             "armed": bool(status.get("armed")),
             "auto_cashout": bool(policy.get("auto_cashout")),
@@ -2745,7 +2828,7 @@ async def _execution_lane_summaries() -> dict[str, dict[str, Any]]:
 async def _decorate_execution_status(
     status: dict[str, Any],
     *,
-    lane: Literal["live", "dry_run"] | None,
+    lane: ExecutionLane | None,
     trader: PolymarketUSAutoTrader,
 ) -> dict[str, Any]:
     """Attach lane identity and both scheduler summaries to an action result."""
@@ -2764,7 +2847,7 @@ async def _decorate_execution_status(
     dependencies=[Depends(verify_auth)],
 )
 async def polymarket_us_trading_status(
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     trader = _require_execution_lane(lane)
     status = await asyncio.to_thread(trader.status)
@@ -2855,7 +2938,7 @@ async def polymarket_us_trading_sync():
 )
 async def polymarket_us_trading_config(
     payload: LiveTradingConfigIn,
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     trader = _require_execution_lane(lane)
     try:
@@ -2879,7 +2962,7 @@ async def polymarket_us_trading_config(
 )
 async def polymarket_us_trading_clear_adaptive_exit_history(
     payload: AdaptiveExitHistoryClearIn,
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     try:
         return await asyncio.to_thread(
@@ -2896,7 +2979,7 @@ async def polymarket_us_trading_clear_adaptive_exit_history(
 )
 async def polymarket_us_trading_arm(
     payload: LiveTradingArmIn,
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     trader = _require_execution_lane(lane)
     try:
@@ -2919,7 +3002,7 @@ async def polymarket_us_trading_arm(
     dependencies=[Depends(verify_auth)],
 )
 async def polymarket_us_trading_disarm(
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     trader = _require_execution_lane(lane)
     status = await asyncio.to_thread(
@@ -2938,7 +3021,7 @@ async def polymarket_us_trading_disarm(
     dependencies=[Depends(verify_auth)],
 )
 async def polymarket_us_trading_stop(
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     trader = _require_execution_lane(lane)
     status = await asyncio.to_thread(
@@ -2957,7 +3040,7 @@ async def polymarket_us_trading_stop(
     dependencies=[Depends(verify_auth)],
 )
 async def polymarket_us_trading_emergency_stop(
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     trader = _require_execution_lane(lane)
     status = await asyncio.to_thread(
@@ -2975,7 +3058,7 @@ async def polymarket_us_trading_emergency_stop(
     dependencies=[Depends(verify_auth)],
 )
 async def polymarket_us_trading_run(
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     trader = _require_execution_lane(lane)
     try:
@@ -3000,7 +3083,7 @@ async def polymarket_us_trading_run(
 )
 async def polymarket_us_trading_liquidate(
     payload: LiveTradingLiquidateIn,
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     if lane is not None and lane != payload.mode:
         raise HTTPException(
@@ -3035,7 +3118,7 @@ async def polymarket_us_trading_liquidate(
 )
 async def polymarket_us_trading_clear_dry_run_history(
     payload: DryRunHistoryClearIn,
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     try:
         return await asyncio.to_thread(
@@ -3113,7 +3196,7 @@ async def polymarket_us_trading_journal(
     limit: int = 25,
     offset: int = 0,
     kinds: str = "",
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     """Return one bounded page of execution-journal rows.
 
@@ -3135,7 +3218,7 @@ async def polymarket_us_trading_journal(
     dependencies=[Depends(verify_auth)],
 )
 async def polymarket_us_trading_positions(
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     return await asyncio.to_thread(_require_execution_lane(lane).positions)
 
@@ -3145,7 +3228,7 @@ async def polymarket_us_trading_positions(
     dependencies=[Depends(verify_auth)],
 )
 async def polymarket_us_trading_archive_exited_positions(
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     return await asyncio.to_thread(
         _require_execution_lane(lane).archive_exited_positions
@@ -3157,7 +3240,7 @@ async def polymarket_us_trading_archive_exited_positions(
     dependencies=[Depends(verify_auth)],
 )
 async def polymarket_us_trading_performance(
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     return await asyncio.to_thread(_require_execution_lane(lane).performance)
 
@@ -3180,7 +3263,7 @@ async def polymarket_us_trading_performance_ledger(
     query: str = "",
     format: Literal["json", "csv"] = "json",
     limit: int = 2_000,
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     try:
         dataset_mode: Literal["combined", "live", "dry_run"] = (
@@ -3298,7 +3381,7 @@ async def _policy_advisor_model_evidence(
 )
 async def polymarket_us_trading_policy_advice(
     payload: PolicyAdviceIn,
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     trader = _require_execution_lane(lane)
     analysis_mode = (
@@ -3332,7 +3415,7 @@ async def polymarket_us_trading_policy_advice(
 )
 async def polymarket_us_trading_policy_advice_history(
     limit: int = 10,
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     return await asyncio.to_thread(
         _require_execution_lane(lane).policy_advice_history,
@@ -3346,7 +3429,7 @@ async def polymarket_us_trading_policy_advice_history(
 )
 async def polymarket_us_trading_policy_sessions(
     limit: int = 20,
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     return await asyncio.to_thread(
         _require_execution_lane(lane).policy_sessions,
@@ -3359,11 +3442,9 @@ async def polymarket_us_trading_policy_sessions(
     dependencies=[Depends(verify_auth)],
 )
 async def polymarket_us_trading_model_readiness(
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
-    requested_lane: Literal["live", "dry_run"] = (
-        "dry_run" if lane == "dry_run" else "live"
-    )
+    requested_lane: ExecutionLane = lane or "live"
     dataset = await _advisor_datasets(requested_lane)
     return await _policy_advisor_model_evidence(
         dataset["positions"]
@@ -3377,7 +3458,7 @@ async def polymarket_us_trading_model_readiness(
 async def polymarket_us_trading_apply_policy_advice(
     advice_id: str,
     payload: PolicyAdviceApplyIn,
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     try:
         return await asyncio.to_thread(
@@ -3428,7 +3509,7 @@ async def polymarket_us_trading_reset_dry_run_performance(
 )
 async def polymarket_us_trading_reset_risk_session(
     payload: RiskSessionResetIn,
-    lane: Literal["live", "dry_run"] | None = None,
+    lane: ExecutionLane | None = None,
 ):
     try:
         return await asyncio.to_thread(

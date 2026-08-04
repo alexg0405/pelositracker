@@ -8026,17 +8026,41 @@ class PolymarketUSAutoTrader:
             policy.stop_loss * policy.catastrophic_stop_multiplier,
         )
         base_payload["catastrophic_stop_loss"] = catastrophic_loss
+        state_corroborates_collapse = bool(
+            context["terminal"] or context["structurally_lost"]
+        )
         if return_fraction <= -catastrophic_loss:
-            base_payload.update(
-                status="immediate",
-                reason="catastrophic loss boundary reached",
-            )
-            return (
-                "catastrophic_stop_loss",
-                base_payload,
-                prior_trigger,
-                prior_count,
-                min(exit_value, prior_low if prior_low is not None else exit_value),
+            # A single quote at the catastrophic boundary is more often a
+            # momentary book gap than a real collapse. The 2026-08-03 slate
+            # sold four positions here whose orders then filled 15-35c above
+            # the triggering quote and kept climbing afterwards — the book
+            # had refilled before the fill-or-kill even executed. Live game
+            # state is the independent witness: when it corroborates the
+            # collapse this stays an immediate exit, and when it does not,
+            # the quote is treated as suspect and must survive the ordinary
+            # confirmation window. This mirrors the settled_in_favor guard
+            # above, which already refuses to sell a low quote that conflicts
+            # with a favorable score.
+            if state_corroborates_collapse:
+                base_payload.update(
+                    status="immediate",
+                    reason="catastrophic loss boundary reached",
+                )
+                return (
+                    "catastrophic_stop_loss",
+                    base_payload,
+                    prior_trigger,
+                    prior_count,
+                    min(
+                        exit_value,
+                        prior_low if prior_low is not None else exit_value,
+                    ),
+                )
+            base_payload["catastrophic_price_unconfirmed"] = True
+            base_payload["catastrophic_price_conflict_reason"] = (
+                "the executable quote reached the catastrophic boundary but "
+                "live game state does not corroborate a lost position; "
+                "confirming before selling"
             )
         if context["terminal"] or context["structurally_lost"]:
             base_payload.update(
@@ -8124,17 +8148,24 @@ class PolymarketUSAutoTrader:
         )
         base_payload["catastrophic_stop_loss"] = catastrophic_loss
         if return_fraction <= -catastrophic_loss:
-            base_payload.update(
-                status="immediate",
-                reason="catastrophic loss boundary reached",
-            )
-            return (
-                "catastrophic_stop_loss",
-                base_payload,
-                prior_trigger,
-                prior_count,
-                immediate_low,
-            )
+            # No game state is available here, so there is no independent
+            # witness to a collapse at all — the price is the only evidence,
+            # and a lone gapped quote is exactly what this path must not act
+            # on. Require the boundary to survive one more reading; a real
+            # collapse stays collapsed, a thin-book gap does not.
+            if prior_count >= 1:
+                base_payload.update(
+                    status="immediate",
+                    reason="catastrophic loss boundary confirmed",
+                )
+                return (
+                    "catastrophic_stop_loss",
+                    base_payload,
+                    prior_trigger,
+                    prior_count,
+                    immediate_low,
+                )
+            base_payload["catastrophic_price_unconfirmed"] = True
         material_reversal = -max(0.03, policy.min_edge)
         if current_edge is not None and current_edge <= material_reversal:
             base_payload.update(

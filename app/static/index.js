@@ -395,7 +395,14 @@
     setActionBusy(button, true, "Verifying...");
     status.textContent = "Verifying the key directly with Polymarket US. Automation will be stopped before the session key becomes active...";
     try {
-      const response = await fetch("/api/polymarket-us/runtime-credentials", {
+      // Keys install into the ACTIVE live-mode lane, so Anthony and Alex
+      // each post to their own lane; from the dry lane this targets the
+      // primary (Anthony) lane.
+      const credentialLane = isLiveModeLane(activeTradingLane)
+        ? activeTradingLane
+        : "live";
+      const response = await fetch(
+        tradingApi("/api/polymarket-us/runtime-credentials", credentialLane), {
         method: "POST",
         headers: {"content-type":"application/json"},
         body: JSON.stringify({
@@ -426,7 +433,13 @@
     setActionBusy(button, true, "Forgetting...");
     if (status) status.textContent = "Stopping automation and clearing the runtime credential from server memory...";
     try {
-      const response = await fetch("/api/polymarket-us/runtime-credentials", {method:"DELETE"});
+      const response = await fetch(
+        tradingApi(
+          "/api/polymarket-us/runtime-credentials",
+          isLiveModeLane(activeTradingLane) ? activeTradingLane : "live"
+        ),
+        {method:"DELETE"}
+      );
       const data = await response.json().catch(()=>({}));
       if (!response.ok) throw new Error(data.detail || "Could not forget runtime key");
       document.querySelector("#us-runtime-key-id").value = "";
@@ -458,11 +471,19 @@
   let usTradingHydrationEpoch = 0;
   let lastRiskPresets = {};
   let lineExecutionProfiles = [];
+  const TRADING_LANES = ["dry_run", "live", "alex"];
+  // The primary live lane belongs to Anthony; the optional second live lane
+  // (its own Polymarket credentials, own book) belongs to Alex and only
+  // appears when the server enables it.
+  const TRADING_LANE_LABELS = {
+    live: "Anthony", alex: "Alex", dry_run: "Dry-run",
+  };
+  const tradingLaneLabel = lane => TRADING_LANE_LABELS[lane] || lane;
+  const isLiveModeLane = lane => lane !== "dry_run";
   let activeTradingLane = (() => {
     try {
-      return window.localStorage.getItem("pelosi-trading-lane") === "live"
-        ? "live"
-        : "dry_run";
+      const stored = window.localStorage.getItem("pelosi-trading-lane");
+      return TRADING_LANES.includes(stored) ? stored : "dry_run";
     } catch {
       return "dry_run";
     }
@@ -476,9 +497,15 @@
   function renderTradingLanes(status = lastUSTradingStatus) {
     const lanes = status?.lanes || {};
     const running = [];
-    for (const lane of ["dry_run", "live"]) {
+    let availableLanes = 0;
+    for (const lane of TRADING_LANES) {
       const laneStatus = lanes[lane] || {};
       const button = document.querySelector(`[data-trading-lane="${lane}"]`);
+      // The Alex lane only renders when the server actually runs it.
+      if (lane === "alex" && button) {
+        button.hidden = !(lane in lanes) && lane !== activeTradingLane;
+      }
+      if (lane in lanes || lane !== "alex") availableLanes += 1;
       button?.classList.toggle("is-active", lane === activeTradingLane);
       button?.classList.toggle("is-running", !!laneStatus.automation_enabled);
       button?.setAttribute(
@@ -489,12 +516,14 @@
       const summary = document.querySelector(
         lane === "live"
           ? "#us-live-lane-summary"
-          : "#us-dry-run-lane-summary"
+          : lane === "alex"
+            ? "#us-alex-lane-summary"
+            : "#us-dry-run-lane-summary"
       );
-      if (!summary) continue;
+      if (!summary || !(lane in lanes)) continue;
       const state = laneStatus.automation_enabled ? "RUNNING" : "STOPPED";
       if (laneStatus.automation_enabled) running.push(lane);
-      const armed = lane === "live"
+      const armed = isLiveModeLane(lane)
         ? laneStatus.armed ? " · ARMED" : " · DISARMED"
         : "";
       summary.textContent = (
@@ -504,21 +533,23 @@
     }
     const coordination = document.querySelector("#us-lane-coordination-status");
     if (coordination) {
-      coordination.classList.toggle("is-both-running", running.length === 2);
+      coordination.classList.toggle(
+        "is-both-running", running.length >= 2
+      );
       coordination.textContent = usTradingLaneSwitching
-        ? `Loading the ${activeTradingLane === "live" ? "live" : "dry-run"} lane policy...`
-        : running.length === 2
-          ? "Dry-run and live automation are both running independently."
+        ? `Loading the ${tradingLaneLabel(activeTradingLane)} lane policy...`
+        : running.length >= 2
+          ? `${running.map(tradingLaneLabel).join(" and ")} automation are running independently.`
           : running.length === 1
-            ? `${running[0] === "live" ? "Live" : "Dry-run"} automation is running. The other lane remains independently stopped.`
-            : "Both automation lanes are stopped. Tap a lane to edit its saved policy.";
+            ? `${tradingLaneLabel(running[0])} automation is running. Every other lane remains independently stopped.`
+            : "All automation lanes are stopped. Tap a lane to edit its saved policy.";
     }
     const selected = lanes[activeTradingLane] || {};
     const quickToggle = document.querySelector("#us-lane-automation-toggle");
     const quickTitle = document.querySelector("#us-quick-lane-title");
     const quickStatus = document.querySelector("#us-quick-lane-status");
     const selectedRunning = !!selected.automation_enabled;
-    const selectedLabel = activeTradingLane === "live" ? "Live" : "Dry-run";
+    const selectedLabel = tradingLaneLabel(activeTradingLane);
     if (quickTitle) quickTitle.textContent = `${selectedLabel} quick control`;
     if (quickToggle && !quickToggle.getAttribute("aria-busy")) {
       quickToggle.disabled = usTradingLaneSwitching;
@@ -537,11 +568,11 @@
       quickStatus.className = "";
       quickStatus.textContent = selectedRunning
         ? `${selectedLabel} cycles are running. This control stops only that lane.`
-        : activeTradingLane === "live"
+        : isLiveModeLane(activeTradingLane)
           ? "Starts live analysis cycles only. Real orders remain impossible until the separate live latch is armed."
           : "Starts the saved simulated policy on the server, so it keeps running after you close this page.";
     }
-    const liveOnly = activeTradingLane === "live";
+    const liveOnly = isLiveModeLane(activeTradingLane);
     const disarm = document.querySelector("#us-disarm");
     const arm = document.querySelector("#us-arm");
     const armApproval = document.querySelector("#us-arm-confirmation");
@@ -553,12 +584,12 @@
     const laneHint = document.querySelector("#us-live-control-hint");
     if (laneHint) {
       laneHint.textContent = liveOnly
-        ? "Live-order controls apply only to this live lane."
-        : "Switch to the live lane to arm or disarm real orders. Dry-run automation can run without arming.";
+        ? `Live-order controls apply only to the ${selectedLabel} lane.`
+        : "Switch to a live lane to arm or disarm real orders. Dry-run automation can run without arming.";
     }
     const save = document.querySelector("#us-policy-save");
     const run = document.querySelector("#us-run-now");
-    const laneLabel = liveOnly ? "live" : "dry-run";
+    const laneLabel = selectedLabel;
     if (save && !save.getAttribute("aria-busy")) {
       save.textContent = usTradingFormDirty
         ? `Save ${laneLabel} policy - unsaved`
@@ -570,7 +601,7 @@
   }
 
   async function switchTradingLane(lane) {
-    const next = lane === "live" ? "live" : "dry_run";
+    const next = TRADING_LANES.includes(lane) ? lane : "dry_run";
     const selector = document.querySelector("#us-trading-mode");
     if (usTradingLaneSwitching) {
       if (selector) selector.value = activeTradingLane;
@@ -810,7 +841,7 @@
     if (!box) return;
     clearPolicySaveNotice();
     revealPolicyTarget(target);
-    const laneLabel = activeTradingLane === "live" ? "Live" : "Dry-run";
+    const laneLabel = tradingLaneLabel(activeTradingLane);
     box.hidden = false;
     box.classList.add(`is-${kind}`);
     box.innerHTML = `
@@ -881,10 +912,10 @@
       const status = document.querySelector("#us-quick-lane-status");
       const laneStatus = lastUSTradingStatus?.lanes?.[activeTradingLane] || {};
       const running = !!laneStatus.automation_enabled;
-      const laneLabel = activeTradingLane === "live" ? "live" : "dry-run";
+      const laneLabel = tradingLaneLabel(activeTradingLane);
       if (
         !running
-        && activeTradingLane === "live"
+        && isLiveModeLane(activeTradingLane)
         && !window.confirm(
           "Start live analysis cycles? This does not arm real orders; the separate live-order approval and timer remain required."
         )
@@ -2733,7 +2764,7 @@
     const download = document.querySelector("#us-policy-advisor-download");
     if (download) download.disabled = false;
     status.className = "refresh-status";
-    status.textContent = `${String(advice.status || "research").replaceAll("_", " ")} · ${evidence.analysis_mode || "current"} mode · ${Number(evidence.eligible_closed_trades || 0)} eligible closes across ${Number(evidence.independent_events || 0)} events · target ${activeTradingLane === "live" ? "live" : "dry-run"} lane · model stage ${String(model.stage || "unavailable").replaceAll("_", " ")}`;
+    status.textContent = `${String(advice.status || "research").replaceAll("_", " ")} · ${evidence.analysis_mode || "current"} mode · ${Number(evidence.eligible_closed_trades || 0)} eligible closes across ${Number(evidence.independent_events || 0)} events · target ${tradingLaneLabel(activeTradingLane)} lane · model stage ${String(model.stage || "unavailable").replaceAll("_", " ")}`;
     body.innerHTML = `
       <div class="us-policy-advisor-summary">
         <div><span>Current qualified pace</span><strong>${currentRate.toFixed(2)}/hr</strong></div>
@@ -3672,7 +3703,7 @@
         applyTradingPolicy(body, {force:true});
       }
       renderTradingStatus(body);
-      const laneLabel = activeTradingLane === "live" ? "Live" : "Dry-run";
+      const laneLabel = tradingLaneLabel(activeTradingLane);
       const running = body?.policy?.automation_enabled ? "running" : "stopped";
       showPolicySaveNotice(
         `${laneLabel} automation is ${running}. The other lane was not changed.`,

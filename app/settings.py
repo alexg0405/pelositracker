@@ -75,6 +75,14 @@ class Settings:
     polymarket_us_secret_key: str
     polymarket_us_trading_db: Path
     polymarket_us_dry_run_db: Path
+    # Optional second live lane (display name "Alex") so a second person can
+    # trade their own Polymarket account beside the primary ("Anthony")
+    # lane. Off by default: with the flag unset the server behaves exactly
+    # as a single-live-lane deployment.
+    enable_polymarket_us_alex_lane: bool
+    polymarket_us_alex_key_id: str
+    polymarket_us_alex_secret_key: str
+    polymarket_us_alex_trading_db: Path
     model_lab_db: Path
     odds_api_key: str
     odds_regions: str
@@ -153,6 +161,21 @@ class Settings:
                 values.get(
                     "POLYMARKET_US_DRY_RUN_DB",
                     "workstation-data/polymarket-us-dry-run.db",
+                )
+            ),
+            enable_polymarket_us_alex_lane=_bool(
+                values, "ENABLE_POLYMARKET_US_ALEX_LANE", False
+            ),
+            polymarket_us_alex_key_id=values.get(
+                "POLYMARKET_US_ALEX_KEY_ID", ""
+            ).strip(),
+            polymarket_us_alex_secret_key=values.get(
+                "POLYMARKET_US_ALEX_SECRET_KEY", ""
+            ).strip(),
+            polymarket_us_alex_trading_db=Path(
+                values.get(
+                    "POLYMARKET_US_ALEX_TRADING_DB",
+                    "polymarket-us-alex.db",
                 )
             ),
             model_lab_db=Path(
