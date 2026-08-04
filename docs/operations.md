@@ -255,3 +255,54 @@ than silently falling back.
 The one-time copy above remains available if local history should seed the
 hosted database; it opens the local files read-only, so they are never
 modified. Local analysis tools keep reading the local files either way.
+
+## Per-line execution profiles from settlement evidence (added 2026-08-02)
+
+The 2026-08-02 settlement grading (1,030 graded positions, 72 events, both
+lanes — `docs/mlb-line-profile-optimization-2026-08-02.md`) found the exit
+rules line-specific: 67.5% of stopped moneylines settle as winners while
+only 29.9% of stopped totals do, and the model-reversal exit gives back
+~$222 on moneyline while saving ~$100 each on spread and totals. Two changes
+carry that into execution:
+
+### `reversal_confirmation_readings` is now a profile field
+
+A line/stage profile can override the model-reversal confirmation window
+(`LINE_EXECUTION_PROFILE_FIELDS`, integer 1–10, UI field "Model-reversal
+confirmations"). The effective per-line value is captured in
+`entry_policy_json` at entry like every other profile field, so a position
+keeps its window for life. Payloads carrying per-line readings require a
+server started from this code or newer; `tools/apply_line_profiles.py`
+refuses to write them under a running older server.
+
+### The offline profile apply tool
+
+```bash
+./.venv/Scripts/python.exe -m tools.apply_line_profiles --lane dry            # preview
+./.venv/Scripts/python.exe -m tools.apply_line_profiles --lane dry --apply    # write
+```
+
+Writes the exact `_save_policy` shape (full normalized policy + fresh
+control token) plus a `trading_policy_sessions` boundary
+(`external_profile_apply`), changing only `line_execution_profiles`. With
+the server stopped the policy loads on next start. With a server running,
+the rotated token makes it adopt the save on its next cycle and defensively
+disarm — the dry lane continues (its entries and simulated exits never
+consult the arm latches), the live lane requires re-arming, and the tool
+demands `--allow-running-server` before touching a listening port.
+`--payload FILE` applies a custom profile list; `--strip-new-fields`
+degrades the embedded recommendation for a running pre-2026-08-02 server.
+
+Both lanes had the embedded recommendation applied on 2026-08-02 with the
+server stopped: moneyline px 0.15–0.45 / max_edge 0.10 / stop 0.65 / target
+0.40; spread unchanged band, stop 0.60 / target 0.30; totals early+middle
+only, px 0.15–0.38 / min_edge 0.10 / target 0.30, late blocked. On
+2026-08-03 (operator-directed) the ML and spread reversal windows were
+raised to the maximum (readings 10, ~5 sustained adverse minutes): the Aug 2
+audit showed confirmed 5-reading reversal sales still selling settlement
+winners — 8 in that night alone, 4 of 7 tracked sales recovering to entry
+within 30 minutes — so the wide stop owns disaster protection and the
+reversal exit is near-vestigial on those lines. Totals keep readings 3;
+reversal exits genuinely save money there. The standing cautions apply: a UI
+save rebuilds profiles from the editor, and an advisor apply can overwrite
+them — check profiles after either.

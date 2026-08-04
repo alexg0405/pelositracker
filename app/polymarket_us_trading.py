@@ -546,6 +546,14 @@ LINE_EXECUTION_PROFILE_FIELDS = frozenset({
     "trailing_drawdown",
     "stop_loss",
     "exit_edge",
+    # Per-line reversal confirmation: the 2026-08-02 settlement grading found
+    # the model-reversal exit destroying value on moneyline (58% of reversal
+    # sales settled as winners, +$222 giveback) while *saving* money on spread
+    # and totals. One lane-wide window cannot express that split.
+    "reversal_confirmation_readings",
+    # Wall-clock floor for the reversal window (seconds) so a fast analysis
+    # cycle cannot compress the confirmation into noise-trigger range.
+    "reversal_confirmation_seconds",
     "min_mlb_fraction_remaining",
     # Optional per-profile capital limits. These can only tighten the lane's
     # shared boundaries; see PROFILE_TIGHTEN_ONLY_FIELDS.
@@ -568,6 +576,7 @@ PROFILE_TIGHTEN_ONLY_FIELDS = frozenset({
 PROFILE_INTEGER_FIELDS = frozenset({
     "min_reference_sources",
     "entry_confirmation_readings",
+    "reversal_confirmation_readings",
     "max_entries_per_event_per_hour",
     "max_profile_open_positions",
     "max_profile_orders_per_hour",
@@ -588,6 +597,29 @@ def _execution_game_stage(fraction_remaining: float | None) -> str | None:
     if fraction_remaining >= 0.25:
         return "middle"
     return "late"
+
+
+TOTAL_SIDES = ("over", "under")
+SPREAD_SIDES = ("favorite", "underdog")
+_SPREAD_HANDICAP_RE = re.compile(r"([+-])\s*\d+(?:\.\d+)?\s*$")
+
+
+def _totals_side(outcome: str) -> str | None:
+    """Classify a totals selection as over/under; None when unrecognizable."""
+    lowered = outcome.strip().casefold()
+    if lowered.startswith("over"):
+        return "over"
+    if lowered.startswith("under"):
+        return "under"
+    return None
+
+
+def _spread_side(outcome: str) -> str | None:
+    """Classify a run-line selection by its handicap sign; None if unclear."""
+    match = _SPREAD_HANDICAP_RE.search(outcome.strip())
+    if match is None:
+        return None
+    return "underdog" if match.group(1) == "+" else "favorite"
 
 
 def _normalize_line_execution_profiles(
@@ -715,6 +747,20 @@ class TradingPolicy:
     global_entry_enabled: bool = True
     allowed_market_types: tuple[str, ...] = SUPPORTED_ENTRY_MARKET_TYPES
     allowed_market_scopes: tuple[str, ...] = SUPPORTED_ENTRY_MARKET_SCOPES
+    # Which sides of the game total may enter. The 2026-08-03 settlement
+    # grading split the totals record cleanly by side: Overs lost -57.6% per
+    # $1 across every stage, edge, price, and line value measured (16.8%
+    # settlement win rate, n=155) while Unders returned +85.8% (64.8% win,
+    # n=142). Both sides stay eligible by default; the gate is a policy
+    # decision, not a schema default.
+    allowed_total_sides: tuple[str, ...] = TOTAL_SIDES
+    # Which run-line sides may enter. The 2026-08-03 settlement grading
+    # split spreads by handicap sign: favorites (-X.5) won 26.6% at ~34c
+    # (+2.2% per $1 overall, negative in the tradeable band) while
+    # underdogs (+X.5) won 76.1% at ~41c (+96.7% per $1, positive in every
+    # magnitude, price, edge, and stage cut; n=278/218). Both sides stay
+    # eligible by default; the gate is a policy decision.
+    allowed_spread_sides: tuple[str, ...] = SPREAD_SIDES
     allow_live_segment_markets: bool = False
     trading_allocation_usd: float = 10.0
     risk_preset: str = "custom"
@@ -760,6 +806,11 @@ class TradingPolicy:
     # 2026-08-02 settlement grading measured 62-65% of single-reading
     # reversal exits going on to win, on both lanes independently.
     reversal_confirmation_readings: int = 1
+    # Wall-clock floor for the same confirmation, so shortening the analysis
+    # cycle to chase entry dips cannot silently compress the reversal window:
+    # the streak must satisfy BOTH the reading count and this many seconds of
+    # unbroken adverse edge. Zero preserves the pure count behavior.
+    reversal_confirmation_seconds: float = 0.0
     cycle_seconds: float = 30.0
     candidate_cooldown_seconds: int = 300
     max_entries_per_event_per_hour: int = 3
@@ -811,6 +862,24 @@ class TradingPolicy:
                 SUPPORTED_ENTRY_MARKET_SCOPES
                 if str(clean.get("execution_mode") or "dry_run") == "dry_run"
                 else (FULL_GAME_SCOPE,)
+            )
+        if "allowed_total_sides" in clean:
+            raw_total_sides = clean["allowed_total_sides"]
+            if not isinstance(raw_total_sides, (list, tuple)):
+                raise TradingPolicyError("allowed_total_sides must be a list")
+            clean["allowed_total_sides"] = tuple(
+                dict.fromkeys(
+                    str(side).strip().casefold() for side in raw_total_sides
+                )
+            )
+        if "allowed_spread_sides" in clean:
+            raw_spread_sides = clean["allowed_spread_sides"]
+            if not isinstance(raw_spread_sides, (list, tuple)):
+                raise TradingPolicyError("allowed_spread_sides must be a list")
+            clean["allowed_spread_sides"] = tuple(
+                dict.fromkeys(
+                    str(side).strip().casefold() for side in raw_spread_sides
+                )
             )
         clean["line_execution_profiles"] = _normalize_line_execution_profiles(
             clean.get("line_execution_profiles")
@@ -937,6 +1006,19 @@ class TradingPolicy:
             raise TradingPolicyError(
                 "adaptive_exit_max_tightening must be between 0 and 0.60"
             )
+        if not self.allowed_total_sides or not set(
+            self.allowed_total_sides
+        ) <= set(TOTAL_SIDES):
+            raise TradingPolicyError(
+                "allowed_total_sides must be a non-empty subset of over/under"
+            )
+        if not self.allowed_spread_sides or not set(
+            self.allowed_spread_sides
+        ) <= set(SPREAD_SIDES):
+            raise TradingPolicyError(
+                "allowed_spread_sides must be a non-empty subset of "
+                "favorite/underdog"
+            )
         if not 2 <= self.stop_confirmation_readings <= 10:
             raise TradingPolicyError(
                 "stop_confirmation_readings must be between 2 and 10"
@@ -944,6 +1026,13 @@ class TradingPolicy:
         if not 1 <= self.reversal_confirmation_readings <= 10:
             raise TradingPolicyError(
                 "reversal_confirmation_readings must be between 1 and 10"
+            )
+        if (
+            not math.isfinite(self.reversal_confirmation_seconds)
+            or not 0 <= self.reversal_confirmation_seconds <= 1800
+        ):
+            raise TradingPolicyError(
+                "reversal_confirmation_seconds must be between 0 and 1800"
             )
         if not 0.5 <= self.stop_grace_minutes <= 15:
             raise TradingPolicyError(
@@ -6517,6 +6606,26 @@ class PolymarketUSAutoTrader:
             return None, (
                 f"{profile_key} is disabled by the line-specific execution policy"
             )
+        if market_type == "total":
+            total_side = _totals_side(str(signal.outcome or ""))
+            if (
+                total_side is not None
+                and total_side not in policy.allowed_total_sides
+            ):
+                return None, (
+                    f"{total_side} totals are disabled by the totals side "
+                    "policy"
+                )
+        if market_type == "spread":
+            spread_side = _spread_side(str(signal.outcome or ""))
+            if (
+                spread_side is not None
+                and spread_side not in policy.allowed_spread_sides
+            ):
+                return None, (
+                    f"{spread_side} run lines are disabled by the spread "
+                    "side policy"
+                )
         engine_gate_blocker = self._engine_gate_blocker(signal)
         if engine_gate_blocker:
             return None, engine_gate_blocker
@@ -8220,17 +8329,28 @@ class PolymarketUSAutoTrader:
         if current_edge is None or current_edge > threshold:
             return False, None, 0
         required = max(1, int(policy.reversal_confirmation_readings))
+        floor_seconds = max(0.0, float(policy.reversal_confirmation_seconds))
         now = self._clock()
         window = max(
             60.0,
             float(policy.cycle_seconds) * float(required + 2),
         )
+        if floor_seconds:
+            # The streak must be allowed to live long enough to satisfy the
+            # wall-clock floor at any cycle speed, plus slack for jitter.
+            window = max(
+                window,
+                floor_seconds + 2.0 * float(policy.cycle_seconds),
+            )
         prior_ts = _amount(position.get("reversal_triggered_ts"))
         prior_count = int(position.get("reversal_observation_count") or 0)
         consecutive = prior_ts is not None and now - prior_ts <= window
         triggered_at = prior_ts if consecutive else now
         count = prior_count + 1 if consecutive else 1
-        return count >= required, triggered_at, count
+        confirmed = count >= required and (
+            not floor_seconds or now - triggered_at >= floor_seconds
+        )
+        return confirmed, triggered_at, count
 
     def _profit_guard_decision(
         self,

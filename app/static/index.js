@@ -721,6 +721,8 @@
     global_entry_enabled: "#us-line-type-policy",
     allowed_market_types: "#us-line-type-policy",
     allowed_market_scopes: "#us-market-scope-policy",
+    allowed_total_sides: "#us-total-side-policy",
+    allowed_spread_sides: "#us-spread-side-policy",
     adaptive_exit_horizon_minutes: "#us-adaptive-exit-horizon",
     adaptive_exit_min_samples: "#us-adaptive-exit-min-samples",
     adaptive_exit_max_tightening: "#us-adaptive-exit-max-tightening",
@@ -987,6 +989,12 @@
   const entryMarketScopeInputs = () => [
     ...document.querySelectorAll("[data-entry-market-scope]")
   ];
+  const entryTotalSideInputs = () => [
+    ...document.querySelectorAll("[data-entry-total-side]")
+  ];
+  const entrySpreadSideInputs = () => [
+    ...document.querySelectorAll("[data-entry-spread-side]")
+  ];
 
   function updateEngineGateAvailability() {
     const strict = document.querySelector("#us-require-engine")?.checked;
@@ -1168,7 +1176,9 @@
       minimum_locked_profit:"retained floor",
       trailing_drawdown:"trailing",
       stop_loss:"stop",
-      exit_edge:"reversal edge",
+      exit_edge:"lock decay edge",
+      reversal_confirmation_readings:"reversal confirmations",
+      reversal_confirmation_seconds:"reversal floor s",
       min_mlb_fraction_remaining:"game remaining",
       max_position_usd:"max position $",
       max_event_exposure_usd:"max event $",
@@ -1199,6 +1209,7 @@
                     [
                       "min_reference_sources",
                       "entry_confirmation_readings",
+                      "reversal_confirmation_readings",
                       "max_entries_per_event_per_hour",
                       "max_profile_open_positions",
                       "max_profile_orders_per_hour"
@@ -1270,6 +1281,8 @@
       trailing_drawdown:"#us-trailing-drawdown",
       stop_loss:"#us-stop-loss",
       exit_edge:"#us-exit-edge",
+      reversal_confirmation_readings:"#us-reversal-confirmation-readings",
+      reversal_confirmation_seconds:"#us-reversal-confirmation-seconds",
       min_mlb_fraction_remaining:"#us-min-mlb-remaining",
       max_position_usd:"#us-max-position",
       max_event_exposure_usd:"#us-max-event",
@@ -1392,6 +1405,7 @@
       "#us-stop-loss": policy.stop_loss == null ? null : policy.stop_loss * 100,
       "#us-exit-edge": policy.exit_edge == null ? null : policy.exit_edge * 100,
       "#us-reversal-confirmation-readings": policy.reversal_confirmation_readings,
+      "#us-reversal-confirmation-seconds": policy.reversal_confirmation_seconds,
       "#us-cycle-seconds": policy.cycle_seconds,
       "#us-adaptive-exit-profile": policy.adaptive_exit_profile || "observe",
       "#us-adaptive-exit-horizon": policy.adaptive_exit_horizon_minutes,
@@ -1452,6 +1466,22 @@
     );
     for (const input of entryMarketScopeInputs()) {
       input.checked = selectedMarketScopes.has(input.dataset.entryMarketScope);
+    }
+    const selectedTotalSides = new Set(
+      Array.isArray(policy.allowed_total_sides)
+        ? policy.allowed_total_sides
+        : ["over", "under"]
+    );
+    for (const input of entryTotalSideInputs()) {
+      input.checked = selectedTotalSides.has(input.dataset.entryTotalSide);
+    }
+    const selectedSpreadSides = new Set(
+      Array.isArray(policy.allowed_spread_sides)
+        ? policy.allowed_spread_sides
+        : ["favorite", "underdog"]
+    );
+    for (const input of entrySpreadSideInputs()) {
+      input.checked = selectedSpreadSides.has(input.dataset.entrySpreadSide);
     }
     const liveSegmentApproval = document.querySelector(
       "#us-allow-live-segments"
@@ -3470,6 +3500,36 @@
       );
       return;
     }
+    const allowedTotalSides = entryTotalSideInputs()
+      .filter(input => input.checked)
+      .map(input => input.dataset.entryTotalSide);
+    if (!allowedTotalSides.length) {
+      setActionBusy(button, false);
+      statusBox.textContent = "Select at least one game-total side for automatic entry.";
+      showPolicySaveNotice(
+        "Select at least one game-total side (Over/Under) for automatic entry.",
+        {
+          target:document.querySelector("#us-total-side-policy"),
+          scroll:true
+        }
+      );
+      return;
+    }
+    const allowedSpreadSides = entrySpreadSideInputs()
+      .filter(input => input.checked)
+      .map(input => input.dataset.entrySpreadSide);
+    if (!allowedSpreadSides.length) {
+      setActionBusy(button, false);
+      statusBox.textContent = "Select at least one run-line side for automatic entry.";
+      showPolicySaveNotice(
+        "Select at least one run-line side (favorite/underdog) for automatic entry.",
+        {
+          target:document.querySelector("#us-spread-side-policy"),
+          scroll:true
+        }
+      );
+      return;
+    }
     const allowedMarketScopes = entryMarketScopeInputs()
       .filter(input => input.checked)
       .map(input => input.dataset.entryMarketScope);
@@ -3529,6 +3589,8 @@
       global_entry_enabled: globalEntryEnabled,
       allowed_market_types: allowedMarketTypes,
       allowed_market_scopes: allowedMarketScopes,
+      allowed_total_sides: allowedTotalSides,
+      allowed_spread_sides: allowedSpreadSides,
       allow_live_segment_markets: document.querySelector(
         "#us-allow-live-segments"
       ).checked,
@@ -3583,6 +3645,9 @@
       exit_edge: Number(document.querySelector("#us-exit-edge").value) / 100,
       reversal_confirmation_readings: Number(
         document.querySelector("#us-reversal-confirmation-readings").value
+      ),
+      reversal_confirmation_seconds: Number(
+        document.querySelector("#us-reversal-confirmation-seconds").value
       ),
       cycle_seconds: Number(document.querySelector("#us-cycle-seconds").value)
     };

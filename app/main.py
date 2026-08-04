@@ -1950,6 +1950,7 @@ class LiveTradingConfigIn(BaseModel):
     volatility_stop_enabled: bool | None = None
     stateless_stop_confirmation: bool | None = None
     reversal_confirmation_readings: int | None = None
+    reversal_confirmation_seconds: float | None = None
     stop_confirmation_readings: int | None = None
     stop_grace_minutes: float | None = None
     catastrophic_stop_multiplier: float | None = None
@@ -1959,6 +1960,8 @@ class LiveTradingConfigIn(BaseModel):
     global_entry_enabled: bool | None = None
     allowed_market_types: list[str] | None = None
     allowed_market_scopes: list[str] | None = None
+    allowed_total_sides: list[str] | None = None
+    allowed_spread_sides: list[str] | None = None
     allow_live_segment_markets: bool | None = None
     trading_allocation_usd: float | None = None
     risk_preset: str | None = None

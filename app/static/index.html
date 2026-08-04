@@ -526,8 +526,14 @@
             <label>Stop loss (%)
               <input data-profile-field="stop_loss" data-profile-percent type="number" min="0.01" max="99" step="any" placeholder="Inherit">
             </label>
-            <label>Model-reversal edge (%)
+            <label>Profit-lock decay edge (%)
               <input data-profile-field="exit_edge" data-profile-percent type="number" min="-99" max="99" step="any" placeholder="Inherit">
+            </label>
+            <label>Model-reversal confirmations
+              <input data-profile-field="reversal_confirmation_readings" data-profile-integer type="number" min="1" max="10" step="1" placeholder="Inherit">
+            </label>
+            <label>Model-reversal floor (seconds)
+              <input data-profile-field="reversal_confirmation_seconds" type="number" min="0" max="1800" step="any" placeholder="Inherit">
             </label>
             <label>Minimum MLB game remaining (%)
               <input data-profile-field="min_mlb_fraction_remaining" data-profile-percent type="number" min="0" max="100" step="any" placeholder="Inherit">
@@ -549,6 +555,18 @@
           <div class="field-note">First-five winner, run-line, and total products follow the line-type choices above. First-inning runs use the total filter. These exact per-event markets are requested from The Odds API only while a lane using them is running, and each additional market can consume credits.</div>
           <label class="us-segment-live-approval"><input id="us-allow-live-segments" type="checkbox"> Allow real orders on selected MLB segment markets after reviewing dry-run results</label>
           <div id="us-segment-research-status" class="us-segment-research-status" role="status" aria-live="polite">No retained MLB segment simulations yet.</div>
+        </fieldset>
+        <fieldset id="us-total-side-policy" class="us-line-type-policy us-check-wide">
+          <legend>Game-total sides eligible for automatic entry</legend>
+          <label><input type="checkbox" data-entry-total-side="over"> Over totals</label>
+          <label><input type="checkbox" data-entry-total-side="under"> Under totals</label>
+          <div class="field-note">Settlement grading (2026-08-03, 297 totals positions): Over entries lost in every stage, edge, price, and line-value bucket measured (16.8% settlement win rate, −57.6% per $1) while Unders won 64.8% (+85.8% per $1). This gate applies before any line/stage profile. At least one side must stay selected.</div>
+        </fieldset>
+        <fieldset id="us-spread-side-policy" class="us-line-type-policy us-check-wide">
+          <legend>Run-line sides eligible for automatic entry</legend>
+          <label><input type="checkbox" data-entry-spread-side="favorite"> Favorites (−X.5)</label>
+          <label><input type="checkbox" data-entry-spread-side="underdog"> Underdogs (+X.5)</label>
+          <div class="field-note">Settlement grading (2026-08-03, 496 spread positions): favorite run lines won 26.6% at ~34¢ (negative per $1 in the tradeable band; −49% at −2.5 lines) while underdog run lines won 76.1% at ~41¢ (+96.7% per $1, positive in every magnitude, price, edge, and stage cut). At least one side must stay selected.</div>
         </fieldset>
         </div>
         <div class="us-policy-step" data-policy-step="limits" data-step-label="3 · Bankroll &amp; entry filters" hidden>
@@ -760,6 +778,10 @@
             <label>Model-reversal confirmation readings
               <input id="us-reversal-confirmation-readings" type="number" min="1" max="10" step="1" required>
               <span class="field-note">Consecutive negative-edge readings before a model-reversal sale. 1 sells on a single adverse quote; the 2026-08-02 grading measured 62–65% of those sales going on to win at settlement.</span>
+            </label>
+            <label>Model-reversal confirmation floor (seconds)
+              <input id="us-reversal-confirmation-seconds" type="number" min="0" max="1800" step="any" required>
+              <span class="field-note">Wall-clock minimum for the same streak, so a fast analysis cycle cannot compress the reversal window: the sale needs the reading count AND this many seconds of unbroken adverse edge. 0 uses readings only.</span>
             </label>
             <label>Analysis cycle (seconds)
               <input id="us-cycle-seconds" data-derived-risk type="number" min="1" max="300" step="0.5" required>
