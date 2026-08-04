@@ -412,31 +412,50 @@ class Ledger:
             updates[key] = (timestamp, fingerprint)
         return selected, updates
 
-    def _record_close_mark(self, cur, event: Event, signal: Signal) -> None:
+    @staticmethod
+    def _decision_mark_row(event: Event, signal: Signal) -> tuple:
+        """Decision-mark parameters, in the column order of the INSERT below."""
+        return (
+            signal.decision_hash, event.id, signal.market, signal.outcome,
+            signal.observed_at.timestamp(), signal.consensus_probability,
+            signal.market_probability, signal.edge, signal.ev_per_stake,
+            signal.action, "\n".join(signal.reasons), signal.decision_id,
+            signal.engine_version, signal.configuration_hash,
+            signal.source_mapping_version, signal.model_version,
+            signal.calibration_version, signal.execution_policy_version,
+            # The full request snapshot is kept only for placed entries; a
+            # WATCH row's lineage is reproducible from its decision hash.
+            (signal.input_snapshot_json if signal.action == "PAPER_BET" else None),
+            signal.token_id,
+            signal.order_book_snapshot_id, signal.requested_cash,
+            signal.execution_vwap, signal.execution_fee,
+            signal.calibrated_consensus_probability, signal.uncertainty_low,
+            signal.uncertainty_high, signal.probability_net_ev_positive,
+            signal.net_expected_value_per_share, signal.net_expected_value_total,
+            signal.consensus_method, signal.calibration_sample_size,
+            json.dumps(signal.gate_results, sort_keys=True, separators=(",", ":")),
+            signal.independent_model_probability,
+            signal.independent_model_version, signal.independent_model_hash,
+            signal.independent_calibration_version,
+            signal.independent_calibration_hash,
+            signal.independent_model_sample_size,
+            signal.independent_model_event_count,
+            signal.independent_model_registry_version,
+        )
+
+    @staticmethod
+    def _close_mark_row(event: Event, signal: Signal) -> tuple | None:
+        """Close-mark parameters for a signal, or None when it is not eligible."""
         if signal.market_probability <= 0 or not _close_mark_gates_pass(signal):
-            return
-        self._db.execute(
-            cur,
-            """INSERT INTO close_marks
-               (event_id, market, outcome, executable_probability,
-                consensus_probability, observed_at, decision_hash)
-               VALUES (%s,%s,%s,%s,%s,%s,%s)
-               ON CONFLICT(event_id, market, outcome) DO UPDATE SET
-                 executable_probability=EXCLUDED.executable_probability,
-                 consensus_probability=EXCLUDED.consensus_probability,
-                 observed_at=EXCLUDED.observed_at,
-                 decision_hash=EXCLUDED.decision_hash
-               WHERE EXCLUDED.observed_at >= close_marks.observed_at
-                 AND close_marks.finalized_at IS NULL""",
-            (
-                event.id,
-                signal.market,
-                signal.outcome,
-                signal.market_probability,
-                signal.consensus_probability,
-                signal.observed_at.timestamp(),
-                signal.decision_hash,
-            ),
+            return None
+        return (
+            event.id,
+            signal.market,
+            signal.outcome,
+            signal.market_probability,
+            signal.consensus_probability,
+            signal.observed_at.timestamp(),
+            signal.decision_hash,
         )
 
     def record_signals(self, event: Event, signals: Iterable[Signal]) -> int:
@@ -479,8 +498,16 @@ class Ledger:
             )
             inserted = 0
             with self._db.transaction() as cur:
-                for signal in signals:
-                    self._db.execute(
+                # One statement for the whole decision instead of one per signal.
+                # A prop-heavy event journals ~114 marks per tick; as separate
+                # executes that is 114 round trips, which is cheap-ish against
+                # local SQLite and expensive against a managed PostgreSQL where
+                # each one is a network hop. execute_many collapses them
+                # (psycopg2 execute_batch on PostgreSQL, executemany on SQLite).
+                # Ordering and ON CONFLICT semantics are unchanged: the rows are
+                # applied in the same sequence inside the same transaction.
+                if signals:
+                    self._db.execute_many(
                         cur,
                         """INSERT INTO decision_marks
                            (decision_hash, event_id, market, outcome, as_of,
@@ -502,37 +529,43 @@ class Ledger:
                                     %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                                     %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                            ON CONFLICT(decision_hash, market, outcome) DO NOTHING""",
-                        (signal.decision_hash, event.id, signal.market, signal.outcome,
-                         signal.observed_at.timestamp(), signal.consensus_probability,
-                         signal.market_probability, signal.edge, signal.ev_per_stake,
-                         signal.action, "\n".join(signal.reasons), signal.decision_id,
-                         signal.engine_version, signal.configuration_hash,
-                         signal.source_mapping_version, signal.model_version,
-                         signal.calibration_version, signal.execution_policy_version,
-                         (signal.input_snapshot_json
-                          if signal.action == "PAPER_BET" else None), signal.token_id,
-                          signal.order_book_snapshot_id, signal.requested_cash,
-                          signal.execution_vwap, signal.execution_fee,
-                          signal.calibrated_consensus_probability, signal.uncertainty_low,
-                          signal.uncertainty_high, signal.probability_net_ev_positive,
-                          signal.net_expected_value_per_share, signal.net_expected_value_total,
-                          signal.consensus_method, signal.calibration_sample_size,
-                          json.dumps(signal.gate_results, sort_keys=True, separators=(",", ":")),
-                          signal.independent_model_probability,
-                          signal.independent_model_version, signal.independent_model_hash,
-                          signal.independent_calibration_version,
-                          signal.independent_calibration_hash,
-                          signal.independent_model_sample_size,
-                          signal.independent_model_event_count,
-                          signal.independent_model_registry_version),
+                        [self._decision_mark_row(event, signal) for signal in signals],
                     )
-                    self._record_close_mark(cur, event, signal)
+                # Close-line tracking stays live for every signal, including the
+                # ones whose redundant diagnostic rows were sampled off disk.
+                # Built in the original order (persisted first) so the
+                # newest-observation guard in the ON CONFLICT clause resolves
+                # exactly as it did statement by statement.
                 persisted_ids = {id(signal) for signal in signals}
-                for signal in all_signals:
-                    if id(signal) not in persisted_ids:
-                        # Close-line tracking remains live even when redundant
-                        # diagnostic rows are sampled off disk.
-                        self._record_close_mark(cur, event, signal)
+                close_rows = [
+                    row for row in (
+                        self._close_mark_row(event, signal)
+                        for signal in signals
+                    ) if row is not None
+                ]
+                close_rows += [
+                    row for row in (
+                        self._close_mark_row(event, signal)
+                        for signal in all_signals
+                        if id(signal) not in persisted_ids
+                    ) if row is not None
+                ]
+                if close_rows:
+                    self._db.execute_many(
+                        cur,
+                        """INSERT INTO close_marks
+                           (event_id, market, outcome, executable_probability,
+                            consensus_probability, observed_at, decision_hash)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT(event_id, market, outcome) DO UPDATE SET
+                             executable_probability=EXCLUDED.executable_probability,
+                             consensus_probability=EXCLUDED.consensus_probability,
+                             observed_at=EXCLUDED.observed_at,
+                             decision_hash=EXCLUDED.decision_hash
+                           WHERE EXCLUDED.observed_at >= close_marks.observed_at
+                             AND close_marks.finalized_at IS NULL""",
+                        close_rows,
+                    )
                 for row in rows:
                     self._db.execute(
                         cur,

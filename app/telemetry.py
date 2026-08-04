@@ -9,6 +9,7 @@ import time
 import tracemalloc
 from collections import Counter, deque
 from collections.abc import Iterator
+from typing import ClassVar
 from contextlib import contextmanager
 from threading import Lock
 
@@ -29,7 +30,10 @@ def _windows_memory_counters():
         from ctypes import wintypes
 
         class _PMC(ctypes.Structure):
-            _fields_ = [
+            # ctypes reads _fields_ when the class body is evaluated; the
+            # ClassVar annotation is for the type checker only and does not
+            # change that.
+            _fields_: ClassVar[list] = [
                 ("cb", wintypes.DWORD),
                 ("PageFaultCount", wintypes.DWORD),
                 ("PeakWorkingSetSize", ctypes.c_size_t),

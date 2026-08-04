@@ -32,6 +32,13 @@
 - Made the native-engine import fail closed at first scoring call rather than at
   import, so storage, security, and identity tests no longer need the compiled
   extension; production startup still refuses to run without it.
+- Batched the ledger's decision-mark and close-mark inserts through
+  `Database.execute_many` instead of one statement per signal (~114 per
+  prop-heavy tick). 1.21x on local SQLite; the round-trip saving it exists for
+  only appears against the managed PostgreSQL backend, so CI's postgres job now
+  measures that A/B and uploads it as the `postgres-write-benchmark` artifact
+  rather than the speedup being asserted. The `bets` loop is unchanged: it
+  branches on per-row `rowcount` and is only ever a few rows.
 - Replaced shared-executor store calls with one bounded write lane per database
   (`app/dbwriter.py`). Ledger and account writes stay durable-before-continue;
   model-lab research rows are queued instead of awaited, leaving the per-event

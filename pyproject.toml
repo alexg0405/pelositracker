@@ -77,6 +77,13 @@ ignore = [
   # Retrying or logging per item requires the try inside the loop; hoisting it
   # would abort the whole batch on one bad row.
   "PERF203",
+  # `isinstance(x, X | Y)` is measurably SLOWER than the tuple form, because the
+  # union object is rebuilt on every call, and several of these sites are in the
+  # per-quote validation and per-observation telemetry hot paths. Ruff itself
+  # deprecated this rule for that reason -- it is absent from newer versions, so
+  # this entry only matters while the pinned ruff in requirements-dev.txt still
+  # emits it. Keep the tuple form.
+  "UP038",
 ]
 
 [tool.ruff.lint.flake8-bugbear]

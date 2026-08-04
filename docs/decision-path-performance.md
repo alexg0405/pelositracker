@@ -192,6 +192,37 @@ instead, and `stop()` drains before the stores close. Saturation therefore shows
 up as latency and queue depth, which are measurable, rather than as missing
 evidence, which is not.
 
+### Batched decision-mark writes
+
+With the lanes in place, `ledger.record_signals` was the dominant persistence
+cost still on the awaited path — and it issued **one `INSERT` per signal**, so a
+prop-heavy tick was ~114 separate statements. `Database.execute_many` already
+existed (psycopg2 `execute_batch` on PostgreSQL, `executemany` on SQLite); it
+simply was not used here. Decision marks and close marks now go out as one
+batched statement each. The `bets` loop deliberately does not: it branches on
+per-row `rowcount` to decide whether to write the order and fill, and it is only
+ever a handful of rows.
+
+Measured with an in-process A/B that alternates the two strategies round by
+round, so machine noise hits both arms equally (114 rows, 25 rounds):
+
+| Strategy | p50 | mean |
+|---|---:|---:|
+| per-row `execute` | 4.83 ms | 4.94 ms |
+| `execute_many` | 4.04 ms | 4.71 ms |
+
+**1.21× on SQLite — and that number is close to meaningless for production.**
+SQLite runs in-process, so a statement loop costs no round trips; the change
+exists for the managed PostgreSQL backend, where each `execute` is a network
+hop. That win cannot be measured on a development machine, and there is no
+Docker here to stand up a server.
+
+So rather than assert it, CI measures it. The `postgres-migrations` job already
+runs a real PostgreSQL service, and `tools/bench_pg_writes.py` now reports the
+same A/B there on every run, uploaded as the `postgres-write-benchmark`
+artifact. Read that artifact before concluding anything about the production
+effect of this change.
+
 ## Event-loop lag
 
 `normal` fixture, 8 events scoring concurrently, lag sampled by an ordinary
