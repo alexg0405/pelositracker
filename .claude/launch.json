@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "ui-restyle",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": [".tools/ui_dev_server.py"],
+      "port": 8771,
+      "autoPort": true
+    }
+  ]
+}

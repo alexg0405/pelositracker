@@ -18,14 +18,12 @@
         window.scrollTo({top:Math.max(0, Number(panel.offsetTop || 0) - 8), behavior:"auto"});
       }
       try { sessionStorage.setItem("pelositracker-active-tab", tab); } catch {}
+      // The research sections are routed views now, so a deep link selects a
+      // view instead of scrolling a single long document to an anchor.
       const restoreResearchSection = () => {
-        if (tab !== "tab-us-research" || window.location.hash.length <= 1) return;
-        const hashTarget = document.getElementById(
-          decodeURIComponent(window.location.hash.slice(1))
-        );
-        if (hashTarget && panel.contains(hashTarget)) {
-          hashTarget.scrollIntoView({block:"start"});
-        }
+        if (tab !== "tab-us-research") return;
+        const fromHash = researchViewFromHash();
+        if (fromHash) showResearchView(fromHash, {resetScroll: false});
       };
       if (tab === "tab-live") renderEvents(lastEvents);
       if (tab === "tab-discovery") {
@@ -65,6 +63,195 @@
     next.focus();
     activatePrimaryTab(next, {resetScroll:true});
   });
+
+  // Inline help ("ⓘ") ------------------------------------------------------
+  // Every .field-note used to sit permanently above its controls, two to four
+  // lines each. The prose is compliance-relevant so none of it is deleted:
+  // each note becomes a popover reached from a small info button next to the
+  // control, legend, summary or heading it explains.
+  //
+  // One controller handles every instance. If this code never runs the notes
+  // simply render inline as before, which is a safe degradation.
+  const infoPopovers = (() => {
+    let seq = 0;
+    let openButton = null;
+
+    const place = (popover, button) => {
+      // Fixed positioning, measured from the trigger, so no ancestor with
+      // overflow:hidden can clip the popover and nothing gets reparented.
+      popover.style.left = "0px";
+      popover.style.top = "0px";
+      const trigger = button.getBoundingClientRect();
+      const box = popover.getBoundingClientRect();
+      const margin = 8;
+      let left = trigger.left;
+      if (left + box.width > window.innerWidth - margin) {
+        left = Math.max(margin, window.innerWidth - box.width - margin);
+      }
+      let top = trigger.bottom + 6;
+      if (top + box.height > window.innerHeight - margin) {
+        const above = trigger.top - box.height - 6;
+        if (above >= margin) top = above;
+      }
+      // Final clamp: preferring "above the trigger" is not enough on its own,
+      // because a trigger that is itself off-screen would place the popover
+      // off-screen too. Keep it inside the viewport unconditionally.
+      left = Math.min(Math.max(margin, left), Math.max(margin, window.innerWidth - box.width - margin));
+      top = Math.min(Math.max(margin, top), Math.max(margin, window.innerHeight - box.height - margin));
+      popover.style.left = `${Math.round(left)}px`;
+      popover.style.top = `${Math.round(top)}px`;
+    };
+
+    // While open the popover is hosted on <body>. Anything else risks a
+    // containing block that breaks position:fixed — a closed <details> gets
+    // content-visibility:hidden in Chrome, which does exactly that — or an
+    // ancestor with overflow:hidden that clips it. It returns to its original
+    // place on close, so the document keeps its authored reading order at rest.
+    const host = popover => {
+      if (popover.parentElement === document.body) return;
+      popover._homeParent = popover.parentElement;
+      popover._homeNext = popover.nextSibling;
+      document.body.appendChild(popover);
+    };
+    const unhost = popover => {
+      if (!popover._homeParent) return;
+      popover._homeParent.insertBefore(popover, popover._homeNext || null);
+      popover._homeParent = null;
+      popover._homeNext = null;
+    };
+
+    const close = ({restoreFocus = false} = {}) => {
+      if (!openButton) return;
+      const popover = document.getElementById(openButton.getAttribute("aria-controls"));
+      if (popover) {
+        popover.hidden = true;
+        unhost(popover);
+      }
+      openButton.setAttribute("aria-expanded", "false");
+      const previous = openButton;
+      openButton = null;
+      if (restoreFocus) previous.focus();
+    };
+
+    const open = button => {
+      close();
+      const popover = document.getElementById(button.getAttribute("aria-controls"));
+      if (!popover) return;
+      host(popover);
+      popover.hidden = false;
+      button.setAttribute("aria-expanded", "true");
+      openButton = button;
+      place(popover, button);
+    };
+
+    // A <label> in this form is a column flex container, so appending the
+    // button would drop it onto its own line under the field. Wrap the label's
+    // leading text in an inline row and put the button beside it there.
+    const labelTextRow = label => {
+      let row = label.querySelector(":scope > .info-label-row");
+      if (row) return row;
+      row = document.createElement("span");
+      row.className = "info-label-row";
+      const leading = [];
+      let node = label.firstChild;
+      while (node && !(node.nodeType === 1 && /^(INPUT|SELECT|TEXTAREA|DIV|SPAN|DETAILS|FIELDSET)$/.test(node.tagName))) {
+        leading.push(node);
+        node = node.nextSibling;
+      }
+      label.insertBefore(row, label.firstChild);
+      leading.forEach(item => row.appendChild(item));
+      return row;
+    };
+
+    // Choose where the button visually belongs: beside the thing it explains.
+    const anchorFor = note => {
+      const parent = note.parentElement;
+      if (!parent) return null;
+      if (parent.tagName === "LABEL") return {host: labelTextRow(parent), before: null};
+      if (parent.tagName === "FIELDSET") {
+        const legend = parent.querySelector(":scope > legend");
+        if (legend) return {host: legend, before: null};
+      }
+      if (parent.tagName === "DETAILS") {
+        const summary = parent.querySelector(":scope > summary");
+        if (summary) return {host: summary, before: null};
+      }
+      let sibling = note.previousElementSibling;
+      while (sibling) {
+        if (/^(H2|H3|H4|LEGEND|SUMMARY|STRONG)$/.test(sibling.tagName)) return {host: sibling, before: null};
+        sibling = sibling.previousElementSibling;
+      }
+      const heading = parent.querySelector(":scope > .title, :scope > h2, :scope > h3, :scope > strong");
+      if (heading) return {host: heading, before: null};
+      const section = note.closest("section,.panel,fieldset,details");
+      const sectionTitle = section && section.querySelector(".title, legend, summary");
+      if (sectionTitle) return {host: sectionTitle, before: null};
+      return null;
+    };
+
+    const migrate = (root = document) => {
+      const notes = [...root.querySelectorAll(".field-note:not(.info-popover)")];
+      for (const note of notes) {
+        // An empty-state message is content, not help: leave it visible.
+        if (!note.textContent.trim()) continue;
+        const anchor = anchorFor(note);
+        seq += 1;
+        const id = `info-note-${seq}`;
+        note.id = note.id || id;
+        note.classList.add("info-popover");
+        note.hidden = true;
+        note.setAttribute("role", "note");
+
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "info-btn";
+        button.setAttribute("aria-expanded", "false");
+        button.setAttribute("aria-controls", note.id);
+        button.setAttribute("aria-describedby", note.id);
+        // Name it after what it explains so the control is not just "i".
+        const host = anchor && anchor.host;
+        const subject = (host ? host.textContent : "").trim().replace(/\s+/g, " ").slice(0, 60);
+        button.setAttribute("aria-label", subject ? `Help: ${subject}` : "More information");
+        button.textContent = "i";
+
+        // Never stack a second button on a host that already explains
+        // something else: a step-level note whose only candidate anchor is the
+        // section heading belongs beside its own content instead.
+        if (host && !host.querySelector(".info-btn")) {
+          if (anchor.before && anchor.before.parentElement === host) host.insertBefore(button, anchor.before);
+          else host.appendChild(button);
+        } else {
+          note.parentElement.insertBefore(button, note);
+        }
+      }
+      return notes.length;
+    };
+
+    // A button inside a <label> would otherwise forward its click to the
+    // label's control and toggle the very checkbox it documents.
+    document.addEventListener("click", event => {
+      const button = event.target.closest?.(".info-btn");
+      if (button) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (openButton === button) close({restoreFocus: true});
+        else open(button);
+        return;
+      }
+      if (openButton && !event.target.closest?.(".info-popover")) close();
+    });
+    document.addEventListener("keydown", event => {
+      if (event.key === "Escape" && openButton) {
+        event.stopPropagation();
+        close({restoreFocus: true});
+      }
+    });
+    window.addEventListener("resize", () => close());
+    window.addEventListener("scroll", () => close(), {passive: true});
+
+    return {migrate, close};
+  })();
+  infoPopovers.migrate();
 
   // Auth & Login Logic
   document.querySelector("#login-form").addEventListener("submit", async e => {
@@ -127,45 +314,63 @@
   const discoveryTabVisible = () => !document.querySelector("#tab-discovery").classList.contains("is-hidden");
   const usResearchTabVisible = () => !document.querySelector("#tab-us-research").classList.contains("is-hidden");
 
+  // Research view router --------------------------------------------------
+  // The "Workspace map" used to be anchor links that scroll-jumped inside one
+  // 100-screen document, with a scroll-spy highlighting whichever section
+  // happened to be under a reference line. They are now real views: exactly
+  // one is in the document flow at a time.
+  //
+  // Routing stays in the hash, so existing deep links (#us-ledger) and the
+  // browser back button both keep working without any pushState bookkeeping.
+  // Result-chart state lives above the router: showResearchView runs during
+  // initialisation, and a cold deep link to #us-performance would otherwise
+  // reach renderPerformanceCharts before these bindings exist.
+  const usCharts = {equity: null, lines: null, edge: null};
+  let lastLedgerRows = [];
+  let lastLedgerLineSummary = [];
+
+  const researchViews = new Map();
+  document.querySelectorAll("[data-research-view]").forEach(view => {
+    researchViews.set(view.dataset.researchView, view);
+  });
   const researchSectionLinks = [
     ...document.querySelectorAll("[data-research-section]")
   ];
-  const researchSections = researchSectionLinks
-    .map(link => document.getElementById(link.dataset.researchSection))
-    .filter(Boolean);
-  let researchScrollFrame = null;
+  const DEFAULT_RESEARCH_VIEW = "us-research-overview";
+  let activeResearchView = DEFAULT_RESEARCH_VIEW;
 
   function setActiveResearchSection(sectionId) {
     researchSectionLinks.forEach(link => {
       const selected = link.dataset.researchSection === sectionId;
       link.classList.toggle("active", selected);
-      if (selected) link.setAttribute("aria-current", "location");
+      if (selected) link.setAttribute("aria-current", "page");
       else link.removeAttribute("aria-current");
     });
   }
 
-  function updateResearchSectionFromScroll() {
-    researchScrollFrame = null;
-    if (!usResearchTabVisible() || !researchSections.length) return;
-    const referenceLine = Math.min(180, Math.max(116, window.innerHeight * 0.2));
-    let active = researchSections[0];
-    for (const section of researchSections) {
-      if (section.getBoundingClientRect().top <= referenceLine) active = section;
-      else break;
-    }
-    setActiveResearchSection(active.id);
+  function showResearchView(name, {resetScroll = true} = {}) {
+    const target = researchViews.has(name) ? name : DEFAULT_RESEARCH_VIEW;
+    researchViews.forEach((view, key) => { view.hidden = key !== target; });
+    setActiveResearchSection(target);
+    activeResearchView = target;
+    if (resetScroll) window.scrollTo({top: 0, behavior: "auto"});
+    // Chart.js cannot size a canvas inside a hidden view, so draw on entry.
+    if (target === "us-performance") renderPerformanceCharts();
   }
 
-  researchSectionLinks.forEach(link => {
-    link.addEventListener("click", () => {
-      setActiveResearchSection(link.dataset.researchSection);
-    });
+  // Only claim a hash that names a view. Anything else (for example the
+  // "Top ↑" link's #global-tab-nav) must leave the current view alone.
+  function researchViewFromHash() {
+    if (window.location.hash.length <= 1) return null;
+    const raw = decodeURIComponent(window.location.hash.slice(1));
+    return researchViews.has(raw) ? raw : null;
+  }
+
+  window.addEventListener("hashchange", () => {
+    const fromHash = researchViewFromHash();
+    if (fromHash) showResearchView(fromHash);
   });
-  window.addEventListener("scroll", () => {
-    if (researchScrollFrame != null) return;
-    researchScrollFrame = window.requestAnimationFrame(updateResearchSectionFromScroll);
-  }, {passive:true});
-  window.addEventListener("resize", updateResearchSectionFromScroll);
+  showResearchView(researchViewFromHash() || DEFAULT_RESEARCH_VIEW, {resetScroll: false});
 
   function showBotActionStatus(message, state = "pending", clearAfter = 0) {
     const box = document.querySelector("#bot-action-status");
@@ -275,6 +480,17 @@
     }
   }
 
+  // Progressive disclosure for the US inventory. Rendering every event with
+  // every market produced an 87,000px view (109 screens at 1280x800), and a
+  // single event's market list is on its own taller than three screens, so
+  // paging events alone is not enough. Both levels reveal on demand; nothing
+  // is dropped, and no request shape changes — this is presentation only.
+  const US_EVENT_PAGE = 4;
+  const US_MARKETS_PER_EVENT = 5;
+  let usEventsShown = US_EVENT_PAGE;
+  const usEventsExpanded = new Set();
+  const usEventKey = event => `${event.title || ""}|${event.start || ""}`;
+
   function renderUSEvents() {
     const body = document.querySelector("#us-events");
     const search = document.querySelector("#us-events-search");
@@ -291,8 +507,15 @@
       body.innerHTML = `<div class="metrics-empty">${lastUSEvents.length ? "No US markets match that filter." : "No active US sports markets were returned."}</div>`;
       return;
     }
-    body.innerHTML = events.map(event => {
-      const markets = (event.markets || []).map(market => {
+    const visible = events.slice(0, usEventsShown);
+    const remaining = events.length - visible.length;
+    body.innerHTML = visible.map(event => {
+      const key = usEventKey(event);
+      const allMarkets = event.markets || [];
+      const expanded = usEventsExpanded.has(key);
+      const shownMarkets = expanded ? allMarkets : allMarkets.slice(0, US_MARKETS_PER_EVENT);
+      const hiddenMarkets = allMarkets.length - shownMarkets.length;
+      const markets = shownMarkets.map(market => {
         const line = market.line == null ? "" : ` · line ${esc(market.line)}`;
         const sides = (market.sides || []).map(side => `
           <div class="us-side">
@@ -322,9 +545,31 @@
           ${live}
         </div>
         <div class="us-market-grid">${markets}</div>
+        ${hiddenMarkets > 0 || expanded ? `<button class="ghost compact-button us-market-more" type="button" data-us-event-key="${esc(key)}">${
+          expanded
+            ? `Show fewer markets`
+            : `Show ${hiddenMarkets} more market${hiddenMarkets === 1 ? "" : "s"}`
+        }</button>` : ""}
       </article>`;
-    }).join("");
+    }).join("") + (remaining > 0
+      ? `<button class="ghost us-events-more" type="button" data-us-events-more>Show ${Math.min(US_EVENT_PAGE, remaining)} more event${Math.min(US_EVENT_PAGE, remaining) === 1 ? "" : "s"} · ${remaining} remaining</button>`
+      : "");
   }
+
+  document.querySelector("#us-events")?.addEventListener("click", event => {
+    const marketToggle = event.target.closest("[data-us-event-key]");
+    if (marketToggle) {
+      const key = marketToggle.dataset.usEventKey;
+      if (usEventsExpanded.has(key)) usEventsExpanded.delete(key);
+      else usEventsExpanded.add(key);
+      renderUSEvents();
+      return;
+    }
+    if (event.target.closest("[data-us-events-more]")) {
+      usEventsShown += US_EVENT_PAGE;
+      renderUSEvents();
+    }
+  });
 
   async function loadUSEvents(force = false) {
     if (usEventsLoading) return;
@@ -407,7 +652,11 @@
   }
 
   document.querySelector("#us-events-refresh")?.addEventListener("click", () => loadUSEvents(true));
-  document.querySelector("#us-events-search")?.addEventListener("input", renderUSEvents);
+  // A new filter starts from the first page again.
+  document.querySelector("#us-events-search")?.addEventListener("input", () => {
+    usEventsShown = US_EVENT_PAGE;
+    renderUSEvents();
+  });
   document.querySelector("#us-account-refresh")?.addEventListener("click", loadUSAccount);
 
   document.querySelector("#us-runtime-credential-form")?.addEventListener("submit", async event => {
@@ -1622,6 +1871,7 @@
       step.hidden = step.dataset.policyStep !== currentPolicyStep;
     }
     renderPolicyStepNav();
+    renderPolicyStepIndicator();
     if (currentPolicyStep === "review") renderEffectivePolicyReview();
     if (focus) {
       document.querySelector("#us-policy-rail")?.scrollIntoView({
@@ -1647,6 +1897,36 @@
       }">${esc(step.dataset.stepLabel || name)}${invalid ? " ⚠" : ""}</button>`;
     }).join("");
   }
+
+  // Sticky-footer step movement. The step nav above is still authoritative;
+  // these just walk it so Back/Next work without aiming at a small chip.
+  function stepPosition() {
+    const names = policySteps().map(step => step.dataset.policyStep);
+    return {names, index: Math.max(0, names.indexOf(currentPolicyStep))};
+  }
+
+  function movePolicyStep(delta) {
+    const {names, index} = stepPosition();
+    const next = names[index + delta];
+    if (next) showPolicyStep(next);
+  }
+
+  function renderPolicyStepIndicator() {
+    const indicator = document.querySelector("#us-policy-step-indicator");
+    if (!indicator) return;
+    const {names, index} = stepPosition();
+    const label = policySteps()[index]?.dataset.stepLabel || "";
+    indicator.textContent = names.length
+      ? `Step ${index + 1} of ${names.length}${label ? ` · ${label.replace(/^\d+\s*·\s*/, "")}` : ""}`
+      : "";
+    const prev = document.querySelector("#us-policy-step-prev");
+    const next = document.querySelector("#us-policy-step-next");
+    if (prev) prev.disabled = index === 0;
+    if (next) next.disabled = index >= names.length - 1;
+  }
+
+  document.querySelector("#us-policy-step-prev")?.addEventListener("click", () => movePolicyStep(-1));
+  document.querySelector("#us-policy-step-next")?.addEventListener("click", () => movePolicyStep(1));
 
   document.querySelector("#us-policy-steps")?.addEventListener("click", event => {
     const target = event.target.closest("[data-goto-step]");
@@ -2330,7 +2610,10 @@
       dryCount.textContent = `${dryTotal} trade${dryTotal === 1 ? "" : "s"}`;
     }
     if (liveCount) liveCount.textContent = `${liveOpen} open`;
-    body.innerHTML = summaries.map(summary => {
+    // One segmented table instead of three identical cards. The same nine
+    // figures per lane now line up in columns so Dry run, Live and Combined
+    // are directly comparable down a row.
+    const rows = summaries.map(summary => {
       const wins = Number(summary.wins || 0);
       const losses = Number(summary.losses || 0);
       const pushes = Number(summary.pushes || 0);
@@ -2349,21 +2632,32 @@
         ? `display session since ${new Date(summary.session_started_at).toLocaleString()}`
         : "";
       const note = [sessionNote, activityNote].filter(Boolean).join(" · ");
-      return `<article class="us-performance-card is-${esc(modeClass)}" data-performance-mode="${esc(summary.mode || "")}">
-        <div class="us-performance-head"><strong>${esc(summary.label || summary.mode || "Mode")}</strong><span>${Number(summary.total_positions || 0)} trades</span></div>
-        <div class="us-performance-hero">
-          <div><span class="us-performance-key">W–L–P</span><strong class="us-performance-value">${esc(record)}</strong></div>
-          <div><span class="us-performance-key">Total net${complete ? "" : "*"}</span><strong class="us-performance-value ${netClass}">${esc(money(totalNet))}</strong></div>
-        </div>
-        <div class="us-performance-metrics">
-          <div><span>Win rate</span><strong>${esc(pct(summary.win_rate))}</strong></div>
-          <div><span>Realized net</span><strong>${esc(money(Number(summary.realized_net_usd || 0)))}</strong></div>
-          <div><span>Open marked P/L</span><strong>${esc(money(Number(summary.open_unrealized_pnl_usd || 0)))}</strong></div>
-          <div><span>Open exposure</span><strong>$${Number(summary.open_cost_basis_usd || 0).toFixed(2)}</strong></div>
-        </div>
-        <div class="us-performance-note${complete ? "" : " is-partial"}">${esc(note)}</div>
-      </article>`;
+      return `<tr class="us-performance-card is-${esc(modeClass)}" data-performance-mode="${esc(summary.mode || "")}">
+        <th scope="row">${esc(summary.label || summary.mode || "Mode")}</th>
+        <td>${Number(summary.total_positions || 0)}</td>
+        <td class="us-performance-value">${esc(record)}</td>
+        <td>${esc(pct(summary.win_rate))}</td>
+        <td class="us-performance-value ${netClass}">${esc(money(totalNet))}${complete ? "" : "*"}</td>
+        <td>${esc(money(Number(summary.realized_net_usd || 0)))}</td>
+        <td>${esc(money(Number(summary.open_unrealized_pnl_usd || 0)))}</td>
+        <td>$${Number(summary.open_cost_basis_usd || 0).toFixed(2)}</td>
+        <td class="us-performance-note${complete ? "" : " is-partial"}">${esc(note)}</td>
+      </tr>`;
     }).join("");
+    body.innerHTML = `<div class="table-wrap"><table class="us-performance-table">
+      <thead><tr>
+        <th scope="col">Lane</th>
+        <th scope="col">Trades</th>
+        <th scope="col">W–L–P</th>
+        <th scope="col">Win rate</th>
+        <th scope="col">Total net</th>
+        <th scope="col">Realized</th>
+        <th scope="col">Open P/L</th>
+        <th scope="col">Exposure</th>
+        <th scope="col">Activity</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`;
   }
 
   function ledgerSettingsText(settings) {
@@ -2468,6 +2762,11 @@
       : '<div class="metrics-empty">No verifiable closed trades match these filters yet.</div>';
 
     const rows = Array.isArray(data.rows) ? data.rows : [];
+    // Hand the same rows to the result charts; they re-draw when the
+    // Performance view is on screen.
+    lastLedgerRows = rows;
+    lastLedgerLineSummary = lineGroups;
+    renderPerformanceCharts();
     rowBox.innerHTML = rows.length
       ? rows.map(row => {
           const resultClass = ["win", "loss"].includes(row.result)
@@ -2536,6 +2835,246 @@
       if (!quiet) setActionBusy(button, false);
     }
   }
+
+  // Result charts ---------------------------------------------------------
+  // Drawn from the rows renderPerformanceLedger already received, so adding
+  // them costs no extra request and touches no threshold or engine value.
+  // Colours are read from the :root tokens so the charts cannot drift from
+  // the stylesheet.
+  const cssToken = name =>
+    getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+  // Distinguishable at AA on white and still separable in greyscale.
+  const CHART_SERIES = ["#1570ef", "#b54708", "#7839ee", "#0e7090", "#067647"];
+
+  function chartBaseOptions() {
+    const ink = cssToken("--text") || "#1a1a1a";
+    const soft = cssToken("--text-secondary") || "#5c5c5c";
+    const grid = cssToken("--border") || "#e6e6e1";
+    const strong = cssToken("--border-strong") || "#d3d3cc";
+    const surface = cssToken("--bg") || "#ffffff";
+    return {
+      responsive: true,
+      maintainAspectRatio: false,
+      // Off for everyone: these are read-often research charts, and it also
+      // satisfies prefers-reduced-motion without a second code path.
+      animation: false,
+      plugins: {
+        legend: {labels: {color: ink, boxWidth: 12, usePointStyle: true, font: {size: 12}}},
+        tooltip: {
+          backgroundColor: surface, titleColor: ink, bodyColor: soft,
+          borderColor: strong, borderWidth: 1
+        }
+      },
+      scales: {
+        x: {grid: {color: grid}, border: {color: grid}, ticks: {color: soft, font: {size: 12}}},
+        y: {grid: {color: grid}, border: {color: grid}, ticks: {color: soft, font: {size: 12}}}
+      }
+    };
+  }
+
+  function destroyUSCharts() {
+    for (const key of Object.keys(usCharts)) {
+      usCharts[key]?.destroy();
+      usCharts[key] = null;
+    }
+  }
+
+  const usPerformanceViewVisible = () =>
+    !!document.querySelector('[data-research-view="us-performance"]:not([hidden])');
+
+  async function renderPerformanceCharts() {
+    const status = document.querySelector("#us-charts-status");
+    const equityCanvas = document.querySelector("#us-chart-equity");
+    if (!equityCanvas) return;
+    // A canvas inside a hidden view measures 0x0, so wait until the view is on
+    // screen; showResearchView calls back in when it becomes visible.
+    if (!usPerformanceViewVisible()) return;
+
+    const closed = lastLedgerRows.filter(
+      row => row.realized_net_usd != null && row.opened_at
+    );
+    const grid = document.querySelector(".chart-grid");
+    if (!closed.length) {
+      destroyUSCharts();
+      // Empty axes read as broken; the status line carries the explanation.
+      if (grid) grid.hidden = true;
+      if (status) {
+        status.className = "refresh-status";
+        status.textContent = lastLedgerRows.length
+          ? `${lastLedgerRows.length} retained rows, none closed yet — charts need realized results.`
+          : "No retained trade rows yet, so there is nothing to plot.";
+      }
+      return;
+    }
+
+    try {
+      await loadChartLibrary();
+    } catch {
+      if (status) {
+        status.className = "refresh-status is-error";
+        status.textContent = "Could not load the charting library.";
+      }
+      return;
+    }
+    destroyUSCharts();
+    if (grid) grid.hidden = false;
+    const base = chartBaseOptions();
+    const ink = cssToken("--text") || "#1a1a1a";
+    const positive = cssToken("--positive") || "#067647";
+    const negative = cssToken("--negative") || "#b42318";
+    const muted = cssToken("--text-muted") || "#6b6b6b";
+
+    // 1. Cumulative realized net per lane, in trade order.
+    const byLane = new Map();
+    for (const row of [...closed].sort(
+      (a, b) => new Date(a.opened_at) - new Date(b.opened_at)
+    )) {
+      const lane = String(row.mode || "unknown");
+      if (!byLane.has(lane)) byLane.set(lane, {running: 0, points: []});
+      const series = byLane.get(lane);
+      series.running += Number(row.realized_net_usd || 0);
+      series.points.push({x: new Date(row.opened_at).getTime(), y: +series.running.toFixed(2)});
+    }
+    const equityOptions = JSON.parse(JSON.stringify(base));
+    equityOptions.scales.x.type = "linear";
+    usCharts.equity = new Chart(equityCanvas.getContext("2d"), {
+      type: "line",
+      data: {
+        datasets: [...byLane.entries()].map(([lane, series], index) => ({
+          label: `${lane.replaceAll("_", " ")} · ${money(series.running)}`,
+          data: series.points,
+          borderColor: CHART_SERIES[index % CHART_SERIES.length],
+          backgroundColor: CHART_SERIES[index % CHART_SERIES.length],
+          borderWidth: 2, pointRadius: 0, stepped: true, fill: false
+        }))
+      },
+      options: {
+        ...equityOptions,
+        scales: {
+          x: {
+            ...equityOptions.scales.x,
+            ticks: {
+              ...equityOptions.scales.x.ticks,
+              callback: value => new Date(value).toLocaleDateString()
+            }
+          },
+          y: {
+            ...equityOptions.scales.y,
+            ticks: {
+              ...equityOptions.scales.y.ticks,
+              callback: value => `$${Number(value).toFixed(0)}`
+            }
+          }
+        }
+      }
+    });
+
+    // 2. Realized net per line type, from the same grouped summary the cards use.
+    const lineGroups = lastLedgerLineSummary.length
+      ? lastLedgerLineSummary
+      : [...closed.reduce((acc, row) => {
+          const key = String(row.market_type || "unknown");
+          acc.set(key, (acc.get(key) || 0) + Number(row.realized_net_usd || 0));
+          return acc;
+        }, new Map())].map(([market_type, realized_net_usd]) => ({market_type, realized_net_usd}));
+    const lineLabels = lineGroups.map(g => String(g.market_type || "line").replaceAll("_", " "));
+    const lineValues = lineGroups.map(g => +Number(g.realized_net_usd || 0).toFixed(2));
+    const linesCanvas = document.querySelector("#us-chart-lines");
+    if (linesCanvas) {
+      usCharts.lines = new Chart(linesCanvas.getContext("2d"), {
+        type: "bar",
+        data: {
+          labels: lineLabels,
+          datasets: [{
+            label: "Realized net",
+            data: lineValues,
+            backgroundColor: lineValues.map(v => (v >= 0 ? positive : negative)),
+            borderWidth: 0
+          }]
+        },
+        options: {
+          ...base,
+          plugins: {...base.plugins, legend: {display: false}},
+          scales: {
+            x: base.scales.x,
+            y: {
+              ...base.scales.y,
+              ticks: {...base.scales.y.ticks, callback: value => `$${Number(value).toFixed(0)}`}
+            }
+          }
+        }
+      });
+    }
+
+    // 3. Entry edge against realized net, one point per closed trade.
+    const edgeCanvas = document.querySelector("#us-chart-edge");
+    if (edgeCanvas) {
+      const bucket = {win: [], loss: [], other: []};
+      for (const row of closed) {
+        const edge = row.entry_execution_edge ?? row.entry_signal_edge;
+        if (edge == null) continue;
+        const point = {
+          x: +(Number(edge) * 100).toFixed(2),
+          y: +Number(row.realized_net_usd || 0).toFixed(2)
+        };
+        (bucket[row.result] ? bucket[row.result] : bucket.other).push(point);
+      }
+      usCharts.edge = new Chart(edgeCanvas.getContext("2d"), {
+        type: "scatter",
+        data: {
+          datasets: [
+            {label: `Profitable (${bucket.win.length})`, data: bucket.win, backgroundColor: positive},
+            {label: `Losing (${bucket.loss.length})`, data: bucket.loss, backgroundColor: negative},
+            {label: `Flat / other (${bucket.other.length})`, data: bucket.other, backgroundColor: muted}
+          ].filter(set => set.data.length),
+
+        },
+        options: {
+          ...base,
+          scales: {
+            x: {
+              ...base.scales.x,
+              title: {display: true, text: "Entry edge (¢)", color: ink, font: {size: 12}},
+              ticks: {...base.scales.x.ticks, callback: value => `${Number(value).toFixed(0)}¢`}
+            },
+            y: {
+              ...base.scales.y,
+              title: {display: true, text: "Realized net ($)", color: ink, font: {size: 12}},
+              ticks: {...base.scales.y.ticks, callback: value => `$${Number(value).toFixed(0)}`}
+            }
+          }
+        }
+      });
+    }
+
+    // Canvases are opaque to assistive tech, so state the outcome in text.
+    const total = closed.reduce((sum, row) => sum + Number(row.realized_net_usd || 0), 0);
+    equityCanvas.setAttribute(
+      "aria-label",
+      `Cumulative realized net over ${closed.length} closed trades across ` +
+      `${byLane.size} lane${byLane.size === 1 ? "" : "s"}, ending at ${money(total)}. ` +
+      "The trade datasheet lists every row."
+    );
+    if (linesCanvas) {
+      linesCanvas.setAttribute(
+        "aria-label",
+        "Realized net by line type: " +
+        lineLabels.map((label, i) => `${label} ${money(lineValues[i])}`).join(", ") + "."
+      );
+    }
+    if (status) {
+      status.className = "refresh-status";
+      status.textContent =
+        `${closed.length} closed trade${closed.length === 1 ? "" : "s"} plotted · ` +
+        `${money(total)} realized net · charts follow the datasheet filters.`;
+    }
+  }
+
+  document.querySelector("#us-charts-refresh")?.addEventListener(
+    "click",
+    () => renderPerformanceCharts()
+  );
 
   document.querySelector("#us-ledger-refresh")?.addEventListener(
     "click",
@@ -2918,6 +3457,8 @@
       "click",
       loadExitThresholdsIntoLineProfile
     );
+    // This block renders its own .field-note, so move it behind an "ⓘ" too.
+    infoPopovers.migrate(body);
   }
 
   async function loadPolicyAdvisorSessions() {
@@ -5343,7 +5884,12 @@
       if (currentChart) currentChart.destroy();
 
       const datasets = [];
-      const colors = ['#29e7d6', '#ffcf3f', '#ff4d2e', '#a020f0', '#00ff00', '#ff00ff'];
+      // Series palette for a white plot area; each reads at AA on white and
+      // stays distinguishable in greyscale. Matches the index.css tokens.
+      const colors = ['#1570ef', '#b54708', '#067647', '#7839ee', '#b42318', '#0e7090'];
+      const ink = '#1a1a1a';
+      const inkSoft = '#5c5c5c';
+      const gridLine = '#e6e6e1';
       let cIdx = 0;
 
       const byOutcome = {};
@@ -5352,16 +5898,39 @@
         byOutcome[q.outcome].push({x: q.observed_at * 1000, y: q.probability * 100});
       }
       for (const [outcome, pts] of Object.entries(byOutcome)) {
-        datasets.push({ label: outcome + ' Prob (%)', data: pts, borderColor: colors[cIdx % colors.length], fill: false, stepped: true });
+        datasets.push({ label: outcome + ' Prob (%)', data: pts, borderColor: colors[cIdx % colors.length], borderWidth: 2, pointRadius: 0, fill: false, stepped: true });
         cIdx++;
       }
 
       const homeScores = data.states.filter(s => s.home_score != null).map(s => ({x: s.observed_at * 1000, y: s.home_score}));
-      if (homeScores.length > 0) datasets.push({ label: 'Home Score', data: homeScores, borderColor: '#ffffff', borderDash: [5, 5], stepped: true });
+      if (homeScores.length > 0) datasets.push({ label: 'Home Score', data: homeScores, borderColor: ink, borderWidth: 1.5, pointRadius: 0, borderDash: [5, 5], stepped: true });
 
       currentChart = new Chart(ctx, {
         type: 'line', data: { datasets },
-        options: { responsive: true, maintainAspectRatio: false, scales: { x: { type: 'linear', ticks: { callback: v => new Date(v).toLocaleTimeString() } }, y: { min: 0 } }, animation: false }
+        options: {
+          responsive: true, maintainAspectRatio: false, animation: false,
+          plugins: {
+            legend: { labels: { color: ink, boxWidth: 12, font: { size: 12 } } },
+            tooltip: {
+              backgroundColor: '#ffffff', titleColor: ink, bodyColor: inkSoft,
+              borderColor: '#d3d3cc', borderWidth: 1, displayColors: true
+            }
+          },
+          scales: {
+            x: {
+              type: 'linear',
+              grid: { color: gridLine },
+              border: { color: gridLine },
+              ticks: { color: inkSoft, font: { size: 12 }, callback: v => new Date(v).toLocaleTimeString() }
+            },
+            y: {
+              min: 0,
+              grid: { color: gridLine },
+              border: { color: gridLine },
+              ticks: { color: inkSoft, font: { size: 12 } }
+            }
+          }
+        }
       });
     } catch {
       console.error("Failed to load chart");

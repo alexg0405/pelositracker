@@ -6,7 +6,7 @@
   <meta name="description" content="Auditable live sports-market research and controlled Polymarket US execution">
   <title>PelosiTracker Dashboard</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <link rel="stylesheet" href="/static/index.css?v=workstation-cockpit-1">
+  <link rel="stylesheet" href="/static/index.css?v=editorial-5">
 </head>
 <body class="research-workstation">
 <a class="skip-link" href="#main-content">Skip to dashboard</a>
@@ -146,6 +146,7 @@
         <a class="research-section-link" data-research-section="us-ledger" href="#us-ledger">Trade data</a>
         <a class="research-section-link" data-research-section="us-advisor" href="#us-advisor">Advisor</a>
         <a class="research-section-link" data-research-section="us-auto-trader" href="#us-auto-trader">Auto trader</a>
+        <a class="research-section-link" data-research-section="us-policy" href="#us-policy">Policy</a>
         <a class="research-section-link" data-research-section="us-activity" href="#us-activity">Positions &amp; log</a>
         <a class="research-section-link" data-research-section="us-model-lab" href="#us-model-lab">Model lab</a>
         <a class="research-section-link" data-research-section="us-market-browser" href="#us-market-browser">US markets</a>
@@ -153,7 +154,7 @@
       <a class="research-section-top" href="#global-tab-nav" aria-label="Back to the top of the workspace">Top ↑</a>
     </nav>
 
-    <section class="panel pad section-gap us-research-hero research-anchor" id="us-research-overview">
+    <section class="panel pad section-gap us-research-hero research-anchor" id="us-research-overview" data-research-view="us-research-overview">
       <div class="browse-head">
         <div>
           <h2 class="title">Polymarket US research & execution</h2>
@@ -169,7 +170,7 @@
       <div class="notice us-safety-note"><strong>Safety boundary:</strong> live entries and live cash-outs are disarmed after every restart and when the selected 30-minute to 4-hour latch expires. Dry-run is the default. Orders are bounded fill-or-kill limits, every live order is previewed, and the emergency stop touches only orders created here.</div>
     </section>
 
-    <div class="us-overview-grid section-gap">
+    <div class="us-overview-grid section-gap" data-research-view="us-performance">
       <section class="panel pad us-performance-panel research-anchor" id="us-performance">
         <div class="browse-head">
           <div>
@@ -187,6 +188,35 @@
           <div class="metrics-empty">No managed trade results yet.</div>
         </div>
         <div class="us-performance-footnote">Total net = realized net + current executable cash-out value minus entry cost on priced open positions. The tally buttons start a new display session only — for reading one night's dry-run profit on its own — and never delete positions, journal evidence, the datasheet, or daily-loss safeguards.</div>
+      </section>
+
+      <!-- Charts read the retained trade rows already loaded for the datasheet;
+           they issue no request of their own and change no threshold. -->
+      <section class="panel pad us-performance-charts" aria-labelledby="us-charts-heading">
+        <div class="browse-head">
+          <div>
+            <h2 class="title" id="us-charts-heading">Result charts</h2>
+            <div class="field-note">Drawn from the same retained closed trades as the datasheet, using each trade's recorded entry settings. Closed trades only — open positions carry no realized net yet. A short run of trades is weak evidence regardless of how the line slopes.</div>
+          </div>
+          <div class="us-performance-actions">
+            <button class="ghost compact-button" id="us-charts-refresh" type="button">Redraw charts</button>
+          </div>
+        </div>
+        <div id="us-charts-status" class="refresh-status" role="status" aria-live="polite">Charts draw once retained trade rows have loaded.</div>
+        <div class="chart-grid">
+          <figure class="chart-card chart-card-wide">
+            <figcaption>Cumulative realized net by lane</figcaption>
+            <div class="chart-frame-sm"><canvas id="us-chart-equity" role="img" aria-label="Cumulative realized net over time, per automation lane."></canvas></div>
+          </figure>
+          <figure class="chart-card">
+            <figcaption>Realized net by line type</figcaption>
+            <div class="chart-frame-sm"><canvas id="us-chart-lines" role="img" aria-label="Realized net per line type."></canvas></div>
+          </figure>
+          <figure class="chart-card">
+            <figcaption>Entry edge vs realized net</figcaption>
+            <div class="chart-frame-sm"><canvas id="us-chart-edge" role="img" aria-label="Each closed trade's entry edge against its realized net."></canvas></div>
+          </figure>
+        </div>
       </section>
 
       <section class="panel pad us-account-panel">
@@ -220,7 +250,7 @@
       </section>
     </div>
 
-    <section class="panel pad section-gap us-performance-ledger-panel research-anchor" id="us-ledger">
+    <section class="panel pad section-gap us-performance-ledger-panel research-anchor" id="us-ledger" data-research-view="us-ledger">
       <div class="browse-head">
         <div>
           <h2 class="title">Trade performance datasheet</h2>
@@ -292,7 +322,7 @@
       </div>
     </section>
 
-    <section class="panel pad section-gap us-policy-advisor-panel research-anchor" id="us-advisor">
+    <section class="panel pad section-gap us-policy-advisor-panel research-anchor" id="us-advisor" data-research-view="us-advisor">
       <div class="browse-head">
         <div>
           <h2 class="title">Reactive settings advisor</h2>
@@ -347,7 +377,7 @@
       <div id="us-policy-advisor-sessions" class="us-policy-advisor-sessions"></div>
     </section>
 
-    <section class="panel pad section-gap us-trading-panel research-anchor" id="us-auto-trader">
+    <section class="panel pad section-gap us-trading-panel research-anchor" id="us-auto-trader" data-research-view="us-auto-trader">
       <div class="browse-head">
         <div>
           <h2 class="title">Automatic trade controls</h2>
@@ -389,6 +419,45 @@
           <span id="us-quick-lane-status">Start or stop the selected lane without changing its other saved settings.</span>
         </div>
         <button class="primary" id="us-lane-automation-toggle" type="button">Start dry-run automation</button>
+      </div>
+      <div class="us-arm-row">
+        <label class="us-approval-toggle">
+          <input id="us-arm-confirmation" type="checkbox" disabled>
+          <span>I approve live orders for the selected duration</span>
+        </label>
+        <label>Arm duration
+          <select id="us-arm-duration" disabled>
+            <option value="1800">30 minutes</option>
+            <option value="3600">1 hour</option>
+            <option value="7200">2 hours</option>
+            <option value="14400">4 hours</option>
+          </select>
+        </label>
+        <button class="danger" id="us-arm" type="button" disabled>Arm for 30 minutes</button>
+      </div>
+      <div id="us-live-control-hint" class="field-note us-live-control-hint">
+        Switch to the live lane to arm or disarm real orders. Dry-run automation can run without arming.
+      </div>
+      <div class="notice us-safety-note"><strong>Recommended rollout:</strong> start with strict mode or the core-gates preset and run dry-run until the journal shows exact event/line mappings and exits you agree with. Selective mode changes only which existing engine gate results this execution sidecar requires; it never changes their calculations. Live mode still requires positive source edge and every authenticated US execution safeguard.</div>
+      <div class="us-policy-handoff">
+        <div>
+          <strong>Execution policy</strong>
+          <span id="us-policy-handoff-summary">Six steps: lane &amp; capital, authorization, bankroll, exit behaviour, advanced gates, review.</span>
+        </div>
+        <a class="us-policy-handoff-link" href="#us-policy" data-research-section="us-policy">Edit execution policy</a>
+      </div>
+    </section>
+
+    <!-- The ~90 policy inputs are their own view. Mixing them into the auto
+         trader made that screen a 5,000-pixel scroll; here one step shows at a
+         time and the save/step controls stay pinned in a footer. -->
+    <section class="panel pad section-gap us-policy-panel research-anchor" id="us-policy" data-research-view="us-policy">
+      <div class="browse-head">
+        <div>
+          <h2 class="title">Execution policy setup</h2>
+          <div class="field-note">These are execution limits around the existing model—not new probability, edge, quality, or calibration formulas. Each step saves to the lane selected in the auto trader.</div>
+        </div>
+        <a class="us-policy-handoff-link" href="#us-auto-trader" data-research-section="us-auto-trader">Back to auto trader</a>
       </div>
       <div id="us-policy-save-status" class="us-policy-save-status" role="alert" aria-live="assertive" hidden></div>
       <div id="us-policy-rail" class="us-policy-rail">
@@ -479,7 +548,7 @@
             <label>Qualifying readings required
               <input data-profile-field="entry_confirmation_readings" data-profile-integer type="number" min="1" max="10" step="1" placeholder="Inherit">
             </label>
-            <label>Maximum confirmation price drift (Â¢)
+            <label>Maximum confirmation price drift (¢)
               <input data-profile-field="max_confirmation_price_drift" data-profile-percent type="number" min="0" max="100" step="any" placeholder="Inherit">
             </label>
             <label>Minimum independent references
@@ -760,7 +829,7 @@
               <input id="us-entry-confirmation-readings" data-derived-risk type="number" min="1" max="10" step="1" required>
               <span class="field-note">Readings must have a newer signal timestamp. One preserves immediate entry behavior.</span>
             </label>
-            <label>Maximum ask drift while confirming (Â¢)
+            <label>Maximum ask drift while confirming (¢)
               <input id="us-max-confirmation-price-drift" data-derived-risk type="number" min="0" max="100" step="any" required>
               <span class="field-note">Restarts confirmation if the executable ask worsens beyond this amount.</span>
             </label>
@@ -806,7 +875,6 @@
           <div id="us-risk-session-status" class="us-liquidate-status" role="status" aria-live="assertive"></div>
         </section>
         <div class="us-trading-actions us-check-wide">
-          <button class="primary" id="us-policy-save" type="submit">Save execution policy</button>
           <button class="ghost" id="us-run-now" type="button">Run one cycle now</button>
           <button class="ghost" id="us-disarm" type="button" disabled>Disarm live orders</button>
           <button class="danger" id="us-emergency-stop" type="button">Stop automation now</button>
@@ -814,28 +882,17 @@
         <div id="us-stop-status" class="us-liquidate-status us-check-wide" role="status" aria-live="assertive"></div>
         </div>
       </form>
-      <div class="us-arm-row">
-        <label class="us-approval-toggle">
-          <input id="us-arm-confirmation" type="checkbox" disabled>
-          <span>I approve live orders for the selected duration</span>
-        </label>
-        <label>Arm duration
-          <select id="us-arm-duration" disabled>
-            <option value="1800">30 minutes</option>
-            <option value="3600">1 hour</option>
-            <option value="7200">2 hours</option>
-            <option value="14400">4 hours</option>
-          </select>
-        </label>
-        <button class="danger" id="us-arm" type="button" disabled>Arm for 30 minutes</button>
+      <!-- Save and step movement stay reachable from every step instead of
+           living only at the bottom of step 6. -->
+      <div class="us-policy-footer">
+        <button class="ghost" id="us-policy-step-prev" type="button">← Back</button>
+        <span id="us-policy-step-indicator" aria-live="polite">Step 1 of 6</span>
+        <button class="ghost" id="us-policy-step-next" type="button">Next →</button>
+        <button class="primary" id="us-policy-save" type="submit" form="us-trading-form">Save execution policy</button>
       </div>
-      <div id="us-live-control-hint" class="field-note us-live-control-hint">
-        Switch to the live lane to arm or disarm real orders. Dry-run automation can run without arming.
-      </div>
-      <div class="notice us-safety-note"><strong>Recommended rollout:</strong> start with strict mode or the core-gates preset and run dry-run until the journal shows exact event/line mappings and exits you agree with. Selective mode changes only which existing engine gate results this execution sidecar requires; it never changes their calculations. Live mode still requires positive source edge and every authenticated US execution safeguard.</div>
     </section>
 
-    <div class="us-activity-grid section-gap research-anchor" id="us-activity">
+    <div class="us-activity-grid section-gap research-anchor" id="us-activity" data-research-view="us-activity">
       <section class="panel pad us-positions-panel">
         <div class="browse-head">
           <div>
@@ -910,7 +967,7 @@
       </section>
     </div>
 
-    <section class="panel pad section-gap model-lab-panel research-anchor" id="us-model-lab">
+    <section class="panel pad section-gap model-lab-panel research-anchor" id="us-model-lab" data-research-view="us-model-lab">
       <div class="browse-head">
         <div>
           <h2 class="title">Sport Model Lab</h2>
@@ -972,7 +1029,7 @@
       <div id="model-lab-momentum" class="model-lab-momentum"><div class="metrics-empty">Waiting for moneyline observations.</div></div>
     </section>
 
-    <section class="panel pad research-anchor" id="us-market-browser">
+    <section class="panel pad research-anchor" id="us-market-browser" data-research-view="us-market-browser">
       <div class="browse-head">
         <div>
           <h2 class="title">US/mobile sports inventory</h2>
@@ -1078,6 +1135,6 @@
 
 
 <script src="/static/csrf.js" defer></script>
-<script src="/static/index.js?v=workstation-cockpit-1" defer></script>
+<script src="/static/index.js?v=editorial-3" defer></script>
 </body>
 </html>
