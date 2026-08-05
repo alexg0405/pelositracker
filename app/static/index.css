@@ -22,9 +22,9 @@
 
   /* Text. Never pure white on near-black — it vibrates and smears. */
   --text:           #eceef5;
-  --text-secondary: #a7a9bd;
-  /* This is the floor for AA on --bg (4.9:1). Dimmer stops being readable. */
-  --text-muted:     #82859d;
+  --text-secondary: #b6b8ca;
+  /* Raised from #82859d, which sat at 4.9:1 — effectively on the AA floor. */
+  --text-muted:     #9295ab;
 
   /* Accent — the Cyberpunk 2077 acid yellow. Alone among the neons here it
      works as both a fill and a text colour: 14.6:1 on --bg, and it takes
@@ -178,6 +178,20 @@ body::after {
 }
 /* The field belongs to the dark theme only; the light theme is editorial. */
 [data-theme="light"] body::before, [data-theme="light"] body::after { display: none; }
+/* Dashboard price tapes. Same layer as the glyph field: fixed, behind
+   everything, pointer-inert. Panels are opaque, so these read only in the
+   gutters — motion at the edge of vision, never under text. */
+.bg-tapes {
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  /* Same resting weight as the glyph field. Decoration must not compete with
+     the interface; the tapes are meant to be noticed only peripherally. */
+  opacity: .13;
+}
+/* No bloom on this layer: the glow haloed into the gutters beside panel edges. */
+.bg-tapes .hud-tape { filter: none; opacity: 1; }
+.bg-tapes svg { width: 100%; height: 100%; display: block; }
+[data-theme="light"] .bg-tapes { display: none; }
+
 /* Raise every top-level surface above the field. */
 .wrap, #login-overlay, .app-dialog, .info-popover, .skip-link { position: relative; z-index: 1; }
 #login-overlay { z-index: 1000; }
@@ -307,7 +321,18 @@ header {
 .panel, .event, .empty {
   position: relative; background: var(--bg); border: 1px solid var(--border);
   border-radius: var(--radius-card); min-width: 0;
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
+/* A short accent rule at the top-left of every panel, so a screenful of panels
+   has a rhythm instead of reading as undifferentiated boxes. */
+.panel::before {
+  content: ""; position: absolute; top: -1px; left: -1px; width: 52px; height: 2px;
+  background: var(--accent); border-radius: var(--radius-card) 0 0 0; opacity: .5;
+}
+.panel:hover { border-color: var(--border-strong); }
+/* Views fade and lift in on a route change rather than snapping. */
+@keyframes view-in { from { opacity: 0; transform: translateY(6px); } }
+[data-research-view]:not([hidden]) { animation: view-in .26s var(--ease); }
 /* HUD corner brackets. Purely decorative, drawn with borders on pseudo
    elements — no clip-path, so nothing clips content, shadows or sticky
    children. Diagonally opposed so a panel reads as a framed instrument. */
@@ -333,7 +358,30 @@ header {
   background: var(--bg); color: var(--text); text-align: left; text-decoration: none; min-height: 148px; overflow: hidden;
 }
 .bento-card.is-wide { grid-column: span 3; }
-.bento-card:hover { border-color: var(--border-strong); background: var(--surface); }
+/* Each tile owns a hue, set once here and inherited by its rule, arrow and
+   glow. Colour-coding the launcher is what stops the overview reading as nine
+   identical grey boxes, and it doubles as a recognition cue. */
+.bento-card:nth-child(1) { --tile: var(--positive); }
+.bento-card:nth-child(2) { --tile: var(--info); }
+.bento-card:nth-child(3) { --tile: var(--accent); }
+.bento-card:nth-child(4) { --tile: #8b7bff; }
+.bento-card:nth-child(5) { --tile: var(--warning); }
+.bento-card:nth-child(6) { --tile: #4ad6c0; }
+.bento-card:nth-child(7) { --tile: #ff8ab0; }
+.bento-card:nth-child(8) { --tile: var(--hud-ghost); }
+/* Hairline of the tile's hue along the top edge. */
+.bento-card::before {
+  content: ""; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+  background: var(--tile, var(--border-strong)); opacity: .4;
+  transition: opacity var(--dur) var(--ease);
+}
+.bento-card:hover {
+  border-color: var(--tile, var(--border-strong)); background: var(--surface);
+  box-shadow: 0 0 0 1px var(--tile, transparent), 0 0 24px -10px var(--tile, transparent);
+}
+.bento-card:hover::before { opacity: 1; }
+.bento-card:hover::after { background: var(--tile); color: var(--page); }
+.bento-metric { color: var(--tile, var(--text)); }
 .bento-card h3 { padding-right: var(--sp-8); font-size: var(--text-xl); line-height: 1.2; letter-spacing: -.018em; }
 .bento-card p { margin: 0; color: var(--text-secondary); font-size: var(--text-sm); }
 .bento-card .bento-metric { margin-top: auto; font: 600 var(--text-2xl)/1.1 var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; }

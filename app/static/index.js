@@ -286,11 +286,13 @@
   })();
   infoPopovers.migrate();
 
-  // Sign-in price tapes ---------------------------------------------------
+  // Price tapes -----------------------------------------------------------
   // Decorative. Each tape is a random walk: every step picks its own direction,
   // so the series never repeats and no two page loads look alike. A CSS keyframe
   // could only replay one fixed path, which is why the transform is driven here.
-  // Purely presentational — it reads no market data and feeds nothing.
+  // Purely presentational — it reads no market data and feeds nothing. Runs for
+  // the whole session because the dashboard carries the same tapes in its
+  // gutters; it pauses whenever the tab is hidden.
   (() => {
     const groups = [...document.querySelectorAll("[data-tape]")];
     if (!groups.length) return;
@@ -343,7 +345,6 @@
     // Respect the motion preference: a generated-but-still series, no loop.
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
 
-    const overlay = document.querySelector("#login-overlay");
     let last = performance.now();
     let frameId = null;
 
@@ -363,14 +364,11 @@
         }
         tape.group.setAttribute("transform", `translate(${-tape.offset.toFixed(2)} 0)`);
       }
-      // The tapes only exist behind the sign-in screen; stop once it is gone
-      // rather than animating an invisible layer for the rest of the session.
-      if (overlay?.hidden) { frameId = null; return; }
       frameId = window.requestAnimationFrame(frame);
     }
 
     const start = () => {
-      if (frameId == null && !overlay?.hidden) {
+      if (frameId == null) {
         last = performance.now();
         frameId = window.requestAnimationFrame(frame);
       }

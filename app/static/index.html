@@ -6,10 +6,24 @@
   <meta name="description" content="Auditable live sports-market research and controlled Polymarket US execution">
   <title>PelosiTracker Dashboard</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <link rel="stylesheet" href="/static/index.css?v=tape-3">
+  <link rel="stylesheet" href="/static/index.css?v=alive-1">
 </head>
 <body class="research-workstation">
 <a class="skip-link" href="#main-content">Skip to dashboard</a>
+<!-- Live price tapes carried through from the sign-in HUD so the dashboard is
+     not a dead-flat drop-off from it. Panels stay opaque, so these only ever
+     show in the gutters and margins — never behind text. Same [data-tape]
+     contract, so the same random-walk driver in index.js picks them up. -->
+<div class="bg-tapes" aria-hidden="true">
+  <svg viewBox="0 0 1200 800" preserveAspectRatio="xMidYMid slice" focusable="false">
+    <g class="hud-tape hud-tape-up" data-tape data-band="150" data-spread="74" data-speed="20">
+      <path d="M0 150 L300 110 L600 186 L900 116 L1200 172 L1500 108 L1800 180 L2100 120 L2400 150"/>
+    </g>
+    <g class="hud-tape hud-tape-down" data-tape data-band="660" data-spread="74" data-speed="15">
+      <path d="M0 660 L300 700 L600 622 L900 690 L1200 630 L1500 704 L1800 624 L2100 694 L2400 660"/>
+    </g>
+  </svg>
+</div>
 <div id="login-overlay">
   <!-- Decorative targeting HUD behind the sign-in card. Purely presentational,
        so it is aria-hidden and carries no text; every animation is disabled
@@ -1383,6 +1397,6 @@
 
 
 <script src="/static/csrf.js" defer></script>
-<script src="/static/index.js?v=tape-3" defer></script>
+<script src="/static/index.js?v=alive-1" defer></script>
 </body>
 </html>
