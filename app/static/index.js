@@ -286,6 +286,104 @@
   })();
   infoPopovers.migrate();
 
+  // Sign-in price tapes ---------------------------------------------------
+  // Decorative. Each tape is a random walk: every step picks its own direction,
+  // so the series never repeats and no two page loads look alike. A CSS keyframe
+  // could only replay one fixed path, which is why the transform is driven here.
+  // Purely presentational — it reads no market data and feeds nothing.
+  (() => {
+    const groups = [...document.querySelectorAll("[data-tape]")];
+    if (!groups.length) return;
+    // Sampling is deliberately tight and the steps large relative to it: wide
+    // spacing with small steps produced shallow, wave-like slopes. 18px spacing
+    // against steps of up to ~0.6 * spread gives near-vertical legs.
+    const STEP = 18;     // px between samples in viewBox units
+    const COUNT = 134;   // 133 * 18 = 2394, just over two viewBox widths
+
+    // Random walk: each step picks its own direction. A weak pull toward the band
+    // keeps it on screen without flattening the trend, and frequent jumps give it
+    // hard spikes instead of uniform noise.
+    const nextValue = (v, band, spread) => {
+      const jump = Math.random() < 0.22 ? (Math.random() - 0.5) * spread * 1.9 : 0;
+      const pull = (band - v) * 0.05;
+      const step = (Math.random() - 0.5) * spread * 1.2;
+      return Math.max(band - spread, Math.min(band + spread, v + step + pull + jump));
+    };
+
+    const tapes = groups.map(group => {
+      const band = Number(group.dataset.band) || 400;
+      const spread = Number(group.dataset.spread) || 55;
+      const points = [];
+      let value = band;
+      for (let i = 0; i < COUNT; i += 1) {
+        value = nextValue(value, band, spread);
+        points.push(value);
+      }
+      return {
+        group,
+        band,
+        spread,
+        points,
+        speed: Number(group.dataset.speed) || 30,
+        offset: 0,
+        path: group.querySelector("path")
+      };
+    });
+
+    const paint = tape => {
+      tape.path?.setAttribute(
+        "d",
+        tape.points
+          .map((y, i) => `${i ? "L" : "M"}${i * STEP} ${y.toFixed(1)}`)
+          .join(" ")
+      );
+    };
+    tapes.forEach(paint);
+
+    // Respect the motion preference: a generated-but-still series, no loop.
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+
+    const overlay = document.querySelector("#login-overlay");
+    let last = performance.now();
+    let frameId = null;
+
+    function frame(now) {
+      // Clamp dt so a backgrounded tab does not jump the series on return.
+      const dt = Math.min(64, now - last);
+      last = now;
+      for (const tape of tapes) {
+        tape.offset += (tape.speed * dt) / 1000;
+        while (tape.offset >= STEP) {
+          tape.offset -= STEP;
+          tape.points.shift();
+          tape.points.push(
+            nextValue(tape.points[tape.points.length - 1], tape.band, tape.spread)
+          );
+          paint(tape);
+        }
+        tape.group.setAttribute("transform", `translate(${-tape.offset.toFixed(2)} 0)`);
+      }
+      // The tapes only exist behind the sign-in screen; stop once it is gone
+      // rather than animating an invisible layer for the rest of the session.
+      if (overlay?.hidden) { frameId = null; return; }
+      frameId = window.requestAnimationFrame(frame);
+    }
+
+    const start = () => {
+      if (frameId == null && !overlay?.hidden) {
+        last = performance.now();
+        frameId = window.requestAnimationFrame(frame);
+      }
+    };
+    const stop = () => {
+      if (frameId != null) { window.cancelAnimationFrame(frameId); frameId = null; }
+    };
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) stop(); else start();
+    });
+    start();
+  })();
+
   // Auth & Login Logic
   document.querySelector("#login-form").addEventListener("submit", async e => {
     e.preventDefault();

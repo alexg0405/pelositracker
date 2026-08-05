@@ -646,21 +646,18 @@ tbody tr:hover td { background: var(--surface); }
 .hud-nodes rect { fill: currentColor; opacity: .95; filter: drop-shadow(0 0 5px var(--hud-node-glow)); }
 /* Neon price tapes. Laser look comes from a tight bloom on a thin stroke; the
    round joins stop each turn reading as a hard corner. */
+/* Mitred joins, not round: round joins blunted every turn, which is what made
+   the peaks read as soft waves rather than price ticks. */
 .hud-tape path {
-  fill: none; stroke: currentColor; stroke-width: 2;
-  stroke-linejoin: round; stroke-linecap: round;
+  fill: none; stroke: currentColor; stroke-width: 1.75;
+  stroke-linejoin: miter; stroke-miterlimit: 6; stroke-linecap: butt;
   vector-effect: non-scaling-stroke;
 }
 .hud-tape { opacity: .85; }
 .hud-tape-up   { color: var(--positive); filter: drop-shadow(0 0 7px var(--hud-cell-glow)); }
 .hud-tape-down { color: var(--hud-red);  filter: drop-shadow(0 0 7px var(--hud-glow-red)); }
-.hud-tape-ref  { color: var(--info); opacity: .4; filter: drop-shadow(0 0 6px var(--hud-glow-ghost)); }
-/* Scroll by exactly one viewBox width so the doubled path loops seamlessly.
-   Different speeds give the three series a parallax separation. */
-@keyframes tape-scroll { to { transform: translateX(-1200px); } }
-.hud-tape-up   { animation: tape-scroll 34s linear infinite; }
-.hud-tape-down { animation: tape-scroll 46s linear infinite; }
-.hud-tape-ref  { animation: tape-scroll 68s linear infinite; }
+/* No CSS scroll animation: index.js owns the transform, because a keyframe can
+   only replay a fixed path and the series is generated per step. */
 
 /* Motion. Each keyframe touches opacity/transform only. */
 @keyframes hud-spin { to { transform: rotate(360deg); } }
