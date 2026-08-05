@@ -6,7 +6,7 @@
   <meta name="description" content="Auditable live sports-market research and controlled Polymarket US execution">
   <title>PelosiTracker Dashboard</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <link rel="stylesheet" href="/static/index.css?v=hud-2">
+  <link rel="stylesheet" href="/static/index.css?v=hud-6">
 </head>
 <body class="research-workstation">
 <a class="skip-link" href="#main-content">Skip to dashboard</a>
@@ -21,6 +21,9 @@
         <pattern id="hud-ticks" width="9" height="18" patternUnits="userSpaceOnUse">
           <line x1="1" y1="0" x2="1" y2="18" stroke="currentColor" stroke-width="1.5"/>
         </pattern>
+        <pattern id="hud-ticks-fine" width="5" height="8" patternUnits="userSpaceOnUse">
+          <line x1="1" y1="0" x2="1" y2="8" stroke="currentColor" stroke-width="1"/>
+        </pattern>
         <linearGradient id="hud-fade" x1="0" x2="1">
           <stop offset="0" stop-color="currentColor" stop-opacity="0"/>
           <stop offset=".5" stop-color="currentColor" stop-opacity="1"/>
@@ -31,55 +34,87 @@
         </mask>
       </defs>
 
-      <!-- Mirrored hexagonal frames -->
-      <g class="hud-frames">
-        <path d="M60 250 L170 150 L470 150 L540 215 L540 585 L470 650 L170 650 L60 550 Z"/>
-        <path d="M1140 250 L1030 150 L730 150 L660 215 L660 585 L730 650 L1030 650 L1140 550 Z"/>
-        <path class="hud-frame-inner" d="M96 268 L184 188 L452 188 L512 244 L512 556 L452 612 L184 612 L96 532 Z"/>
-        <path class="hud-frame-inner" d="M1104 268 L1016 188 L748 188 L688 244 L688 556 L748 612 L1016 612 L1104 532 Z"/>
+      <!-- Dim green status row, behind everything, spanning the full width -->
+      <g class="hud-dots">
+        <circle cx="120" cy="392" r="26"/><circle cx="196" cy="418" r="17"/>
+        <circle cx="286" cy="386" r="21"/><circle cx="372" cy="410" r="14"/>
+        <circle cx="452" cy="392" r="24"/><circle cx="536" cy="414" r="16"/>
+        <circle cx="668" cy="414" r="16"/><circle cx="752" cy="392" r="24"/>
+        <circle cx="836" cy="410" r="14"/><circle cx="918" cy="386" r="21"/>
+        <circle cx="1008" cy="418" r="17"/><circle cx="1086" cy="392" r="26"/>
       </g>
 
-      <!-- Connector runs -->
+      <!-- Mirrored angled frames, three deep on each side -->
+      <g class="hud-frames">
+        <path d="M40 264 L168 136 L468 136 L556 224 L556 576 L468 664 L168 664 L40 536 Z"/>
+        <path d="M1160 264 L1032 136 L732 136 L644 224 L644 576 L732 664 L1032 664 L1160 536 Z"/>
+        <path class="hud-frame-inner" d="M84 282 L184 182 L448 182 L522 256 L522 544 L448 618 L184 618 L84 518 Z"/>
+        <path class="hud-frame-inner" d="M1116 282 L1016 182 L752 182 L678 256 L678 544 L752 618 L1016 618 L1116 518 Z"/>
+        <path class="hud-frame-inner" d="M128 300 L206 222 L430 222 L492 284 L492 516 L430 578 L206 578 L128 500 Z"/>
+        <path class="hud-frame-inner" d="M1072 300 L994 222 L770 222 L708 284 L708 516 L770 578 L994 578 L1072 500 Z"/>
+      </g>
+
+      <!-- Connector runs, with a bracket at each corner -->
       <g class="hud-lines">
-        <path d="M540 300 H660"/><path d="M540 500 H660"/>
-        <path d="M96 400 H300"/><path d="M900 400 H1104"/>
-        <path d="M170 150 L170 96"/><path d="M1030 150 L1030 96"/>
-        <path d="M170 650 L170 704"/><path d="M1030 650 L1030 704"/>
+        <path d="M556 300 H644"/><path d="M556 500 H644"/>
+        <path d="M556 340 H610"/><path d="M590 460 H644"/>
+        <path d="M40 400 H128"/><path d="M1072 400 H1160"/>
+        <path d="M84 340 H24"/><path d="M1116 340 H1176"/>
+        <path d="M84 460 H24"/><path d="M1116 460 H1176"/>
+        <path d="M168 136 L168 72 L360 72"/><path d="M1032 136 L1032 72 L840 72"/>
+        <path d="M168 664 L168 728 L360 728"/><path d="M1032 664 L1032 728 L840 728"/>
+        <path d="M206 222 L246 182"/><path d="M994 222 L954 182"/>
+        <path d="M206 578 L246 618"/><path d="M994 578 L954 618"/>
+        <path d="M300 104 H520"/><path d="M900 104 H680"/>
+        <path d="M300 696 H520"/><path d="M900 696 H680"/>
       </g>
 
       <!-- Tick strips with a travelling scan highlight -->
       <g class="hud-ticks" mask="url(#hud-tick-mask)">
-        <rect x="430" y="322" width="340" height="16" fill="url(#hud-ticks)"/>
-        <rect x="430" y="462" width="340" height="16" fill="url(#hud-ticks)"/>
+        <rect x="392" y="150" width="416" height="18" fill="url(#hud-ticks)"/>
+        <rect x="392" y="632" width="416" height="18" fill="url(#hud-ticks)"/>
+        <rect class="hud-ticks-fine" x="432" y="126" width="336" height="8" fill="url(#hud-ticks-fine)"/>
+        <rect class="hud-ticks-fine" x="432" y="666" width="336" height="8" fill="url(#hud-ticks-fine)"/>
+      </g>
+      <g class="hud-tick-rails">
+        <path d="M392 146 H808"/><path d="M392 172 H808"/>
+        <path d="M392 628 H808"/><path d="M392 654 H808"/>
       </g>
       <g class="hud-scan">
-        <rect x="0" y="318" width="46" height="24"/>
-        <rect x="0" y="458" width="46" height="24"/>
+        <rect x="0" y="146" width="52" height="26"/>
+        <rect x="0" y="628" width="52" height="26"/>
       </g>
 
       <!-- Reticle -->
       <g class="hud-reticle">
-        <circle class="hud-ring-outer" cx="600" cy="400" r="146"/>
-        <circle class="hud-ring-spin" cx="600" cy="400" r="128"/>
-        <circle class="hud-ring-spin-alt" cx="600" cy="400" r="108"/>
-        <circle class="hud-core" cx="600" cy="400" r="26"/>
-        <path class="hud-cross" d="M600 336 V364 M600 436 V464 M536 400 H564 M636 400 H664"/>
+        <circle class="hud-ring-outer" cx="600" cy="400" r="286"/>
+        <circle class="hud-ring-spin" cx="600" cy="400" r="262"/>
+        <circle class="hud-ring-spin-alt" cx="600" cy="400" r="238"/>
+        <path class="hud-cross" d="M600 88 V128 M600 672 V712 M290 400 H330 M870 400 H910"/>
       </g>
 
-      <!-- Pulsing nodes and dim status dots -->
+      <!-- Pulsing nodes -->
       <g class="hud-nodes">
-        <rect x="112" y="286" width="12" height="12"/><rect x="1076" y="286" width="12" height="12"/>
-        <rect x="112" y="502" width="12" height="12"/><rect x="1076" y="502" width="12" height="12"/>
-        <rect x="330" y="140" width="10" height="10"/><rect x="860" y="140" width="10" height="10"/>
-        <rect x="330" y="650" width="10" height="10"/><rect x="860" y="650" width="10" height="10"/>
-      </g>
-      <g class="hud-dots">
-        <circle cx="250" cy="400" r="20"/><circle cx="360" cy="400" r="13"/>
-        <circle cx="840" cy="400" r="13"/><circle cx="950" cy="400" r="20"/>
+        <rect x="96" y="290" width="14" height="14"/><rect x="1090" y="290" width="14" height="14"/>
+        <rect x="96" y="496" width="14" height="14"/><rect x="1090" y="496" width="14" height="14"/>
+        <rect x="352" y="66" width="12" height="12"/><rect x="836" y="66" width="12" height="12"/>
+        <rect x="352" y="722" width="12" height="12"/><rect x="836" y="722" width="12" height="12"/>
+        <rect x="16" y="334" width="10" height="10"/><rect x="1174" y="334" width="10" height="10"/>
+        <rect x="16" y="454" width="10" height="10"/><rect x="1174" y="454" width="10" height="10"/>
+        <rect x="514" y="98" width="10" height="10"/><rect x="676" y="98" width="10" height="10"/>
+        <rect x="514" y="690" width="10" height="10"/><rect x="676" y="690" width="10" height="10"/>
       </g>
     </svg>
   </div>
+  <!-- No panel: the form is instrumentation inside the HUD, so it carries no
+       card background, border or shadow. The corner brackets are decorative
+       spans rather than pseudo-elements so all four can be placed. -->
   <div class="login-box">
+    <span class="login-bracket login-bracket-tl" aria-hidden="true"></span>
+    <span class="login-bracket login-bracket-tr" aria-hidden="true"></span>
+    <span class="login-bracket login-bracket-bl" aria-hidden="true"></span>
+    <span class="login-bracket login-bracket-br" aria-hidden="true"></span>
+    <p class="login-status" aria-hidden="true"><span class="login-status-dot"></span>Secure channel</p>
     <h1>Pelosi<span>Alpha</span></h1>
     <div id="login-error" class="error" hidden></div>
     <form id="login-form">
@@ -597,15 +632,15 @@
       </div>
       <div id="us-trading-lanes" class="us-trading-lanes" aria-label="Automation lanes">
         <button type="button" data-trading-lane="dry_run">
-          <strong>Dry-run lane</strong>
+          <strong data-lane-title>Dry-run lane</strong>
           <span id="us-dry-run-lane-summary">Loading separate simulated settings…</span>
         </button>
         <button type="button" data-trading-lane="live">
-          <strong>Anthony · live</strong>
+          <strong data-lane-title>Live lane</strong>
           <span id="us-live-lane-summary">Loading separate live settings…</span>
         </button>
         <button type="button" data-trading-lane="alex" hidden>
-          <strong>Alex · live</strong>
+          <strong data-lane-title>Second live lane</strong>
           <span id="us-alex-lane-summary">Enable ENABLE_POLYMARKET_US_ALEX_LANE on the server to open this lane.</span>
         </button>
       </div>
@@ -1345,6 +1380,6 @@
 
 
 <script src="/static/csrf.js" defer></script>
-<script src="/static/index.js?v=hud-2" defer></script>
+<script src="/static/index.js?v=hud-6" defer></script>
 </body>
 </html>

@@ -305,8 +305,15 @@
       if (typedUser) { window.currentUsername = typedUser; try { sessionStorage.setItem("pt_user", typedUser); } catch {} }
 
       const overlay = document.querySelector("#login-overlay");
+      // Hand the sign-in HUD off to the dashboard's X-glyph field: the HUD
+      // disperses outward while the field converges inward. is-entering drives
+      // only that one-shot arrival and is removed so it cannot replay.
       overlay.classList.add("dissolve");
-      setTimeout(() => { overlay.hidden = true; }, 1500);
+      document.body.classList.add("is-entering");
+      setTimeout(() => {
+        overlay.hidden = true;
+        document.body.classList.remove("is-entering");
+      }, 1500);
 
       // Start the app!
       startApp();
@@ -790,13 +797,20 @@
   let lastRiskPresets = {};
   let lineExecutionProfiles = [];
   const TRADING_LANES = ["dry_run", "live", "alex"];
-  // The primary live lane belongs to Anthony; the optional second live lane
-  // (its own Polymarket credentials, own book) belongs to Alex and only
-  // appears when the server enables it.
+  // Lane names are generic by default. A personal name only appears when the
+  // server has actually been configured with an owner for that lane
+  // (POLYMARKET_US_LANE_OWNERS -> status.user.lane_owners); hard-coding one
+  // meant every deployment showed the same operator's name to whoever was
+  // logged in. The optional second live lane runs its own credentials and its
+  // own book, and only appears when the server enables it.
   const TRADING_LANE_LABELS = {
-    live: "Anthony", alex: "Alex", dry_run: "Dry-run",
+    live: "Live", alex: "Second live", dry_run: "Dry-run",
   };
-  const tradingLaneLabel = lane => TRADING_LANE_LABELS[lane] || lane;
+  const tradingLaneLabel = lane => {
+    const owner = usUserIdentity?.lane_owners?.[lane];
+    if (owner && lane !== "dry_run") return owner;
+    return TRADING_LANE_LABELS[lane] || lane;
+  };
   const isLiveModeLane = lane => lane !== "dry_run";
   let activeTradingLane = (() => {
     try {
@@ -831,6 +845,14 @@
         lane === activeTradingLane ? "true" : "false"
       );
       if (button) button.disabled = usTradingLaneSwitching;
+      // Headline name follows the configured owner, so no operator's name is
+      // baked into the markup. "· you" marks the lane the signed-in user owns.
+      const title = button?.querySelector("[data-lane-title]");
+      if (title) {
+        const owner = usUserIdentity?.lane_owners?.[lane];
+        const mine = owner && owner === usUserIdentity?.username;
+        title.textContent = `${tradingLaneLabel(lane)} lane${mine ? " · you" : ""}`;
+      }
       const summary = document.querySelector(
         lane === "live"
           ? "#us-live-lane-summary"

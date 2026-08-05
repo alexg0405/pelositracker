@@ -145,6 +145,11 @@ body::before, body::after {
    the readability problem this rebuild removed. The field lives in the gutters
    and margins instead. */
 body::before { opacity: .14; }
+/* The other half of the sign-in hand-off: the resting field arrives from a
+   larger scale as the HUD disperses outward, so the glyphs appear to settle out
+   of it. Set for one run by index.js and removed afterwards. */
+@keyframes xfield-arrive { from { opacity: 0; transform: scale(1.4); } to { opacity: .14; transform: none; } }
+body.is-entering::before { animation: xfield-arrive 1.15s var(--ease); }
 body::after {
   opacity: .7;
   /* A disc at the pointer. transparent->black in a mask alpha-reveals. */
@@ -321,7 +326,16 @@ header {
 }
 .bento-card:hover::after { background: var(--accent); color: var(--on-accent); }
 .bento-card:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
-.browse-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-3); margin-bottom: var(--sp-3); }
+/* Hairline rules. One divider colour and one width everywhere, used to close
+   off a heading from its content and to separate repeated rows. Borders rather
+   than <hr> so nothing is added to the DOM and screen readers are unaffected. */
+.browse-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-3);
+  margin-bottom: var(--sp-3); padding-bottom: var(--sp-3); border-bottom: 1px solid var(--border);
+}
+/* A stacked head (account panel, small screens) would otherwise put the rule
+   between the title and its own actions. */
+.us-account-panel .browse-head { padding-bottom: 0; border-bottom: 0; }
 .browse-head .title { margin: 0; }
 
 /* Forms ------------------------------------------------------------------- */
@@ -472,7 +486,12 @@ details.us-exit-recovery-audit > *:last-child { margin-bottom: var(--sp-3); }
 .key, .mtile .k, .us-status-card span, .hint, .mtile .sub2, .us-state-chip span {
   display: block; color: var(--text-secondary); font: 500 var(--text-xs)/1.4 var(--font-mono); letter-spacing: .04em;
 }
-.value, .mtile .v, .us-status-card strong { display: block; margin-top: var(--sp-1); font: 600 var(--text-lg)/1.2 var(--font-mono); letter-spacing: -.01em; }
+/* Rule between a tile's label and its value, so the pair reads as a labelled
+   figure instead of two stacked lines of text. */
+.value, .mtile .v, .us-status-card strong {
+  display: block; margin-top: var(--sp-2); padding-top: var(--sp-2); border-top: 1px solid var(--border);
+  font: 600 var(--text-lg)/1.2 var(--font-mono); letter-spacing: -.01em;
+}
 .hint, .mtile .sub2 { margin-top: var(--sp-05); color: var(--text-muted); }
 .us-status-card { min-height: 72px; }
 
@@ -532,7 +551,18 @@ tbody tr:hover td { background: var(--surface); }
   position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; padding: var(--sp-4);
   background: var(--page); transition: opacity .4s ease; overflow: hidden;
 }
-#login-overlay.dissolve { opacity: 0; pointer-events: none; }
+/* Hand-off to the dashboard. The overlay itself is not faded as a whole any
+   more: its backdrop clears while the HUD expands outward and the X-glyph field
+   converges inward from a larger scale, so the instrumentation reads as
+   dispersing into the background texture rather than cross-fading with it.
+   `forwards` is safe on these three because the overlay is hidden immediately
+   afterwards — unlike the entrance animations, nothing stays on screen
+   depending on them. */
+#login-overlay.dissolve { background: transparent; pointer-events: none; }
+#login-overlay.dissolve .login-hud { animation: hud-disperse 1.05s var(--ease) forwards; }
+#login-overlay.dissolve .login-box { animation: hud-card-out .45s var(--ease) forwards; }
+@keyframes hud-disperse { from { opacity: .5; transform: none; } to { opacity: 0; transform: scale(2.1); } }
+@keyframes hud-card-out { to { opacity: 0; transform: translateY(-8px) scale(.97); } }
 
 /* Targeting HUD ---------------------------------------------------------
    Decorative. Sits behind the card, drawn in the semantic red so it reads as
@@ -546,19 +576,25 @@ tbody tr:hover td { background: var(--surface); }
 .login-hud svg { width: 100%; height: 100%; display: block; }
 .login-hud path, .login-hud circle, .login-hud rect, .login-hud line { vector-effect: non-scaling-stroke; }
 
-.hud-frames path { fill: none; stroke: currentColor; stroke-width: 1.5; opacity: .55; }
-.hud-frames .hud-frame-inner { stroke-width: 1; opacity: .22; }
-.hud-lines path { fill: none; stroke: currentColor; stroke-width: 1; opacity: .3; }
-.hud-ticks { color: var(--text-secondary); opacity: .55; }
-.hud-scan rect { fill: currentColor; opacity: .32; filter: blur(2px); }
+.hud-frames path { fill: none; stroke: currentColor; stroke-width: 1.5; opacity: .6; }
+.hud-frames .hud-frame-inner { stroke-width: 1; opacity: .26; }
+.hud-lines path { fill: none; stroke: currentColor; stroke-width: 1; opacity: .34; }
+/* Tick strips read as light instrumentation against the red frame work. */
+.hud-ticks { color: var(--text); opacity: .5; }
+.hud-ticks-fine { opacity: .6; }
+.hud-tick-rails path { fill: none; stroke: var(--text); stroke-width: 1; opacity: .3; }
+.hud-scan rect { fill: var(--text); opacity: .3; filter: blur(2px); }
 .hud-reticle circle { fill: none; stroke: currentColor; stroke-width: 1.5; }
-.hud-ring-outer { opacity: .4; }
+.hud-ring-outer { opacity: .45; stroke-width: 2; }
+/* Lens bracket and inner ring are light, matching the reference's white core. */
+.hud-lens { fill: none; stroke: var(--text); stroke-width: 1.5; opacity: .55; }
+.hud-core-ring { stroke: var(--text) !important; opacity: .8; }
 /* transform-box declared so the rotation origin is read in viewBox units and
    the rings spin about the reticle centre rather than the SVG's own corner. */
 .hud-ring-spin { stroke-dasharray: 34 16 8 16; opacity: .85; transform-box: view-box; transform-origin: 600px 400px; }
 .hud-ring-spin-alt { stroke-dasharray: 4 22; opacity: .5; transform-box: view-box; transform-origin: 600px 400px; }
-.hud-core { opacity: .9; }
-.hud-cross { fill: none; stroke: currentColor; stroke-width: 2; opacity: .75; }
+.hud-core { fill: var(--text) !important; stroke: none !important; opacity: .95; }
+.hud-cross { fill: none; stroke: currentColor; stroke-width: 2; opacity: .5; }
 .hud-nodes rect { fill: currentColor; opacity: .9; }
 .hud-dots circle { fill: var(--positive); opacity: .16; }
 
@@ -583,33 +619,90 @@ tbody tr:hover td { background: var(--surface); }
 .hud-core { transform-box: fill-box; transform-origin: center; animation: hud-core-pulse 3.4s ease-in-out infinite; }
 .hud-scan rect { animation: hud-scan-sweep 4.8s var(--ease) infinite alternate; }
 .hud-scan rect:nth-child(2) { animation-duration: 6.2s; animation-direction: alternate-reverse; }
+/* Stagger all 16 nodes so the HUD never pulses in unison. The shorthand above
+   sets no delay, so these longhand overrides are what offset each one. */
 .hud-nodes rect { animation: hud-node-pulse 3s ease-in-out infinite; }
-.hud-nodes rect:nth-child(2) { animation-delay: .4s; }
-.hud-nodes rect:nth-child(3) { animation-delay: .8s; }
-.hud-nodes rect:nth-child(4) { animation-delay: 1.2s; }
-.hud-nodes rect:nth-child(5) { animation-delay: 1.6s; }
-.hud-nodes rect:nth-child(6) { animation-delay: 2s; }
-.hud-nodes rect:nth-child(7) { animation-delay: 2.4s; }
-.hud-nodes rect:nth-child(8) { animation-delay: 2.8s; }
+.hud-nodes rect:nth-child(2)  { animation-delay: .18s; }
+.hud-nodes rect:nth-child(3)  { animation-delay: .36s; }
+.hud-nodes rect:nth-child(4)  { animation-delay: .54s; }
+.hud-nodes rect:nth-child(5)  { animation-delay: .72s; }
+.hud-nodes rect:nth-child(6)  { animation-delay: .9s; }
+.hud-nodes rect:nth-child(7)  { animation-delay: 1.08s; }
+.hud-nodes rect:nth-child(8)  { animation-delay: 1.26s; }
+.hud-nodes rect:nth-child(9)  { animation-delay: 1.44s; }
+.hud-nodes rect:nth-child(10) { animation-delay: 1.62s; }
+.hud-nodes rect:nth-child(11) { animation-delay: 1.8s; }
+.hud-nodes rect:nth-child(12) { animation-delay: 1.98s; }
+.hud-nodes rect:nth-child(13) { animation-delay: 2.16s; }
+.hud-nodes rect:nth-child(14) { animation-delay: 2.34s; }
+.hud-nodes rect:nth-child(15) { animation-delay: 2.52s; }
+.hud-nodes rect:nth-child(16) { animation-delay: 2.7s; }
 .hud-dots circle { animation: hud-dot-drift 7s ease-in-out infinite; }
-.hud-dots circle:nth-child(even) { animation-delay: 2.2s; }
+.hud-dots circle:nth-child(3n+2) { animation-delay: 2.3s; }
+.hud-dots circle:nth-child(3n) { animation-delay: 4.6s; }
 
-/* The card keeps an opaque fill and a hairline so the HUD never competes with
-   the labels or the inputs sitting on top of it. */
+/* The sign-in controls are part of the HUD, not a panel on top of it: no card
+   fill, no border, no shadow. Legibility instead comes from the HUD being
+   cleared out of the centre (the tick strips sit at the top and bottom of the
+   viewBox and the rings frame this area) plus a soft radial scrim that only
+   deepens the ink directly behind the text. */
 .login-box {
   position: relative; z-index: 1;
-  width: 100%; max-width: 380px; padding: var(--sp-8); background: var(--bg); border: 1px solid var(--border-strong); border-radius: var(--radius-card);
-  box-shadow: var(--elevation);
+  width: 100%; max-width: 400px; padding: var(--sp-8) var(--sp-6);
   animation: hud-card-in .45s var(--ease);
+}
+.login-box::before {
+  content: ""; position: absolute; inset: -12% -18%; z-index: -1;
+  background: radial-gradient(closest-side, var(--page) 58%, transparent 100%);
+  opacity: .92; pointer-events: none;
+}
+/* Corner brackets stand in for the old border. */
+.login-bracket { position: absolute; width: 18px; height: 18px; border: 1px solid var(--negative); opacity: .55; }
+.login-bracket-tl { top: 0; left: 0; border-right: 0; border-bottom: 0; }
+.login-bracket-tr { top: 0; right: 0; border-left: 0; border-bottom: 0; }
+.login-bracket-bl { bottom: 0; left: 0; border-right: 0; border-top: 0; }
+.login-bracket-br { bottom: 0; right: 0; border-left: 0; border-top: 0; }
+
+.login-status {
+  display: flex; align-items: center; justify-content: center; gap: var(--sp-2);
+  margin: 0 0 var(--sp-2); color: var(--text-muted); font-size: var(--text-xs);
+}
+.login-status-dot {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--positive);
+  animation: hud-node-pulse 2.4s ease-in-out infinite;
 }
 /* Transform only, never opacity: the sign-in form must be readable even if the
    animation never runs. Nothing about being able to log in may depend on it. */
 @keyframes hud-card-in { from { transform: translateY(10px); } }
-.login-box h1 { margin-bottom: var(--sp-6); font-size: var(--text-2xl); text-align: center; }
+.login-box h1 {
+  margin-bottom: var(--sp-6); padding-bottom: var(--sp-3); border-bottom: 1px solid var(--border);
+  font-size: var(--text-2xl); text-align: center;
+}
 .login-box h1 span { color: var(--accent); }
-.login-box label { margin-top: var(--sp-4); }
-.login-box button { width: 100%; margin-top: var(--sp-6); background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
-.login-box button:hover:not(:disabled) { background: var(--accent-hover); }
+
+/* Field labels read as HUD captions. This is the second and last uppercase rule
+   in the stylesheet, and it sits at --text-xs's larger sibling to stay legible. */
+.login-box label {
+  margin: var(--sp-4) 0 var(--sp-1); color: var(--text-secondary);
+  font-size: var(--text-sm); font-weight: 500; letter-spacing: .1em; text-transform: uppercase;
+}
+/* Underlined instruments rather than boxed inputs, so the field belongs to the
+   HUD instead of sitting in its own container. */
+.login-box input {
+  padding: var(--sp-2) 0; border: 0; border-bottom: 1px solid var(--border-strong); border-radius: 0;
+  background: transparent; font-family: var(--font-mono); font-size: var(--text-base);
+}
+.login-box input:focus {
+  border-bottom-color: var(--accent); box-shadow: 0 1px 0 0 var(--accent);
+}
+.login-box input:focus-visible { outline: none; }
+.login-box button {
+  width: 100%; margin-top: var(--sp-8); border-radius: 0;
+  background: var(--accent); border: 1px solid var(--accent); color: var(--on-accent);
+  font-weight: 600; letter-spacing: .04em;
+}
+.login-box button:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+.login-box .error { border-radius: 0; }
 
 /* Live radar: monitored events ------------------------------------------ */
 .stack { display: flex; flex-direction: column; gap: var(--sp-4); }
@@ -858,7 +951,10 @@ tbody tr:hover td { background: var(--surface); }
    spreadsheet rather than a dashboard. */
 .us-state-chip { display: grid; gap: var(--sp-1); padding: var(--sp-3); border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
 .us-state-chip span { color: var(--text-secondary); font-size: var(--text-xs); }
-.us-state-chip strong { font: 600 var(--text-base)/1.25 var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+.us-state-chip strong {
+  padding-top: var(--sp-1); border-top: 1px solid var(--border);
+  font: 600 var(--text-base)/1.25 var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -.01em;
+}
 .us-execution-blockers:empty, .us-adaptive-recommendation-slot:empty { display: none; }
 .us-adaptive-recommendation { display: grid; gap: var(--sp-1); font-size: var(--text-sm); }
 .us-authorization-matrix-body { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: var(--sp-1); }
@@ -1109,16 +1205,24 @@ tbody tr:hover td { background: var(--surface); }
 /* US market inventory -------------------------------------------------- */
 .us-event-list { display: flex; flex-direction: column; gap: var(--sp-2); margin-top: var(--sp-3); }
 .us-event { padding: var(--sp-3); border: 1px solid var(--border); border-radius: var(--radius-card); }
-.us-event-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-3); margin-bottom: var(--sp-2); }
-.us-market-grid { display: grid; gap: var(--sp-1); }
+/* Close the event header off from its markets, and rule between each market. */
+.us-event-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-3);
+  margin-bottom: var(--sp-3); padding-bottom: var(--sp-3); border-bottom: 1px solid var(--border);
+}
+.us-market-grid { display: grid; gap: 0; }
 .us-market {
   display: grid; grid-template-columns: minmax(180px, 1.4fr) minmax(135px, .8fr) minmax(145px, .8fr); align-items: center; gap: var(--sp-2);
-  padding: var(--sp-2); border-top: 1px solid var(--border); font-size: var(--text-sm);
+  padding: var(--sp-3) var(--sp-2); border-top: 1px solid var(--border); font-size: var(--text-sm);
 }
+/* The grid's own first row already sits under the header rule. */
+.us-market:first-child { border-top: 0; padding-top: var(--sp-2); }
 .us-market-more { margin-top: var(--sp-2); width: auto; }
 .us-events-more { width: 100%; margin-top: var(--sp-3); }
-.us-sides { display: flex; flex-direction: column; gap: var(--sp-05); min-width: 0; }
-.us-side { display: flex; justify-content: space-between; gap: var(--sp-2); }
+.us-sides { display: flex; flex-direction: column; min-width: 0; }
+/* Separate the long/short pair rather than letting the two prices stack flush. */
+.us-side { display: flex; justify-content: space-between; gap: var(--sp-2); padding: var(--sp-1) 0; }
+.us-side + .us-side { border-top: 1px solid var(--border); }
 .us-side span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Custom bots --------------------------------------------------------- */
