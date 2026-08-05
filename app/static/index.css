@@ -62,6 +62,10 @@
   /* Sign-in HUD only, never text. A hotter red than --negative, which is tuned
      for AA body copy and reads as muted maroon at instrument scale, plus the
      cyan used for the chromatic ghost. */
+  /* Launcher-tile hues with no semantic equivalent to borrow. */
+  --tile-violet: #8b7bff;
+  --tile-mint:   #4ad6c0;
+  --tile-pink:   #ff8ab0;
   --hud-red:   #ff2038;
   --hud-ghost: #2ad4ea;
   --hud-glow-ghost: rgba(42, 212, 234, .5);
@@ -113,6 +117,11 @@
   --elevation: 0 0 0 1px var(--border-strong), 0 16px 40px -12px rgba(0, 0, 0, .9);
   /* Selective neon: active/armed controls only, never a decorative surface. */
   --glow: 0 0 0 1px var(--accent-edge), 0 0 18px -4px rgba(252, 238, 10, .5);
+  /* Hover bloom for controls that are not currently carrying the accent fill. */
+  --glow-soft: 0 0 0 1px var(--border-strong), 0 0 18px -8px rgba(252, 238, 10, .55);
+  /* A 1px top inner highlight reads as a lit edge and is what makes a control
+     look raised rather than painted on. */
+  --lift: inset 0 1px 0 rgba(255, 255, 255, .07);
   --focus: var(--accent);
 }
 
@@ -129,6 +138,9 @@
   --positive-wash: #e9faf2; --negative-wash: #fdf0ee;
   --warning-wash: #fdf6e8; --info-wash: #f3f3f8;
   --radius: 8px; --radius-card: 18px;
+  --tile-violet: #6d5ce0;
+  --tile-mint:   #0f9c86;
+  --tile-pink:   #c8437a;
   --backdrop: rgba(26, 26, 26, .45);
   --hud-red: #c02a1c; --hud-ghost: #0e7090;
   --hud-glow-ghost: rgba(14, 112, 144, .3); --hud-glow-red: rgba(192, 42, 28, .3);
@@ -137,6 +149,8 @@
   --select-chevron: url('data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="10" height="6" viewBox="0 0 10 6"%3E%3Cpath d="M1 1l4 4 4-4" fill="none" stroke="%2355556a" stroke-width="1.5" stroke-linecap="round"/%3E%3C/svg%3E');
   --elevation: 0 4px 12px rgba(0, 0, 0, .08);
   --glow: 0 0 0 3px var(--accent-wash);
+  --glow-soft: 0 0 0 1px var(--border-strong), 0 0 14px -8px rgba(85, 70, 232, .5);
+  --lift: inset 0 1px 0 rgba(255, 255, 255, .7);
   --focus: #14141b;
 }
 
@@ -270,16 +284,17 @@ header {
 .tab-carousel::-webkit-scrollbar { display: none; }
 .tab-carousel .pill {
   flex: 0 0 auto; min-height: 36px; padding: var(--sp-2) var(--sp-3); border: 1px solid transparent; border-radius: var(--radius);
-  background: transparent; color: var(--text-secondary); font-size: var(--text-sm); font-weight: 500; white-space: nowrap; cursor: pointer;
+  background: var(--surface); border-color: var(--border); box-shadow: var(--lift);
+  color: var(--text-secondary); font-size: var(--text-sm); font-weight: 500; white-space: nowrap; cursor: pointer;
 }
-.tab-carousel .pill:hover { background: var(--surface-sunk); color: var(--text); }
+.tab-carousel .pill:hover { background: var(--surface-sunk); color: var(--text); box-shadow: var(--glow-soft), var(--lift); }
 /* The selected workspace is the accent's permanent home, so the brand colour
    is present on every screen without being sprayed around. */
 .tab-carousel .pill.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .tab-carousel .pill.active:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
 /* Selective neon: only the elements that already carry the accent as a fill,
    never a decorative surface. */
-.tab-carousel .pill.active, .primary { box-shadow: var(--glow); }
+.tab-carousel .pill.active, .primary { box-shadow: var(--glow), var(--lift); }
 /* Sticky bars sit on a translucent, blurred backdrop so long tables scrolling
    underneath stay legible without a shadow. */
 .tab-carousel, .research-section-nav, .us-policy-rail, .us-policy-footer {
@@ -300,15 +315,24 @@ header {
 .research-section-nav-label { color: var(--text-muted); font-size: var(--text-xs); white-space: nowrap; }
 .research-section-nav-scroll { display: flex; min-width: 0; gap: var(--sp-1); overflow-x: auto; scrollbar-width: none; }
 .research-section-nav-scroll::-webkit-scrollbar { display: none; }
+/* A resting surface and hairline, not bare text on the page: with a transparent
+   background these read as a row of labels and gave no sign they were
+   pressable until hovered. */
 .research-section-link,
 .research-section-top {
   display: inline-flex; flex: 0 0 auto; min-height: 32px; align-items: center; justify-content: center; padding: 0 var(--sp-3);
-  border: 1px solid transparent; border-radius: var(--radius); color: var(--text-secondary); font-size: var(--text-sm); text-decoration: none;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); box-shadow: var(--lift);
+  color: var(--text-secondary); font-size: var(--text-sm); text-decoration: none;
   white-space: nowrap;
 }
 .research-section-link:hover,
-.research-section-top:hover { background: var(--surface-sunk); color: var(--text); }
-.research-section-link.active { background: var(--accent-wash); border-color: var(--accent-edge); color: var(--accent); font-weight: 600; }
+.research-section-top:hover {
+  background: var(--surface-sunk); color: var(--text); box-shadow: var(--glow-soft), var(--lift);
+}
+.research-section-link.active {
+  background: var(--accent-wash); border-color: var(--accent-edge); color: var(--accent); font-weight: 600;
+  box-shadow: var(--glow-soft), var(--lift);
+}
 .research-anchor, #us-activity { scroll-margin-top: var(--sticky-offset); }
 .carousel { display: flex; gap: var(--sp-2); margin-bottom: var(--sp-3); padding-bottom: var(--sp-1); overflow-x: auto; }
 .carousel .pill {
@@ -370,10 +394,10 @@ header {
 .bento-card:nth-child(1) { --tile: var(--positive); }
 .bento-card:nth-child(2) { --tile: var(--info); }
 .bento-card:nth-child(3) { --tile: var(--accent); }
-.bento-card:nth-child(4) { --tile: #8b7bff; }
+.bento-card:nth-child(4) { --tile: var(--tile-violet); }
 .bento-card:nth-child(5) { --tile: var(--warning); }
-.bento-card:nth-child(6) { --tile: #4ad6c0; }
-.bento-card:nth-child(7) { --tile: #ff8ab0; }
+.bento-card:nth-child(6) { --tile: var(--tile-mint); }
+.bento-card:nth-child(7) { --tile: var(--tile-pink); }
 .bento-card:nth-child(8) { --tile: var(--hud-ghost); }
 /* Hairline of the tile's hue along the top edge. */
 .bento-card::before {
@@ -439,9 +463,9 @@ legend { padding: 0 var(--sp-1); color: var(--text); font-size: var(--text-sm); 
 /* Buttons ---------------------------------------------------------------- */
 button {
   min-height: 38px; padding: var(--sp-2) var(--sp-4); border: 1px solid var(--border-strong); border-radius: var(--radius); background: var(--bg);
-  color: var(--text); font-size: var(--text-sm); font-weight: 500; cursor: pointer;
+  color: var(--text); font-size: var(--text-sm); font-weight: 500; cursor: pointer; box-shadow: var(--lift);
 }
-button:hover:not(:disabled) { background: var(--surface-sunk); }
+button:hover:not(:disabled) { background: var(--surface-sunk); box-shadow: var(--glow-soft), var(--lift); }
 button:disabled { opacity: .5; cursor: not-allowed; }
 .primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
 .primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
