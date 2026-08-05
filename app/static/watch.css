@@ -3,23 +3,23 @@
    keep the values in sync with the :root block in index.css. */
 
 :root {
-  color-scheme: light;
-  --page: #f0f0f4;
-  --bg: #ffffff;
-  --surface: #f6f6fa;
-  --surface-sunk: #eeeef5;
-  --border: #e4e4ee;
-  --border-strong: #d2d2e0;
-  --text: #14141b;
-  --text-secondary: #55556a;
-  --text-muted: #6a6a80;
-  --accent: #5546e8;
-  --accent-hover: #4436d4;
-  --accent-wash: #f0eefe;
-  --on-accent: #ffffff;
-  --positive: #0a7350;
-  --negative: #c02a1c;
-  --warning: #a8560b;
+  color-scheme: dark;
+  --page: #08080d;
+  --bg: #0f0f17;
+  --surface: #16161f;
+  --surface-sunk: #1d1d29;
+  --border: #2b2b3b;
+  --border-strong: #414157;
+  --text: #eceef5;
+  --text-secondary: #a7a9bd;
+  --text-muted: #82859d;
+  --accent: #fcee0a;
+  --accent-hover: #fff64d;
+  --accent-wash: #21200a;
+  --on-accent: #08080d;
+  --positive: #2ee6a0;
+  --negative: #ff5f7e;
+  --warning: #ffb02e;
   --text-xs: 12px; --text-sm: 13px; --text-base: 15px;
   --text-lg: 17px; --text-xl: 20px;
   --sp-05: 2px; --sp-1: 4px; --sp-2: 8px; --sp-3: 12px;
@@ -27,7 +27,7 @@
   --radius: 8px; --radius-card: 18px; --radius-pill: 999px;
   --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
-  --focus: #14141b;
+  --focus: #fcee0a;
 }
 
 *, *::before, *::after { box-sizing: border-box; }
@@ -59,7 +59,7 @@ input {
   border-radius: var(--radius); color: var(--text); font-size: var(--text-sm);
 }
 input::placeholder { color: var(--text-muted); }
-input:focus { outline: none; border-color: var(--text); box-shadow: 0 0 0 3px var(--accent-wash); }
+input:focus { outline: none; border-color: var(--text); box-shadow: 0 0 0 1px #5c5710, 0 0 18px -4px rgba(252,238,10,.5); }
 
 button {
   min-height: 38px; padding: var(--sp-2) var(--sp-4);
@@ -91,7 +91,7 @@ button:hover { background: var(--surface-sunk); }
   overflow: hidden;
 }
 .player video { width: 100%; height: 100%; background: #000; }
-.player .empty { padding: var(--sp-6); color: #f4f4f1; font-size: var(--text-sm); text-align: center; }
+.player .empty { padding: var(--sp-6); color: var(--text-secondary); font-size: var(--text-sm); text-align: center; }
 .source { display: flex; gap: var(--sp-2); margin-top: var(--sp-3); }
 .source input { flex: 1; }
 .note { margin-top: var(--sp-2); color: var(--text-secondary); font-size: var(--text-sm); line-height: 1.55; }

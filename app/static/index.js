@@ -1,3 +1,36 @@
+  // Reactive background ---------------------------------------------------
+  // Feeds the pointer position to the two X-glyph field layers in index.css,
+  // which mask the bright layer to a disc around it. Coalesced into one
+  // rAF per frame so a fast pointer cannot queue a style write per event, and
+  // it only ever writes two custom properties: no layout, no paint of ours.
+  (() => {
+    const root = document.documentElement;
+    // A device without hover has no pointer to follow, and honouring
+    // prefers-reduced-motion here means simply leaving the resting field.
+    if (!window.matchMedia("(hover: hover)").matches) return;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    let queued = false;
+    let px = 0;
+    let py = 0;
+    const flush = () => {
+      queued = false;
+      root.style.setProperty("--field-x", `${px}px`);
+      root.style.setProperty("--field-y", `${py}px`);
+    };
+    window.addEventListener("pointermove", event => {
+      px = event.clientX;
+      py = event.clientY;
+      if (queued) return;
+      queued = true;
+      window.requestAnimationFrame(flush);
+    }, {passive: true});
+    // Retract the disc when the pointer leaves, so the field settles back.
+    window.addEventListener("pointerleave", () => {
+      root.style.setProperty("--field-x", "-9999px");
+      root.style.setProperty("--field-y", "-9999px");
+    }, {passive: true});
+  })();
+
 // Tab Navigation Logic
   // The CSRF-aware fetch wrapper now lives in the shared /static/csrf.js module,
   // loaded before this script (and before watch.js) so both pages behave the same.
@@ -353,6 +386,17 @@
     researchViews.forEach((view, key) => { view.hidden = key !== target; });
     setActiveResearchSection(target);
     activeResearchView = target;
+    // Keep the hash in step with programmatic moves (the setup hand-off, for
+    // example). Without this the URL goes stale, a reload restores the wrong
+    // view, and re-selecting the same hash is a no-op because no hashchange
+    // fires. replaceState, not push, so an automatic move adds no history
+    // entry the back button has to walk through.
+    const current = window.location.hash.length > 1
+      ? decodeURIComponent(window.location.hash.slice(1))
+      : null;
+    if (current !== target) {
+      try { history.replaceState(null, "", `#${target}`); } catch {}
+    }
     if (resetScroll) window.scrollTo({top: 0, behavior: "auto"});
     // Chart.js cannot size a canvas inside a hidden view, so draw on entry.
     if (target === "us-performance") renderPerformanceCharts();
@@ -2857,7 +2901,16 @@
     getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
   // Distinguishable at AA on white and still separable in greyscale.
-  const CHART_SERIES = ["#1570ef", "#b54708", "#7839ee", "#0e7090", "#067647"];
+  // Series colours come from the theme so the charts cannot drift from the
+  // stylesheet; --info/--warning/--accent are already AA on the current
+  // surface in both themes, which a fixed hex array would not be.
+  const chartSeries = () => [
+    cssToken("--info") || "#34e0f2",
+    cssToken("--warning") || "#ffb02e",
+    cssToken("--positive") || "#2ee6a0",
+    cssToken("--negative") || "#ff5f7e",
+    cssToken("--accent") || "#fcee0a"
+  ];
 
   function chartBaseOptions() {
     const ink = cssToken("--text") || "#1a1a1a";
@@ -2944,20 +2997,21 @@
     )) {
       const lane = String(row.mode || "unknown");
       if (!byLane.has(lane)) byLane.set(lane, {running: 0, points: []});
-      const series = byLane.get(lane);
-      series.running += Number(row.realized_net_usd || 0);
-      series.points.push({x: new Date(row.opened_at).getTime(), y: +series.running.toFixed(2)});
+      const laneSeries = byLane.get(lane);
+      laneSeries.running += Number(row.realized_net_usd || 0);
+      laneSeries.points.push({x: new Date(row.opened_at).getTime(), y: +laneSeries.running.toFixed(2)});
     }
     const equityOptions = JSON.parse(JSON.stringify(base));
     equityOptions.scales.x.type = "linear";
+    const palette = chartSeries();
     usCharts.equity = new Chart(equityCanvas.getContext("2d"), {
       type: "line",
       data: {
-        datasets: [...byLane.entries()].map(([lane, series], index) => ({
-          label: `${lane.replaceAll("_", " ")} · ${money(series.running)}`,
-          data: series.points,
-          borderColor: CHART_SERIES[index % CHART_SERIES.length],
-          backgroundColor: CHART_SERIES[index % CHART_SERIES.length],
+        datasets: [...byLane.entries()].map(([lane, laneSeries], index) => ({
+          label: `${lane.replaceAll("_", " ")} · ${money(laneSeries.running)}`,
+          data: laneSeries.points,
+          borderColor: palette[index % palette.length],
+          backgroundColor: palette[index % palette.length],
           borderWidth: 2, pointRadius: 0, stepped: true, fill: false
         }))
       },
@@ -3082,6 +3136,279 @@
         `${money(total)} realized net · charts follow the datasheet filters.`;
     }
   }
+
+  // Guided setup ----------------------------------------------------------
+  // Owns no trading logic. Each step writes into the controls that already
+  // exist and then submits the same forms a manual user would, so there is a
+  // single code path and a single set of server-side validations. It never
+  // arms live orders: that stays the explicit approval + timer on the auto
+  // trader view, which also survives a restart.
+  (() => {
+    const panel = document.querySelector("#us-setup");
+    if (!panel) return;
+
+    const steps = [...panel.querySelectorAll("[data-setup-step]")];
+    const rail = panel.querySelector("#us-setup-steps");
+    const backBtn = panel.querySelector("#us-setup-back");
+    const nextBtn = panel.querySelector("#us-setup-next");
+    const finishBtn = panel.querySelector("#us-setup-finish");
+    const progress = panel.querySelector("#us-setup-progress");
+    const badge = panel.querySelector("#us-setup-mode-badge");
+    const liveWarning = panel.querySelector("#us-setup-live-warning");
+    const accountSlot = panel.querySelector("#us-setup-account-slot");
+    const accountHint = panel.querySelector("#us-setup-account-hint");
+    const allocationInput = panel.querySelector("#us-setup-allocation");
+    const presetSelect = panel.querySelector("#us-setup-risk-preset");
+    const derivedBox = panel.querySelector("#us-setup-derived");
+    const summaryBox = panel.querySelector("#us-setup-summary");
+    const saveStatus = panel.querySelector("#us-setup-save-status");
+    let index = 0;
+
+    const chosenMode = () =>
+      panel.querySelector('input[name="setup-mode"]:checked')?.value || "dry_run";
+    const isLive = () => chosenMode() === "live";
+    // money() signs its output for profit and loss. A ceiling is neither, so
+    // "+$175.00" would misread as a gain.
+    const usd = value => value == null ? "—" : `$${Number(value).toFixed(2)}`;
+
+    // The credential form is a single node in the document: borrow it while
+    // setup is showing, and put it back so the account panel keeps working.
+    const homeSlot = document.querySelector("#us-account-credential-slot");
+    const credentials = () => document.querySelector("#us-runtime-credentials");
+    function holdCredentials() {
+      const node = credentials();
+      if (node && accountSlot && node.parentElement !== accountSlot) {
+        accountSlot.appendChild(node);
+        node.open = true;
+      }
+    }
+    function releaseCredentials() {
+      const node = credentials();
+      if (node && homeSlot && node.parentElement !== homeSlot) homeSlot.appendChild(node);
+    }
+
+    function renderRail() {
+      if (!rail) return;
+      rail.innerHTML = steps.map((step, i) => {
+        const label = step.dataset.stepLabel || `Step ${i + 1}`;
+        const state = i === index ? " is-active" : (i < index ? " is-done" : "");
+        return `<button type="button" class="us-setup-step-chip${state}" data-setup-goto="${i}"${i > index ? " disabled" : ""}>${esc(label)}</button>`;
+      }).join("");
+    }
+
+    function show(next) {
+      index = Math.max(0, Math.min(steps.length - 1, next));
+      steps.forEach((step, i) => { step.hidden = i !== index; });
+      const last = index === steps.length - 1;
+      backBtn.disabled = index === 0;
+      nextBtn.hidden = last;
+      finishBtn.hidden = !last;
+      if (progress) progress.textContent = `Step ${index + 1} of ${steps.length}`;
+      if (steps[index].dataset.setupStep === "account") holdCredentials();
+      else releaseCredentials();
+      if (last) renderSummary();
+      renderRail();
+      panel.scrollIntoView({block: "start"});
+    }
+
+    function syncMode() {
+      const live = isLive();
+      if (badge) badge.textContent = live ? "LIVE · REAL MONEY" : "DRY RUN";
+      if (liveWarning) liveWarning.hidden = !live;
+      if (accountHint) {
+        accountHint.textContent = live
+          ? "Live orders need a verified key. Connect one here, or set POLYMARKET_US_KEY_ID on the server."
+          : "Dry run does not need a key. You can connect one now anyway.";
+      }
+      if (finishBtn) {
+        finishBtn.textContent = live ? "Save live policy" : "Save dry-run policy";
+        finishBtn.classList.toggle("danger", live);
+        finishBtn.classList.toggle("primary", !live);
+      }
+    }
+
+    // Preview only. The presets come from the server (lastRiskPresets), and
+    // the server re-derives and versions every field on save — this scales the
+    // money values the same way updateRiskPresetUI does so the wizard cannot
+    // show a number the policy form would not.
+    function renderDerived() {
+      if (!derivedBox) return;
+      const allocation = Number(allocationInput?.value || 0);
+      if (!(allocation > 0)) {
+        derivedBox.innerHTML = '<div class="metrics-empty">Enter an allocation to see the derived limits.</div>';
+        return;
+      }
+      const preset = lastRiskPresets[presetSelect?.value || "balanced"];
+      const derived = preset?.derived_policy;
+      if (!derived) {
+        derivedBox.innerHTML = '<div class="metrics-empty">Risk styles load with the execution policy; open the Policy view once if this stays empty.</div>';
+        return;
+      }
+      const source = Number(derived.trading_allocation_usd || allocation || 1);
+      const scale = source > 0 ? allocation / source : 1;
+      const scaled = value => (value == null ? null : usd(Number(value) * scale));
+      const rows = [
+        ["Max total exposure", scaled(derived.max_total_exposure_usd)],
+        ["Cash reserve", scaled(derived.minimum_cash_reserve_usd)],
+        ["Max per position", scaled(derived.max_position_usd)],
+        ["Max per event", scaled(derived.max_event_exposure_usd)],
+        ["Daily realized-loss stop", scaled(derived.max_daily_loss_usd)],
+        ["Minimum edge", derived.min_edge == null ? null : pct(derived.min_edge)]
+      ].filter(([, value]) => value);
+      derivedBox.innerHTML =
+        `<dl>${rows.map(([key, value]) => `<div><span>${esc(key)}</span><strong>${esc(value)}</strong></div>`).join("")}</dl>`
+        + `<p class="field-note">${esc(preset.description || "")} The server derives and versions the full field set from your allocation when you save.</p>`;
+    }
+
+    function renderSummary() {
+      if (!summaryBox) return;
+      const allocation = Number(allocationInput?.value || 0);
+      const keyState = usCredentialsConfigured
+        ? "configured"
+        : "not configured";
+      summaryBox.innerHTML = `<dl>
+        <div><span>Mode</span><strong>${isLive() ? "Live · real money" : "Dry run · simulated"}</strong></div>
+        <div><span>Account key</span><strong>${esc(keyState)}</strong></div>
+        <div><span>Allocation</span><strong>${esc(usd(allocation))}</strong></div>
+        <div><span>Risk style</span><strong>${esc(presetSelect?.value || "balanced")}</strong></div>
+      </dl>`;
+    }
+
+    function validate() {
+      const step = steps[index].dataset.setupStep;
+      if (step === "account" && isLive() && !usCredentialsConfigured) {
+        setSetupStatus(
+          "Live mode needs a verified account key before a policy can be saved.",
+          "is-error"
+        );
+        return false;
+      }
+      if (step === "capital") {
+        if (!(Number(allocationInput?.value || 0) > 0)) {
+          allocationInput?.focus();
+          setSetupStatus("Enter an allocation greater than zero.", "is-error");
+          return false;
+        }
+      }
+      setSetupStatus("", "");
+      return true;
+    }
+
+    function setSetupStatus(message, state) {
+      if (!saveStatus) return;
+      saveStatus.textContent = message;
+      saveStatus.className = `us-liquidate-status${state ? " " + state : ""}`;
+    }
+
+    // Finish: drive the real controls, in the order a person would.
+    async function finish() {
+      const live = isLive();
+      if (live && !window.confirm(
+        "Save this as your LIVE policy?\n\nThis does not place an order or arm live "
+        + "trading. Live entries stay disarmed until you approve them and start the "
+        + "timer on the auto trader view."
+      )) return;
+
+      setActionBusy(finishBtn, true, "Saving…");
+      try {
+        // 1. Select the lane through the existing switcher.
+        await switchTradingLane(live ? "live" : "dry_run");
+
+        // 2. Write the two values into the real policy inputs, firing the
+        //    events their own listeners are bound to so the preset derivation
+        //    runs exactly as it does when a person types.
+        const allocation = document.querySelector("#us-trading-allocation");
+        const preset = document.querySelector("#us-risk-preset");
+        if (allocation) {
+          allocation.value = String(Number(allocationInput.value));
+          allocation.dispatchEvent(new Event("input", {bubbles: true}));
+        }
+        if (preset) {
+          preset.value = presetSelect.value;
+          preset.dispatchEvent(new Event("change", {bubbles: true}));
+        }
+
+        // 3. For dry run, ask for analysis cycles as part of the policy being
+        //    saved rather than clicking the toggle afterwards: one request, and
+        //    no race against the reload the save triggers. Live automation is
+        //    deliberately left alone — the operator starts that themselves.
+        const automation = document.querySelector("#us-automation-enabled");
+        if (!live && automation && !automation.checked) {
+          automation.checked = true;
+          automation.dispatchEvent(new Event("change", {bubbles: true}));
+        }
+
+        // 4. Submit the same form the Policy view submits. requestSubmit runs
+        //    the existing handler, including its validity sweep.
+        const form = document.querySelector("#us-trading-form");
+        if (!form) throw new Error("The execution policy form is unavailable.");
+        form.requestSubmit(document.querySelector("#us-policy-save"));
+        await new Promise(resolve => setTimeout(resolve, 1400));
+
+        if (live) {
+          // Never arm from here. Hand off to the explicit approval control.
+          setSetupStatus(
+            "Live policy saved. Live orders are still disarmed — approve them and "
+            + "start the timer on the auto trader view.",
+            "is-success"
+          );
+          showResearchView("us-auto-trader");
+          document.querySelector("#us-arm-confirmation")?.focus();
+        } else {
+          // Report what the server actually came back with, not what was asked
+          // for: the save can be accepted while automation stays off.
+          const running = !!lastUSTradingStatus?.lanes?.dry_run?.automation_enabled;
+          setSetupStatus(
+            running
+              ? "Dry-run policy saved and analysis cycles are running."
+              : "Dry-run policy saved. Analysis cycles are still stopped — start "
+                + "them from the dry-run quick control on the auto trader view.",
+            running ? "is-success" : ""
+          );
+          showResearchView(running ? "us-activity" : "us-auto-trader");
+        }
+      } catch (error) {
+        setSetupStatus(error.message || "Could not complete setup.", "is-error");
+      } finally {
+        setActionBusy(finishBtn, false);
+      }
+    }
+
+    panel.querySelectorAll('input[name="setup-mode"]').forEach(radio => {
+      radio.addEventListener("change", () => { syncMode(); renderSummary(); });
+    });
+    allocationInput?.addEventListener("input", renderDerived);
+    presetSelect?.addEventListener("change", renderDerived);
+    backBtn?.addEventListener("click", () => show(index - 1));
+    nextBtn?.addEventListener("click", () => { if (validate()) show(index + 1); });
+    finishBtn?.addEventListener("click", () => void finish());
+    rail?.addEventListener("click", event => {
+      const chip = event.target.closest("[data-setup-goto]");
+      if (chip && !chip.disabled) show(Number(chip.dataset.setupGoto));
+    });
+    panel.querySelector("#us-setup-test-key")?.addEventListener(
+      "click",
+      () => document.querySelector("#us-account-refresh")?.click()
+    );
+
+    // Seed the allocation from whatever the lane already has saved.
+    window.setTimeout(() => {
+      const current = document.querySelector("#us-trading-allocation")?.value;
+      if (current && allocationInput && !allocationInput.value) {
+        allocationInput.value = current;
+        renderDerived();
+      }
+    }, 1200);
+
+    // Release the borrowed credential form when leaving the setup view.
+    window.addEventListener("hashchange", () => {
+      if (decodeURIComponent(window.location.hash.slice(1)) !== "us-setup") releaseCredentials();
+    });
+
+    syncMode();
+    renderDerived();
+    show(0);
+  })();
 
   document.querySelector("#us-charts-refresh")?.addEventListener(
     "click",
@@ -5898,10 +6225,10 @@
       const datasets = [];
       // Series palette for a white plot area; each reads at AA on white and
       // stays distinguishable in greyscale. Matches the index.css tokens.
-      const colors = ['#1570ef', '#b54708', '#067647', '#7839ee', '#b42318', '#0e7090'];
-      const ink = '#1a1a1a';
-      const inkSoft = '#5c5c5c';
-      const gridLine = '#e6e6e1';
+      const colors = chartSeries();
+      const ink = cssToken('--text') || '#eceef5';
+      const inkSoft = cssToken('--text-secondary') || '#a7a9bd';
+      const gridLine = cssToken('--border') || '#2b2b3b';
       let cIdx = 0;
 
       const byOutcome = {};
@@ -5924,8 +6251,8 @@
           plugins: {
             legend: { labels: { color: ink, boxWidth: 12, font: { size: 12 } } },
             tooltip: {
-              backgroundColor: '#ffffff', titleColor: ink, bodyColor: inkSoft,
-              borderColor: '#d3d3cc', borderWidth: 1, displayColors: true
+              backgroundColor: cssToken('--bg') || '#0f0f17', titleColor: ink, bodyColor: inkSoft,
+              borderColor: cssToken('--border-strong') || '#414157', borderWidth: 1, displayColors: true
             }
           },
           scales: {

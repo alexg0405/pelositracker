@@ -6,7 +6,7 @@
   <meta name="description" content="Auditable live sports-market research and controlled Polymarket US execution">
   <title>PelosiTracker Dashboard</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <link rel="stylesheet" href="/static/index.css?v=iris-2">
+  <link rel="stylesheet" href="/static/index.css?v=setup-4">
 </head>
 <body class="research-workstation">
 <a class="skip-link" href="#main-content">Skip to dashboard</a>
@@ -142,6 +142,7 @@
       <span class="research-section-nav-label">Workspace map</span>
       <div class="research-section-nav-scroll">
         <a class="research-section-link active" data-research-section="us-research-overview" href="#us-research-overview" aria-current="location">Status</a>
+        <a class="research-section-link" data-research-section="us-setup" href="#us-setup">Get started</a>
         <a class="research-section-link" data-research-section="us-performance" href="#us-performance">Performance</a>
         <a class="research-section-link" data-research-section="us-ledger" href="#us-ledger">Trade data</a>
         <a class="research-section-link" data-research-section="us-advisor" href="#us-advisor">Advisor</a>
@@ -168,6 +169,14 @@
         <div class="us-status-card"><span>Trading</span><strong>Loading…</strong></div>
       </div>
       <div class="notice us-safety-note"><strong>Safety boundary:</strong> live entries and live cash-outs are disarmed after every restart and when the selected 30-minute to 4-hour latch expires. Dry-run is the default. Orders are bounded fill-or-kill limits, every live order is previewed, and the emergency stop touches only orders created here.</div>
+
+      <div class="us-setup-cta">
+        <div>
+          <strong>Set up trading</strong>
+          <span id="us-setup-cta-status">Pick simulated or real money, connect an account, set your allocation and a risk style.</span>
+        </div>
+        <a class="primary us-setup-cta-button" href="#us-setup" data-research-section="us-setup">Start setup</a>
+      </div>
 
       <!-- Launcher for the other eight views. These are the same in-page hash
            routes the workspace map uses, so deep links and the back button
@@ -208,6 +217,94 @@
           <p>Raw Polymarket US bid/ask and listed outcomes.</p>
         </a>
       </nav>
+    </section>
+
+    <!-- Guided setup. This view owns no trading logic of its own: each step
+         writes into the controls that already exist and then submits the same
+         forms a manual user would, so there is one code path and one set of
+         server-side checks. It never arms live orders — that stays the
+         explicit approval + timer on the auto trader view. -->
+    <section class="panel pad section-gap us-setup-panel research-anchor" id="us-setup" data-research-view="us-setup">
+      <div class="browse-head">
+        <div>
+          <h2 class="title">Get started <span>with trading</span></h2>
+          <div class="field-note">Collects the minimum needed to run: a mode, an account key for live orders, an allocation ceiling, and a risk style. Everything set here can be changed afterwards in the Policy view, and nothing is saved until the final step.</div>
+        </div>
+        <span id="us-setup-mode-badge" class="us-venue-badge">DRY RUN</span>
+      </div>
+
+      <nav class="us-setup-steps" id="us-setup-steps" aria-label="Setup steps"></nav>
+
+      <div class="us-setup-body">
+        <!-- 1. Mode -->
+        <div class="us-setup-step" data-setup-step="mode" data-step-label="1 · Mode">
+          <fieldset class="us-setup-choice">
+            <legend>How should this lane trade?</legend>
+            <label class="us-setup-option">
+              <input type="radio" name="setup-mode" value="dry_run" checked>
+              <span>
+                <strong>Dry run · simulated fills</strong>
+                <small>No real orders and no money at risk. Uses live prices and the same gates, then records simulated fills so you can read the journal and the datasheet before risking anything.</small>
+              </span>
+            </label>
+            <label class="us-setup-option">
+              <input type="radio" name="setup-mode" value="live">
+              <span>
+                <strong>Live · real money</strong>
+                <small>Places real bounded fill-or-kill orders on your Polymarket US account. Requires a verified account key, and still requires the separate live-order approval and 30-minute to 4-hour timer before any order can be sent.</small>
+              </span>
+            </label>
+          </fieldset>
+          <div class="notice us-safety-note" id="us-setup-live-warning" hidden><strong>Live mode selected:</strong> saving a live policy does not by itself send an order. Live entries stay disarmed until you tick the approval box and start the timer on the auto trader view, and they disarm again on every server restart.</div>
+        </div>
+
+        <!-- 2. Account. Hosts the one runtime-credential form; the account
+             panel links here rather than holding a second secret input. -->
+        <div class="us-setup-step" data-setup-step="account" data-step-label="2 · Account" hidden>
+          <div class="us-setup-row">
+            <div>
+              <strong>Account connection</strong>
+              <span id="us-setup-account-hint">Dry run does not need a key. You can connect one now anyway.</span>
+            </div>
+            <button class="ghost compact-button" id="us-setup-test-key" type="button">Test account key</button>
+          </div>
+          <div id="us-setup-account-slot" class="us-setup-account-slot"></div>
+        </div>
+
+        <!-- 3. Capital and risk -->
+        <div class="us-setup-step" data-setup-step="capital" data-step-label="3 · Capital &amp; risk" hidden>
+          <div class="us-setup-grid">
+            <label>Managed trading allocation ($)
+              <input id="us-setup-allocation" type="number" min="0.01" step="0.01" inputmode="decimal" required>
+              <span class="field-note">A hard ceiling for what this workstation can ever have at risk. It cannot reach the rest of your account.</span>
+            </label>
+            <label>Risk style
+              <select id="us-setup-risk-preset">
+                <option value="cautious">Cautious</option>
+                <option value="balanced" selected>Balanced</option>
+                <option value="active">Active</option>
+                <option value="aggressive">Aggressive research</option>
+              </select>
+              <span class="field-note">Derives the exposure, reserve, per-position, per-event, daily-loss and entry-filter values from your allocation. The Policy view exposes each one individually afterwards.</span>
+            </label>
+          </div>
+          <div id="us-setup-derived" class="us-setup-derived" aria-live="polite"></div>
+        </div>
+
+        <!-- 4. Review -->
+        <div class="us-setup-step" data-setup-step="review" data-step-label="4 · Review &amp; save" hidden>
+          <div id="us-setup-summary" class="us-setup-summary" aria-live="polite"></div>
+          <div class="notice us-safety-note">Saving writes this to the selected lane through the same validated endpoint the Policy view uses. Per-position stops, exposure ceilings, the cash reserve, price and liquidity limits, and the selected engine gates all still apply and cannot be bypassed from here.</div>
+          <div id="us-setup-save-status" class="us-liquidate-status" role="status" aria-live="assertive"></div>
+        </div>
+      </div>
+
+      <div class="us-setup-footer">
+        <button class="ghost" id="us-setup-back" type="button" disabled>Back</button>
+        <span id="us-setup-progress" class="us-setup-progress" aria-live="polite"></span>
+        <button class="primary" id="us-setup-next" type="button">Next</button>
+        <button class="primary" id="us-setup-finish" type="button" hidden>Save dry-run policy</button>
+      </div>
     </section>
 
     <div class="us-overview-grid section-gap" data-research-view="us-performance">
@@ -268,22 +365,27 @@
           <button class="ghost compact-button" id="us-account-refresh" type="button">Test account key</button>
         </div>
         <div id="us-account-status" class="refresh-status" role="status" aria-live="polite"></div>
-        <details class="advanced us-runtime-credentials">
-          <summary>Use a key for this server session</summary>
-          <form id="us-runtime-credential-form" autocomplete="off">
-            <label>Polymarket US Key ID
-              <input id="us-runtime-key-id" required maxlength="1000" autocapitalize="none" spellcheck="false" autocomplete="off">
-            </label>
-            <label>One-time Secret Key
-              <input id="us-runtime-secret-key" required type="password" maxlength="8000" autocapitalize="none" spellcheck="false" autocomplete="new-password">
-            </label>
-            <div class="us-runtime-credential-actions">
-              <button class="primary compact-button" id="us-runtime-credential-save" type="submit">Verify &amp; use session key</button>
-              <button class="ghost compact-button" id="us-runtime-credential-clear" type="button">Forget runtime key</button>
-            </div>
-          </form>
-          <div class="field-note">Changing or forgetting a key immediately stops automation and closes the live arm. A runtime key disappears on server restart. Open live managed positions block account switching so they cannot be detached from their account.</div>
-        </details>
+        <!-- The runtime-credential form lives in the guided setup view and is
+             moved back into this slot by index.js whenever setup is not the
+             active view. One secret input exists in the document, never two. -->
+        <div id="us-account-credential-slot" class="us-account-credential-slot">
+          <details class="advanced us-runtime-credentials" id="us-runtime-credentials">
+            <summary>Use a key for this server session</summary>
+            <form id="us-runtime-credential-form" autocomplete="off">
+              <label>Polymarket US Key ID
+                <input id="us-runtime-key-id" required maxlength="1000" autocapitalize="none" spellcheck="false" autocomplete="off">
+              </label>
+              <label>One-time Secret Key
+                <input id="us-runtime-secret-key" required type="password" maxlength="8000" autocapitalize="none" spellcheck="false" autocomplete="new-password">
+              </label>
+              <div class="us-runtime-credential-actions">
+                <button class="primary compact-button" id="us-runtime-credential-save" type="submit">Verify &amp; use session key</button>
+                <button class="ghost compact-button" id="us-runtime-credential-clear" type="button">Forget runtime key</button>
+              </div>
+            </form>
+            <div class="field-note">Changing or forgetting a key immediately stops automation and closes the live arm. A runtime key disappears on server restart. Open live managed positions block account switching so they cannot be detached from their account.</div>
+          </details>
+        </div>
         <div id="us-account" class="us-account-view">
           <div class="metrics-empty">No account request has been made. Public US market data below does not require a key.</div>
         </div>
@@ -1175,6 +1277,6 @@
 
 
 <script src="/static/csrf.js" defer></script>
-<script src="/static/index.js?v=iris-2" defer></script>
+<script src="/static/index.js?v=setup-4" defer></script>
 </body>
 </html>
