@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 import asyncio
+import re
 
 import pytest
 from fastapi.testclient import TestClient
@@ -116,11 +117,18 @@ def test_mutation_requires_csrf_and_security_headers_are_strict():
 def test_deployed_dashboard_cannot_reuse_stale_javascript():
     with TestClient(app) as client:
         page = client.get("/")
-        script = client.get("/static/index.js?v=workstation-cockpit-1")
-
         assert page.status_code == 200
+
+        # Assert the invariant, not one literal version string. What protects a
+        # deployment is that the page requests a *versioned* URL and that both
+        # responses forbid caching; pinning the token here only guaranteed that
+        # CI went red on every legitimate cache-buster bump.
+        match = re.search(r'src="(/static/index\.js\?v=([^"]+))"', page.text)
+        assert match, "the dashboard must load index.js with a ?v= cache buster"
+        assert match.group(2).strip(), "the cache buster must not be empty"
+
+        script = client.get(match.group(1))
         assert script.status_code == 200
-        assert "/static/index.js?v=workstation-cockpit-1" in page.text
         for response in (page, script):
             assert response.headers["cache-control"] == (
                 "no-store, no-cache, must-revalidate, max-age=0"

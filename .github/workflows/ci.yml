@@ -84,7 +84,14 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      # Request the same components as the test job. Without them, rustup
+      # resolves them lazily inside `maturin develop` and collides with the
+      # cargo-fmt already on the runner image ("failed to install component:
+      # rustfmt-preview, detected conflict: bin/cargo-fmt"), which failed this
+      # job while the test job's identical build step passed.
       - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: rustfmt, clippy
 
       - name: Install deps and build the native engine
         run: |

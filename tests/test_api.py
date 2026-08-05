@@ -1,5 +1,7 @@
 import asyncio
+import html as html_module
 import os
+import re
 from dataclasses import replace
 
 from fastapi.testclient import TestClient
@@ -151,15 +153,27 @@ def test_final_event_view_cannot_return_a_recommendation():
         store.remove_event(event_id)
 
 
+def visible_text(markup: str) -> str:
+    """Rendered text with tags dropped and whitespace collapsed.
+
+    Headings are split across a span so the qualifying phrase can be styled
+    separately ("Paste Polymarket <span>link</span>"), which leaves the reader
+    with the same sentence but breaks a raw substring match. Assert on what is
+    actually read instead of on adjacent bytes.
+    """
+    return " ".join(html_module.unescape(re.sub(r"<[^>]+>", " ", markup)).split())
+
+
 def test_dashboard_contains_merged_ui_behaviors():
     with TestClient(app) as client:
         html = client.get("/").text
         javascript = client.get("/static/index.js").text
+        text = visible_text(html)
         assert "data-remove-event" in javascript
         assert "lastEvents=lastEvents.filter" in javascript
         assert 'fetch(`/api/events/${encodeURIComponent(eventId)}`,{method:"DELETE"})' in javascript
         assert "details[open][data-detail-key]" in javascript
-        assert "Paste Polymarket link" in html
+        assert "Paste Polymarket link" in text
         assert "data-save-position" in javascript
         assert "Signal quality" in javascript
         assert "Edge buffer" in javascript or "edge_buffer" in javascript
