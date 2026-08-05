@@ -59,6 +59,22 @@
   --field-r: 320px;
 
   --backdrop: rgba(4, 4, 8, .74);
+  /* Sign-in HUD only, never text. A hotter red than --negative, which is tuned
+     for AA body copy and reads as muted maroon at instrument scale, plus the
+     cyan used for the chromatic ghost. */
+  --hud-red:   #ff2038;
+  --hud-ghost: #2ad4ea;
+  --hud-glow-ghost: rgba(42, 212, 234, .5);
+  --hud-glow-red:   rgba(255, 32, 56, .5);
+  --hud-bloom:      rgba(255, 32, 56, .32);
+  --hud-node-glow:  rgba(255, 32, 56, .85);
+  --hud-wash:       rgba(120, 12, 26, .3);
+  --hud-cell-glow:  rgba(46, 230, 160, .45);
+  /* Sign-in copy runs slightly warm so it belongs to the red instrumentation
+     instead of reading as cold UI chrome dropped on top of it. */
+  --hud-ink:       #f2e8ea;
+  --hud-ink-dim:   #cbb2b7;
+  --hud-red-hover: #ff4759;
   --select-chevron: url('data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="10" height="6" viewBox="0 0 10 6"%3E%3Cpath d="M1 1l4 4 4-4" fill="none" stroke="%23a7a9bd" stroke-width="1.5" stroke-linecap="round"/%3E%3C/svg%3E');
 
   /* Type scale — 12px floor */
@@ -110,6 +126,10 @@
   --warning-wash: #fdf6e8; --info-wash: #f3f3f8;
   --radius: 8px; --radius-card: 18px;
   --backdrop: rgba(26, 26, 26, .45);
+  --hud-red: #c02a1c; --hud-ghost: #0e7090;
+  --hud-glow-ghost: rgba(14, 112, 144, .3); --hud-glow-red: rgba(192, 42, 28, .3);
+  --hud-bloom: rgba(192, 42, 28, .18); --hud-node-glow: rgba(192, 42, 28, .45);
+  --hud-wash: rgba(192, 42, 28, .06); --hud-cell-glow: rgba(10, 115, 80, .25);
   --select-chevron: url('data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="10" height="6" viewBox="0 0 10 6"%3E%3Cpath d="M1 1l4 4 4-4" fill="none" stroke="%2355556a" stroke-width="1.5" stroke-linecap="round"/%3E%3C/svg%3E');
   --elevation: 0 4px 12px rgba(0, 0, 0, .08);
   --glow: 0 0 0 3px var(--accent-wash);
@@ -549,7 +569,13 @@ tbody tr:hover td { background: var(--surface); }
 /* Login ----------------------------------------------------------------- */
 #login-overlay {
   position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; padding: var(--sp-4);
-  background: var(--page); transition: opacity .4s ease; overflow: hidden;
+  transition: opacity .4s ease, background-color .8s var(--ease); overflow: hidden;
+  /* Atmospheric wash so the HUD sits in a lit volume instead of on flat black,
+     which is what carries the reference's depth. A full-bleed backdrop layer,
+     not a fill on a component surface. */
+  background:
+    radial-gradient(115% 85% at 50% 50%, var(--hud-wash) 0%, transparent 62%),
+    var(--page);
 }
 /* Hand-off to the dashboard. The overlay itself is not faded as a whole any
    more: its backdrop clears while the HUD expands outward and the X-glyph field
@@ -571,19 +597,39 @@ tbody tr:hover td { background: var(--surface); }
    the CPU. */
 .login-hud {
   position: absolute; inset: 0; pointer-events: none;
-  color: var(--negative); opacity: .5;
+  color: var(--hud-red); opacity: .82;
 }
-.login-hud svg { width: 100%; height: 100%; display: block; }
+/* Chromatic split plus bloom. Two zero-blur drop-shadows offset in opposite
+   directions produce offset colour copies of the alpha silhouette, which is the
+   RGB-split glitch, without duplicating any geometry — a <use> clone would not
+   inherit the CSS animations and would sit frozen beside the live original. The
+   third shadow is the halo. */
+.login-hud svg {
+  width: 100%; height: 100%; display: block;
+  filter:
+    drop-shadow(-2px 0 0 var(--hud-glow-ghost))
+    drop-shadow(2px 0 0 var(--hud-glow-red))
+    drop-shadow(0 0 7px var(--hud-bloom));
+}
+/* A rare, brief horizontal tear. Mostly idle so it reads as a glitch rather
+   than a wobble, and it is transform-only. */
+@keyframes hud-tear {
+  0%, 92%, 100% { transform: none; }
+  93% { transform: translateX(-5px) skewX(.6deg); }
+  95% { transform: translateX(4px); }
+  97% { transform: translateX(-2px) skewX(-.4deg); }
+}
+.login-hud svg { animation: hud-tear 9s steps(1, end) infinite; }
 .login-hud path, .login-hud circle, .login-hud rect, .login-hud line { vector-effect: non-scaling-stroke; }
 
 .hud-frames path { fill: none; stroke: currentColor; stroke-width: 1.5; opacity: .6; }
 .hud-frames .hud-frame-inner { stroke-width: 1; opacity: .26; }
 .hud-lines path { fill: none; stroke: currentColor; stroke-width: 1; opacity: .34; }
 /* Tick strips read as light instrumentation against the red frame work. */
-.hud-ticks { color: var(--text); opacity: .5; }
-.hud-ticks-fine { opacity: .6; }
-.hud-tick-rails path { fill: none; stroke: var(--text); stroke-width: 1; opacity: .3; }
-.hud-scan rect { fill: var(--text); opacity: .3; filter: blur(2px); }
+.hud-ticks { color: var(--text); opacity: .82; }
+.hud-ticks-fine { opacity: .7; }
+.hud-tick-rails path { fill: none; stroke: var(--text); stroke-width: 1; opacity: .45; }
+.hud-scan rect { fill: var(--text); opacity: .4; filter: blur(2px); }
 .hud-reticle circle { fill: none; stroke: currentColor; stroke-width: 1.5; }
 .hud-ring-outer { opacity: .45; stroke-width: 2; }
 /* Lens bracket and inner ring are light, matching the reference's white core. */
@@ -595,8 +641,26 @@ tbody tr:hover td { background: var(--surface); }
 .hud-ring-spin-alt { stroke-dasharray: 4 22; opacity: .5; transform-box: view-box; transform-origin: 600px 400px; }
 .hud-core { fill: var(--text) !important; stroke: none !important; opacity: .95; }
 .hud-cross { fill: none; stroke: currentColor; stroke-width: 2; opacity: .5; }
-.hud-nodes rect { fill: currentColor; opacity: .9; }
-.hud-dots circle { fill: var(--positive); opacity: .16; }
+/* Nodes carry their own tighter bloom, which is what makes them read as lit
+   emitters rather than flat swatches. */
+.hud-nodes rect { fill: currentColor; opacity: .95; filter: drop-shadow(0 0 5px var(--hud-node-glow)); }
+/* Neon price tapes. Laser look comes from a tight bloom on a thin stroke; the
+   round joins stop each turn reading as a hard corner. */
+.hud-tape path {
+  fill: none; stroke: currentColor; stroke-width: 2;
+  stroke-linejoin: round; stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+.hud-tape { opacity: .85; }
+.hud-tape-up   { color: var(--positive); filter: drop-shadow(0 0 7px var(--hud-cell-glow)); }
+.hud-tape-down { color: var(--hud-red);  filter: drop-shadow(0 0 7px var(--hud-glow-red)); }
+.hud-tape-ref  { color: var(--info); opacity: .4; filter: drop-shadow(0 0 6px var(--hud-glow-ghost)); }
+/* Scroll by exactly one viewBox width so the doubled path loops seamlessly.
+   Different speeds give the three series a parallax separation. */
+@keyframes tape-scroll { to { transform: translateX(-1200px); } }
+.hud-tape-up   { animation: tape-scroll 34s linear infinite; }
+.hud-tape-down { animation: tape-scroll 46s linear infinite; }
+.hud-tape-ref  { animation: tape-scroll 68s linear infinite; }
 
 /* Motion. Each keyframe touches opacity/transform only. */
 @keyframes hud-spin { to { transform: rotate(360deg); } }
@@ -605,7 +669,6 @@ tbody tr:hover td { background: var(--surface); }
 @keyframes hud-node-pulse { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
 @keyframes hud-breathe { 0%, 100% { opacity: .32; } 50% { opacity: .5; } }
 @keyframes hud-core-pulse { 0%, 100% { opacity: .55; transform: scale(1); } 50% { opacity: 1; transform: scale(1.12); } }
-@keyframes hud-dot-drift { 0%, 100% { opacity: .1; } 50% { opacity: .26; } }
 @keyframes hud-settle { from { opacity: 0; transform: scale(1.06); } to { opacity: .5; transform: none; } }
 
 /* No fill mode anywhere in here on purpose. `both`/`backwards` would hold the
@@ -637,9 +700,6 @@ tbody tr:hover td { background: var(--surface); }
 .hud-nodes rect:nth-child(14) { animation-delay: 2.34s; }
 .hud-nodes rect:nth-child(15) { animation-delay: 2.52s; }
 .hud-nodes rect:nth-child(16) { animation-delay: 2.7s; }
-.hud-dots circle { animation: hud-dot-drift 7s ease-in-out infinite; }
-.hud-dots circle:nth-child(3n+2) { animation-delay: 2.3s; }
-.hud-dots circle:nth-child(3n) { animation-delay: 4.6s; }
 
 /* The sign-in controls are part of the HUD, not a panel on top of it: no card
    fill, no border, no shadow. Legibility instead comes from the HUD being
@@ -678,12 +738,12 @@ tbody tr:hover td { background: var(--surface); }
   margin-bottom: var(--sp-6); padding-bottom: var(--sp-3); border-bottom: 1px solid var(--border);
   font-size: var(--text-2xl); text-align: center;
 }
-.login-box h1 span { color: var(--accent); }
+.login-box h1 span { color: var(--hud-red); }
 
 /* Field labels read as HUD captions. This is the second and last uppercase rule
    in the stylesheet, and it sits at --text-xs's larger sibling to stay legible. */
 .login-box label {
-  margin: var(--sp-4) 0 var(--sp-1); color: var(--text-secondary);
+  margin: var(--sp-4) 0 var(--sp-1); color: var(--hud-ink-dim);
   font-size: var(--text-sm); font-weight: 500; letter-spacing: .1em; text-transform: uppercase;
 }
 /* Underlined instruments rather than boxed inputs, so the field belongs to the
@@ -696,13 +756,21 @@ tbody tr:hover td { background: var(--surface); }
   border-bottom-color: var(--accent); box-shadow: 0 1px 0 0 var(--accent);
 }
 .login-box input:focus-visible { outline: none; }
+/* The dashboard's yellow accent read as a foreign element on a red HUD, so the
+   submit takes the HUD's own red. Near-black on --hud-red measures 5.2:1, which
+   the reverse (light text on red, 3.8:1) would not. */
 .login-box button {
   width: 100%; margin-top: var(--sp-8); border-radius: 0;
-  background: var(--accent); border: 1px solid var(--accent); color: var(--on-accent);
-  font-weight: 600; letter-spacing: .04em;
+  background: var(--hud-red); border: 1px solid var(--hud-red); color: var(--page);
+  font-weight: 600; letter-spacing: .08em;
+  box-shadow: 0 0 18px -4px var(--hud-bloom);
 }
-.login-box button:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+.login-box button:hover:not(:disabled) { background: var(--hud-red-hover); border-color: var(--hud-red-hover); }
 .login-box .error { border-radius: 0; }
+/* Warm off-white rather than the cool --text, which looked cold beside the red. */
+.login-box h1, .login-box input { color: var(--hud-ink); }
+.login-box input::placeholder { color: var(--hud-ink-dim); opacity: .65; }
+.login-status { color: var(--hud-ink-dim); }
 
 /* Live radar: monitored events ------------------------------------------ */
 .stack { display: flex; flex-direction: column; gap: var(--sp-4); }

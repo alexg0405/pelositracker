@@ -6,7 +6,7 @@
   <meta name="description" content="Auditable live sports-market research and controlled Polymarket US execution">
   <title>PelosiTracker Dashboard</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <link rel="stylesheet" href="/static/index.css?v=hud-6">
+  <link rel="stylesheet" href="/static/index.css?v=tape-1">
 </head>
 <body class="research-workstation">
 <a class="skip-link" href="#main-content">Skip to dashboard</a>
@@ -34,14 +34,23 @@
         </mask>
       </defs>
 
-      <!-- Dim green status row, behind everything, spanning the full width -->
-      <g class="hud-dots">
-        <circle cx="120" cy="392" r="26"/><circle cx="196" cy="418" r="17"/>
-        <circle cx="286" cy="386" r="21"/><circle cx="372" cy="410" r="14"/>
-        <circle cx="452" cy="392" r="24"/><circle cx="536" cy="414" r="16"/>
-        <circle cx="668" cy="414" r="16"/><circle cx="752" cy="392" r="24"/>
-        <circle cx="836" cy="410" r="14"/><circle cx="918" cy="386" r="21"/>
-        <circle cx="1008" cy="418" r="17"/><circle cx="1086" cy="392" r="26"/>
+      <!-- Neon price tapes, behind everything. Each series is drawn twice, the
+           second copy shifted a full viewBox width, and the group scrolls by
+           exactly that width — so the loop is seamless with no visible seam or
+           snap-back. Each path's first and last y are equal for the same reason.
+           Green rises, red falls, cyan is the slow reference series, which keeps
+           the colours consistent with the P/L semantics used elsewhere. -->
+      <g class="hud-tape hud-tape-up">
+        <path d="M0 440 L50 424 L100 452 L150 436 L200 410 L250 428 L300 396 L350 418 L400 402 L450 380 L500 398 L550 372 L600 390 L650 408 L700 386 L750 412 L800 398 L850 424 L900 406 L950 432 L1000 418 L1050 444 L1100 428 L1150 452 L1200 440"/>
+        <path transform="translate(1200 0)" d="M0 440 L50 424 L100 452 L150 436 L200 410 L250 428 L300 396 L350 418 L400 402 L450 380 L500 398 L550 372 L600 390 L650 408 L700 386 L750 412 L800 398 L850 424 L900 406 L950 432 L1000 418 L1050 444 L1100 428 L1150 452 L1200 440"/>
+      </g>
+      <g class="hud-tape hud-tape-down">
+        <path d="M0 300 L50 316 L100 292 L150 308 L200 328 L250 306 L300 322 L350 344 L400 320 L450 336 L500 312 L550 330 L600 350 L650 328 L700 344 L750 322 L800 340 L850 316 L900 334 L950 310 L1000 326 L1050 304 L1100 318 L1150 286 L1200 300"/>
+        <path transform="translate(1200 0)" d="M0 300 L50 316 L100 292 L150 308 L200 328 L250 306 L300 322 L350 344 L400 320 L450 336 L500 312 L550 330 L600 350 L650 328 L700 344 L750 322 L800 340 L850 316 L900 334 L950 310 L1000 326 L1050 304 L1100 318 L1150 286 L1200 300"/>
+      </g>
+      <g class="hud-tape hud-tape-ref">
+        <path d="M0 560 L50 536 L100 552 L150 520 L200 544 L250 512 L300 532 L350 508 L400 528 L450 548 L500 524 L550 544 L600 568 L650 546 L700 570 L750 552 L800 576 L850 556 L900 580 L950 560 L1000 584 L1050 564 L1100 576 L1150 540 L1200 560"/>
+        <path transform="translate(1200 0)" d="M0 560 L50 536 L100 552 L150 520 L200 544 L250 512 L300 532 L350 508 L400 528 L450 548 L500 524 L550 544 L600 568 L650 546 L700 570 L750 552 L800 576 L850 556 L900 580 L950 560 L1000 584 L1050 564 L1100 576 L1150 540 L1200 560"/>
       </g>
 
       <!-- Mirrored angled frames, three deep on each side -->
@@ -1380,6 +1389,6 @@
 
 
 <script src="/static/csrf.js" defer></script>
-<script src="/static/index.js?v=hud-6" defer></script>
+<script src="/static/index.js?v=tape-1" defer></script>
 </body>
 </html>
