@@ -90,6 +90,10 @@
   --sp-05: 2px;  /* stacked label/value pairs only */
   --sp-1: 4px;   --sp-2: 8px;   --sp-3: 12px;  --sp-4: 16px;  --sp-5: 20px;
   --sp-6: 24px;  --sp-8: 32px;  --sp-12: 48px; --sp-16: 64px;
+  /* Horizontal page gutter. The sticky bars bleed by exactly this much, so
+     their background reaches the page edges while their content stays aligned
+     with the panels below. Redefined per breakpoint further down. */
+  --gutter: var(--sp-6);
   --sticky-offset: 104px;  /* clears the two sticky nav bars */
   /* Hard edges. Soft 18px cards read as friendly SaaS; this UI is meant to
      look like instrumentation. The light theme keeps the rounded values. */
@@ -235,7 +239,7 @@ button:active:not(:disabled) { transform: translateY(.5px); }
   border: 1px solid var(--border-strong); border-radius: var(--radius); font-size: var(--text-sm); transform: translateY(-200%);
 }
 .skip-link:focus { transform: none; }
-.wrap { max-width: 1200px; margin: 0 auto; padding: var(--sp-6) var(--sp-6) var(--sp-16); }
+.wrap { max-width: 1200px; margin: 0 auto; padding: var(--sp-6) var(--gutter) var(--sp-16); }
 .research-workstation .wrap { max-width: 1320px; }
 header {
   display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4); padding-bottom: var(--sp-4); margin-bottom: var(--sp-6);
@@ -259,7 +263,8 @@ header {
 
 /* ----------------------------------------------------------- navigation --- */
 .tab-carousel {
-  position: sticky; top: 0; z-index: 40; display: flex; gap: var(--sp-1); margin-bottom: var(--sp-6); padding: var(--sp-2) 0; background: var(--bg);
+  position: sticky; top: 0; z-index: 40; display: flex; gap: var(--sp-1); margin: 0 calc(var(--gutter) * -1) var(--sp-6);
+  padding: var(--sp-2) var(--gutter); background: var(--bg);
   border-bottom: 1px solid var(--border); overflow-x: auto; scrollbar-width: none;
 }
 .tab-carousel::-webkit-scrollbar { display: none; }
@@ -289,7 +294,8 @@ header {
    here already reads as a segmented control rather than a link list. */
 .research-section-nav {
   position: sticky; top: 53px; z-index: 35; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: var(--sp-3);
-  margin-bottom: var(--sp-6); padding: var(--sp-2) 0; background: var(--bg); border-bottom: 1px solid var(--border);
+  margin: 0 calc(var(--gutter) * -1) var(--sp-6); padding: var(--sp-2) var(--gutter);
+  background: var(--bg); border-bottom: 1px solid var(--border);
 }
 .research-section-nav-label { color: var(--text-muted); font-size: var(--text-xs); white-space: nowrap; }
 .research-section-nav-scroll { display: flex; min-width: 0; gap: var(--sp-1); overflow-x: auto; scrollbar-width: none; }
@@ -1571,7 +1577,8 @@ a.us-setup-cta-button:hover { background: var(--accent-hover); border-color: var
   .us-activity-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 900px) {
-  .wrap, .research-workstation .wrap { padding: var(--sp-4) var(--sp-4) var(--sp-12); }
+  :root { --gutter: var(--sp-4); }
+  .wrap, .research-workstation .wrap { padding: var(--sp-4) var(--gutter) var(--sp-12); }
   .us-overview-grid,
   .model-lab-grid,
   .us-liquidate-controls,
@@ -1624,7 +1631,8 @@ a.us-setup-cta-button:hover { background: var(--accent-hover); border-color: var
   .us-performance-actions, .model-lab-actions { width: 100%; justify-content: flex-start; }
 }
 @media (max-width: 640px) {
-  .wrap, .research-workstation .wrap { padding: var(--sp-3) var(--sp-3) var(--sp-12); }
+  :root { --gutter: var(--sp-3); }
+  .wrap, .research-workstation .wrap { padding: var(--sp-3) var(--gutter) var(--sp-12); }
   header, .event-head, .us-position-toolbar, .us-venue-sync-bar,
   .discover-batch-bar { align-items: flex-start; flex-direction: column; }
   .header-brand, .config { width: 100%; }
