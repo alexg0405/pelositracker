@@ -1,45 +1,47 @@
-/* PelosiTracker dashboard — single-layer stylesheet.
-   ONE layer only: no override pass is appended below and none should ever be.
-   If a rule needs to change, change it in place. This file replaced five
-   stacked re-skins (a dark base, three density passes, a lobby theme), which
-   is why nothing could previously be adjusted predictably.
-   Order: tokens -> reset -> shell -> nav -> primitives -> components
-          -> responsive -> motion.
-   Invariants: every value comes from a token; nothing below 12px; uppercase
-   only on table column headers; numerics in --font-mono with tabular-nums;
-   panels are flat, and --elevation is reserved for popovers and dialogs. */
+/* PelosiTracker dashboard — single-layer stylesheet. ONE layer only: never
+   append an override pass; change rules in place. Order: tokens, reset, shell,
+   nav, primitives, components, responsive, motion. Invariants: every value
+   from a token; nothing under 12px; uppercase only on table column headers;
+   numerics in --font-mono with tabular-nums; --elevation is for popovers and
+   dialogs only. */
 :root {
   color-scheme: light;
-
-  /* Surfaces */
+  /* Surfaces — cool neutrals with a trace of violet, so the accent reads as
+     part of the same family rather than pasted on. */
+  /* --page is the canvas, --bg is anything sitting on it. Keeping cards white
+     on a calm grey page preserves every text contrast ratio unchanged while
+     giving the panels an edge without needing a shadow. */
+  --page:          #f0f0f4;
   --bg:            #ffffff;
-  --surface:       #fafaf8;
-  --surface-sunk:  #f4f4f1;
-  --border:        #e6e6e1;
-  --border-strong: #d3d3cc;
+  --surface:       #f6f6fa;
+  --surface-sunk:  #eeeef5;
+  --border:        #e4e4ee;
+  --border-strong: #d2d2e0;
 
   /* Text */
-  --text:           #1a1a1a;
-  --text-secondary: #5c5c5c;
-  /* Darkened from the #8a8a8a starting value: that reads 3.5:1 on white and
-     fails WCAG AA for text. #6b6b6b is 5.1:1 and still recedes. */
-  --text-muted:     #6b6b6b;
+  --text:           #14141b;
+  --text-secondary: #55556a;
+  /* Any lighter fails WCAG AA on white; this is 5.0:1 and still recedes. */
+  --text-muted:     #6a6a80;
 
-  /* Accent — one yellow, dark text on it */
-  --accent:       #f5d800;
-  --accent-hover: #e3c800;
-  --accent-wash:  #fffbe0;
-  --on-accent:    #1a1a1a;
+  /* Accent — electric iris. Deliberately not a lime/green: green means profit
+     and red means loss here, so a green brand colour would read as a value.
+     Violet carries no financial meaning. Dark enough for white text (5.6:1). */
+  --accent:       #5546e8;
+  --accent-hover: #4436d4;
+  --accent-wash:  #f0eefe;
+  --accent-edge:  #c9c2fb;
+  --on-accent:    #ffffff;
 
-  /* Semantic — all AA on white */
-  --positive: #067647;
-  --negative: #b42318;
-  --warning:  #b54708;
-  --info:     #344054;
-  --positive-wash: #ecfdf3;
-  --negative-wash: #fef3f2;
-  --warning-wash:  #fffaeb;
-  --info-wash:     #f2f4f7;
+  /* Semantic — all AA on white, tuned to sit beside the violet */
+  --positive: #0a7350;
+  --negative: #c02a1c;
+  --warning:  #a8560b;
+  --info:     #3a3a52;
+  --positive-wash: #e9faf2;
+  --negative-wash: #fdf0ee;
+  --warning-wash:  #fdf6e8;
+  --info-wash:     #f3f3f8;
 
   /* Type scale — 12px floor */
   --text-xs:   12px;
@@ -51,17 +53,16 @@
   --text-3xl:  30px;
 
   /* Spacing — 4px base */
-  --sp-05: 2px;  /* hairline gap inside a stacked label/value pair only */
+  --sp-05: 2px;  /* stacked label/value pairs only */
   --sp-1: 4px;   --sp-2: 8px;   --sp-3: 12px;  --sp-4: 16px;  --sp-5: 20px;
   --sp-6: 24px;  --sp-8: 32px;  --sp-12: 48px; --sp-16: 64px;
-  /* Offset for content scrolled under the two sticky nav bars. */
-  --sticky-offset: 104px;
+  --sticky-offset: 104px;  /* clears the two sticky nav bars */
   --radius:      8px;
-  --radius-card: 12px;
+  --radius-card: 18px;
   --radius-pill: 999px;
 
-  /* One easing and one duration for every state change, so hovers and
-     selections feel like the same object rather than six different widgets. */
+  /* One easing/duration for every state change, so hovers and selections feel
+     like one object rather than six widgets. */
   --ease: cubic-bezier(.2, 0, .2, 1);
   --dur: 130ms;
   --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -76,7 +77,7 @@
 *, *::before, *::after { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; }
 body {
-  margin: 0; background: var(--bg); color: var(--text); font: var(--text-base)/1.55 var(--font-sans);
+  margin: 0; background: var(--page); color: var(--text); font: var(--text-base)/1.55 var(--font-sans);
   -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; text-rendering: optimizeLegibility;
 }
 
@@ -152,15 +153,18 @@ header {
   background: transparent; color: var(--text-secondary); font-size: var(--text-sm); font-weight: 500; white-space: nowrap; cursor: pointer;
 }
 .tab-carousel .pill:hover { background: var(--surface-sunk); color: var(--text); }
-.tab-carousel .pill.active { background: var(--text); border-color: var(--text); color: var(--bg); }
+/* The selected workspace is the accent's permanent home, so the brand colour
+   is present on every screen without being sprayed around. */
+.tab-carousel .pill.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.tab-carousel .pill.active:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
 /* Sticky bars sit on a translucent, blurred backdrop so long tables scrolling
    underneath stay legible without a shadow. */
 .tab-carousel, .research-section-nav, .us-policy-rail, .us-policy-footer {
-  background: color-mix(in srgb, var(--bg) 86%, transparent); backdrop-filter: saturate(180%) blur(8px);
+  background: color-mix(in srgb, var(--page) 86%, transparent); backdrop-filter: saturate(180%) blur(8px);
   -webkit-backdrop-filter: saturate(180%) blur(8px);
 }
 @supports not (backdrop-filter: blur(1px)) {
-  .tab-carousel, .research-section-nav, .us-policy-rail, .us-policy-footer { background: var(--bg); }
+  .tab-carousel, .research-section-nav, .us-policy-rail, .us-policy-footer { background: var(--page); }
 }
 
 /* Workspace map. Phase 3 turns these into real view switches; the styling
@@ -180,7 +184,7 @@ header {
 }
 .research-section-link:hover,
 .research-section-top:hover { background: var(--surface-sunk); color: var(--text); }
-.research-section-link.active { background: var(--accent-wash); border-color: var(--accent); color: var(--text); font-weight: 500; }
+.research-section-link.active { background: var(--accent-wash); border-color: var(--accent-edge); color: var(--accent); font-weight: 600; }
 .research-anchor, #us-activity { scroll-margin-top: var(--sticky-offset); }
 .carousel { display: flex; gap: var(--sp-2); margin-bottom: var(--sp-3); padding-bottom: var(--sp-1); overflow-x: auto; }
 .carousel .pill {
@@ -192,10 +196,38 @@ header {
 .discover-league-filter { margin: var(--sp-3) 0 var(--sp-1); }
 
 /* ----------------------------------------------------------- primitives --- */
+/* Data panels stay white with a hairline: tinting them would collapse the
+   contrast against the wells, tables and forms inside. The tinted bento fill
+   is used on the overview launcher, where nothing dense competes. */
 .panel, .event, .empty { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-card); min-width: 0; }
 /* 20px, not 16: at 16 the panels read cramped against a 12px type floor. */
 .pad { padding: var(--sp-5); }
 .title { margin: 0 0 var(--sp-3); color: var(--text); font-size: var(--text-lg); font-weight: 600; }
+/* Two-tone heading: the subject stays ink, the qualifying phrase drops to
+   secondary at the same size. Reads as one sentence, scans as a label. */
+.title > span, .bento-card h3 > span { color: var(--text-secondary); font-weight: 500; }
+
+/* Bento launcher — white tiles on the grey canvas. */
+.bento-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: var(--sp-3); margin-top: var(--sp-4); }
+.bento-card {
+  position: relative; display: flex; flex-direction: column; gap: var(--sp-2); grid-column: span 2;
+  padding: var(--sp-5); border: 1px solid var(--border); border-radius: var(--radius-card);
+  background: var(--bg); color: var(--text); text-align: left; text-decoration: none; min-height: 148px; overflow: hidden;
+}
+.bento-card.is-wide { grid-column: span 3; }
+.bento-card:hover { border-color: var(--border-strong); background: var(--surface); }
+.bento-card h3 { padding-right: var(--sp-8); font-size: var(--text-xl); line-height: 1.2; letter-spacing: -.018em; }
+.bento-card p { margin: 0; color: var(--text-secondary); font-size: var(--text-sm); }
+.bento-card .bento-metric { margin-top: auto; font: 600 var(--text-2xl)/1.1 var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+.bento-card .bento-metric small { display: block; margin-top: var(--sp-1); color: var(--text-secondary); font-weight: 400; }
+/* Corner affordance: a white pill holding an arrow, as on a Ramp tile. */
+.bento-card::after {
+  content: "↗"; position: absolute; top: var(--sp-4); right: var(--sp-4); display: grid; place-items: center; width: 30px; height: 30px;
+  border-radius: 50%; background: var(--bg); color: var(--text); font-size: var(--text-sm); line-height: 1;
+  transition: background-color var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.bento-card:hover::after { background: var(--accent); color: var(--on-accent); }
+.bento-card:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .browse-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-3); margin-bottom: var(--sp-3); }
 .browse-head .title { margin: 0; }
 
@@ -399,7 +431,7 @@ tbody tr:hover td { background: var(--surface); }
 /* Login ----------------------------------------------------------------- */
 #login-overlay {
   position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; padding: var(--sp-4);
-  background: var(--surface); transition: opacity .4s ease;
+  background: var(--page); transition: opacity .4s ease;
 }
 #login-overlay.dissolve { opacity: 0; pointer-events: none; }
 .login-box {
@@ -612,10 +644,9 @@ tbody tr:hover td { background: var(--surface); }
    this screen allowed to be solid yellow. A selected card gets weight and an
    edge marker instead, so the two never compete. */
 .us-trading-lanes button.is-active { border-color: var(--border-strong); background: var(--surface); box-shadow: inset 3px 0 0 var(--accent); }
-/* A status bar, not a table. The server writes one <strong> state plus a
-   variable number of prose <span>s here, so five rigid columns squeezed the
-   long ones into a wall. Flex-wrap fits whatever arrives, at every width,
-   which also removes the need for any responsive override of this rule. */
+/* A status bar, not a table. The server writes one <strong> plus a variable
+   number of prose <span>s, so five rigid columns squeezed the long ones into a
+   wall. Flex-wrap fits any content at any width, needing no override. */
 .us-trading-status {
   display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-3);
   padding: var(--sp-3) var(--sp-4); border: 1px solid var(--border); border-radius: var(--radius);
@@ -623,14 +654,10 @@ tbody tr:hover td { background: var(--surface); }
 }
 .us-trading-status > * { min-width: 0; }
 .us-trading-status strong {
-  display: inline-flex; align-items: center; gap: var(--sp-2); flex: 0 0 auto;
-  font: 600 var(--text-base)/1.2 var(--font-mono); letter-spacing: -.01em;
+  display: inline-flex; align-items: center; gap: var(--sp-2); flex: 0 0 auto; font: 600 var(--text-base)/1.2 var(--font-mono); letter-spacing: -.01em;
 }
 /* State marker, so the headline state is scannable without colour alone. */
-.us-trading-status strong::before {
-  content: ""; width: var(--sp-2); height: var(--sp-2); border-radius: 50%;
-  background: var(--text-muted); flex: 0 0 auto;
-}
+.us-trading-status strong::before { content: ""; width: var(--sp-2); height: var(--sp-2); border-radius: 50%; background: var(--text-muted); flex: 0 0 auto; }
 .us-trading-status span { color: var(--text-secondary); }
 /* Hairline separators between meta items instead of column gutters. */
 .us-trading-status span + span { padding-left: var(--sp-3); border-left: 1px solid var(--border-strong); }
@@ -1081,6 +1108,8 @@ dialog::backdrop { background: rgba(26, 26, 26, .45); }
   .activity-row,
   .us-market { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .us-runtime-credential-actions { grid-column: auto; }
+  .bento-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .bento-card, .bento-card.is-wide { grid-column: span 1; }
   .us-lane-quick-control button,
   .us-risk-session-control button { width: 100%; min-width: 0; }
   .us-policy-rail { position: static; }
@@ -1129,6 +1158,8 @@ dialog::backdrop { background: rgba(26, 26, 26, .45); }
   .us-mode-switch,
   .chart-grid,
   .us-market { grid-template-columns: 1fr; }
+  .bento-grid { grid-template-columns: 1fr; }
+  .bento-card, .bento-card.is-wide { grid-column: span 1; min-height: 0; }
   .chart-frame-sm, .chart-card-wide .chart-frame-sm { height: 200px; }
   .us-trading-actions { grid-template-columns: 1fr; }
   .best-bet { align-items: flex-start; flex-direction: column; }

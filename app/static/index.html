@@ -6,7 +6,7 @@
   <meta name="description" content="Auditable live sports-market research and controlled Polymarket US execution">
   <title>PelosiTracker Dashboard</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <link rel="stylesheet" href="/static/index.css?v=editorial-5">
+  <link rel="stylesheet" href="/static/index.css?v=iris-2">
 </head>
 <body class="research-workstation">
 <a class="skip-link" href="#main-content">Skip to dashboard</a>
@@ -60,7 +60,7 @@
   <div id="tab-discovery" class="tab-content is-hidden" role="tabpanel" aria-labelledby="tab-discovery-button">
     <div class="panel pad section-gap">
       <div class="browse-head">
-        <h2 class="title">Best current bets</h2>
+        <h2 class="title">Best <span>current bets</span></h2>
         <span class="metrics-sub" id="best-bets-sub"></span>
       </div>
       <div class="field-note">Positive research edges across monitored games. Each row shows whether an exact Polymarket US contract is qualified, queued, open, or research-only. Tap one to jump to the Live Radar.</div>
@@ -68,7 +68,7 @@
     </div>
 
     <div class="panel pad section-gap">
-      <h2 class="title">Paste Polymarket link</h2>
+      <h2 class="title">Paste <span>Polymarket link</span></h2>
       <div class="error" id="form-error" role="alert" hidden></div>
       <form id="form">
         <label for="polymarket-url">Event link</label>
@@ -86,7 +86,7 @@
 
     <div class="panel pad">
       <div class="browse-head">
-        <h2 class="title">Live Polymarket games</h2>
+        <h2 class="title">Live Polymarket <span>games</span></h2>
         <div class="inline-controls">
           <label class="auto-monitor-label" title="Master switch for paid sportsbook polling"><input class="compact-input" type="checkbox" id="odds-api-toggle"> Odds API polling</label>
           <label class="auto-monitor-label" for="odds-api-interval">Every
@@ -157,7 +157,7 @@
     <section class="panel pad section-gap us-research-hero research-anchor" id="us-research-overview" data-research-view="us-research-overview">
       <div class="browse-head">
         <div>
-          <h2 class="title">Polymarket US research & execution</h2>
+          <h2 class="title">Polymarket US <span>research &amp; execution</span></h2>
           <div class="field-note">The established engine remains unchanged. A separate, auditable execution policy maps its signals to exact US/mobile contracts and enforces your bankroll limits.</div>
         </div>
         <span class="us-venue-badge">POLYMARKET US</span>
@@ -168,13 +168,53 @@
         <div class="us-status-card"><span>Trading</span><strong>Loading…</strong></div>
       </div>
       <div class="notice us-safety-note"><strong>Safety boundary:</strong> live entries and live cash-outs are disarmed after every restart and when the selected 30-minute to 4-hour latch expires. Dry-run is the default. Orders are bounded fill-or-kill limits, every live order is previewed, and the emergency stop touches only orders created here.</div>
+
+      <!-- Launcher for the other eight views. These are the same in-page hash
+           routes the workspace map uses, so deep links and the back button
+           behave identically whichever control you reach them from. -->
+      <nav class="bento-grid" aria-label="Workspace">
+        <a class="bento-card is-wide" href="#us-performance">
+          <h3>Performance <span>at a glance</span></h3>
+          <p>Lane tallies and result charts from every retained closed trade.</p>
+          <span class="bento-metric" id="bento-net">—<small>Total net</small></span>
+        </a>
+        <a class="bento-card is-wide" href="#us-ledger">
+          <h3>Trade data <span>row by row</span></h3>
+          <p>Every retained trade with the exact settings snapshot it was entered on.</p>
+          <span class="bento-metric" id="bento-trades">—<small>Retained trades</small></span>
+        </a>
+        <a class="bento-card" href="#us-auto-trader">
+          <h3>Auto trader <span>lanes</span></h3>
+          <p>Arm, disarm and watch execution state.</p>
+        </a>
+        <a class="bento-card" href="#us-policy">
+          <h3>Policy <span>in six steps</span></h3>
+          <p>Bankroll, authorization, exits and gates.</p>
+        </a>
+        <a class="bento-card" href="#us-activity">
+          <h3>Positions <span>&amp; journal</span></h3>
+          <p>Open trades and every gate decision.</p>
+        </a>
+        <a class="bento-card" href="#us-advisor">
+          <h3>Advisor <span>comparisons</span></h3>
+          <p>Reactive settings analysis over retained evidence.</p>
+        </a>
+        <a class="bento-card" href="#us-model-lab">
+          <h3>Model lab <span>research</span></h3>
+          <p>Observations, candidate fits and readiness.</p>
+        </a>
+        <a class="bento-card" href="#us-market-browser">
+          <h3>US markets <span>inventory</span></h3>
+          <p>Raw Polymarket US bid/ask and listed outcomes.</p>
+        </a>
+      </nav>
     </section>
 
     <div class="us-overview-grid section-gap" data-research-view="us-performance">
       <section class="panel pad us-performance-panel research-anchor" id="us-performance">
         <div class="browse-head">
           <div>
-            <h2 class="title">Trading performance</h2>
+            <h2 class="title">Trading <span>performance</span></h2>
             <div class="field-note">Running execution results for positions managed by this execution service. W–L–P counts closed trades by realized profit, loss, or push; open trades affect marked net but do not enter the record until they close.</div>
           </div>
           <div class="us-performance-actions">
@@ -195,7 +235,7 @@
       <section class="panel pad us-performance-charts" aria-labelledby="us-charts-heading">
         <div class="browse-head">
           <div>
-            <h2 class="title" id="us-charts-heading">Result charts</h2>
+            <h2 class="title" id="us-charts-heading">Result <span>charts</span></h2>
             <div class="field-note">Drawn from the same retained closed trades as the datasheet, using each trade's recorded entry settings. Closed trades only — open positions carry no realized net yet. A short run of trades is weak evidence regardless of how the line slopes.</div>
           </div>
           <div class="us-performance-actions">
@@ -222,7 +262,7 @@
       <section class="panel pad us-account-panel">
         <div class="browse-head">
           <div>
-            <h2 class="title">Account connection</h2>
+            <h2 class="title">Account <span>connection</span></h2>
             <div class="field-note">Use a server environment key, or paste a key from your phone for this server process only. Runtime credentials are verified before use and this application never writes them to browser storage, a database, the journal, or Git.</div>
           </div>
           <button class="ghost compact-button" id="us-account-refresh" type="button">Test account key</button>
@@ -253,7 +293,7 @@
     <section class="panel pad section-gap us-performance-ledger-panel research-anchor" id="us-ledger" data-research-view="us-ledger">
       <div class="browse-head">
         <div>
-          <h2 class="title">Trade performance datasheet</h2>
+          <h2 class="title">Trade performance <span>datasheet</span></h2>
           <div class="field-note">Every retained managed trade, its execution result, line type, entry-time signal, and immutable settings snapshot. A win means positive realized after-cost P/L; it is not a claim about the final game result.</div>
         </div>
         <div class="us-performance-actions">
@@ -325,7 +365,7 @@
     <section class="panel pad section-gap us-policy-advisor-panel research-anchor" id="us-advisor" data-research-view="us-advisor">
       <div class="browse-head">
         <div>
-          <h2 class="title">Reactive settings advisor</h2>
+          <h2 class="title">Reactive settings <span>advisor</span></h2>
           <div class="field-note">Compares realized after-cost managed trades across whole events, estimates how many logged opportunities would clear alternative execution filters, and reports the fitted sport model's shadow readiness. It does not alter probability, edge, signal quality, calibration, or engine gates.</div>
         </div>
         <button class="ghost compact-button" id="us-policy-advisor-refresh" type="button">Analyze all retained data</button>
@@ -380,7 +420,7 @@
     <section class="panel pad section-gap us-trading-panel research-anchor" id="us-auto-trader" data-research-view="us-auto-trader">
       <div class="browse-head">
         <div>
-          <h2 class="title">Automatic trade controls</h2>
+          <h2 class="title">Automatic trade <span>controls</span></h2>
           <div class="field-note">These are execution limits around the existing model—not new probability, edge, quality, or calibration formulas.</div>
         </div>
         <span id="us-trading-mode-badge" class="us-venue-badge">DISARMED</span>
@@ -454,7 +494,7 @@
     <section class="panel pad section-gap us-policy-panel research-anchor" id="us-policy" data-research-view="us-policy">
       <div class="browse-head">
         <div>
-          <h2 class="title">Execution policy setup</h2>
+          <h2 class="title">Execution policy <span>setup</span></h2>
           <div class="field-note">These are execution limits around the existing model—not new probability, edge, quality, or calibration formulas. Each step saves to the lane selected in the auto trader.</div>
         </div>
         <a class="us-policy-handoff-link" href="#us-auto-trader" data-research-section="us-auto-trader">Back to auto trader</a>
@@ -896,7 +936,7 @@
       <section class="panel pad us-positions-panel">
         <div class="browse-head">
           <div>
-            <h2 class="title">Managed positions</h2>
+            <h2 class="title">Managed <span>positions</span></h2>
             <div class="field-note">Managed trades show exact entry quantity and cost. The authenticated account snapshot below also shows phone/manual positions read-only; those are never adopted for automatic trading.</div>
           </div>
         </div>
@@ -951,7 +991,7 @@
       <section class="panel pad us-journal-panel">
         <div class="browse-head">
           <div>
-            <h2 class="title">Execution journal</h2>
+            <h2 class="title">Execution <span>journal</span></h2>
             <div class="field-note">A running window into candidates, gate rejections, mapping decisions, previews, fills, marks, and cash-outs. Rejections include the observed value and configured threshold so you can see exactly which check failed.</div>
           </div>
         </div>
@@ -970,7 +1010,7 @@
     <section class="panel pad section-gap model-lab-panel research-anchor" id="us-model-lab" data-research-view="us-model-lab">
       <div class="browse-head">
         <div>
-          <h2 class="title">Sport Model Lab</h2>
+          <h2 class="title">Sport <span>Model Lab</span></h2>
           <div class="field-note">Local research only. It records the existing engine output beside sport-specific live state and price movement, then labels observations after the final. The MLB candidate is state-aware, not a momentum score. It never changes a production probability, activates a model, or authorizes a trade.</div>
         </div>
         <div class="model-lab-actions">
@@ -1032,7 +1072,7 @@
     <section class="panel pad research-anchor" id="us-market-browser" data-research-view="us-market-browser">
       <div class="browse-head">
         <div>
-          <h2 class="title">US/mobile sports inventory</h2>
+          <h2 class="title">US/mobile <span>sports inventory</span></h2>
           <div class="field-note">Raw Polymarket US long-side bid/ask and listed outcomes. The execution layer may map established signals to these contracts; it never feeds these prices back into or changes the calculation engine.</div>
         </div>
         <button class="ghost compact-button" id="us-events-refresh" type="button">Refresh US markets</button>
@@ -1135,6 +1175,6 @@
 
 
 <script src="/static/csrf.js" defer></script>
-<script src="/static/index.js?v=editorial-3" defer></script>
+<script src="/static/index.js?v=iris-2" defer></script>
 </body>
 </html>

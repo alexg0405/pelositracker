@@ -2767,6 +2767,18 @@
     lastLedgerRows = rows;
     lastLedgerLineSummary = lineGroups;
     renderPerformanceCharts();
+    // Headline figures for the overview launcher tiles.
+    const bentoNet = document.querySelector("#bento-net");
+    const bentoTrades = document.querySelector("#bento-trades");
+    if (bentoNet) {
+      const net = Number(summary.realized_net_usd || 0);
+      bentoNet.firstChild.nodeValue = rows.length ? money(net) : "—";
+      bentoNet.classList.toggle("is-positive", rows.length > 0 && net > 0);
+      bentoNet.classList.toggle("is-negative", rows.length > 0 && net < 0);
+    }
+    if (bentoTrades) {
+      bentoTrades.firstChild.nodeValue = String(Number(data.total_matching_rows || 0));
+    }
     rowBox.innerHTML = rows.length
       ? rows.map(row => {
           const resultClass = ["win", "loss"].includes(row.result)

@@ -4,33 +4,34 @@
 
 :root {
   color-scheme: light;
+  --page: #f0f0f4;
   --bg: #ffffff;
-  --surface: #fafaf8;
-  --surface-sunk: #f4f4f1;
-  --border: #e6e6e1;
-  --border-strong: #d3d3cc;
-  --text: #1a1a1a;
-  --text-secondary: #5c5c5c;
-  --text-muted: #6b6b6b;
-  --accent: #f5d800;
-  --accent-hover: #e3c800;
-  --accent-wash: #fffbe0;
-  --on-accent: #1a1a1a;
-  --positive: #067647;
-  --negative: #b42318;
-  --warning: #b54708;
+  --surface: #f6f6fa;
+  --surface-sunk: #eeeef5;
+  --border: #e4e4ee;
+  --border-strong: #d2d2e0;
+  --text: #14141b;
+  --text-secondary: #55556a;
+  --text-muted: #6a6a80;
+  --accent: #5546e8;
+  --accent-hover: #4436d4;
+  --accent-wash: #f0eefe;
+  --on-accent: #ffffff;
+  --positive: #0a7350;
+  --negative: #c02a1c;
+  --warning: #a8560b;
   --text-xs: 12px; --text-sm: 13px; --text-base: 15px;
   --text-lg: 17px; --text-xl: 20px;
   --sp-05: 2px; --sp-1: 4px; --sp-2: 8px; --sp-3: 12px;
   --sp-4: 16px; --sp-6: 24px; --sp-8: 32px; --sp-12: 48px;
-  --radius: 6px; --radius-card: 8px; --radius-pill: 999px;
+  --radius: 8px; --radius-card: 18px; --radius-pill: 999px;
   --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
-  --focus: #1a1a1a;
+  --focus: #14141b;
 }
 
 *, *::before, *::after { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--text); font: var(--text-base)/1.55 var(--font-sans); }
+body { margin: 0; background: var(--page); color: var(--text); font: var(--text-base)/1.55 var(--font-sans); }
 small, sub, sup { font-size: var(--text-xs); }
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 2px; }
 
